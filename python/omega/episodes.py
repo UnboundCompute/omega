@@ -39,6 +39,7 @@ __all__ = [
     "SCHEDULE_CREATED",
     "SCHEDULE_CANCELLED",
     "CLAIM_EXTRACTED",
+    "CLAIM_RETRACTED",
     "MIN_EVERY_SECONDS",
     "TRIGGER_FIELDS",
     "BadPayload",
@@ -56,6 +57,7 @@ __all__ = [
     "schedule_created",
     "schedule_cancelled",
     "claim_extracted",
+    "claim_retracted",
     "now",
 ]
 
@@ -73,6 +75,7 @@ WORK_FINISHED = "work.finished"
 SCHEDULE_CREATED = "schedule.created"
 SCHEDULE_CANCELLED = "schedule.cancelled"
 CLAIM_EXTRACTED = "claim.extracted"
+CLAIM_RETRACTED = "claim.retracted"
 
 #: The complete M1 kind set (§2.1: "and that is all of them").
 #:
@@ -92,6 +95,7 @@ KINDS = frozenset(
         SCHEDULE_CREATED,
         SCHEDULE_CANCELLED,
         CLAIM_EXTRACTED,
+        CLAIM_RETRACTED,
     }
 )
 
@@ -112,6 +116,9 @@ KINDS = frozenset(
 # learned set is a *derived view* of these records, rebuilt from the log and
 # stored nowhere, so a claim has to be an episode or DL-017's rebuild-from-log
 # stops being true for the one kind of memory that changes behaviour silently.
+# `claim.retracted` is a record for exactly those two reasons again (DL-048):
+# forgetting something must not run a turn, and the forgetting has to be in the
+# log or a rebuild would resurrect what the person asked omega to drop.
 
 #: The trigger vocabulary (DL-042), deliberately too weak to be interesting.
 #: Every field optional and ANDed; a claim with no trigger is always active,
@@ -570,6 +577,41 @@ def claim_extracted(
     return payload
 
 
+def claim_retracted(
+    *,
+    for_seq: int,
+    claim_seq: int,
+    at: Optional[str] = None,
+) -> dict[str, Any]:
+    """The person asked omega to forget a claim (DL-048).
+
+    An append, exactly as :func:`schedule_cancelled` is: the ``claim.extracted``
+    record stays in the log, :class:`omega.derive.Learned` simply stops
+    including it, and "what did omega believe in March" is still answerable.
+    Deleting the record instead would break DL-017's rebuild-from-log for the
+    one kind of memory that changes behaviour silently, which is the property
+    every memory decision here rests on.
+
+    Distinct from ``supersedes`` on purpose. Supersession is the model replacing
+    a belief with a better one while writing that better one down; retraction is
+    the person removing a belief and putting nothing in its place. Only the
+    second can be asked for, and before this kind existed it could not be.
+
+    Attached to the turn that did it (``for_seq``) because a retraction is
+    always something a turn was asked to do — unlike a schedule definition,
+    which belongs to no turn.
+    """
+    payload = {
+        "v": VERSION,
+        "kind": CLAIM_RETRACTED,
+        "for_seq": for_seq,
+        "claim_seq": claim_seq,
+        "at": at or now(),
+    }
+    _validate(payload)
+    return payload
+
+
 def _copy_trigger(trigger: dict[str, Any]) -> dict[str, Any]:
     copied = dict(trigger)
     if isinstance(copied.get("any"), list):
@@ -599,6 +641,7 @@ _REQUIRED: dict[str, tuple[str, ...]] = {
         "trigger",
         "at",
     ),
+    CLAIM_RETRACTED: ("for_seq", "claim_seq", "at"),
 }
 
 #: The kinds that are *not* about one turn. Everything else names the inbound
@@ -725,6 +768,14 @@ def _validate(payload: dict[str, Any]) -> None:
                 # confusion of the two seqs, not a fact anyone meant to record.
                 raise BadPayload("supersedes must name a claim, not the source")
         _validate_trigger(payload["trigger"])
+
+    if kind == CLAIM_RETRACTED:
+        _require_seq(payload, "claim_seq")
+        if payload["claim_seq"] == payload["for_seq"]:
+            # The same confusion `supersedes` guards against, from the other
+            # side: a retraction naming its own turn is two seqs mixed up, not
+            # a claim anybody meant to forget.
+            raise BadPayload("claim_seq must name a claim, not the turn")
 
     _require_str(payload, "at", non_empty=True)
 

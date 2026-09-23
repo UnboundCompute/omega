@@ -43,8 +43,11 @@ def _claim_obj(seq: int, text: str, **over) -> derive.Claim:
     return derive.Claim(**fields)
 
 
-def _answer(*claims: dict) -> str:
-    return json.dumps({"claims": list(claims)})
+def _answer(*claims: dict, retract=()) -> str:
+    out: dict = {"claims": list(claims)}
+    if retract:
+        out["retract"] = list(retract)
+    return json.dumps(out)
 
 
 def _a_claim(text="keep status updates short", **over) -> dict:
@@ -130,6 +133,12 @@ def _log(q: EventQueue) -> list[tuple[int, dict]]:
 def _claims_in(q: EventQueue) -> list[tuple[int, dict]]:
     return [
         (seq, p) for seq, p in _log(q) if p.get("kind") == episodes.CLAIM_EXTRACTED
+    ]
+
+
+def _retractions_in(q: EventQueue) -> list[tuple[int, dict]]:
+    return [
+        (seq, p) for seq, p in _log(q) if p.get("kind") == episodes.CLAIM_RETRACTED
     ]
 
 

@@ -152,6 +152,7 @@ NOT_PROJECTED = frozenset(
         episodes.SCHEDULE_CREATED,
         episodes.SCHEDULE_CANCELLED,
         episodes.CLAIM_EXTRACTED,
+        episodes.CLAIM_RETRACTED,
     }
 )
 

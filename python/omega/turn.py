@@ -446,6 +446,13 @@ def _teach(
         stopped = learn.cancel_schedules(
             ctx.queue, extracted.cancel, running=running, at=at
         )
+        # Retractions next, for the same reason and one more: a note that
+        # forgets one claim and teaches a replacement must not leave both
+        # active, because the window between them is exactly where omega would
+        # hold two contradictory beliefs and act on whichever rendered first.
+        forgotten = learn.retract_claims(
+            ctx.queue, extracted.retract, for_seq=pending.seq, known=known, at=at
+        )
         written = learn.file_claims(
             ctx.queue,
             extracted.claims,
@@ -460,7 +467,11 @@ def _teach(
         reason = str(exc) or type(exc).__name__
         return learn.receipt((), error=reason)
     return learn.receipt(
-        written, known=known, scheduled=scheduled, stopped=stopped
+        written,
+        known=known,
+        scheduled=scheduled,
+        stopped=stopped,
+        forgotten=forgotten,
     )
 
 

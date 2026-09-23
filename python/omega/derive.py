@@ -288,7 +288,7 @@ class Claim:
 
 
 class Learned:
-    """Everything omega has been taught that has not been superseded.
+    """Everything omega has been taught that is still standing.
 
     Folded from ``claim.extracted`` records the same way :class:`OpenWork` is
     folded from blocks, and kept as a separate view rather than a second field
@@ -296,13 +296,20 @@ class Learned:
     lifetimes: an obligation is discharged by an answer and gone, a claim
     persists until something contradicts it.
 
-    **Supersession removes a claim from the active set and from nowhere else.**
-    The superseded record stays in the log, so re-derivation can always reach
-    the earlier state and "destroy core memory" is impossible by construction
-    rather than by a model getting a criticality test right (DL-034, DL-042).
-    That is the property that lets ``explicit`` be a cheap static flag about
-    *escalation* instead of a safety mechanism carrying weight it could not
-    hold.
+    A claim leaves the active set two ways. **Supersession** is the model
+    replacing a belief while writing a better one down; **retraction**
+    (``claim.retracted``, DL-048) is the person removing one and putting nothing
+    in its place. Only the second can be asked for, which is why it needed a
+    kind of its own rather than a supersession with an empty replacement.
+
+    **Both remove a claim from the active set and from nowhere else.** The
+    record stays in the log, so re-derivation can always reach the earlier state
+    and "destroy core memory" is impossible by construction rather than by a
+    model getting a criticality test right (DL-034, DL-042). That is the
+    property that lets ``explicit`` be a cheap static flag about *escalation*
+    instead of a safety mechanism carrying weight it could not hold — and it is
+    why retraction had to be an append even though "forget this" sounds like a
+    delete.
     """
 
     __slots__ = ("_claims", "_through")
@@ -352,6 +359,14 @@ class Learned:
                 explicit=bool(payload.get("explicit", False)),
                 supersedes=None if supersedes is None else int(supersedes),
             )
+        elif payload.get("kind") == episodes.CLAIM_RETRACTED:
+            # ``pop`` with a default for the same reason supersession uses one:
+            # naming a claim that is no longer active is an ordinary race in an
+            # append-only log, not a corruption a derived view should adjudicate.
+            # The *refusal* to retract an unknown id lives at extraction, where
+            # there is a person to tell (DL-048 #4); by the time a record exists
+            # the decision was already made and this only replays it.
+            self._claims.pop(int(payload["claim_seq"]), None)
         self._through = seq
 
     def claims(self) -> list[Claim]:

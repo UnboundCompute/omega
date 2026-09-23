@@ -35,8 +35,8 @@ DIGEST = "sha256:" + "0123456789abcdef" * 4
 def test_every_kind_round_trips():
     """Each constructor produces something `decode(encode(x)) == x`.
 
-    Covers all six kinds in one place so adding a seventh without a round-trip
-    is a failure rather than an omission nobody notices.
+    Covers every kind in one place so adding another without a round-trip is a
+    failure rather than an omission nobody notices.
     """
     built = [
         ep.inbound("hello", channel="tray", at="2026-09-23T10:00:00+00:00"),
@@ -69,6 +69,9 @@ def test_every_kind_round_trips():
             explicit=True,
             trigger={"any": ["review"]},
             at="2026-09-23T10:00:00+00:00",
+        ),
+        ep.claim_retracted(
+            for_seq=41, claim_seq=12, at="2026-09-23T10:00:00+00:00"
         ),
     ]
     assert {p["kind"] for p in built} == ep.KINDS, "a kind has no round-trip test"

@@ -72,6 +72,7 @@ __all__ = [
     "file_claims",
     "file_schedules",
     "cancel_schedules",
+    "retract_claims",
     "schedule_id",
     "receipt",
     "when_phrase",
@@ -113,19 +114,22 @@ MAX_INSTRUCTION_CHARS = 500
 class Extraction:
     """What one teaching note turned into, before any of it is written.
 
-    Three lists rather than one because they are three different writes, and
+    Four lists rather than one because they are four different writes, and
     keeping them apart until :func:`file_claims` / :func:`file_schedules` /
-    :func:`cancel_schedules` is what lets validation reject the whole note
-    without having appended part of it.
+    :func:`cancel_schedules` / :func:`retract_claims` is what lets validation
+    reject the whole note without having appended part of it.
     """
 
     claims: list[dict[str, Any]] = field(default_factory=list)
     schedules: list[dict[str, Any]] = field(default_factory=list)
     #: Ids of standing schedules the note asks to retire.
     cancel: list[str] = field(default_factory=list)
+    #: Seqs of active claims the note asks omega to forget (DL-048). The
+    #: counterpart of ``cancel``, which claims went without for one entry.
+    retract: list[int] = field(default_factory=list)
 
     def __bool__(self) -> bool:
-        return bool(self.claims or self.schedules or self.cancel)
+        return bool(self.claims or self.schedules or self.cancel or self.retract)
 
 
 class NotExtracted(RuntimeError):
@@ -213,7 +217,8 @@ def _messages(
         "You turn a teaching note into things to remember and things to do.",
         "",
         "Answer with JSON and nothing else:",
-        '  {"claims": [...], "schedules": [...], "cancel": [...]}',
+        '  {"claims": [...], "schedules": [...], "cancel": [...],',
+        '   "retract": [...]}',
         "",
         "A claim is something to bear in mind while answering.",
         "A schedule wakes you up at a time and gives you something to do,",
@@ -243,6 +248,10 @@ def _messages(
         "                 or */N. Local time.",
         "",
         '"cancel" is a list of ids of standing schedules to stop.',
+        '"retract" is a list of ids of remembered things to forget. Use it',
+        "when the note asks you to stop believing something and puts nothing",
+        "in its place; if it replaces one thing with another, write the new",
+        'claim with "supersedes" instead.',
         "",
         'Return empty lists if the note asks you for nothing.',
     ]
@@ -273,10 +282,10 @@ def parse_answer(
     is refused: a parser that hunted for a JSON object inside prose would be
     reading a model that did not follow the format as though it had.
 
-    ``schedules`` and ``cancel`` may be absent — they are additive on an answer
-    shape that already exists — but ``claims`` may not, because the model is
-    always told to return it and an answer missing it is an answer in a
-    different format.
+    ``schedules``, ``cancel`` and ``retract`` may be absent — each was additive
+    on an answer shape that already existed — but ``claims`` may not, because
+    the model is always told to return it and an answer missing it is an answer
+    in a different format.
     """
     body = _unfence(text).strip()
     if not body:
@@ -291,6 +300,7 @@ def parse_answer(
         claims=_parse_claim_list(parsed["claims"], known),
         schedules=_parse_schedule_list(parsed.get("schedules")),
         cancel=_parse_cancel_list(parsed.get("cancel"), running),
+        retract=_parse_retract_list(parsed.get("retract"), known),
     )
 
 
@@ -438,6 +448,39 @@ def _parse_cancel_list(raw: Any, running: Sequence[Schedule]) -> list[str]:
     return out
 
 
+def _parse_retract_list(raw: Any, known: Sequence[Claim]) -> list[int]:
+    """An id naming nothing currently believed is refused (DL-048 #4).
+
+    The same rule as :func:`_parse_cancel_list`, and it binds harder here. A
+    cancel that silently no-ops leaves a reminder firing while the receipt says
+    it stopped — annoying, and visible the next time it fires. A *retract* that
+    named the wrong claim would quietly drop an instruction the person
+    deliberately authored, and nothing would ever fire to reveal it: the only
+    symptom is omega gradually not doing something it was told. Destructive to
+    the derived view beats annoying, so an unknown id fails the whole note
+    rather than being skipped.
+    """
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise NotExtracted('"retract" was not a list')
+    live = {c.seq for c in known}
+    out: list[int] = []
+    for item in raw:
+        # ``bool`` first: ``isinstance(True, int)`` is true, and ``True`` would
+        # otherwise sail through as claim 1.
+        if isinstance(item, bool) or not isinstance(item, int):
+            raise NotExtracted("a retract id was not a number")
+        if item not in live:
+            raise NotExtracted(
+                f"asked to forget claim {item}, which is not something omega "
+                f"currently believes"
+            )
+        if item not in out:
+            out.append(item)
+    return out
+
+
 def _unfence(text: str) -> str:
     stripped = text.strip()
     if not stripped.startswith("```"):
@@ -574,6 +617,33 @@ def cancel_schedules(
     return stopped
 
 
+def retract_claims(
+    queue: Any,
+    seqs: Sequence[int],
+    *,
+    for_seq: int,
+    known: Sequence[Claim] = (),
+    at: Optional[str] = None,
+) -> list[Claim]:
+    """Forget each claim and return the ones that were dropped (DL-048).
+
+    Returns the :class:`~omega.derive.Claim` objects rather than the seqs for
+    :func:`cancel_schedules`' reason, which applies word for word: telling
+    someone claim ``41`` has been forgotten is a confirmation they cannot
+    check. The receipt has to say the sentence.
+    """
+    by_seq = {c.seq: c for c in known}
+    dropped: list[Claim] = []
+    for seq in seqs:
+        queue.append(
+            episodes.claim_retracted(for_seq=for_seq, claim_seq=seq, at=at)
+        )
+        existing = by_seq.get(seq)
+        if existing is not None:
+            dropped.append(existing)
+    return dropped
+
+
 # --- the receipt ------------------------------------------------------------
 
 
@@ -583,6 +653,7 @@ def receipt(
     known: Sequence[Claim] = (),
     scheduled: Sequence[Schedule] = (),
     stopped: Sequence[Schedule] = (),
+    forgotten: Sequence[Claim] = (),
     error: Optional[str] = None,
 ) -> str:
     """What to append to the reply so the person can check the record.
@@ -597,13 +668,20 @@ def receipt(
     omega holds was authored deliberately by the person, so every supersession
     is the case the rule wanted escalated. The quiet path arrives with inferred
     claims and would be dead code before then.
+
+    ``forgotten`` is the retraction half (DL-048) and it is named in the
+    person's own sentence rather than by seq, for the reason
+    :func:`cancel_schedules` gives about ids. It matters more here than
+    anywhere else in this receipt: a retraction is the one thing omega does
+    that makes it *less* capable, so if the wrong claim was dropped this line
+    is the only place it will ever be visible.
     """
     if error:
         return (
             f"I could not write that down — {error}. Nothing was recorded, so "
             f"tell me again if it matters."
         )
-    if not (written or scheduled or stopped):
+    if not (written or scheduled or stopped or forgotten):
         return "I did not find anything to remember in that, so nothing was recorded."
 
     by_seq = {c.seq: c for c in known}
@@ -632,6 +710,11 @@ def receipt(
             lines.append("")
         lines.append("I stopped this:")
         lines += [f"- {item.instruction}" for item in stopped]
+    if forgotten:
+        if lines:
+            lines.append("")
+        lines.append("I forgot this:")
+        lines += [f"- {claim.text}" for claim in forgotten]
     return "\n".join(lines)
 
 
