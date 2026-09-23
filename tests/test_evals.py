@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import pytest
 
-from omega import evals, provider
+from omega import evals, executor, provider
 from omega.evals import (
     FAIL,
     PASS,
@@ -690,3 +690,158 @@ def test_a_judge_agreeing_both_ways_still_produces_a_verdict():
     )
     assert observed.same_speaker is True
     assert "both ways" in observed.judge_why
+
+
+# --- the resume phase: continuity across a restart (DL-045) ------------------
+
+
+def recalling(needle: str, otherwise: str = "I have no idea"):
+    """Replies with ``needle`` only if the assembled prompt contains it.
+
+    The whole point of the resume phase is that the second process can only
+    know what the first was told by reading the log, so the provider is made to
+    answer *from the prompt* rather than from a script. A fixed reply would
+    score the same whether recall crossed the restart or not, which is the
+    defect DL-045 is about, reproduced in the instrument.
+    """
+
+    def act(role, messages):
+        body = "\n".join(str(m["content"]) for m in messages)
+        return f"It is called {needle}." if needle in body else otherwise
+
+    return provider.FakeProvider(
+        {provider.JUDGE: lambda role, messages: "SPEAK", provider.ACT: act}
+    ).complete
+
+
+def _across_a_restart(**over) -> Scenario:
+    fields = dict(
+        name="resume-probe",
+        drive=evals._says("My bike is called Rusty."),
+        resume=evals._says("What is my bike called?"),
+        capability=evals._recalls("rusty"),
+        violation=evals._resumed_cleanly,
+    )
+    fields.update(over)
+    return Scenario(**fields)
+
+
+def test_the_resume_phase_reads_the_first_phase_off_the_log() -> None:
+    """The capability, and the reason the provider answers from the prompt:
+    the second runtime shares nothing with the first but the store, so a reply
+    naming the bike can only have come from the log."""
+    out = evals.run_once(_across_a_restart(), complete=recalling("Rusty"))
+
+    assert out.capability.verdict == PASS, out.capability.why
+    assert out.violation.verdict == PASS, out.violation.why
+    assert out.clean is True
+
+
+def test_a_scenario_without_a_resume_phase_reports_no_restart() -> None:
+    """Fail closed on empty, pointed at the violation check: with nothing to
+    look at it must decline, never say fine."""
+    out = evals.run_once(
+        Scenario(
+            name="one-process",
+            drive=asking("hello"),
+            capability=evals._never_fails,
+            violation=evals._resumed_cleanly,
+        ),
+        complete=speaking("hi"),
+    )
+
+    assert out.observed.resumed_clean is None
+    assert out.violation.verdict == UNDETERMINED
+    assert out.clean is False, "an undetermined violation is not a clean run"
+
+
+def test_the_restart_is_reported_clean_and_both_phases_are_in_one_log() -> None:
+    """The log is the thing that crossed, so both phases must be in it — and
+    the reopen must be DL-016-clean, which is the violation half."""
+    out = evals.run_once(_across_a_restart(), complete=recalling("Rusty"))
+
+    assert out.observed.resumed_clean is True
+    assert len(out.observed.said) == 2, "both phases must appear in `said`"
+    texts = [u.text for u in out.observed.updates if u.text]
+    assert "My bike is called Rusty." in texts
+    assert "What is my bike called?" in texts
+
+
+def test_a_restart_that_recovers_dirty_is_a_violation_not_a_miss() -> None:
+    """Graded from DL-016's own startup verdict. Forced here rather than by
+    corrupting a store, because the point under test is that the check reads
+    the report — how a report comes to be unclean is `test_restart.py`'s
+    subject, and re-deriving an opinion about it would be a second thing that
+    can be wrong."""
+    dirty = Observed(
+        updates=[], said=[], store=None, seconds=0.0, resumed_clean=False
+    )
+
+    grade = evals._resumed_cleanly(dirty)
+
+    assert grade.verdict == FAIL
+    assert "unclean" in grade.why
+
+
+def test_run_once_reports_the_startup_verdict_rather_than_its_own_opinion(
+    monkeypatch,
+) -> None:
+    """The violation must be DL-016's answer, not a second one.
+
+    Forced through the report rather than by crashing a process mid-turn:
+    *how* a recovery comes to be unclean is `test_restart.py`'s subject, and
+    the only thing this file is responsible for is that the harness reads that
+    verdict instead of deciding for itself. Asserted here because a runner
+    that hardcoded a clean reopen would score every restart green forever.
+    """
+    monkeypatch.setattr(
+        executor.StartupReport, "clean", property(lambda self: False)
+    )
+
+    out = evals.run_once(_across_a_restart(), complete=recalling("Rusty"))
+
+    assert out.observed.resumed_clean is False
+    assert out.violation.verdict == FAIL
+    assert out.clean is False, "a dirty reopen is never a clean run"
+
+
+def test_the_counter_input_restarts_too(monkeypatch) -> None:
+    """A falsification that ran in one process would show the check failing at
+    being a single-session check — falsifying the scenario DL-045 replaced,
+    not this one. So `resume` is carried like `pair` is.
+
+    Asserted on the scenario `falsify` actually runs, because the verdict
+    cannot see the difference: a counter-input that establishes *Thunder*
+    fails `_recalls("rusty")` whether or not it restarted, so a test reading
+    only the grade would pass against a runner that silently dropped the
+    restart.
+    """
+    seen: list[object] = []
+    real = evals.run_once
+    monkeypatch.setattr(
+        evals,
+        "run_once",
+        lambda s, **kw: (seen.append(s.resume), real(s, **kw))[1],
+    )
+    scenario = _across_a_restart(
+        falsify=evals._says("My bike is called Thunder."),
+    )
+
+    grade = evals.falsify(scenario, complete=recalling("Rusty"))
+
+    assert seen and seen[0] is not None, "the counter-input did not restart"
+    assert grade.verdict == PASS, grade.why
+    assert "fails when it should" in grade.why
+
+
+def test_the_shipped_continuity_scenario_crosses_a_restart() -> None:
+    """The scenario in the suite, not a fixture of one — so renaming it back to
+    a single-process drive fails here rather than silently scoring the weaker
+    claim at 5/5 forever."""
+    (scenario,) = [
+        s for s in evals.SCENARIOS if s.name.startswith("continuity.")
+    ]
+
+    assert scenario.name == "continuity.resumes-cold-after-a-restart"
+    assert scenario.resume is not None, "continuity must cross a restart"
+    assert scenario.violation is evals._resumed_cleanly

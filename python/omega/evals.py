@@ -150,6 +150,15 @@ class Observed:
     #: check would have made grading non-deterministic and re-runnable, which
     #: is how a scoreboard starts disagreeing with itself.
     same_speaker: Optional[bool] = None
+    #: Whether the *reopen* recovered cleanly, for a scenario that declared a
+    #: resume phase (DL-045); ``None`` when there was no restart to report on.
+    #:
+    #: Read off DL-016's own startup verdict rather than re-derived, because a
+    #: second opinion about a clean start would be a second thing that can be
+    #: wrong about it. It is a violation signal, not a capability one: the
+    #: obvious way to make a continuity check pass is to widen recall, and the
+    #: failure class that spawns is a startup that replays or double-claims.
+    resumed_clean: Optional[bool] = None
     #: Why :attr:`same_speaker` is what it is — including the reason it is
     #: ``None``, which is the case worth being able to read.
     judge_why: str = ""
@@ -227,6 +236,16 @@ class Scenario:
     #: here is not measuring anything, and the report says so louder than it
     #: says anything else.
     falsify: Optional[Drive] = None
+    #: A second conversation, run against a **new** :class:`~omega.runtime.Runtime`
+    #: opened on the same store once the first has closed (DL-045).
+    #:
+    #: M2's done-bar is *"reopen and it resumes cold"*, and a scenario whose
+    #: turns all happen inside one process cannot tell that apart from a
+    #: harness that kept the conversation in a list and never wrote the log.
+    #: The restart is a separate object rather than a ``restart()`` method so
+    #: that everything cached in Python is gone because it is unreachable,
+    #: not because something remembered to clear it.
+    resume: Optional[Drive] = None
     #: Two replies to hand the differential judge (DL-040). Set this only for
     #: the residue that structure genuinely cannot reach — whether one speaker
     #: wrote both. Everything expressible as "did this happen" stays a
@@ -326,12 +345,20 @@ class Result:
         return statistics.mean(o.observed.seconds for o in self.outcomes)
 
 
-def _observe(rt: Runtime, said: Sequence[Said], store: Path, t0: float) -> Observed:
+def _observe(
+    rt: Runtime,
+    said: Sequence[Said],
+    store: Path,
+    t0: float,
+    *,
+    resumed_clean: Optional[bool] = None,
+) -> Observed:
     return Observed(
         updates=list(projection.updates_since(rt.queue, 0)),
         said=list(said),
         store=store,
         seconds=time.monotonic() - t0,
+        resumed_clean=resumed_clean,
     )
 
 
@@ -578,8 +605,27 @@ def run_once(
             tick=scenario.tick,
             turn_timeout=RUN_TIMEOUT,
         ) as rt:
-            said = scenario.drive(rt)
+            said = list(scenario.drive(rt))
             observed = _observe(rt, said, store, t0)
+        if scenario.resume is not None:
+            # A second process over the same store (DL-045). The observation is
+            # retaken from *this* runtime rather than merged with the one above:
+            # its queue is the same log, so it already holds both phases, and
+            # re-reading it is what proves the first phase was written down
+            # rather than merely remembered.
+            with Runtime(
+                store,
+                complete=complete,
+                listen=False,
+                clock=scenario.clock,
+                tick=scenario.tick,
+                turn_timeout=RUN_TIMEOUT,
+            ) as rt:
+                # Read before the resume drives anything, so it describes the
+                # reopen and not the turns that followed it.
+                clean = rt.report.clean
+                said += list(scenario.resume(rt))
+                observed = _observe(rt, said, store, t0, resumed_clean=clean)
         # Outside the runtime, because the judge is an observation *about* the
         # run and must not be able to add to the log it is reading.
         observed = judged(observed, scenario.pair, complete)
@@ -628,6 +674,11 @@ def falsify(
         # "unproven" forever — the falsification would be quietly impossible
         # rather than merely failing, which is worse than not having one.
         pair=scenario.pair,
+        # Carried for the same reason `pair` is. A counter-input that ran in a
+        # single process would show the check failing at being a single-session
+        # check, which is the shape DL-045 replaced — it would falsify the old
+        # scenario, not this one.
+        resume=scenario.resume,
         clock=scenario.clock,
         tick=scenario.tick,
         why=scenario.why,
@@ -754,6 +805,20 @@ def _never_fails(o: Observed) -> Grade:
         errors = [u.error for u in o.updates if u.error]
         return failed(f"the turn failed: {errors}")
     return passed("no failed turn")
+
+
+def _resumed_cleanly(o: Observed) -> Grade:
+    """DL-045's violation half: the reopen itself must be clean.
+
+    Undetermined rather than passing when there was no restart, because a
+    violation check that says "fine" about something it never looked at is the
+    exact shape *fail closed on empty* rules out.
+    """
+    if o.resumed_clean is None:
+        return undetermined("the scenario declared no resume phase")
+    if not o.resumed_clean:
+        return failed("the reopen reported an unclean recovery")
+    return _never_fails(o)
 
 
 def _stays_silent(o: Observed) -> Grade:
@@ -1002,14 +1067,23 @@ SCENARIOS: list[Scenario] = [
         violation=_never_fails,
     ),
     Scenario(
-        name="continuity.uses-what-was-said-earlier",
+        name="continuity.resumes-cold-after-a-restart",
         why=(
             "The cheapest possible continuity probe, and the one that must "
             "keep working when recall changes. It is deliberately a bare "
             "statement first: omega should stay silent on it *and* still have "
-            "it, which is exactly the case a reply-shaped memory would miss."
+            "it, which is exactly the case a reply-shaped memory would miss. "
+            "The question is asked from a *second process* (DL-045), because "
+            "M2's done-bar is 'reopen and it resumes cold' and both turns in "
+            "one process cannot tell that apart from a harness that kept the "
+            "conversation in a list and never wrote the log."
         ),
-        drive=_says("My bike is called Rusty.", "What is my bike called?"),
+        # The name says 'cold' and not 'after three days' on purpose. The gap
+        # is not simulated: recall is count-bounded, so wall-clock age is not
+        # an input to anything in omega today, and ageing the log would score a
+        # green check for a property the system does not have.
+        drive=_says("My bike is called Rusty."),
+        resume=_says("What is my bike called?"),
         # A different name established, so the reply is a real answer that is
         # not 'Rusty'. This proves the check reads what the log actually holds
         # rather than matching any confident-looking reply.
@@ -1018,9 +1092,9 @@ SCENARIOS: list[Scenario] = [
         # at all -- was tried and is *weaker*: omega stayed silent rather than
         # inventing a name, which is the right behaviour and a useless
         # falsification, because an empty run cannot show a check discriminating.
-        falsify=_says("My bike is called Thunder.", "What is my bike called?"),
+        falsify=_says("My bike is called Thunder."),
         capability=_recalls("rusty"),
-        violation=_never_fails,
+        violation=_resumed_cleanly,
     ),
     # The residue, and the only scenario in this file that spends a judge.
     Scenario(
