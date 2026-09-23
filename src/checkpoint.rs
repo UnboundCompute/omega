@@ -252,7 +252,10 @@ mod tests {
         assert_eq!(store.get("graph"), 9);
         assert_eq!(store.get("user-model"), 3);
         assert_eq!(store.get("nope"), 0);
-        assert_eq!(store.names(), vec!["graph".to_string(), "user-model".to_string()]);
+        assert_eq!(
+            store.names(),
+            vec!["graph".to_string(), "user-model".to_string()]
+        );
     }
 
     #[test]

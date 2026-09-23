@@ -496,7 +496,11 @@ mod tests {
         {
             let mut log = open(&d);
             for i in 0..50u64 {
-                assert_eq!(log.append(format!("p{i}").as_bytes(), "", i as i64).unwrap(), i + 1);
+                assert_eq!(
+                    log.append(format!("p{i}").as_bytes(), "", i as i64)
+                        .unwrap(),
+                    i + 1
+                );
             }
             assert_eq!(log.head(), 50);
         }
@@ -561,12 +565,7 @@ mod tests {
         let d = TempDir::new("edges");
         let mut log = open(&d);
         let big = vec![0xabu8; 10 * 1024 * 1024];
-        let cases: Vec<Vec<u8>> = vec![
-            vec![],
-            vec![0, 0, 0],
-            vec![0xff, 0xfe, 0xfd],
-            big.clone(),
-        ];
+        let cases: Vec<Vec<u8>> = vec![vec![], vec![0, 0, 0], vec![0xff, 0xfe, 0xfd], big.clone()];
         for (i, c) in cases.iter().enumerate() {
             assert_eq!(log.append(c, "", i as i64).unwrap(), i as u64 + 1);
         }
@@ -617,7 +616,12 @@ mod tests {
         let err = reopen_err(&d);
         assert!(matches!(err, Error::CorruptFrame { .. }), "got {err:?}");
         // the file is not truncated and later episodes are not discarded
-        assert_eq!(std::fs::read(d.path().join(EPISODES_FILENAME)).unwrap().len(), bytes.len());
+        assert_eq!(
+            std::fs::read(d.path().join(EPISODES_FILENAME))
+                .unwrap()
+                .len(),
+            bytes.len()
+        );
     }
 
     #[test]
@@ -676,7 +680,17 @@ mod tests {
         write_raw(&d, &bytes);
 
         let err = reopen_err(&d);
-        assert!(matches!(err, Error::SequenceBreak { expected: 1, found: 7, .. }), "got {err:?}");
+        assert!(
+            matches!(
+                err,
+                Error::SequenceBreak {
+                    expected: 1,
+                    found: 7,
+                    ..
+                }
+            ),
+            "got {err:?}"
+        );
     }
 
     #[test]
@@ -691,7 +705,10 @@ mod tests {
         let huge = vec![7u8; MAX_BODY as usize - FIXED_BODY_LEN + 1];
         assert!(matches!(log.append(&huge, "", 1), Err(Error::TooLarge(_))));
         let long_key = "k".repeat(MAX_KEY + 1);
-        assert!(matches!(log.append(b"x", &long_key, 1), Err(Error::TooLarge(_))));
+        assert!(matches!(
+            log.append(b"x", &long_key, 1),
+            Err(Error::TooLarge(_))
+        ));
         assert_eq!(log.head(), 1);
         drop(log);
 
@@ -710,7 +727,16 @@ mod tests {
 
         let mut log = open(&d);
         let err = log.append(b"second", "k", 2).unwrap_err();
-        assert!(matches!(err, Error::WriteKeyConflict { existing_seq: 1, .. }), "got {err:?}");
+        assert!(
+            matches!(
+                err,
+                Error::WriteKeyConflict {
+                    existing_seq: 1,
+                    ..
+                }
+            ),
+            "got {err:?}"
+        );
         assert_eq!(log.head(), 1);
         drop(log);
         assert_eq!(raw(&d), before);
@@ -723,7 +749,10 @@ mod tests {
         log.append(b"a", "", 1).unwrap();
         assert!(matches!(
             log.range_since(2),
-            Err(Error::CheckpointAhead { requested: 2, head: 1 })
+            Err(Error::CheckpointAhead {
+                requested: 2,
+                head: 1
+            })
         ));
         assert!(log.range_since(1).is_ok());
         // seq 0 is reserved: it is never a record, and asking for it is a
@@ -731,12 +760,18 @@ mod tests {
         assert!(matches!(log.read(0), Err(Error::InvalidArgument(_))));
         assert!(matches!(
             log.read(2),
-            Err(Error::CheckpointAhead { requested: 2, head: 1 })
+            Err(Error::CheckpointAhead {
+                requested: 2,
+                head: 1
+            })
         ));
         // and on an empty log, since=1 is already ahead
         let d2 = TempDir::new("ahead2");
         let log2 = open(&d2);
-        assert!(matches!(log2.range_since(1), Err(Error::CheckpointAhead { .. })));
+        assert!(matches!(
+            log2.range_since(1),
+            Err(Error::CheckpointAhead { .. })
+        ));
         assert!(log2.range_since(0).is_ok());
     }
 
@@ -754,7 +789,12 @@ mod tests {
     #[test]
     fn unwritable_path_is_a_clear_io_error() {
         let d = TempDir::new("unwritable");
-        let missing = d.path().join("no").join("such").join("dir").join("episodes.log");
+        let missing = d
+            .path()
+            .join("no")
+            .join("such")
+            .join("dir")
+            .join("episodes.log");
         let err = Log::open(&missing).unwrap_err();
         assert!(matches!(err, Error::Io(_)), "got {err:?}");
     }
@@ -765,7 +805,8 @@ mod tests {
         {
             let mut log = open(d);
             for i in 0..3 {
-                log.append(format!("payload-{i}").as_bytes(), "", i).unwrap();
+                log.append(format!("payload-{i}").as_bytes(), "", i)
+                    .unwrap();
             }
         }
         raw(d)
@@ -883,7 +924,8 @@ mod tests {
         let d = TempDir::new("indexes");
         let mut log = open(&d);
         for i in 0..20u64 {
-            log.append(&i.to_le_bytes(), &format!("k{i}"), i as i64).unwrap();
+            log.append(&i.to_le_bytes(), &format!("k{i}"), i as i64)
+                .unwrap();
         }
         let offsets_before = log.offsets().to_vec();
         let head_before = log.head();
@@ -918,8 +960,7 @@ mod tests {
             start += PREFIX_LEN + bl;
         }
         let body_start = last + PREFIX_LEN;
-        let body_len =
-            u32::from_le_bytes(bytes[last..last + 4].try_into().unwrap()) as usize;
+        let body_len = u32::from_le_bytes(bytes[last..last + 4].try_into().unwrap()) as usize;
         bytes[body_start..body_start + 8].copy_from_slice(&42u64.to_le_bytes());
         let crc = frame::crc32(&bytes[body_start..body_start + body_len]);
         bytes[last + 4..last + 8].copy_from_slice(&crc.to_le_bytes());
@@ -952,7 +993,11 @@ mod tests {
             let all = log.records_since(0).unwrap();
             assert_eq!(all.iter().map(|r| r.seq).collect::<Vec<_>>(), vec![1, 2, 3]);
             for (i, r) in all.iter().enumerate() {
-                assert_eq!(r.payload, format!("payload-{i}").as_bytes(), "zeros={zeros}");
+                assert_eq!(
+                    r.payload,
+                    format!("payload-{i}").as_bytes(),
+                    "zeros={zeros}"
+                );
             }
             drop(log);
 
@@ -996,7 +1041,11 @@ mod tests {
         let log = open(&d);
         assert_eq!(log.head(), 4);
         assert_eq!(
-            log.records_since(0).unwrap().iter().map(|r| r.seq).collect::<Vec<_>>(),
+            log.records_since(0)
+                .unwrap()
+                .iter()
+                .map(|r| r.seq)
+                .collect::<Vec<_>>(),
             vec![1, 2, 3, 4]
         );
         assert_eq!(log.read(4).unwrap().payload, b"next");
@@ -1012,7 +1061,8 @@ mod tests {
         let d = TempDir::new("zeros_mid");
         let full = three_records(&d);
         let frame2 = {
-            let bl = u32::from_le_bytes(full[HEADER_LEN..HEADER_LEN + 4].try_into().unwrap()) as usize;
+            let bl =
+                u32::from_le_bytes(full[HEADER_LEN..HEADER_LEN + 4].try_into().unwrap()) as usize;
             HEADER_LEN + PREFIX_LEN + bl
         };
         let mut bytes = full.clone();
@@ -1022,7 +1072,11 @@ mod tests {
         write_raw(&d, &bytes);
         let err = reopen_err(&d);
         assert!(matches!(err, Error::CorruptFrame { .. }), "got {err:?}");
-        assert_eq!(raw(&d).len(), bytes.len(), "a corrupt log must not be truncated");
+        assert_eq!(
+            raw(&d).len(),
+            bytes.len(),
+            "a corrupt log must not be truncated"
+        );
 
         // (b) a zero run appended, then non-zero bytes after it
         let d = TempDir::new("zeros_then_garbage");

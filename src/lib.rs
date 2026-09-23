@@ -21,7 +21,10 @@ pub enum Error {
     /// The header's version is not one we can read.
     UnsupportedVersion(u32),
     /// A frame that was fully durable is damaged. Fail closed; never truncate.
-    CorruptFrame { offset: u64, detail: String },
+    CorruptFrame {
+        offset: u64,
+        detail: String,
+    },
     /// A complete frame in the middle of the file has the wrong sequence number.
     SequenceBreak {
         offset: u64,
@@ -29,10 +32,16 @@ pub enum Error {
         found: u64,
     },
     /// The write key exists with a different payload. Nothing was written.
-    WriteKeyConflict { key: String, existing_seq: u64 },
+    WriteKeyConflict {
+        key: String,
+        existing_seq: u64,
+    },
     /// A consumer position is past the end of the log. Cannot legitimately
     /// happen, and must not be reported as "no new episodes".
-    CheckpointAhead { requested: u64, head: u64 },
+    CheckpointAhead {
+        requested: u64,
+        head: u64,
+    },
     /// Another open log holds the exclusive lock (the singleton rule, DL-016).
     AlreadyLocked,
     /// A caller-supplied payload, key or name is over its limit. Nothing was
@@ -51,7 +60,11 @@ impl fmt::Display for Error {
         match self {
             Error::NotAnOmegaLog => write!(f, "not an omega log: bad magic"),
             Error::UnsupportedVersion(v) => {
-                write!(f, "unsupported log version {v}, this build reads version {}", frame::VERSION)
+                write!(
+                    f,
+                    "unsupported log version {v}, this build reads version {}",
+                    frame::VERSION
+                )
             }
             Error::CorruptFrame { offset, detail } => {
                 write!(f, "corrupt frame at offset {offset}: {detail}")
@@ -144,15 +157,60 @@ mod py {
     use crate::log::Log;
     use crate::Error;
 
-    create_exception!(_log, OmegaLogError, PyException, "Base for every omega log error.");
-    create_exception!(_log, NotAnOmegaLog, OmegaLogError, "The file is not an omega log.");
-    create_exception!(_log, UnsupportedVersion, OmegaLogError, "The log's format version is unreadable.");
-    create_exception!(_log, CorruptFrame, OmegaLogError, "A durable frame is damaged; the log refuses to open.");
-    create_exception!(_log, SequenceBreak, OmegaLogError, "A mid-file frame has the wrong sequence number.");
-    create_exception!(_log, WriteKeyConflict, OmegaLogError, "The write key exists with a different payload.");
-    create_exception!(_log, CheckpointAhead, OmegaLogError, "A consumer position is ahead of the log's head.");
-    create_exception!(_log, AlreadyLocked, OmegaLogError, "Another handle holds the exclusive lock.");
-    create_exception!(_log, TooLarge, OmegaLogError, "A payload, key or name is over its limit.");
+    create_exception!(
+        _log,
+        OmegaLogError,
+        PyException,
+        "Base for every omega log error."
+    );
+    create_exception!(
+        _log,
+        NotAnOmegaLog,
+        OmegaLogError,
+        "The file is not an omega log."
+    );
+    create_exception!(
+        _log,
+        UnsupportedVersion,
+        OmegaLogError,
+        "The log's format version is unreadable."
+    );
+    create_exception!(
+        _log,
+        CorruptFrame,
+        OmegaLogError,
+        "A durable frame is damaged; the log refuses to open."
+    );
+    create_exception!(
+        _log,
+        SequenceBreak,
+        OmegaLogError,
+        "A mid-file frame has the wrong sequence number."
+    );
+    create_exception!(
+        _log,
+        WriteKeyConflict,
+        OmegaLogError,
+        "The write key exists with a different payload."
+    );
+    create_exception!(
+        _log,
+        CheckpointAhead,
+        OmegaLogError,
+        "A consumer position is ahead of the log's head."
+    );
+    create_exception!(
+        _log,
+        AlreadyLocked,
+        OmegaLogError,
+        "Another handle holds the exclusive lock."
+    );
+    create_exception!(
+        _log,
+        TooLarge,
+        OmegaLogError,
+        "A payload, key or name is over its limit."
+    );
     create_exception!(_log, LogClosed, OmegaLogError, "The log has been closed.");
 
     fn to_py(e: Error) -> PyErr {
@@ -181,7 +239,10 @@ mod py {
         shared.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    fn with_log<R>(shared: &Shared, f: impl FnOnce(&mut Log) -> Result<R, Error>) -> Result<R, Error> {
+    fn with_log<R>(
+        shared: &Shared,
+        f: impl FnOnce(&mut Log) -> Result<R, Error>,
+    ) -> Result<R, Error> {
         match guard(shared).as_mut() {
             Some(log) => f(log),
             None => Err(Error::Closed),
