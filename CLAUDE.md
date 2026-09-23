@@ -41,8 +41,18 @@ its place.
 
 ## Stack
 
-- **Python** and **Rust.** The exact boundary (what is Rust vs Python) is still being
-  decided — see `AGENT.md`.
+- **Python** and **Rust**, in **one process**, talking in-process via PyO3 — never as a
+  service.
+- **Rust** owns the *structural* half of memory: nodes, edges, the append-only log, entity
+  keys, supersede pointers, traversal, indexes.
+- **Python** owns everything else — the clock, the queue, the executor, tools, prompts, LLM
+  calls — and deliberately keeps the *policy* half of retrieval (fusion, ranking, what counts
+  as a strong enough match), because that part is empirical and must stay cheap to iterate on.
+- The line to hold: **"what exists" is Rust, "what comes back" is Python.**
+- Memory is a **graph derived from the episodic log**, never written independently. There are
+  no data migrations — a schema change means dropping the graph and re-deriving it, so
+  rebuild-from-log has to work from day one.
+- Rationale, alternatives and the rules that make this safe: `AGENT.md` (DL-016/017/018).
 
 ## How we work
 
