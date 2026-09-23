@@ -55,6 +55,7 @@ from the tool name and its arguments.
 
 from __future__ import annotations
 
+import http.client
 import ipaddress
 import os
 import socket
@@ -82,6 +83,7 @@ __all__ = [
     "RUN_TIMEOUT",
     "FETCH_TIMEOUT",
     "MAX_FETCH_BYTES",
+    "TEXTUAL_TYPES",
     "ToolError",
     "ToolRejected",
     "Decision",
@@ -89,6 +91,8 @@ __all__ = [
     "schemas",
     "refusal_for_address",
     "refusal_for_host",
+    "refusal_for_content_type",
+    "vetted_address",
     "check_url",
     "read_file",
     "write_file",
@@ -523,6 +527,18 @@ def _resolve_host(host: str, port: int) -> list[str]:
     return [info[4][0] for info in infos]
 
 
+def _refusal_for_addresses(host: str, addresses: Sequence[str]) -> Optional[str]:
+    if not addresses:
+        # Fail closed: "resolved to nothing" is not "resolved to something
+        # safe", and a check that passes on empty is not a check.
+        return f"{host!r} resolved to no address at all"
+    for address in addresses:
+        why = refusal_for_address(address)
+        if why is not None:
+            return f"{host} resolves to {address} and {why}"
+    return None
+
+
 def refusal_for_host(
     host: str,
     port: int = 443,
@@ -536,22 +552,38 @@ def refusal_for_host(
     ordering of a DNS answer, which is the attacker's to choose. ``resolve`` is
     injectable so the rule is testable without a network or a real name.
 
-    *Honest limit:* this checks the resolution and the connection then resolves
-    again, so a name that changes its answer in between is not caught. Closing
-    that means pinning the socket to the checked address and carrying the
-    hostname through TLS separately, which is a real mechanism and its own
-    decision. What is here refuses by address, which is what DL-028 asks for.
+    This is the *predicate*, and on its own it is still a check-then-use: it
+    answers about one resolution, and whoever connects afterwards resolves
+    again. :func:`vetted_address` is the half that closes that, and `fetch`
+    goes through that one — see its docstring for why the gap was real.
+    """
+    return _refusal_for_addresses(host, resolve(host, port))
+
+
+def vetted_address(
+    host: str,
+    port: int = 443,
+    *,
+    resolve: Callable[[str, int], list[str]] = _resolve_host,
+) -> str:
+    """The address `fetch` will connect to, refusing if any resolution is bad.
+
+    Returns an address rather than a verdict, and that is the entire point.
+    :func:`refusal_for_host` could only ever say *this name looked fine a
+    moment ago*; the connection that followed did its own DNS lookup, so a name
+    whose answer changed in between — one public record to pass the check, a
+    loopback or `169.254.169.254` record to serve the connection — was refused
+    by nothing. The check and the use were about two different addresses.
+
+    Handing back the vetted address makes them one address: the caller connects
+    to *this*, not to whatever the name says next, and the hostname is carried
+    separately for `Host` and for TLS so certificate validation is unweakened.
     """
     addresses = resolve(host, port)
-    if not addresses:
-        # Fail closed: "resolved to nothing" is not "resolved to something
-        # safe", and a check that passes on empty is not a check.
-        return f"{host!r} resolved to no address at all"
-    for address in addresses:
-        why = refusal_for_address(address)
-        if why is not None:
-            return f"{host} resolves to {address} and {why}"
-    return None
+    why = _refusal_for_addresses(host, addresses)
+    if why is not None:
+        raise ToolError(f"refusing to fetch {host}: {why}")
+    return addresses[0]
 
 
 def check_url(
@@ -587,6 +619,133 @@ def check_url(
     return host
 
 
+TEXTUAL_TYPES = frozenset(
+    {
+        "application/json",
+        "application/xml",
+        "application/javascript",
+        "application/ecmascript",
+        "application/x-ndjson",
+        "application/yaml",
+        "application/x-yaml",
+        "application/graphql",
+    }
+)
+
+
+def refusal_for_content_type(content_type: str) -> Optional[str]:
+    """Why this body may not be read as a page, or ``None``.
+
+    `fetch` returns text, and until this existed it returned text *whatever
+    came back* — a PDF, a font, a tarball, a video, all run through
+    ``decode(errors="replace")`` and handed to the model as several thousand
+    replacement characters. That is not a security hole so much as a quiet
+    waste with a sharp edge: the bytes are spent, the context is spent, and
+    what the model reads is indistinguishable from a page that happened to be
+    gibberish, so it cannot even report the problem accurately.
+
+    The rule is an allowlist because the failure is open-ended: there is no
+    enumerating the binary types, but the textual ones are a short list plus
+    two structured-suffix conventions. A missing header is ``text/plain`` by
+    the HTTP default, which the header parser already applies.
+    """
+    kind = (content_type or "").strip().lower()
+    if kind.startswith("text/") or kind in TEXTUAL_TYPES:
+        return None
+    subtype = kind.partition("/")[2]
+    if subtype.endswith("+json") or subtype.endswith("+xml"):
+        return None
+    return (
+        f"it answered with {content_type or 'no type at all'}, which is not "
+        "text — omega reads pages, not binaries"
+    )
+
+
+class _PinnedHTTPConnection(http.client.HTTPConnection):
+    """An HTTP connection that dials a given address instead of resolving.
+
+    ``host`` stays the hostname, so the ``Host`` header is the one the server
+    expects; only the socket's destination is replaced.
+    """
+
+    def __init__(self, host: str, *, address: str, **kw: Any) -> None:
+        super().__init__(host, **kw)
+        self._address = address
+
+    def connect(self) -> None:
+        self.sock = self._create_connection(
+            (self._address, self.port), self.timeout, self.source_address
+        )
+        try:
+            self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except OSError:
+            # Not every platform implements it; stock http.client tolerates
+            # this too, and it is a performance option, not a correctness one.
+            pass
+        if self._tunnel_host:
+            self._tunnel()
+
+
+class _PinnedHTTPSConnection(_PinnedHTTPConnection, http.client.HTTPSConnection):
+    """The same, with TLS still validated against the *name*.
+
+    The certificate check is what would quietly rot if the address were carried
+    in ``host``: the handshake would be validated against `93.184.216.34` and
+    fail, and the tempting fix for that failure is to stop verifying. Passing
+    ``server_hostname`` separately means pinning costs nothing in TLS strength.
+    """
+
+    def connect(self) -> None:
+        _PinnedHTTPConnection.connect(self)
+        server_hostname = self._tunnel_host or self.host
+        self.sock = self._context.wrap_socket(self.sock, server_hostname=server_hostname)
+
+
+class _PinningHandler:
+    """Resolve, refuse, and pin — once per hop, at the moment of connecting."""
+
+    def __init__(self, resolve: Callable[[str, int], list[str]]) -> None:
+        self._resolve = resolve
+
+    def _address_for(self, req: urllib.request.Request) -> str:
+        parts = urlsplit(req.full_url)
+        host = parts.hostname
+        if not host:
+            raise ToolError(f"refusing to fetch {req.full_url!r}: it names no host")
+        port = parts.port or (443 if parts.scheme == "https" else 80)
+        return vetted_address(host, port, resolve=self._resolve)
+
+
+class _PinnedHTTPHandler(_PinningHandler, urllib.request.HTTPHandler):
+    def __init__(self, resolve: Callable[[str, int], list[str]]) -> None:
+        _PinningHandler.__init__(self, resolve)
+        urllib.request.HTTPHandler.__init__(self)
+
+    def http_open(self, req):  # type: ignore[override]
+        address = self._address_for(req)
+        return self.do_open(
+            lambda host, **kw: _PinnedHTTPConnection(host, address=address, **kw), req
+        )
+
+
+class _PinnedHTTPSHandler(_PinningHandler, urllib.request.HTTPSHandler):
+    def __init__(self, resolve: Callable[[str, int], list[str]]) -> None:
+        _PinningHandler.__init__(self, resolve)
+        urllib.request.HTTPSHandler.__init__(self)
+
+    def https_open(self, req):  # type: ignore[override]
+        address = self._address_for(req)
+        # context and check_hostname forwarded exactly as the stock handler
+        # forwards them, so pinning changes the destination and nothing else
+        # about how the connection is secured.
+        return self.do_open(
+            lambda host, **kw: _PinnedHTTPSConnection(host, address=address, **kw),
+            req,
+            context=self._context,
+            check_hostname=self._check_hostname,
+        )
+
+
 class _CheckedRedirects(urllib.request.HTTPRedirectHandler):
     """Re-run the address check on **every** hop.
 
@@ -614,20 +773,44 @@ def fetch(
     omega reads: it is the first content someone else wrote. It is returned as
     data, and nothing in it can change what the next pass may run, because that
     is decided by :func:`classify` from the tool name and its arguments.
+
+    Three things guard the reach itself, and each closes a way the address
+    check could have been true and useless: every hop is **pinned** to an
+    address that was vetted rather than re-resolved (:func:`vetted_address`),
+    **no proxy** is consulted, and the body must be **text**
+    (:func:`refusal_for_content_type`). The redirect handler still re-checks
+    each hop's scheme, and each hop opens through the pinning handlers, so a
+    `302` is judged exactly as the first request was.
     """
     check_url(url, resolve=resolve)
-    opener = urllib.request.build_opener(_CheckedRedirects())
+    opener = urllib.request.build_opener(
+        # No proxy, deliberately. An `http_proxy` in the environment would send
+        # every fetch to a host the address check never saw and the pin never
+        # covered — the guard would still pass and mean nothing.
+        urllib.request.ProxyHandler({}),
+        _PinnedHTTPHandler(resolve),
+        _PinnedHTTPSHandler(resolve),
+        _CheckedRedirects(),
+    )
     request = urllib.request.Request(  # noqa: S310 - scheme checked above
         url, headers={"User-Agent": _USER_AGENT}, method="GET"
     )
     try:
         with opener.open(request, timeout=timeout) as response:
+            content_type = response.headers.get_content_type()
+            why = refusal_for_content_type(content_type)
+            if why is not None:
+                # Before the body is read, not after: the point is not to spend
+                # the bytes, and `max_bytes` of a video is still a download.
+                raise ToolError(f"refusing to read {url}: {why}")
+            charset = response.headers.get_content_charset() or "utf-8"
             body = response.read(max_bytes + 1)
             status = getattr(response, "status", None)
             final = response.geturl()
     except ToolError:
-        # A refused redirect hop. Propagated as itself so the reason says which
-        # address was refused rather than "HTTP error".
+        # A refused redirect hop, a refused address, or a refused type.
+        # Propagated as itself so the reason names what was refused rather than
+        # flattening into "could not fetch".
         raise
     except urllib.error.HTTPError as exc:
         raise ToolError(f"{url} answered {exc.code} {exc.reason}") from exc
@@ -635,7 +818,12 @@ def fetch(
         raise ToolError(f"could not fetch {url}: {exc}") from exc
 
     truncated = len(body) > max_bytes
-    text = body[:max_bytes].decode("utf-8", errors="replace")
+    try:
+        text = body[:max_bytes].decode(charset, errors="replace")
+    except LookupError:
+        # A charset nobody has heard of is the server's problem, not a reason
+        # to fail the fetch; utf-8 with replacement is what we did before.
+        text = body[:max_bytes].decode("utf-8", errors="replace")
     head = f"{status} {final}" if final != url else f"{status} {url}"
     if truncated:
         text += f"\n... [truncated at {max_bytes} bytes]"

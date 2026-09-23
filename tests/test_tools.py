@@ -1,11 +1,16 @@
 """Ring 1's remainder and the gate in front of it — M1 step 7; DL-014, DL-028.
 
-**Nothing here touches the network and nothing reads a key.** The address rule
-is tested by calling the classifier on resolved addresses directly and by
-injecting a resolver, which is the only honest way to test it anyway: a real
-request would test whatever the network happened to be doing that minute, and
-the property under test is what omega *refuses*, which is unobservable from a
-request that was never sent.
+**Nothing here reaches the network or reads a key.** The address rule is tested
+by calling the classifier on resolved addresses directly and by injecting a
+resolver, which is the only honest way to test it anyway: a real request would
+test whatever the network happened to be doing that minute, and the property
+under test is what omega *refuses*, which is unobservable from a request that
+was never sent.
+
+One case is a deliberate exception and says so at the point of use: the pinned
+transport binds a loopback server and serves itself one request. No DNS, no
+external host, no key — but a socket, because a wiring fault under the address
+check would leave every decision test green and `fetch` broken in practice.
 """
 
 from __future__ import annotations
@@ -420,6 +425,268 @@ def test_fetch_refuses_before_it_opens_anything(monkeypatch: pytest.MonkeyPatch)
     monkeypatch.setattr(tools.urllib.request, "build_opener", explode)
     with pytest.raises(ToolError):
         tools.fetch("http://127.0.0.1:7717/", resolve=lambda h, p: ["127.0.0.1"])
+
+
+# --- the check and the connection are about the same address ----------------
+
+
+class _DeadSocket:
+    """Enough of a socket for ``connect()`` to finish. Nothing is sent."""
+
+    def setsockopt(self, *args: object) -> None:
+        pass
+
+    def close(self) -> None:
+        pass
+
+
+def test_the_address_that_was_vetted_is_the_address_dialled() -> None:
+    """The whole mechanism in one assertion: the socket goes to the checked
+    address, and the *name* stays on the connection for ``Host`` and for TLS.
+
+    Carrying the address in ``host`` instead would have been the shorter fix
+    and a worse one — the certificate would then be validated against an IP,
+    which fails, and the tempting repair for that failure is to stop verifying.
+    """
+    dialled: list[tuple[str, int]] = []
+
+    conn = tools._PinnedHTTPConnection(
+        "example.com", address="93.184.216.34", port=80
+    )
+    conn._create_connection = lambda addr, *a, **kw: (  # type: ignore[assignment]
+        dialled.append(addr),
+        _DeadSocket(),
+    )[1]
+    conn.connect()
+
+    assert dialled == [("93.184.216.34", 80)]
+    assert conn.host == "example.com"
+
+
+def test_tls_is_validated_against_the_name_not_the_pinned_address() -> None:
+    """The claim the whole design rests on, and the one that would rot
+    silently: if the address were carried in ``host``, the handshake would be
+    validated against `93.184.216.34`, fail, and the obvious repair for *that*
+    failure is to stop verifying — pinning would have bought an SSRF fix and
+    sold a TLS one.
+    """
+    wrapped: dict[str, object] = {}
+
+    class _Context:
+        def wrap_socket(self, sock: object, server_hostname: str = "") -> object:
+            wrapped["server_hostname"] = server_hostname
+            return sock
+
+    conn = tools._PinnedHTTPSConnection(
+        "example.com", address="93.184.216.34", port=443
+    )
+    conn._create_connection = lambda addr, *a, **kw: _DeadSocket()  # type: ignore[assignment]
+    conn._context = _Context()  # type: ignore[assignment]
+    conn.connect()
+
+    assert wrapped["server_hostname"] == "example.com"
+
+
+def test_a_name_that_changes_its_answer_between_check_and_connect_is_refused() -> None:
+    """**The regression test for the TOCTOU.** This resolver answers publicly
+    the first time and loopback the second — DNS rebinding, exactly as it is
+    done.
+
+    The old code resolved once to decide and let urllib resolve again to
+    connect, so the second answer was never judged by anything: the check
+    passed on an address the connection did not use. Now the address that will
+    be dialled is itself vetted, so the second answer is refused and the reason
+    names it.
+    """
+    answers = iter([["93.184.216.34"], ["127.0.0.1"]])
+
+    with pytest.raises(ToolError) as caught:
+        tools.fetch("http://rebind.example/", resolve=lambda h, p: next(answers))
+    assert "127.0.0.1" in str(caught.value)
+
+
+def test_the_pin_vets_every_record_of_the_resolution_it_pins_from() -> None:
+    handler = tools._PinnedHTTPHandler(lambda h, p: ["93.184.216.34", "127.0.0.1"])
+    request = tools.urllib.request.Request("http://split.example/")
+    with pytest.raises(ToolError):
+        handler._address_for(request)
+
+
+def test_the_pin_returns_the_vetted_address_for_a_good_name() -> None:
+    handler = tools._PinnedHTTPHandler(lambda h, p: ["93.184.216.34"])
+    request = tools.urllib.request.Request("http://fine.example/")
+    assert handler._address_for(request) == "93.184.216.34"
+
+
+def test_vetted_address_refuses_rather_than_returning_a_verdict() -> None:
+    """It hands back an address precisely so the caller cannot forget to look
+    at a boolean — the failure mode the predicate form invites."""
+    with pytest.raises(ToolError):
+        tools.vetted_address("bad.example", 443, resolve=lambda h, p: ["169.254.169.254"])
+
+
+def test_a_proxy_in_the_environment_is_not_used(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A proxy would send every fetch to a host the address check never saw and
+    the pin never covered: the guard would still pass and mean nothing.
+
+    The environment variable is set on purpose. Without one in scope, an empty
+    proxy map and *the system's* proxy map are the same empty dict, so the
+    assertion would hold just as well against a handler that honours whatever
+    it finds — a check that passes because nothing was there to catch.
+    """
+    monkeypatch.setenv("http_proxy", "http://someone-elses-host.example:8080")
+    seen: list[object] = []
+
+    def capture(*handlers: object):
+        seen.extend(handlers)
+        raise ToolError("stop here")
+
+    monkeypatch.setattr(tools.urllib.request, "build_opener", capture)
+    with pytest.raises(ToolError):
+        tools.fetch("http://fine.example/", resolve=lambda h, p: ["93.184.216.34"])
+
+    proxies = [h for h in seen if isinstance(h, tools.urllib.request.ProxyHandler)]
+    assert proxies and proxies[0].proxies == {}
+
+
+def test_the_pinned_transport_actually_connects(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The one case that binds a socket, and it earns it.
+
+    Everything above tests the *decision*; a wiring mistake in the opener chain
+    would leave every one of them green and `fetch` broken for real, because
+    nothing else drives ``do_open``. So this serves one request over loopback
+    and checks both halves of the pin at once: the connection arrived, and the
+    ``Host`` header carries the *name* rather than the address it dialled.
+
+    ``refusal_for_address`` is neutralised for this case only — loopback is
+    exactly what the rule exists to refuse, and the rule has its own tests
+    directly above. What is under test here is the transport beneath it.
+    """
+    import http.server
+    import threading
+
+    seen: dict[str, str] = {}
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802 - the stdlib's spelling
+            seen["host"] = self.headers.get("Host", "")
+            body = b"hello from the pin"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args: object) -> None:
+            pass
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+    port = server.server_address[1]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        monkeypatch.setattr(tools, "refusal_for_address", lambda address: None)
+        text = tools.fetch(
+            f"http://pinned.example:{port}/",
+            resolve=lambda h, p: ["127.0.0.1"],
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert "hello from the pin" in text
+    assert seen["host"] == f"pinned.example:{port}"
+
+
+# --- fetch returns pages, not binaries --------------------------------------
+
+
+@pytest.mark.parametrize(
+    "kind", ["text/html", "text/plain", "application/json", "application/ld+json",
+             "image/svg+xml", "TEXT/HTML"]
+)
+def test_a_textual_type_is_readable(kind: str) -> None:
+    assert tools.refusal_for_content_type(kind) is None
+
+
+@pytest.mark.parametrize(
+    "kind", ["application/pdf", "image/png", "video/mp4", "font/woff2",
+             "application/octet-stream", "application/zip", ""]
+)
+def test_a_binary_type_is_refused(kind: str) -> None:
+    """An allowlist because the failure is open-ended: the binary types cannot
+    be enumerated, the textual ones nearly can."""
+    assert tools.refusal_for_content_type(kind) is not None
+
+
+class _FakeResponse:
+    def __init__(self, content_type: str, body: bytes) -> None:
+        from email.message import Message
+
+        self.headers = Message()
+        self.headers["Content-Type"] = content_type
+        self._body = body
+        self.status = 200
+
+    def read(self, n: int) -> bytes:
+        return self._body[:n]
+
+    def geturl(self) -> str:
+        return "http://fine.example/"
+
+    def __enter__(self) -> "_FakeResponse":
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        pass
+
+
+def _opener_returning(response: _FakeResponse):
+    class _Opener:
+        def open(self, request: object, timeout: float = 0) -> _FakeResponse:
+            return response
+
+    return lambda *handlers: _Opener()
+
+
+def test_fetch_refuses_a_binary_body(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Refused on the header, before the body is read: `max_bytes` of a video
+    is still a download, and a megabyte of replacement characters is not a
+    page the model can even report as broken."""
+    response = _FakeResponse("application/pdf", b"%PDF-1.7 binary junk")
+    monkeypatch.setattr(
+        tools.urllib.request, "build_opener", _opener_returning(response)
+    )
+    with pytest.raises(ToolError) as caught:
+        tools.fetch("http://fine.example/x.pdf", resolve=lambda h, p: ["93.184.216.34"])
+    assert "not text" in str(caught.value)
+
+
+def test_fetch_decodes_with_the_charset_the_server_declared(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Latin-1 text decoded as utf-8 is mojibake, and mojibake in context is
+    indistinguishable from a page that was written that way."""
+    response = _FakeResponse("text/plain; charset=latin-1", "café".encode("latin-1"))
+    monkeypatch.setattr(
+        tools.urllib.request, "build_opener", _opener_returning(response)
+    )
+    assert "café" in tools.fetch(
+        "http://fine.example/", resolve=lambda h, p: ["93.184.216.34"]
+    )
+
+
+def test_an_unknown_charset_does_not_fail_the_fetch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    response = _FakeResponse("text/plain; charset=nonesuch-9", b"hello")
+    monkeypatch.setattr(
+        tools.urllib.request, "build_opener", _opener_returning(response)
+    )
+    assert "hello" in tools.fetch(
+        "http://fine.example/", resolve=lambda h, p: ["93.184.216.34"]
+    )
 
 
 # --- results are capped -----------------------------------------------------
