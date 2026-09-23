@@ -39,6 +39,7 @@ from typing import Any, Optional
 from omega import episodes, provider
 from omega.tools import (
     EXTERNAL,
+    LOCAL,
     Decision,
     ToolBox,
     ToolError,
@@ -152,12 +153,12 @@ def act_loop(
 
         repeats = [call for call in calls if _signature(call) in seen]
         if repeats:
-            # Repetition is not progress. The honest cost: a second identical
-            # read really can be the right move (read, write, read back), and
-            # this stops it. That is the deliberate trade — a loop that cannot
-            # recognise repetition spends the whole cap re-running one call and
-            # then reports nothing useful, and re-reading is recoverable by
-            # asking again next turn while flailing is not.
+            # Repetition with nothing moving in between is not progress. The
+            # qualifier is load-bearing: a successful ``local`` call clears the
+            # set below, so read, write, read-back is *not* a stall — it is the
+            # verification §1.5 asks for. What reaches here is the same call
+            # against a world that has not changed since, which would return
+            # what it returned last time.
             names = ", ".join(sorted({call.name for call in repeats}))
             return ActResult(
                 tools=tuple(used),
@@ -214,6 +215,23 @@ def act_loop(
             )
             if ok:
                 used.append(decision.tool)
+                if decision.tier == LOCAL:
+                    # **A successful state change makes every earlier
+                    # observation stale**, so re-reading after one is
+                    # verification and not repetition. Without this, the guard
+                    # above and §1.5's *first* question contradict each other:
+                    # "are we done, verified?" is answered by reading the world
+                    # back — a tool reporting success is explicitly not the
+                    # answer — and read, write, read-back is exactly the shape
+                    # the signature set would have called a stall.
+                    #
+                    # Only ``local`` clears it. ``exploration`` is read-only by
+                    # construction (that is what its allowlist is for) so it
+                    # changes nothing worth re-reading, and ``external`` never
+                    # reaches dispatch at all. So the flailing this is meant to
+                    # catch — the same read over and over with nothing moving —
+                    # is still caught, because nothing cleared the set.
+                    seen.clear()
             messages.append(provider.tool_result(call.id, text))
 
     # The cap, and it is **not** an error (§1.5). The turn goes on to compose a

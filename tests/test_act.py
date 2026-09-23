@@ -407,3 +407,56 @@ def test_the_assembled_runtime_acts_for_real_by_default() -> None:
         inspect.signature(Executor.__init__).parameters["act"].default
         is no_act_loop_yet
     )
+
+
+def test_reading_back_after_a_write_is_verification_not_a_stall(
+    q: EventQueue, box: ToolBox, tmp_path: Path
+) -> None:
+    """§1.5's two questions must not cancel each other out.
+
+    *Are we done, verified?* is answered by reading the world back — "a tool
+    reporting success is not the answer; the resulting state is". *Is this
+    moving?* is answered by refusing to repeat a call. Read, write, read-back
+    is the first question's own shape and the second question's definition of
+    a repeat, so without a rule saying which wins, the guard would make the
+    loop structurally unable to verify anything it did.
+
+    The rule: a successful state change makes every earlier observation stale.
+    """
+    note = tmp_path / "store" / "note.md"
+    note.write_text("before", encoding="utf-8")
+    fp = acting(
+        call("read_file", call_id="a", path=str(note)),
+        call("write_file", call_id="b", path=str(note), content="after"),
+        call("read_file", call_id="c", path=str(note)),
+        "",
+    )
+
+    result = act_loop(ctx_for(q, fp), box=box)
+
+    assert result.stop_reason == DONE_ASKING, result.stop_reason
+    assert result.tools == ("read_file", "write_file", "read_file")
+    assert note.read_text(encoding="utf-8") == "after"
+
+
+def test_only_a_write_clears_the_set_not_any_other_call(
+    q: EventQueue, box: ToolBox, tmp_path: Path
+) -> None:
+    """The control for the rule above. An intervening *read* changes nothing,
+    so the repeat after it is still the same call against the same world and
+    still a stall — otherwise "clears on progress" would quietly become
+    "clears on any activity", which catches nothing."""
+    one = tmp_path / "store" / "one.md"
+    two = tmp_path / "store" / "two.md"
+    one.write_text("1", encoding="utf-8")
+    two.write_text("2", encoding="utf-8")
+    fp = acting(
+        call("read_file", call_id="a", path=str(one)),
+        call("read_file", call_id="b", path=str(two)),
+        call("read_file", call_id="c", path=str(one)),
+        "",
+    )
+
+    result = act_loop(ctx_for(q, fp), box=box)
+
+    assert result.stop_reason.startswith(STALLED), result.stop_reason
