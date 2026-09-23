@@ -1,0 +1,36 @@
+# --- omega private working docs (never tracked) ---
+AGENT.md
+
+# --- secrets / local env ---
+.env
+.env.*
+*.local
+secrets/
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.python-version
+
+# --- Rust ---
+/target/
+**/target/
+*.rs.bk
+
+# --- macOS ---
+.DS_Store
+
+# --- editors / tooling ---
+.idea/
+.vscode/
+*.swp
