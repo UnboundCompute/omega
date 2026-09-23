@@ -227,7 +227,13 @@ def updates_since(queue: EventQueue, since: int) -> Iterator[Update]:
         raise ValueError(f"since {since} is ahead of head {head}")
     if since == head:
         return
-    for pending in queue.recent(head - since):
+    # ``recent(n)`` means *the last n*, which is a window that moves when the
+    # log grows. The executor drains on another thread, so between the head read
+    # above and the one inside ``recent`` an append can land — and a relative
+    # window would then slide forward by exactly that much and skip the oldest
+    # episodes the caller asked for. Pinning the far end with ``before`` makes
+    # the window absolute: seqs ``since+1 .. head``, whatever arrives meanwhile.
+    for pending in queue.recent(head - since, before=head + 1):
         if pending.seq <= since:
             continue
         update = project(pending.payload, pending.seq)

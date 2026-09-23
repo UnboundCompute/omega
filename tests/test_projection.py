@@ -282,6 +282,59 @@ def test_updates_since_on_an_empty_log_yields_nothing(q: EventQueue) -> None:
     assert list(updates_since(q, 0)) == []
 
 
+class GrowsMidRead:
+    """A queue that gains episodes between the head read and the window read.
+
+    Not a mock of the queue — it delegates everything to a real one over a real
+    log. It only forces the interleaving that the drain thread produces by
+    accident, at the one instant it matters, so the case is deterministic
+    instead of a race that fails on someone else's machine.
+    """
+
+    def __init__(self, queue: EventQueue, grow) -> None:
+        self._queue = queue
+        self._grow = grow
+
+    def head(self) -> int:
+        return self._queue.head()
+
+    def recent(self, n: int, *, before=None):
+        self._grow()
+        return self._queue.recent(n, before=before)
+
+
+def test_updates_since_is_not_shortened_by_an_append_made_while_it_reads(
+    q: EventQueue,
+) -> None:
+    """The window must be absolute, not relative.
+
+    ``recent(n)`` means *the last n*, and the last n moves when the log grows.
+    Since M1 step 7 the executor drains on another thread, so an append can and
+    does land between the head this reads and the head ``recent`` reads — and a
+    relative window would then slide forward by exactly that much, silently
+    dropping the oldest episodes the caller asked for. Silently is the problem:
+    the client's cursor would advance past updates it never received, so nothing
+    would ever ask for them again.
+    """
+    first = q.append(episodes.inbound("one", channel="tray", at=AT))
+    q.append(episodes.completed(for_seq=first, outcome="spoke", reply="hi", at=AT))
+
+    def append_two_more() -> None:
+        third = q.append(episodes.inbound("two", channel="tray", at=AT))
+        q.append(episodes.completed(for_seq=third, outcome="silent", at=AT))
+
+    growing = GrowsMidRead(q, append_two_more)
+    seen = list(updates_since(growing, 0))  # type: ignore[arg-type]
+
+    assert [u.seq for u in seen] == [1, 2], (
+        "the caller asked for seqs 1..2 and must get seqs 1..2, whatever "
+        "arrived while it was reading"
+    )
+    # And the episodes that landed mid-read are not lost either: they are simply
+    # after the cursor, which is what the next call asks for.
+    assert [u.seq for u in updates_since(q, 2)] == [3, 4]
+
+
 def test_the_projection_holds_no_state_of_its_own(q: EventQueue) -> None:
     """DL-016 — zero authoritative state in RAM. Read it twice, get the same
     thing; there is no cursor inside the projection to get out of step."""
