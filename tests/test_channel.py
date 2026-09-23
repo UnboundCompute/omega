@@ -7,16 +7,19 @@ speaks the JSON-lines protocol a tray would speak.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import socket
 import struct
 import threading
 import time
+from pathlib import Path
 from typing import Iterator
 
 import pytest
 
 from omega import episodes, provider
+from omega.blobs import BlobStore
 from omega.channel import MAX_LINE, PROTOCOL, Channel, ChannelClient, ChannelError
 from omega.executor import Executor
 from omega.memory import MemoryStore
@@ -32,10 +35,17 @@ def q(store: MemoryStore) -> EventQueue:
 
 
 @pytest.fixture
-def channel(q: EventQueue) -> Iterator[Channel]:
+def blobs(store_dir: Path) -> BlobStore:
+    """The blob store beside the log — a collaborator the channel is handed,
+    exactly like the queue, and opened from the same store directory."""
+    return BlobStore.open(store_dir)
+
+
+@pytest.fixture
+def channel(q: EventQueue, blobs: BlobStore) -> Iterator[Channel]:
     """Port 0: the OS picks a free one. A fixed port in a test suite is a
     collision waiting for a second test run."""
-    ch = Channel(q, port=0, poll=0.005)
+    ch = Channel(q, blobs, port=0, poll=0.005)
     ch.start()
     try:
         yield ch
@@ -248,12 +258,14 @@ def test_reusing_an_id_for_a_different_message_is_named(
     assert q.at(seq).payload["text"] == "the first one"
 
 
-def test_the_append_callback_fires_once_per_real_message(q: EventQueue) -> None:
+def test_the_append_callback_fires_once_per_real_message(
+    q: EventQueue, blobs: BlobStore
+) -> None:
     """How the executor thread learns there is work without polling. It must
     not fire for a duplicate: a wake per retry would turn one dropped
     connection into a burst of empty drains."""
     woken: list[int] = []
-    ch = Channel(q, port=0, poll=0.005, on_append=woken.append)
+    ch = Channel(q, blobs, port=0, poll=0.005, on_append=woken.append)
     ch.start()
     try:
         with ChannelClient(ch.address) as client:
@@ -353,6 +365,81 @@ def test_a_context_that_is_not_a_list_is_refused(
     assert q.head() == 0
 
 
+def test_attaching_a_file_returns_a_reference_a_later_say_can_carry(
+    client: ChannelClient, q: EventQueue, blobs: BlobStore, tmp_path: Path
+) -> None:
+    """DL-027 end to end, the way the tray will do it: upload at capture time,
+    reference at send time.
+
+    The two halves are deliberately separate ops. Here that means the digest is
+    known — and the bytes durable — *before* the message exists, so the episode
+    can be written with a reference that is already resolvable rather than a
+    promise about a copy still in flight.
+    """
+    content = b"\x89PNG\r\n\x1a\n" + b"pixels" * 1000
+    source = tmp_path / "Area capture.png"
+    source.write_bytes(content)
+
+    attached = client.attach(str(source))
+
+    assert attached["op"] == "attached"
+    assert attached["v"] == PROTOCOL
+    assert attached["blob"] == "sha256:" + hashlib.sha256(content).hexdigest()
+    assert attached["mime"] == "image/png"
+    assert attached["bytes"] == len(content)
+    assert blobs.path_for(attached["blob"]).read_bytes() == content
+
+    ack = client.say(
+        "what is this?",
+        context=[
+            {
+                "id": "ctx-1",
+                "kind": "image",
+                "title": "Area capture",
+                "blob": attached["blob"],
+                "mime": attached["mime"],
+                "bytes": attached["bytes"],
+            }
+        ],
+    )
+
+    item = q.at(ack["seq"]).payload["context"][0]
+    assert item["blob"] == attached["blob"]
+    assert item["mime"] == "image/png" and item["bytes"] == len(content)
+    assert blobs.has(item["blob"]), "the log's reference resolves to real bytes"
+
+
+def test_attaching_the_same_file_twice_is_one_blob_and_one_answer(
+    client: ChannelClient, blobs: BlobStore, tmp_path: Path
+) -> None:
+    """A tray that re-stages the same screenshot, or retries after a dropped
+    connection, costs one file. Nothing here implements that — the name is the
+    content, so there is no second place for the second copy to go."""
+    source = tmp_path / "same.txt"
+    source.write_bytes(b"attached twice")
+
+    first = client.attach(str(source))
+    second = client.attach(str(source))
+
+    assert first == second
+    stored = [p for p in blobs.root.rglob("*") if p.is_file()]
+    assert len(stored) == 1
+
+
+def test_attach_does_not_put_anything_in_the_log(
+    client: ChannelClient, q: EventQueue, tmp_path: Path
+) -> None:
+    """§1.6 — the only way to cause a turn is to append an episode, and this is
+    not an append. Ingesting bytes must not wake the loop: the person is still
+    staging, and an assistant that started answering a screenshot before it was
+    sent would be reacting to something nobody said yet."""
+    source = tmp_path / "staged.txt"
+    source.write_bytes(b"still staging")
+
+    assert client.attach(str(source))["op"] == "attached"
+    assert q.head() == 0
+
+
 # --- red: bad input on the one port an untrusted sender can reach -----------
 
 
@@ -381,6 +468,47 @@ def test_a_request_that_is_not_an_object_is_refused(
     answer = client.read()
     assert answer["op"] == "error"
     assert client.request({"v": PROTOCOL, "op": "ping"})["op"] == "pong"
+
+
+@pytest.mark.parametrize(
+    "path",
+    [None, 42, ["/tmp/x"], "", "   ", "/does/not/exist/anywhere.png", "/tmp"],
+    ids=["missing", "int", "list", "empty", "blank", "nonexistent", "directory"],
+)
+def test_an_attach_that_cannot_be_served_answers_and_the_connection_lives(
+    client: ChannelClient, q: EventQueue, path: object
+) -> None:
+    """Every refusal reaches the client as a sentence on the same connection.
+
+    ``_handle`` never raises, and a blob-store failure is not an exception to
+    that: a file the tray cannot attach is an ordinary answer to an ordinary
+    request. A dropped connection here would be far worse than the refusal —
+    the tray would have to guess whether the upload landed, and the next thing
+    it does is reference the digest it never received.
+    """
+    request: dict = {"v": PROTOCOL, "op": "attach"}
+    if path is not None:
+        request["path"] = path
+
+    answer = client.request(request)
+
+    assert answer["op"] == "error"
+    assert answer["request"] == "attach"
+    assert answer["error"], "a refusal with no reason is not a refusal"
+    assert client.request({"v": PROTOCOL, "op": "ping"})["op"] == "pong"
+    assert q.head() == 0
+
+
+def test_a_refused_attach_stores_nothing(
+    client: ChannelClient, blobs: BlobStore, tmp_path: Path
+) -> None:
+    """A refusal must leave the store exactly as it was — including no empty
+    fanout directories to suggest something once happened there."""
+    victim = tmp_path / "a-folder"
+    victim.mkdir()
+
+    assert client.attach(str(victim))["op"] == "error"
+    assert list(blobs.root.rglob("*")) == []
 
 
 def test_an_unknown_op_is_named_back(client: ChannelClient) -> None:
@@ -501,9 +629,9 @@ def test_a_client_hanging_up_mid_stream_leaves_the_log_untouched(
 
 
 def test_stopping_the_channel_is_idempotent_and_closes_clients(
-    q: EventQueue,
+    q: EventQueue, blobs: BlobStore
 ) -> None:
-    ch = Channel(q, port=0, poll=0.005)
+    ch = Channel(q, blobs, port=0, poll=0.005)
     address = ch.start()
     client = ChannelClient(address)
     ch.stop()
@@ -514,8 +642,10 @@ def test_stopping_the_channel_is_idempotent_and_closes_clients(
         ChannelClient(address, timeout=1.0)
 
 
-def test_the_address_is_only_real_once_it_is_listening(q: EventQueue) -> None:
-    ch = Channel(q, port=0)
+def test_the_address_is_only_real_once_it_is_listening(
+    q: EventQueue, blobs: BlobStore
+) -> None:
+    ch = Channel(q, blobs, port=0)
     with pytest.raises(ChannelError):
         ch.address
     ch.start()
@@ -526,18 +656,20 @@ def test_the_address_is_only_real_once_it_is_listening(q: EventQueue) -> None:
         ch.stop()
 
 
-def test_the_channel_refuses_to_listen_off_loopback(q: EventQueue) -> None:
+def test_the_channel_refuses_to_listen_off_loopback(
+    q: EventQueue, blobs: BlobStore
+) -> None:
     """Not a warning and not a default that can be widened: binding the wrong
     address exposes the assistant's entire input surface to the network."""
     for host in ("0.0.0.0", "", "192.168.1.5", "example.com"):
         with pytest.raises(ValueError):
-            Channel(q, host=host, port=0)
+            Channel(q, blobs, host=host, port=0)
 
 
-def test_a_bad_poll_interval_is_refused(q: EventQueue) -> None:
+def test_a_bad_poll_interval_is_refused(q: EventQueue, blobs: BlobStore) -> None:
     for poll in (0, -1):
         with pytest.raises(ValueError):
-            Channel(q, port=0, poll=poll)
+            Channel(q, blobs, port=0, poll=poll)
 
 
 def test_the_listener_is_bound_to_loopback_in_fact_not_only_in_policy(

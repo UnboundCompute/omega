@@ -22,6 +22,7 @@ import json
 from datetime import datetime, timezone
 from typing import Any, Optional
 
+from omega.blobs import is_digest
 from omega.memory import MAX_BODY
 
 __all__ = [
@@ -95,6 +96,14 @@ OUTCOMES = frozenset({"spoke", "silent", "failed"})
 
 _CONTEXT_KINDS = frozenset({"file", "image", "text", "link", "screen"})
 _URGENCIES = frozenset({"normal", "timely"})
+
+#: The reference a context item carries when its bytes are in the blob store
+#: (DL-027). All three or none: a digest with no size is a reference nothing can
+#: budget for, a size with no digest names nothing, and a mime with neither
+#: describes content the log cannot reach. Each partial set is a shape that
+#: would look valid on read and be useless, permanently, because the log is
+#: append-only — so the whole set is one field as far as validation is concerned.
+_BLOB_FIELDS = ("blob", "mime", "bytes")
 
 
 class BadPayload(ValueError):
@@ -231,6 +240,12 @@ def inbound(
     survive delivery *and failure recovery* — ids live in the payload, not in the
     tray's memory, or a ``kill -9`` on either side strands the staged items. The
     tray keeps the previews; the log keeps the identities.
+
+    An entry whose bytes were ingested first (the ``attach`` op) also carries
+    ``{blob, mime, bytes}`` — a reference into the blob store beside the log,
+    never the content itself (DL-027). The reference is immutable by
+    construction: the digest either resolves to exactly what was attached or
+    does not resolve at all.
 
     ``resumes_seq`` is set when this message answers an earlier
     ``turn.blocked``. The answer is an ordinary turn, not a resumption of the
@@ -464,6 +479,51 @@ def _validate_context(context: Any) -> None:
             raise BadPayload(
                 f"context[{i}].kind {item['kind']!r} not in {sorted(_CONTEXT_KINDS)}"
             )
+        _validate_blob_ref(context_at=i, item=item)
+
+
+def _validate_blob_ref(*, context_at: int, item: dict[str, Any]) -> None:
+    """Check the optional ``{blob, mime, bytes}`` reference on one item (DL-027).
+
+    Optional as a *set*, never field by field. An item with none of them is the
+    ordinary case — a link or a selection has identity and no stored bytes — and
+    an item with all three says the content is in the blob store under that
+    digest. Anything between the two is refused here rather than stored and
+    puzzled over later.
+
+    The digest format is checked against :func:`omega.blobs.is_digest`, the same
+    function the store itself uses, so the episode and the filesystem can never
+    disagree about what a reference looks like. This validates the *shape* only:
+    whether the blob is actually present is a question about the store, and
+    asking it here would make encoding an episode depend on a disk.
+    """
+    present = [f for f in _BLOB_FIELDS if f in item]
+    if not present:
+        return
+    if len(present) != len(_BLOB_FIELDS):
+        missing = [f for f in _BLOB_FIELDS if f not in item]
+        raise BadPayload(
+            f"context[{context_at}] has {present} but is missing {missing}; a "
+            f"blob reference is all of {list(_BLOB_FIELDS)} or none of them"
+        )
+
+    if not is_digest(item["blob"]):
+        raise BadPayload(
+            f"context[{context_at}].blob {item['blob']!r} is not a blob "
+            f"reference; expected 'sha256:' and 64 lowercase hex digits"
+        )
+    if not isinstance(item["mime"], str) or not item["mime"]:
+        raise BadPayload(
+            f"context[{context_at}].mime must be a non-empty string, "
+            f"got {item['mime']!r}"
+        )
+    size = item["bytes"]
+    # `bool` is an `int` in Python, and True would silently become 1 byte.
+    if not isinstance(size, int) or isinstance(size, bool) or size < 0:
+        raise BadPayload(
+            f"context[{context_at}].bytes must be a non-negative int, "
+            f"got {size!r}"
+        )
 
 
 def _require_str(payload: dict[str, Any], field: str, *, non_empty: bool = False) -> None:

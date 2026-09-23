@@ -18,6 +18,13 @@ seq back, because the id becomes the episode's write key and M0's dedup refuses
 the second copy. The client does not have to remember whether it already sent
 something; the log already knows.
 
+**Attachment bytes arrive before the message does** (DL-027). ``attach`` streams
+one file into the content-addressed store beside the log and answers with its
+digest; the tray then names that digest in the ``say`` that follows. It is a
+separate op rather than a field on ``say`` so the upload happens at *capture*
+time — the cost and any failure surface while the person is still staging,
+rather than in the moment they press send.
+
 **Outbound is the projection and nothing else.** A subscriber gets
 ``projection.Update`` lines from a cursor it names, read out of the log on
 demand. The server holds no copy of the stream: a client that was away comes
@@ -36,6 +43,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Iterator, Optional
 
 from omega import episodes, projection
+from omega.blobs import BlobError, BlobStore
 from omega.memory import WriteKeyConflict
 from omega.queue import EventQueue
 
@@ -148,6 +156,7 @@ class Channel:
     def __init__(
         self,
         queue: EventQueue,
+        blobs: BlobStore,
         *,
         host: str = DEFAULT_HOST,
         port: int = DEFAULT_PORT,
@@ -162,6 +171,11 @@ class Channel:
         if poll <= 0:
             raise ValueError(f"poll must be positive, got {poll}")
         self._queue = queue
+        # Handed in, exactly like the queue: both are collaborators the channel
+        # uses and neither is one it owns. A channel that opened its own store
+        # would be a second opener of the same directory, and which of the two
+        # you were looking at would depend on how the process was assembled.
+        self._blobs = blobs
         self._host = host
         self._port = port
         self._poll = poll
@@ -285,6 +299,11 @@ class Channel:
         connection; it does not close the channel and it never reaches the
         executor. The listener is the only part of omega an untrusted sender can
         talk to, so it is the part that has to be unexcitable.
+
+        ``BlobError`` is in the named set with the argument errors for the same
+        reason they are: a file the client cannot attach is an ordinary answer
+        to an ordinary request, and it must reach that client as a sentence
+        rather than as a dropped connection it has to interpret.
         """
         try:
             request = json.loads(line)
@@ -297,17 +316,19 @@ class Channel:
         try:
             if op == "say":
                 return self._say(request)
+            if op == "attach":
+                return self._attach(request)
             if op == "subscribe":
                 return self._subscribe(conn, request)
             if op == "ping":
                 return {"v": PROTOCOL, "op": "pong", "head": self._queue.head()}
             return self._error(f"unknown op {op!r}")
-        except (ValueError, TypeError, KeyError) as exc:
+        except (ValueError, TypeError, KeyError, BlobError) as exc:
             return self._error(str(exc), op=op)
         except Exception as exc:  # pragma: no cover - the unexpected still answers
             return self._error(f"{type(exc).__name__}: {exc}", op=op)
 
-    # --- the two ops ------------------------------------------------------
+    # --- the ops ----------------------------------------------------------
 
     def _say(self, request: dict[str, Any]) -> dict[str, Any]:
         """Append one inbound episode. The returned seq is the acknowledgement.
@@ -378,6 +399,42 @@ class Channel:
         if not duplicate and self._on_append is not None:
             self._on_append(seq)
         return {"v": PROTOCOL, "op": "ack", "seq": seq, "duplicate": duplicate}
+
+    def _attach(self, request: dict[str, Any]) -> dict[str, Any]:
+        """Ingest one file into the blob store and answer with its reference.
+
+        The answer — ``{blob, mime, bytes}`` — is exactly the three fields the
+        client then puts on a context item in its ``say``. One shape, produced
+        here and validated there, so a tray cannot assemble a reference omega
+        would reject.
+
+        **This reads a path the client names, and that is not an escalation.**
+        The channel is loopback-only and enforced so (see ``LOOPBACK``), which
+        means the sender is already a local process running as the user — and
+        any such process can read what the user can read, directly, without
+        asking omega. The op adds no reach; it adds a *copy* under a name that
+        cannot be tampered with afterwards. Writing this down because it is the
+        kind of line that gets rediscovered as a finding by whoever reads the op
+        list next, and the reasoning is the same every time.
+
+        There is no size cap (DL-027 defers it). What bounds this is the store's
+        refusal of anything that is not a regular file: a size cap keeps a large
+        file out, but only that check keeps an *endless* one out.
+        """
+        path = request.get("path")
+        if not isinstance(path, str):
+            raise ValueError("'path' must be a string")
+        if not path.strip():
+            raise ValueError("'path' must not be empty")
+
+        ref = self._blobs.put(path)
+        return {
+            "v": PROTOCOL,
+            "op": "attached",
+            "blob": ref.digest,
+            "mime": ref.mime,
+            "bytes": ref.bytes,
+        }
 
     def _subscribe(self, conn: _Conn, request: dict[str, Any]) -> dict[str, Any]:
         since = request.get("since", 0)
@@ -513,6 +570,9 @@ class ChannelClient:
 
     def say(self, text: str, **kwargs: Any) -> dict[str, Any]:
         return self.request({"v": PROTOCOL, "op": "say", "text": text, **kwargs})
+
+    def attach(self, path: Any) -> dict[str, Any]:
+        return self.request({"v": PROTOCOL, "op": "attach", "path": path})
 
     def subscribe(self, since: int = 0) -> dict[str, Any]:
         return self.request({"v": PROTOCOL, "op": "subscribe", "since": since})

@@ -9,6 +9,7 @@ needs a key.
 
 from __future__ import annotations
 
+import hashlib
 import threading
 import time
 from pathlib import Path
@@ -20,7 +21,7 @@ import invariants
 from omega import episodes, projection, provider
 from omega.channel import ChannelClient
 from omega.executor import INTERRUPTED_ERROR
-from omega.memory import MemoryStore
+from omega.memory import EPISODES_FILENAME, MemoryStore
 from omega.queue import EVENT_KINDS, EventQueue
 from omega.runtime import (
     DrainFailed,
@@ -214,6 +215,38 @@ def test_the_listener_wakes_the_drain_rather_than_delivering_the_event(
     assert complete["for_seq"] == ack["seq"]
     assert complete["reply"] == "over the wire"
     assert graded(store_dir), str(graded(store_dir))
+
+
+def test_the_blob_store_is_wired_and_lands_beside_the_log(
+    store_dir: Path, tmp_path: Path
+) -> None:
+    """DL-027 — the runtime opens the blob store where the log is.
+
+    Proven through the socket rather than through ``rt.blobs`` alone, because
+    the thing that can be wrong is the *assembly*: a channel handed no store, or
+    handed one rooted somewhere else, would pass every unit test in
+    ``test_blobs`` and fail the first time a tray attached anything.
+    """
+    content = b"staged before the message exists"
+    source = tmp_path / "staged.png"
+    source.write_bytes(content)
+
+    with runtime_at(store_dir, speaking("seen"), listen=True, port=0) as rt:
+        assert rt.address is not None
+        with ChannelClient(rt.address) as client:
+            attached = client.attach(str(source))
+
+        assert attached["blob"] == "sha256:" + hashlib.sha256(content).hexdigest()
+        assert rt.blobs.root == store_dir / "blobs"
+        assert rt.blobs.path_for(attached["blob"]).read_bytes() == content
+        assert rt.turns == 0, "ingesting bytes is not an event and causes no turn"
+
+    assert (store_dir / "blobs").is_dir()
+    assert (store_dir / EPISODES_FILENAME).is_file()
+    # No ``graded`` here, and that is the point: nothing was logged, so the
+    # invariant check answers *undetermined* rather than pass — which is the
+    # right answer and the wrong assertion to build a test on.
+    assert cursors(store_dir)[2] == 0, "attach writes bytes, never episodes"
 
 
 # --- red: the model, and the missing key ------------------------------------

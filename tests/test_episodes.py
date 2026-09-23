@@ -23,6 +23,11 @@ import pytest
 from omega import episodes as ep
 from omega.memory import MAX_BODY, MemoryStore
 
+#: A well-formed blob reference (DL-027). Written out rather than computed, so
+#: these cases pin the *format the log accepts* instead of restating whatever
+#: the blob store happens to produce today.
+DIGEST = "sha256:" + "0123456789abcdef" * 4
+
 
 # --- green ------------------------------------------------------------------
 
@@ -73,6 +78,39 @@ def test_inbound_carries_context_identity():
         at="2026-09-23T10:00:00+00:00",
     )
     assert ep.decode(ep.encode(payload))["context"][0]["id"] == "ctx-1"
+
+
+def test_a_context_item_may_carry_a_blob_reference():
+    """DL-027 — the episode names the bytes; the bytes live beside the log.
+
+    The reference round-trips whole, because it is the only thing that can find
+    the content again: the log carries no path and no copy, so a digest that did
+    not survive encoding would be an attachment that no longer exists.
+    """
+    item = {
+        "id": "ctx-1",
+        "kind": "image",
+        "title": "Area capture",
+        "blob": DIGEST,
+        "mime": "image/png",
+        "bytes": 184320,
+    }
+    payload = ep.inbound(
+        "what is this",
+        channel="tray",
+        context=[item],
+        at="2026-09-23T10:00:00+00:00",
+    )
+    assert ep.decode(ep.encode(payload))["context"] == [item]
+
+
+def test_a_context_item_without_a_blob_reference_is_still_ordinary():
+    """The three fields are optional as a *set*. A link or a selection has
+    identity and no stored bytes, and that is the common case — this is the one
+    that would break every existing client if the fields became required."""
+    item = {"id": "ctx-2", "kind": "link", "title": "the ticket"}
+    payload = ep.inbound("see this", channel="tray", context=[item], at="t")
+    assert ep.decode(ep.encode(payload))["context"] == [item]
 
 
 def test_encoding_is_deterministic():
@@ -225,6 +263,90 @@ def test_an_empty_channel_is_refused():
         ep.inbound("x", channel="")
 
 
+def test_a_partial_blob_reference_is_refused():
+    """DL-027 — ``{blob, mime, bytes}`` is all three or none.
+
+    Each partial set below would look valid on read and be useless: a digest
+    with no size is a reference nothing can budget for, a size with no digest
+    names nothing at all. In an append-only log a shape like that is permanent,
+    so it is refused at the one gate rather than puzzled over later.
+    """
+    full = {
+        "id": "ctx-1",
+        "kind": "image",
+        "title": "Area capture",
+        "blob": DIGEST,
+        "mime": "image/png",
+        "bytes": 184320,
+    }
+    for drop in ("blob", "mime", "bytes"):
+        partial = {k: v for k, v in full.items() if k != drop}
+        with pytest.raises(ep.BadPayload) as exc:
+            ep.inbound("look", channel="tray", context=[partial])
+        assert drop in str(exc.value), "the message must name what is missing"
+
+    for keep in ("blob", "mime", "bytes"):
+        lonely = {k: v for k, v in full.items() if k in ("id", "kind", "title", keep)}
+        with pytest.raises(ep.BadPayload):
+            ep.inbound("look", channel="tray", context=[lonely])
+
+
+def test_a_malformed_blob_digest_is_refused():
+    """The same rule the store enforces, checked here so a reference cannot
+    reach the log in a spelling the filesystem would never produce."""
+    for bad in (
+        "ab" * 32,                    # no algorithm prefix
+        "sha256:" + "AB" * 32,        # uppercase: two spellings of one content
+        "sha256:" + "ab" * 31,        # too short
+        "sha256:deadbeef",            # plausible and wrong
+        "sha1:" + "ab" * 32,          # a real algorithm, not this one
+        "",
+        None,
+        184320,
+    ):
+        with pytest.raises(ep.BadPayload):
+            ep.inbound(
+                "look",
+                channel="tray",
+                context=[
+                    {
+                        "id": "ctx-1",
+                        "kind": "image",
+                        "title": "t",
+                        "blob": bad,
+                        "mime": "image/png",
+                        "bytes": 1,
+                    }
+                ],
+            )
+
+
+def test_a_blob_reference_with_a_nonsense_size_or_mime_is_refused():
+    for mime, size in (
+        ("", 1),              # empty mime: describes nothing
+        (None, 1),            # not a string
+        ("image/png", -1),    # negative: no file has a negative length
+        ("image/png", "184320"),  # a string that looks like a number
+        ("image/png", 1.5),   # not an int
+        ("image/png", None),
+    ):
+        with pytest.raises(ep.BadPayload):
+            ep.inbound(
+                "look",
+                channel="tray",
+                context=[
+                    {
+                        "id": "ctx-1",
+                        "kind": "image",
+                        "title": "t",
+                        "blob": DIGEST,
+                        "mime": mime,
+                        "bytes": size,
+                    }
+                ],
+            )
+
+
 # --- yellow -----------------------------------------------------------------
 
 
@@ -264,6 +386,43 @@ def test_true_is_not_sequence_one():
         ep.blocked(for_seq=True, needs="?")
     with pytest.raises(ep.BadPayload):
         ep.turn_write_key(True)
+
+
+def blob_item(**overrides):
+    item = {
+        "id": "ctx-1",
+        "kind": "image",
+        "title": "Area capture",
+        "blob": DIGEST,
+        "mime": "image/png",
+        "bytes": 184320,
+    }
+    item.update(overrides)
+    return item
+
+
+def test_true_is_not_one_byte():
+    """The same `bool`-is-an-`int` trap on the attachment's size.
+
+    ``bytes: True`` would pass an `isinstance(x, int)` check and record a
+    184 KB screenshot as one byte long — a value that is wrong, plausible, and
+    permanent. ``False`` is worse: it would read as a zero-length attachment,
+    which is a legitimate value, so nothing downstream would ever question it.
+    """
+    for truthy in (True, False):
+        with pytest.raises(ep.BadPayload):
+            ep.inbound("x", channel="tray", context=[blob_item(bytes=truthy)])
+
+
+def test_a_zero_byte_attachment_is_allowed_but_a_negative_one_is_not():
+    """Zero bytes is content — an empty file has a digest like anything else —
+    while a negative length is not a small mistake but an impossible fact, and
+    the two must not be collapsed into one "non-positive" refusal."""
+    ok = ep.inbound("x", channel="tray", context=[blob_item(bytes=0)], at="t")
+    assert ep.decode(ep.encode(ok))["context"][0]["bytes"] == 0
+
+    with pytest.raises(ep.BadPayload):
+        ep.inbound("x", channel="tray", context=[blob_item(bytes=-1)])
 
 
 def test_seq_zero_and_negative_are_refused():

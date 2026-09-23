@@ -48,9 +48,10 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from omega import episodes, projection, provider
+from omega.blobs import BlobStore
 from omega.channel import DEFAULT_HOST, DEFAULT_PORT, Channel
 from omega.executor import Executor, StartupReport
-from omega.memory import MemoryStore, PathLike
+from omega.memory import EPISODES_FILENAME, MemoryStore, PathLike
 from omega.queue import EventQueue
 from omega.turn import ActResult, TurnContext, no_act_loop_yet
 
@@ -221,6 +222,7 @@ class Runtime:
         self._turn_timeout = turn_timeout
 
         self._store: Optional[MemoryStore] = None
+        self._blobs: Optional[BlobStore] = None
         self._queue: Optional[EventQueue] = None
         self._executor: Optional[Executor] = None
         self._channel: Optional[Channel] = None
@@ -252,6 +254,11 @@ class Runtime:
         self._started = True
         self._store = MemoryStore.open(self._store_path)
         try:
+            # Beside the log, not under it (DL-027). Opened here because this is
+            # where the store directory is known, and opened *after* the log so
+            # that a locked store fails on the lock rather than after having
+            # created a directory the losing process has no business creating.
+            self._blobs = BlobStore.open(self._blobs_dir())
             self._queue = EventQueue(self._store)
             self._executor = Executor(
                 self._queue, complete=self._complete, act=self._act
@@ -264,6 +271,7 @@ class Runtime:
             if self._listen:
                 self._channel = Channel(
                     self._queue,
+                    self._blobs,
                     host=self._host,
                     port=self._port,
                     poll=self._poll,
@@ -320,12 +328,28 @@ class Runtime:
                 f"{self._drain_error}"
             ) from self._drain_error
 
+    def _blobs_dir(self) -> Path:
+        """The store *directory*, whichever way ``store_path`` was spelled.
+
+        ``MemoryStore`` accepts the log file or the directory holding it, and
+        the two are the same store (its ``log_path_for`` rule). The blobs go
+        beside the log either way, so this folds the file spelling back to its
+        directory rather than creating ``episodes.log/blobs``.
+        """
+        if self._store_path.name == EPISODES_FILENAME:
+            return self._store_path.parent
+        return self._store_path
+
     def _unwind(self) -> None:
         """Release the store. Never raises over an already-closed store, because
         it runs on the failure path of ``start`` as well as on ``stop``."""
         if self._store is not None:
             self._store.close()
             self._store = None
+        # The blob store holds no handle and no lock — it is a directory and a
+        # naming rule — so there is nothing to release, only a reference to drop
+        # so that using a stopped runtime fails the same way everywhere.
+        self._blobs = None
         self._queue = None
         self._executor = None
 
@@ -350,6 +374,13 @@ class Runtime:
         if self._queue is None:
             raise NotRunning("the runtime is not running")
         return self._queue
+
+    @property
+    def blobs(self) -> BlobStore:
+        """Where attachment bytes live for this store (DL-027)."""
+        if self._blobs is None:
+            raise NotRunning("the runtime is not running")
+        return self._blobs
 
     @property
     def store_path(self) -> Path:

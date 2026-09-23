@@ -221,6 +221,38 @@ def test_context_ids_cross_but_previews_do_not() -> None:
     assert "salary-review.pdf" not in json.dumps(out)
 
 
+def test_a_blob_reference_does_not_go_back_out_to_the_client() -> None:
+    """DL-027 changed what a context item *stores*, not what it projects.
+
+    A digest is an identifier for bytes the tray already has — it uploaded them
+    — so sending it back is text on the wire with no reader, which is the exact
+    argument that strips titles. Keeping the projection at ``{id, kind}`` is
+    also what keeps the split honest: the tray keeps the previews, the log keeps
+    the identities, and now the store keeps the bytes.
+    """
+    digest = "sha256:" + "0123456789abcdef" * 4
+    out = wire(
+        episodes.inbound(
+            "what is this",
+            channel="tray",
+            context=[
+                {
+                    "id": "ctx-1",
+                    "kind": "image",
+                    "title": "Area capture",
+                    "blob": digest,
+                    "mime": "image/png",
+                    "bytes": 184320,
+                }
+            ],
+            at=AT,
+        )
+    )
+    assert out["context"] == [{"id": "ctx-1", "kind": "image"}]
+    assert digest not in json.dumps(out)
+    assert "image/png" not in json.dumps(out)
+
+
 def test_an_unknown_kind_is_withheld_rather_than_guessed() -> None:
     """``None`` is a real answer. A future kind must not leak outwards with an
     invented state just because the projection did not recognise it."""
