@@ -59,7 +59,9 @@ other.
 {"op":"ping"}
 ```
 
-`say` — `text` must be a non-empty string. Everything else is optional:
+`say` needs **`text`, `context`, or both** — a screenshot dropped in with no words is a real
+message, and the tray's `canSend` already offers it. Only a request with neither is refused.
+Fields:
 
 | field | meaning |
 |---|---|
@@ -68,6 +70,23 @@ other.
 | `context` | array of `{"id","kind","title"}` — **all three required**. |
 | `urgency` | `"normal"` or `"timely"`. |
 | `resumes_seq` | the `for_seq` of a `blocked` update this message answers. |
+
+> ### ⚠ UNRESOLVED AND BLOCKING: context carries identity, not content
+>
+> A context item is `{id, kind, title}` and nothing else. There is **no field for the
+> screenshot's pixels, the file's path, the link's URL, or the selected text** — and no
+> ingestion mechanism keyed by `id` anywhere in omega. So omega learns that an item called
+> *"Area capture"* was attached and has no way to look at it.
+>
+> That is not an oversight in this brief; it is a hole in the protocol. **Do not invent a
+> field to paper over it** — where attachment bytes live is a real decision with a permanent
+> consequence, because memory is a graph *derived from the append-only log* and anything
+> written into an episode is re-derived forever.
+>
+> Until it is decided, build the connection, the streaming, and the text path. Staged context
+> will round-trip its identity correctly and omega will not be able to inspect it. **Do not
+> ship screen capture as a working feature on top of this**, and do not let the UI imply
+> omega can see something it cannot.
 
 `context[].kind` must be one of **`file` `image` `text` `link` `screen`** — lowercase.
 `StagedContext.Kind`'s raw values are capitalised (`"File"`, `"Image"`, …), so **map the case,
@@ -169,12 +188,40 @@ the `head` from the `hello` greeting.
 **`since` ahead of `head` is an error**, which is what you get if the store was reset while the
 tray kept its cursor. Catch it and fall back to `hello`'s `head`.
 
-**Ordering.** Updates arrive in `seq` order and `seq` is monotonic. A gap means you missed
-something — reconnect with `since` = last good `seq` rather than papering over it.
+**Ordering: `seq` is monotonic, never contiguous.** Updates arrive in ascending `seq` order,
+and that is the whole guarantee. **A gap is not data loss and must never trigger a reconnect.**
+`project()` returns `None` for any episode the projection withholds, and `_pump_once` then
+advances the cursor past it on purpose — the comment there says why: otherwise a withheld kind
+would be re-read on every tick forever. A client that reconnects on a gap would ask for the
+same range, receive the same gap, and reconnect again, forever.
+
+Today the stream happens to be contiguous — all six M1 episode kinds project, and the
+`CLAIMED`/`DONE` checkpoints are named checkpoints rather than episodes, so they consume no
+`seq`. That is a coincidence of the current kind set, not a contract, and the projection is
+explicitly built as a filter. Treat gaps as normal from the first line of code.
 
 **The server outlives the tray.** Disconnecting is ordinary; omega keeps running and keeps
 turning. Reconnect with backoff and resume from the cursor. Never let a broken pipe surface as
 a modal.
+
+**The recovery threshold — when to restore the draft, stated exactly.** A dropped connection
+and a failed turn are different events and must not share a code path. The rule:
+
+1. **Before the `ack`** — nothing is known to be in the log. Retry the same `say` with the
+   same `id`. A `duplicate: true` answer means the first attempt landed; carry on as if it
+   had been the first.
+2. **After the `ack`, connection intact** — drive state from updates until a terminal one.
+3. **After the `ack`, connection dropped** — **do not restore the draft.** The episode is
+   durable and the turn will run whether or not the tray is watching; restoring the draft here
+   is how one message becomes two. Reconnect, `subscribe` from the persisted cursor, and read
+   the turn's outcome out of the replay.
+4. **Only if that resume cannot establish an outcome** — the reconnect succeeds but no
+   terminal update for that `for_seq` ever arrives, or the `ack` was never received in the
+   first place — restore the draft and context and offer the retry.
+
+The short version: **the draft comes back when the turn's fate is unknowable, not when the
+socket hiccups.** The `ack` is the line between the two, which is what makes it worth holding
+onto rather than treating as a formality.
 
 ---
 
