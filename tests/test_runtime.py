@@ -10,6 +10,7 @@ needs a key.
 from __future__ import annotations
 
 import hashlib
+import json
 import threading
 import time
 from datetime import datetime, timedelta
@@ -24,6 +25,7 @@ from omega.channel import ChannelClient
 from omega.executor import INTERRUPTED_ERROR
 from omega.memory import EPISODES_FILENAME, MemoryStore
 from omega.queue import EVENT_KINDS, EventQueue
+from omega.schedule import Scheduler
 from omega.runtime import (
     ClockFailed,
     DrainFailed,
@@ -33,6 +35,7 @@ from omega.runtime import (
     TurnTimeout,
 )
 from omega.turn import ActResult, TurnContext
+from tests.teaching import TRAY_INSTRUCTION
 
 AT = "2026-09-23T12:00:00+00:00"
 
@@ -722,3 +725,108 @@ def test_an_unparseable_cron_breaks_one_schedule_and_not_the_clock(
         assert rt.scheduler is not None
         assert list(rt.scheduler.broken) == ["bad"]
         assert [s.id for s in rt.scheduler.schedules] == ["good"]
+
+
+def _taught_a_minutely_reminder() -> provider.FakeProvider:
+    return provider.FakeProvider(
+        {
+            provider.JUDGE: lambda role, messages: "SPEAK",
+            provider.ACT: lambda role, messages: "will do",
+            provider.LEARN: lambda role, messages: json.dumps(
+                {
+                    "claims": [],
+                    "schedules": [
+                        {"instruction": "Remind me to stand up.", "cron": "* * *"}
+                    ],
+                    "cancel": [],
+                }
+            ),
+        }
+    )
+
+
+def test_a_taught_schedule_survives_the_restart_that_learned_it(
+    store_dir: Path,
+) -> None:
+    """The seam DL-044 exists to close, on the real threads.
+
+    Every other case in this section seeds its schedule with ``rt.append`` —
+    the programmatic path, which is precisely the one DL-044 found nothing in
+    production could reach. So they prove the clock runs what it is given and
+    say nothing about whether anything can give it anything.
+
+    The restart is the load-bearing part. A schedule that only survives while
+    the process that learned it is still up is a reminder that forgets
+    overnight, so the fold has to come off the log rather than out of the
+    teaching turn's memory — and the second runtime shares nothing with the
+    first except the store directory.
+    """
+    note = f"{TRAY_INSTRUCTION}\n\nEvery minute, remind me to stand up."
+    with runtime_at(store_dir, _taught_a_minutely_reminder(), clock=False) as rt:
+        said = rt.say(note)
+
+        assert said.spoke is True
+        assert "Remind me to stand up." in said.reply, (
+            "the receipt must name the schedule, or the person has no way to "
+            "check what omega is about to start doing"
+        )
+
+    with runtime_at(store_dir, speaking("standing"), clock=True, tick=0.05) as rt:
+        assert rt.scheduler is not None
+        assert until(lambda: bool(rt.scheduler.schedules)), "the fold found nothing"
+        assert [s.instruction for s in rt.scheduler.schedules] == [
+            "Remind me to stand up."
+        ]
+        assert [s.cron for s in rt.scheduler.schedules] == ["* * *"]
+        assert not rt.scheduler.broken
+        assert rt.clock_error is None
+
+
+def test_a_taught_schedule_fires_a_real_turn_nobody_typed(store_dir: Path) -> None:
+    """The other half: what the clock holds becomes a turn.
+
+    Split from the case above rather than folded into it because a taught
+    schedule is due only at a slot *after* the moment it was taught —
+    ``_slot_for`` baselines on ``created_at`` so that teaching a 9am reminder
+    at 3pm does not fire it for this morning. Waiting for a real minute
+    boundary would put a minute of wall clock in the suite to prove something
+    the explicit ``now`` proves exactly as well, so the scheduler is ticked at
+    a named moment instead. The clock *thread's* own ability to tick is what
+    the cases above this one already cover.
+
+    What is not faked is everything after the fire: the episode goes into the
+    same log, the drain picks it up on its own thread, and the reply comes
+    from a provider that never saw the teaching note.
+    """
+    note = f"{TRAY_INSTRUCTION}\n\nEvery minute, remind me to stand up."
+    with runtime_at(store_dir, _taught_a_minutely_reminder(), clock=False) as rt:
+        rt.say(note)
+
+        clock = Scheduler(rt.queue)
+        clock.refresh()
+        (standing,) = clock.schedules
+        fired = clock.tick(now=standing.created_at + timedelta(minutes=1))
+
+        assert len(fired) == 1, "the taught schedule was not due a minute later"
+        # Waited on the cursor rather than on `rt.turns`, because the counter
+        # lags `say` by a moment — so a `turns` comparison releases on the
+        # *teaching* turn and stops the runtime with the fire still unclaimed.
+        # The cursor is the state; the counter is a narration of it.
+        assert until(lambda: rt.queue.done() >= fired[0]), "the fire ran no turn"
+
+    inbound = [
+        p.payload
+        for p in _every_episode(store_dir)
+        if p.payload.get("channel") == "schedule"
+    ]
+    assert [p["text"] for p in inbound] == ["Remind me to stand up."]
+    assert [p["kind"] for p in inbound] == [episodes.MESSAGE_INBOUND]
+    assert [p["schedule_id"] for p in inbound] == [standing.id]
+    assert [t["outcome"] for t in terminals(store_dir)] == ["spoke", "spoke"]
+    assert graded(store_dir), str(graded(store_dir))
+
+
+def _every_episode(path: Path):
+    with MemoryStore.open(path) as store:
+        q = EventQueue(store)
+        return list(q.recent(q.head()))
