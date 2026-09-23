@@ -82,7 +82,8 @@ claimed > done   →  the episode at seq `claimed` was interrupted
 claimed == done  →  nothing was in flight; a clean stop
 ```
 
-- every claimed turn ends by appending `turn.completed` **and then** advancing `DONE`;
+- every claimed turn ends by appending a terminal record — `turn.completed`, or
+  `turn.blocked` when it stops to ask you something (§2.1) — **and then** advancing `DONE`;
 - on startup, `claimed > done` is the whole check — no scan, no scan window to get wrong, and
   it cannot be fooled by a detached `work.finished` landing between the two;
 - omega **says so** — "you asked me X, I was cut off partway, want me to pick it up?" — and
@@ -173,13 +174,44 @@ M0 made `payload` **opaque bytes** on purpose, which means this is a Python-side
 migration, so a schema change is a re-derive, not a migration.
 
 ```json
-{"v": 1, "kind": "message.inbound", "text": "...", "channel": "local", "at": "..."}
+{"v": 1, "kind": "message.inbound", "text": "...", "channel": "tray",
+ "context": [{"id": "…", "kind": "file|image|text|link|screen", "title": "…"}],
+ "urgency": "normal", "at": "..."}
+{"v": 1, "kind": "turn.blocked",   "for_seq": 41, "needs": "…what omega needs from you…"}
 {"v": 1, "kind": "turn.completed", "for_seq": 41, "outcome": "spoke|silent|failed",
  "reply": "..." , "tools": [...], "error": null}
 ```
 
-M1 kinds, and that is all of them: `message.inbound`, `turn.completed`, `tool.called`,
-`tool.returned`, `work.finished` (a detached sub-loop re-entering per §1.5).
+M1 kinds, and that is all of them: `message.inbound`, `turn.blocked`, `turn.completed`,
+`tool.called`, `tool.returned`, `work.finished` (a detached sub-loop re-entering per §1.5).
+
+Three fields exist because the tray requires them (§Q10), not because they were anticipated:
+
+- **`context[].id`** — tray requirement 2, stable identity through delivery *and failure
+  recovery*. Ids must be in the payload, not held in the tray's memory, or a `kill -9` on
+  either side strands the staged items. The tray keeps the previews; the log keeps the
+  identities.
+- **`urgency`** — tray requirement 4, normal vs genuinely time-sensitive. Always `"normal"`
+  at M1; reserved so M5 does not have to version the schema to add one enum value.
+- **`turn.blocked`** — tray requirement 5 lists *blocked* as a peer outcome. It is where the
+  sub-loop's "is this moving?" answering **no** surfaces. Without it, a stall has to be
+  encoded as a failure, and DL-011 is explicit that stopping to ask is the correct behaviour,
+  not a failure.
+
+**`turn.blocked` is terminal for the cursor, and this is not a detail.** A blocked turn is
+waiting on a human, which is unbounded; if it stayed claimed, `DONE` would not advance and the
+single consumer would stop draining — one question to you would freeze every other event,
+including M5's ticks. DL-016 already answers this: long work detaches and its completion
+re-enters as an ordinary event. Waiting on a person is the longest work there is.
+
+So blocking **ends** the turn: append `turn.blocked`, advance `DONE`, release the executor.
+The block is durable because it is in the log, not because a thread is parked on it — a
+`turn.blocked` with no later resolution *is* the pending question, and it survives `kill -9`
+for free. Your answer arrives as a new `message.inbound` carrying `resumes_seq`, and is an
+ordinary turn with the blocked one in its recall.
+
+*Consequence for §1.2:* a claimed turn ends with `turn.completed` **or** `turn.blocked`.
+Both advance `DONE`; only their absence means interrupted.
 
 **Write keys used as a real guard, not decoration.** `turn.completed` for inbound seq N
 carries `write_key = "turn:N"`. A double-write is then rejected *by the log itself* rather
@@ -226,29 +258,76 @@ before metrics.
 
 # Part 3 — Needs your call
 
-## Q10 — does M1 include the real transport, or does the loop land headless first?
+## Q10 — does M1 include the real transport? **Recommendation revised: yes, integrate.**
 
-DL-019 says *"This is also where Track B converges — M1 is where the real transport replaces
-`LocalDemoTransport`."* Taken literally, M1 = loop + queue + turn + the real bidirectional
-network-shaped channel, and the tray is rewired in the same milestone.
+*An earlier draft of this section recommended landing the loop headless first and letting a
+few days of real turns shape the envelope. That recommendation rested on one premise — that
+nothing yet exists to shape the contract with, so fixing it now would be the speculative
+abstraction DL-006 rejected. **The premise is false, and reading the tray is what showed it.**
+Retracted in place rather than quietly replaced.*
 
-**The case for doing it in M1 as written:** the done-bar is *daily use starts here*, and you
-cannot use it daily through a test harness. A loop with no surface does not start the corpus,
-and starting the corpus is the entire reason M1 is second.
+### What the tray already fixes about the contract
 
-**The case for landing the loop headless first:** the channel wire format is explicitly
-deferred, and DL-006 already recorded the failure mode — a transport built before the
-contract becomes the contract by default. The brain's actual output is supposed to shape that
-contract (DL-006 amending DL-005), and M1 is the first time the brain *has* an output. Fixing
-the wire format before the loop runs is the speculative abstraction DL-006 rejected; fixing it
-after one week of headless turns is evidence-based.
+`apps/mac-tray/docs/V1_IMPLEMENTATION.md` §"Deliberately waiting at the agent boundary" lists
+six guarantees the replacement must preserve. They were written against this same ledger, so
+they do not merely constrain M1 — they **converge** with it:
 
-**My recommendation: headless first, transport second, both inside M1.** Build the loop
-driven by a local JSON-lines driver over a **localhost socket** — duplex from the first
-commit, so it is network-shaped and bidirectional per DL-016 and relocation stays a config
-change. Run it headless for a few days, let the real turn output shape the envelope, *then*
-define the wire format in the ledger and rewire the tray. The done-bar still lands inside M1;
-it just lands at the end of it rather than the middle.
+| Tray requirement | What in M1 satisfies it |
+|---|---|
+| 1. Acknowledged once, routed to the single omega queue | §1.1 — `append_episode` is the only entry; **the returned `seq` is the acknowledgement token** |
+| 2. Context items keep stable identity through delivery and failure recovery | §2.1 — context ids live in the episode payload, so they survive `kill -9` |
+| 3. Replies and task states never steal focus | Tray-side only; no brain consequence |
+| 4. Proactive events declare normal vs genuinely time-sensitive | M5, but the payload must carry urgency — reserved now (§2.1) |
+| 5. Outcomes distinguish accepted · failed · blocked · verified complete | §2.1 `turn.completed{outcome}` + `turn.blocked` |
+| 6. At-most-once belongs to the core, not the UI | §1.2 — claim-before-act, exactly |
+
+Requirement 6 is the striking one: the tray explicitly *declines* to own at-most-once and
+hands it to the core. §1.2 owns it. Neither was written with the other in view.
+
+### The result: the wire format is a projection of the episode stream
+
+The tray's five durable work states — **understood · working · blocked · failed · verified
+complete** — and M1's episode kinds are **the same alphabet**, because both were derived from
+the same human test:
+
+```
+understood         ≡  inbound episode appended and claimed   (a durable fact, not a UI guess)
+working            ≡  tool.called / tool.returned            (real passes of the act sub-loop)
+blocked            ≡  turn.blocked                           ("is this moving?" answered no)
+verified complete  ≡  turn.completed{outcome:"spoke"}        ("are we done, verified?" passed)
+failed             ≡  turn.completed{outcome:"failed"}
+```
+
+So the transport is **not a second protocol to design.** It is an outward *projection* of the
+episode stream the loop already writes — filtered by policy on the Python side (DL-018), since
+the tray has no business seeing every internal tool call. Three things fall out:
+
+- **"Progress describes real state" becomes structural.** The tray's own spec demands this,
+  and today it cannot deliver: `TrayViewModel.swift:149-153` sets `.working("Working locally")`
+  and `.complete("Demo response received")` around a single `await`, because `send() -> String`
+  has nothing else to tell it. Projecting the log means the UI can only display what actually
+  happened. The guarantee stops depending on discipline.
+- **Initiative needs no second channel.** M5 pushes by appending an episode; the same
+  projection carries it. DL-011's "both wake conditions enter at the same point" becomes
+  visible in the UI rather than merely true internally.
+- **DL-006 is satisfied, not bypassed.** Its fear was a *stub's accidental shape* becoming the
+  contract. We are deleting the stub **because** its shape cannot carry what the tray spec and
+  DL-016 both require, and the replacement is derived from the brain's actual output. That is
+  precisely what DL-006 asked for.
+
+### What this costs, honestly
+
+`send(_:) async throws -> String` becomes a duplex, streaming, push-capable connection —
+JSON-lines over a localhost socket, network-shaped from the first commit per DL-016. Swift
+side: `TrayTransport` is replaced by a connection yielding an `AsyncStream` of turn events,
+and `deliver(...)` stops synthesising `workState` and starts consuming it. That is real work
+and more than the stub, and `TrayViewModel`'s failure-recovery path (draft and context
+restoration) has to be re-proven against a stream rather than a single `await`.
+
+**Recommendation: integrate in M1, and build the loop against the projection from step 3
+rather than bolting it on at step 8.** The remaining open piece is not *whether* but *what the
+projection filter admits* — a policy question, Python-side, cheap to change, and it needs real
+turns to tune. That is the part worth deferring; the envelope is not.
 
 ## Q11 — is `judge` a model call at M1, or a stub?
 
@@ -278,13 +357,19 @@ M0 makes that a hard failure by design (the singleton rule is physical, not advi
 2. The queue as a checkpoint cursor (§1.1) — including claim-before-act (§1.2).
 3. The turn skeleton with all six steps (§1.4), `judge` stubbed, `act` empty.
 4. Interrupted-turn detection at startup (§1.2) and its test.
-5. `judge` as a real call (§Q11, pending your answer).
-6. The `act` sub-loop and its two questions (§1.5).
-7. The localhost driver (§Q10, pending your answer).
-8. Rewire the tray, delete `LocalDemoTransport`.
+5. **The outward projection of the episode stream** (§Q10) and the duplex localhost socket.
+   Placed here, not last: the tray's five work states are already the turn's own alphabet, so
+   the projection is a filter over what steps 1–4 emit rather than a protocol bolted on after.
+6. `judge` as a real call (§Q11, pending your answer).
+7. The `act` sub-loop and its two questions (§1.5) — which is what makes *working*, *blocked*
+   and *verified complete* real states rather than synthesised ones.
+8. Swift side: replace `TrayTransport` with a streaming connection, delete
+   `LocalDemoTransport`, and re-prove `TrayViewModel`'s draft/context restoration against a
+   stream instead of a single `await`.
 
-Steps 1–4 and 6 depend on **nothing that is open**, and touch no file M0 is currently
-editing. They are what can start in parallel today.
+Steps 1–4 and 7 depend on **nothing that is open**, and touch no file M0 is currently
+editing. They are what can start in parallel today. Step 5 needs only the projection-filter
+policy, which is Python-side and cheap to change.
 
 ## The M1 violation metric
 
@@ -294,7 +379,8 @@ regress. M1's capability is *turns complete and land in the log*. Its violation 
 **No acknowledged episode is ever processed twice, and no claimed turn ever vanishes without
 a record.** Concretely, after any number of `kill -9`/restart cycles:
 
-- every inbound episode at seq ≤ `DONE` has **exactly one** `turn.completed` naming it;
+- every inbound episode at seq ≤ `DONE` has **exactly one** terminal record naming it —
+  `turn.completed` or `turn.blocked`, never both and never two;
 - `claimed - done` is never greater than 1 — more than one turn in flight means the queue
   stopped being single-consumer;
 - an inbound episode at seq ≤ `claimed` with no `turn.completed` appears in the startup
