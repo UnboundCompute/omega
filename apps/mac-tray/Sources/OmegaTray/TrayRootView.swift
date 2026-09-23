@@ -516,10 +516,8 @@ private struct MessageView: View {
                 Text("omega")
                     .font(.system(size: 11, weight: .semibold))
                     .foregroundStyle(TrayTheme.signal)
-                Text(message.text)
-                    .font(.system(size: 13))
+                MarkdownMessageView(source: message.text)
                     .foregroundStyle(TrayTheme.primaryText)
-                    .textSelection(.enabled)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
         case .status:
