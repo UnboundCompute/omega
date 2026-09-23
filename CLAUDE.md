@@ -23,6 +23,9 @@ together.
 - **`docs/harness-practices.md`** (tracked) is the offline reference for how agent
   harnesses are built well — loops, context, memory, tools, evals, proactivity. Consult it
   instead of going to the internet for basics. It is evidence, not doctrine.
+- **`docs/reference-implementations.md`** (tracked) is the running register of harnesses
+  we've read — what each does well, what to avoid, and which specific ideas omega takes or
+  rejects. Add a row whenever we read another system; don't let a finding live only in chat.
 - Order of work: **talk → finalize docs → then code.** Code comes last.
 - **Design talk stays at the concept level** — *what it does and why*. Tech choices
   (stores, indexes, embeddings, libraries, the Python/Rust split) are a **separate later
