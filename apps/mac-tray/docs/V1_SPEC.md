@@ -44,7 +44,7 @@ The defining loop is:
 
 - The user can capture an area, window, or display through the native macOS selection
   experience.
-- The default area-capture shortcut is `Control–Option–4`; it opens the tray, removes omega
+- The default area-capture shortcut is `Control–Option–C`; it opens the tray, removes omega
   from the screen during selection, and returns with the capture staged but unsent.
 - omega temporarily leaves the screen while capture is active, then restores the exact prior
   tray state after selection or cancellation, so content behind it remains selectable.

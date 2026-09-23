@@ -39,7 +39,7 @@ swift run OmegaTray
 ```
 
 The app starts as a top-center resting capsule. Press `Control–Option–Space` to toggle the
-persistent panel, or `Control–Option–4` to select and stage a screen area directly. Both
+persistent panel, or `Control–Option–C` to select and stage a screen area directly. Both
 shortcuts can be changed in Settings. The menu-bar fallback can capture, toggle the Privacy
 Veil, show a sample proactive peek, open Settings, or quit.
 

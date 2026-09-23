@@ -38,27 +38,27 @@ struct HotKeyChoice: Identifiable, Equatable {
 
     static let captureAreaChoices = [
         HotKeyChoice(
-            id: "control-option-4",
-            title: "Control–Option–4",
-            keyCode: UInt32(kVK_ANSI_4),
+            id: "control-option-c",
+            title: "Control–Option–C",
+            keyCode: UInt32(kVK_ANSI_C),
             modifiers: UInt32(controlKey | optionKey)
         ),
         HotKeyChoice(
-            id: "control-shift-4",
-            title: "Control–Shift–4",
-            keyCode: UInt32(kVK_ANSI_4),
+            id: "control-shift-c",
+            title: "Control–Shift–C",
+            keyCode: UInt32(kVK_ANSI_C),
             modifiers: UInt32(controlKey | shiftKey)
         ),
         HotKeyChoice(
-            id: "option-shift-4",
-            title: "Option–Shift–4",
-            keyCode: UInt32(kVK_ANSI_4),
+            id: "option-shift-c",
+            title: "Option–Shift–C",
+            keyCode: UInt32(kVK_ANSI_C),
             modifiers: UInt32(optionKey | shiftKey)
         ),
         HotKeyChoice(
-            id: "command-option-4",
-            title: "Command–Option–4",
-            keyCode: UInt32(kVK_ANSI_4),
+            id: "command-option-c",
+            title: "Command–Option–C",
+            keyCode: UInt32(kVK_ANSI_C),
             modifiers: UInt32(cmdKey | optionKey)
         )
     ]
@@ -102,8 +102,17 @@ final class AppSettings: ObservableObject {
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
         hotKeyID = defaults.string(forKey: Keys.hotKeyID) ?? HotKeyChoice.panelFallback.id
-        captureAreaHotKeyID = defaults.string(forKey: Keys.captureAreaHotKeyID) ?? HotKeyChoice.captureAreaFallback.id
+        let savedCaptureAreaHotKeyID = defaults.string(forKey: Keys.captureAreaHotKeyID)
+        if let savedCaptureAreaHotKeyID,
+           HotKeyChoice.captureAreaChoices.contains(where: { $0.id == savedCaptureAreaHotKeyID }) {
+            captureAreaHotKeyID = savedCaptureAreaHotKeyID
+        } else {
+            captureAreaHotKeyID = HotKeyChoice.captureAreaFallback.id
+        }
         hideProactivePreviews = defaults.object(forKey: Keys.hideProactivePreviews) as? Bool ?? true
+        if savedCaptureAreaHotKeyID != captureAreaHotKeyID {
+            defaults.set(captureAreaHotKeyID, forKey: Keys.captureAreaHotKeyID)
+        }
         refreshLaunchAtLogin()
     }
 
