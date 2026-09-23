@@ -54,6 +54,15 @@ struct StagedContext: Identifiable {
     let preview: NSImage?
     let fileURL: URL?
     let text: String?
+    var attachmentState: AttachmentState
+
+    enum AttachmentState: Equatable {
+        case notApplicable
+        case waiting
+        case uploading
+        case ready(TrayAttachmentReference)
+        case failed(String)
+    }
 
     init(
         id: UUID = UUID(),
@@ -62,7 +71,8 @@ struct StagedContext: Identifiable {
         detail: String,
         preview: NSImage? = nil,
         fileURL: URL? = nil,
-        text: String? = nil
+        text: String? = nil,
+        attachmentState: AttachmentState? = nil
     ) {
         self.id = id
         self.kind = kind
@@ -71,6 +81,34 @@ struct StagedContext: Identifiable {
         self.preview = preview
         self.fileURL = fileURL
         self.text = text
+        self.attachmentState = attachmentState ?? (fileURL == nil ? .notApplicable : .waiting)
+    }
+
+    var attachment: TrayAttachmentReference? {
+        guard case .ready(let reference) = attachmentState else { return nil }
+        return reference
+    }
+
+    var blocksSending: Bool {
+        switch attachmentState {
+        case .waiting, .uploading, .failed:
+            true
+        case .notApplicable, .ready:
+            false
+        }
+    }
+
+    var displayDetail: String {
+        switch attachmentState {
+        case .notApplicable:
+            detail
+        case .waiting, .uploading:
+            "\(kind.rawValue) · Storing · Not sent"
+        case .ready:
+            "\(kind.rawValue) · Stored · Not sent"
+        case .failed:
+            "\(kind.rawValue) · Upload failed"
+        }
     }
 }
 
@@ -135,6 +173,29 @@ struct TrayContextReference: Codable, Equatable, Sendable {
     let id: UUID
     let kind: String
     let title: String
+    let blob: String?
+    let mime: String?
+    let bytes: Int?
+
+    init(
+        id: UUID,
+        kind: String,
+        title: String,
+        attachment: TrayAttachmentReference? = nil
+    ) {
+        self.id = id
+        self.kind = kind
+        self.title = title
+        blob = attachment?.blob
+        mime = attachment?.mime
+        bytes = attachment?.bytes
+    }
+}
+
+struct TrayAttachmentReference: Codable, Equatable, Sendable {
+    let blob: String
+    let mime: String
+    let bytes: Int
 }
 
 struct TrayAcknowledgement: Equatable, Sendable {

@@ -65,6 +65,7 @@ final class TrayViewModel: ObservableObject {
     private var activeTurn: ActiveTurn?
     private var eventTask: Task<Void, Never>?
     private var terminalTask: Task<Void, Never>?
+    private var attachmentTasks: [UUID: Task<Void, Never>] = [:]
     private var lastProcessedSeq: Int?
     private var pendingResumeSeq: Int?
     private var urgencyByTurn: [Int: String] = [:]
@@ -121,12 +122,22 @@ final class TrayViewModel: ObservableObject {
     }
 
     var canSubmit: Bool {
-        canSend && !workState.isBusy && connectionState == .connected
+        canSend
+            && !stagedContext.contains(where: \.blocksSending)
+            && !workState.isBusy
+            && connectionState == .connected
     }
 
     var canRetryLastSend: Bool { failedSend != nil }
 
-    var hasStagedContextWithoutContentTransport: Bool { !stagedContext.isEmpty }
+    var hasStagedContentWithoutModelUnderstanding: Bool { !stagedContext.isEmpty }
+
+    var attachmentFailure: String? {
+        for context in stagedContext {
+            if case .failed(let detail) = context.attachmentState { return detail }
+        }
+        return nil
+    }
 
     var statusLabel: String {
         if workState != .ready { return workState.label }
@@ -162,6 +173,8 @@ final class TrayViewModel: ObservableObject {
         eventTask = nil
         terminalTask?.cancel()
         terminalTask = nil
+        attachmentTasks.values.forEach { $0.cancel() }
+        attachmentTasks.removeAll()
         transport.stop()
         didStart = false
     }
@@ -174,7 +187,12 @@ final class TrayViewModel: ObservableObject {
         let submission = TraySubmission(
             text: text,
             context: sentContext.map {
-                TrayContextReference(id: $0.id, kind: $0.kind.wireValue, title: $0.title)
+                TrayContextReference(
+                    id: $0.id,
+                    kind: $0.kind.wireValue,
+                    title: $0.title,
+                    attachment: $0.attachment
+                )
             },
             resumesSeq: pendingResumeSeq
         )
@@ -422,7 +440,17 @@ final class TrayViewModel: ObservableObject {
     }
 
     func removeContext(id: UUID) {
+        attachmentTasks.removeValue(forKey: id)?.cancel()
         stagedContext.removeAll { $0.id == id }
+    }
+
+    func retryFailedAttachments() {
+        for context in stagedContext {
+            guard case .failed = context.attachmentState,
+                  let fileURL = context.fileURL
+            else { continue }
+            uploadAttachment(id: context.id, fileAt: fileURL)
+        }
     }
 
     func receiveProactiveMessage(_ text: String) {
@@ -530,7 +558,7 @@ final class TrayViewModel: ObservableObject {
                     return
                 }
 
-                self?.stagedContext.append(
+                self?.stage(
                     StagedContext(
                         kind: .screen,
                         title: mode.title,
@@ -597,14 +625,14 @@ final class TrayViewModel: ObservableObject {
         change(&messages[index])
     }
 
-    private func stageFile(_ url: URL) {
+    func stageFile(_ url: URL) {
         if let image = NSImage(contentsOf: url) {
             stageImage(image, title: url.lastPathComponent, kind: .image, fileURL: url)
             return
         }
 
         let icon = NSWorkspace.shared.icon(forFile: url.path)
-        stagedContext.append(
+        stage(
             StagedContext(
                 kind: .file,
                 title: url.lastPathComponent,
@@ -616,7 +644,7 @@ final class TrayViewModel: ObservableObject {
     }
 
     private func stageURL(_ url: URL) {
-        stagedContext.append(
+        stage(
             StagedContext(
                 kind: .link,
                 title: url.host ?? url.absoluteString,
@@ -629,7 +657,7 @@ final class TrayViewModel: ObservableObject {
     private func stageText(_ text: String) {
         let normalized = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !normalized.isEmpty else { return }
-        stagedContext.append(
+        stage(
             StagedContext(
                 kind: .text,
                 title: String(normalized.prefix(48)),
@@ -639,20 +667,90 @@ final class TrayViewModel: ObservableObject {
         )
     }
 
-    private func stageImage(
+    func stageImage(
         _ image: NSImage,
         title: String,
         kind: StagedContext.Kind,
         fileURL: URL? = nil
     ) {
-        stagedContext.append(
-            StagedContext(
-                kind: kind,
-                title: title,
-                detail: "Image · Not sent",
-                preview: image,
-                fileURL: fileURL
+        if let fileURL {
+            stage(
+                StagedContext(
+                    kind: kind,
+                    title: title,
+                    detail: "Image · Not sent",
+                    preview: image,
+                    fileURL: fileURL
+                )
             )
-        )
+            return
+        }
+
+        do {
+            let temporaryURL = try writeTemporaryPNG(image)
+            stage(
+                StagedContext(
+                    kind: kind,
+                    title: title,
+                    detail: "Image · Not sent",
+                    preview: image,
+                    fileURL: temporaryURL
+                )
+            )
+        } catch {
+            stagedContext.append(
+                StagedContext(
+                    kind: kind,
+                    title: title,
+                    detail: "Image · Not sent",
+                    preview: image,
+                    attachmentState: .failed("The image could not be prepared for storage.")
+                )
+            )
+        }
+    }
+
+    private func stage(_ context: StagedContext) {
+        stagedContext.append(context)
+        guard let fileURL = context.fileURL else { return }
+        uploadAttachment(id: context.id, fileAt: fileURL)
+    }
+
+    private func uploadAttachment(id: UUID, fileAt url: URL) {
+        attachmentTasks.removeValue(forKey: id)?.cancel()
+        updateContext(id: id) { $0.attachmentState = .uploading }
+
+        attachmentTasks[id] = Task { [weak self, transport] in
+            do {
+                let reference = try await transport.attach(fileAt: url)
+                try Task.checkCancellation()
+                self?.updateContext(id: id) { $0.attachmentState = .ready(reference) }
+            } catch is CancellationError {
+                return
+            } catch {
+                self?.updateContext(id: id) {
+                    $0.attachmentState = .failed(error.localizedDescription)
+                }
+            }
+            self?.attachmentTasks[id] = nil
+        }
+    }
+
+    private func updateContext(id: UUID, change: (inout StagedContext) -> Void) {
+        guard let index = stagedContext.firstIndex(where: { $0.id == id }) else { return }
+        change(&stagedContext[index])
+    }
+
+    private func writeTemporaryPNG(_ image: NSImage) throws -> URL {
+        guard let tiff = image.tiffRepresentation,
+              let bitmap = NSBitmapImageRep(data: tiff),
+              let png = bitmap.representation(using: .png, properties: [:])
+        else {
+            throw CocoaError(.fileWriteUnknown)
+        }
+        let destination = FileManager.default.temporaryDirectory
+            .appendingPathComponent("omega-image-\(UUID().uuidString).png")
+        try png.write(to: destination, options: .atomic)
+        return destination
     }
 }

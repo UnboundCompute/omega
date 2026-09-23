@@ -5,7 +5,7 @@ import XCTest
 
 final class OmegaChannelClientTests: XCTestCase {
     @MainActor
-    func testConnectsToRunningOmegaWhenRequested() async throws {
+    func testConnectsAndAttachesToRunningOmegaWhenRequested() async throws {
         guard ProcessInfo.processInfo.environment["OMEGA_CHANNEL_INTEGRATION"] == "1" else {
             throw XCTSkip("Set OMEGA_CHANNEL_INTEGRATION=1 with omega listening on port 7717.")
         }
@@ -13,7 +13,8 @@ final class OmegaChannelClientTests: XCTestCase {
         let suiteName = "OmegaChannelClientTests.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suiteName)!
         defer { defaults.removePersistentDomain(forName: suiteName) }
-        let client = OmegaChannelClient(defaults: defaults)
+        let port = UInt16(ProcessInfo.processInfo.environment["OMEGA_CHANNEL_PORT"] ?? "7717")!
+        let client = OmegaChannelClient(port: port, defaults: defaults)
         let connected = expectation(description: "Received hello and subscribed")
         let eventTask = Task {
             for await event in client.events {
@@ -26,6 +27,17 @@ final class OmegaChannelClientTests: XCTestCase {
 
         client.start(since: nil)
         await fulfillment(of: [connected], timeout: 3)
+
+        let file = FileManager.default.temporaryDirectory
+            .appendingPathComponent("omega-live-attachment-\(UUID().uuidString).txt")
+        let body = Data("live attachment".utf8)
+        try body.write(to: file)
+        defer { try? FileManager.default.removeItem(at: file) }
+        let reference = try await client.attach(fileAt: file)
+        XCTAssertTrue(reference.blob.hasPrefix("sha256:"))
+        XCTAssertEqual(reference.mime, "text/plain")
+        XCTAssertEqual(reference.bytes, body.count)
+
         client.stop()
         eventTask.cancel()
     }
@@ -158,6 +170,39 @@ final class OmegaChannelClientTests: XCTestCase {
         XCTAssertEqual(context["id"] as? String, contextID.uuidString)
         XCTAssertEqual(context["kind"] as? String, "screen")
         XCTAssertEqual(context["title"] as? String, "Area capture")
+    }
+
+    @MainActor
+    func testAttachmentCodecUploadsAPathAndCitesTheReturnedReference() throws {
+        let file = URL(fileURLWithPath: "/tmp/omega attachment.png")
+        let attachLine = try OmegaChannelClient.encodeAttach(fileAt: file)
+        let attach = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: attachLine.dropLast()) as? [String: Any]
+        )
+        XCTAssertEqual(attach["op"] as? String, "attach")
+        XCTAssertEqual(attach["path"] as? String, file.path)
+
+        let reference = TrayAttachmentReference(
+            blob: "sha256:" + String(repeating: "b", count: 64),
+            mime: "image/png",
+            bytes: 184_320
+        )
+        let context = TrayContextReference(
+            id: UUID(),
+            kind: "screen",
+            title: "Area capture",
+            attachment: reference
+        )
+        let sayLine = try OmegaChannelClient.encodeSay(
+            TraySubmission(text: "look here", context: [context])
+        )
+        let say = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: sayLine.dropLast()) as? [String: Any]
+        )
+        let sentContext = try XCTUnwrap((say["context"] as? [[String: Any]])?.first)
+        XCTAssertEqual(sentContext["blob"] as? String, reference.blob)
+        XCTAssertEqual(sentContext["mime"] as? String, reference.mime)
+        XCTAssertEqual(sentContext["bytes"] as? Int, reference.bytes)
     }
 
     @MainActor

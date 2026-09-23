@@ -1,6 +1,7 @@
 # Mac tray v1 — implementation status
 
-Status: native surface and M1 streaming transport complete; attachment ingestion unresolved.
+Status: native surface, M1 streaming transport, and durable attachment ingestion complete;
+model-side attachment understanding unresolved.
 
 This file maps the confirmed contract in `V1_SPEC.md` to the implementation. It separates
 tray work from the agent-core work under `agent/` so the first transport cannot accidentally
@@ -27,6 +28,10 @@ become a second brain or an undeclared wire protocol.
 - Stream-driven understood, working, blocked, complete, failed, spoken, and silent outcomes;
   no locally invented agent progress.
 - Stable submission ids and duplicate acknowledgements for at-most-once retry behavior.
+- Capture, file, and image ingestion through the channel's `attach` operation before submission,
+  with visible storing/ready/failure states and retry without losing staged context.
+- Content-addressed attachment references (`blob`, `mime`, and `bytes`) carried atomically into the
+  eventual message episode; Send remains disabled until every file-backed item is durable.
 - Post-ack disconnect recovery that resumes from the projection before restoring a draft.
 - Forward-compatible decoding of unknown update states and kinds without losing the cursor.
 - Exact draft and context restoration after a failed send; retry does not create a duplicate
@@ -43,16 +48,21 @@ become a second brain or an undeclared wire protocol.
 - A reproducible `.app` packaging script that uses a stable local signing identity when one is
   available, preserving macOS privacy grants across rebuilds, with an explicit ad-hoc fallback.
 
-## Deliberately waiting at the attachment boundary
+## Deliberately waiting at the model-understanding boundary
 
 `LocalDemoTransport` is gone. `OmegaChannelClient` speaks the M1 channel and the tray remains a
 projection client: it does not persist a second transcript or implement memory, initiative
 judgement, task execution, or verification.
 
-Attachment ingestion is still unresolved. Context currently crosses the wire only as stable
-`id`, lowercase `kind`, and `title`; screenshot pixels, file bytes or paths, URL values, and
-selected text do not. The UI discloses this whenever context is staged. Screen capture remains
-useful for local staging and preview, but must not be described as visible to omega yet.
+File-backed attachment ingestion is complete. The tray uploads each capture, dropped file, or
+pasted image while it is staged; omega copies the bytes into `<store>/blobs`, returns their
+content digest, and the tray sends that immutable reference with the message. Upload errors are
+visible and retryable, and cannot silently degrade into metadata-only delivery.
+
+The provider seam remains text-only. Screenshot pixels and file contents are durable and
+re-readable by omega, but no model receives them yet. URL values and selected text also remain
+display context rather than model-readable content. The UI discloses this whenever context is
+staged; durable ingestion must not be described as visual or document understanding.
 
 The transport preserves these tray-side guarantees:
 
@@ -72,10 +82,12 @@ swift test
 ./scripts/package-app.sh
 ```
 
-The test suite covers framing and wire codecs, interleaved request/update demultiplexing,
+The test suite covers framing, attachment and message wire codecs, interleaved request/update demultiplexing,
 unknown updates, spoken and silent turns, blocked-turn resume, cursor persistence, duplicate
 replay suppression, post-ack reconnect recovery, context identity, capture/turn state
-arbitration, both shortcut preferences, and proactive presentation. Opt-in review renders cover
+arbitration, attachment upload gating and retry, both shortcut preferences, and proactive
+presentation. A live opt-in test uploads a real file through the
+Python listener and validates the returned reference. Opt-in review renders cover
 resting, peek, empty, staged-context disclosure, delivery recovery, drop target, and privacy.
 
 Manual acceptance on a signed app bundle:
@@ -91,5 +103,5 @@ Manual acceptance on a signed app bundle:
 - Turn on Privacy Veil during screen sharing and verify no conversation content is visible.
 - Run repeated text-only delivery, disconnect, restart, silent, blocked/resume, and proactive
   tests against the real omega listener.
-- Do not mark capture/file understanding complete until attachment contents have a designed and
-  tested ingestion path.
+- Do not mark capture/file understanding complete until the provider receives and can interpret
+  attachment contents; durable ingestion alone is not seeing.

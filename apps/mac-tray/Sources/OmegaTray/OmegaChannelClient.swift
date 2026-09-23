@@ -206,6 +206,40 @@ final class OmegaChannelClient: TrayTransport {
         }
     }
 
+    func attach(fileAt url: URL) async throws -> TrayAttachmentReference {
+        guard url.isFileURL else {
+            throw OmegaChannelError.invalidMessage("attachment path must be a file URL")
+        }
+        let line = try Self.encodeAttach(fileAt: url)
+
+        while isRunning {
+            try Task.checkCancellation()
+            try await waitUntilSubscribed()
+
+            do {
+                let (response, bufferedUpdates) = try await request(line)
+                yieldUpdates(bufferedUpdates)
+                guard Self.integer(response["v"]) == 1,
+                      response["op"] as? String == "attached",
+                      let blob = response["blob"] as? String,
+                      Self.isDigest(blob),
+                      let mime = response["mime"] as? String,
+                      !mime.isEmpty,
+                      let bytes = Self.integer(response["bytes"]),
+                      bytes >= 0
+                else {
+                    throw Self.responseError(response, expected: "attached")
+                }
+                return TrayAttachmentReference(blob: blob, mime: mime, bytes: bytes)
+            } catch OmegaChannelError.disconnected {
+                // Content-addressed ingestion is idempotent. If the response was lost,
+                // retrying the same path either stores the same bytes or returns its digest.
+                continue
+            }
+        }
+        throw OmegaChannelError.stopped
+    }
+
     func setResumeCursor(_ seq: Int) {
         guard seq >= 0 else { return }
         if let current = requestedCursor, seq < current { return }
@@ -414,7 +448,7 @@ final class OmegaChannelClient: TrayTransport {
             )
             yieldUpdates(ready)
 
-        case "ack", "subscribed", "pong", "error":
+        case "ack", "attached", "subscribed", "pong", "error":
             guard let pendingResponse else {
                 throw OmegaChannelError.invalidMessage("unsolicited response")
             }
@@ -567,7 +601,17 @@ final class OmegaChannelClient: TrayTransport {
             "text": submission.text,
             "channel": "tray",
             "context": submission.context.map {
-                ["id": $0.id.uuidString, "kind": $0.kind.lowercased(), "title": $0.title]
+                var item: [String: Any] = [
+                    "id": $0.id.uuidString,
+                    "kind": $0.kind.lowercased(),
+                    "title": $0.title,
+                ]
+                if let blob = $0.blob, let mime = $0.mime, let bytes = $0.bytes {
+                    item["blob"] = blob
+                    item["mime"] = mime
+                    item["bytes"] = bytes
+                }
+                return item
             },
             "urgency": submission.urgency,
         ]
@@ -575,6 +619,20 @@ final class OmegaChannelClient: TrayTransport {
             object["resumes_seq"] = resumesSeq
         }
         return try encodeObject(object)
+    }
+
+    static func encodeAttach(fileAt url: URL) throws -> Data {
+        try encodeObject([
+            "op": "attach",
+            "path": url.standardizedFileURL.path,
+        ])
+    }
+
+    private static func isDigest(_ value: String) -> Bool {
+        value.range(
+            of: #"^sha256:[0-9a-f]{64}$"#,
+            options: .regularExpression
+        ) != nil
     }
 
     private static func encodeObject(_ object: [String: Any]) throws -> Data {

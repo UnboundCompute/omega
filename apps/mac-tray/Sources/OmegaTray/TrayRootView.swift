@@ -295,13 +295,23 @@ private struct ExpandedTrayView: View {
             )
         }
 
-        if viewModel.hasStagedContextWithoutContentTransport {
+        if viewModel.hasStagedContentWithoutModelUnderstanding {
             RecoveryNotice(
                 icon: "eye.slash",
-                title: "Attachment viewing isn’t connected yet",
-                detail: "omega will receive item names and types, but cannot read their contents yet. Add the important details in your message.",
+                title: "Attachment understanding isn’t connected yet",
+                detail: "omega preserves file-backed items before sending, but the model cannot inspect staged contents yet. Add the important details in your message.",
                 actionTitle: nil,
                 action: nil
+            )
+        }
+
+        if let detail = viewModel.attachmentFailure {
+            RecoveryNotice(
+                icon: "externaldrive.badge.exclamationmark",
+                title: "Attachment could not be stored",
+                detail: detail,
+                actionTitle: "Retry",
+                action: viewModel.retryFailedAttachments
             )
         }
 
@@ -551,7 +561,7 @@ private struct ContextCard: View {
                     .font(.system(size: 11, weight: .medium))
                     .foregroundStyle(TrayTheme.primaryText)
                     .lineLimit(1)
-                Text(context.detail)
+                Text(context.displayDetail)
                     .font(.system(size: 10))
                     .foregroundStyle(TrayTheme.secondaryText)
             }

@@ -16,6 +16,73 @@ final class TrayModelTests: XCTestCase {
     }
 
     @MainActor
+    func testFileIsAttachedBeforeItsContextCanBeSent() async throws {
+        let (model, transport) = connectedModel()
+        let file = FileManager.default.temporaryDirectory
+            .appendingPathComponent("omega-attachment-\(UUID().uuidString).txt")
+        try Data("attachment body".utf8).write(to: file)
+        defer { try? FileManager.default.removeItem(at: file) }
+
+        model.stageFile(file)
+        XCTAssertFalse(model.canSubmit)
+        await settleTasks()
+
+        let context = try XCTUnwrap(model.stagedContext.first)
+        XCTAssertEqual(transport.attachments, [file])
+        XCTAssertEqual(context.attachment, transport.attachmentReference)
+        XCTAssertTrue(model.canSubmit)
+
+        model.send()
+        await settleTasks()
+        let sent = try XCTUnwrap(transport.submissions.first?.context.first)
+        XCTAssertEqual(sent.blob, transport.attachmentReference.blob)
+        XCTAssertEqual(sent.mime, transport.attachmentReference.mime)
+        XCTAssertEqual(sent.bytes, transport.attachmentReference.bytes)
+    }
+
+    @MainActor
+    func testFailedAttachmentBlocksSendAndCanBeRetried() async throws {
+        let (model, transport) = connectedModel()
+        let file = FileManager.default.temporaryDirectory
+            .appendingPathComponent("omega-attachment-\(UUID().uuidString).bin")
+        try Data([0x01]).write(to: file)
+        defer { try? FileManager.default.removeItem(at: file) }
+        transport.attachmentError = AttachmentTestError.refused
+
+        model.stageFile(file)
+        await settleTasks()
+
+        XCTAssertNotNil(model.attachmentFailure)
+        XCTAssertFalse(model.canSubmit)
+
+        transport.attachmentError = nil
+        model.retryFailedAttachments()
+        await settleTasks()
+
+        XCTAssertNil(model.attachmentFailure)
+        XCTAssertTrue(model.canSubmit)
+    }
+
+    @MainActor
+    func testInMemoryImageIsMaterializedAndAttachedAsPNG() async throws {
+        let (model, transport) = connectedModel()
+        let image = NSImage(size: NSSize(width: 2, height: 2))
+        image.lockFocus()
+        NSColor.systemOrange.setFill()
+        NSRect(x: 0, y: 0, width: 2, height: 2).fill()
+        image.unlockFocus()
+
+        model.stageImage(image, title: "Clipboard image", kind: .image)
+        await settleTasks()
+
+        let uploaded = try XCTUnwrap(transport.attachments.first)
+        defer { try? FileManager.default.removeItem(at: uploaded) }
+        XCTAssertEqual(uploaded.pathExtension, "png")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: uploaded.path))
+        XCTAssertEqual(model.stagedContext.first?.attachment, transport.attachmentReference)
+    }
+
+    @MainActor
     func testSpokenTurnIsDrivenByStreamUpdates() async {
         let (model, transport) = connectedModel()
         model.draft = "Handle this"
@@ -208,6 +275,7 @@ final class TrayModelTests: XCTestCase {
     @MainActor
     func testUnsolicitedReplyUsesProactivePresentation() async {
         let (model, transport) = connectedModel()
+        model.isExpanded = false
         var presentedMessage: String?
         var wasTimeSensitive = false
         model.proactivePresentation = { message, urgency in
@@ -308,6 +376,7 @@ final class TrayModelTests: XCTestCase {
         )
         model.start()
         model.connectionState = .connected
+        model.isExpanded = true
         transport.emit(.connected(head: 0))
         return (model, transport)
     }
@@ -329,9 +398,16 @@ private final class PermissionState {
 @MainActor
 final class ScriptedTransport: TrayTransport {
     private(set) var submissions: [TraySubmission] = []
+    private(set) var attachments: [URL] = []
     private(set) var resumeCursors: [Int] = []
     private var nextSequence = 1
     var bufferedUpdatesOnNextAck: [TrayUpdate] = []
+    var attachmentError: Error?
+    let attachmentReference = TrayAttachmentReference(
+        blob: "sha256:" + String(repeating: "a", count: 64),
+        mime: "application/octet-stream",
+        bytes: 15
+    )
     private let continuation: AsyncStream<TrayTransportEvent>.Continuation
     let events: AsyncStream<TrayTransportEvent>
 
@@ -342,6 +418,12 @@ final class ScriptedTransport: TrayTransport {
     }
 
     func start(since: Int?) {}
+
+    func attach(fileAt url: URL) async throws -> TrayAttachmentReference {
+        attachments.append(url)
+        if let attachmentError { throw attachmentError }
+        return attachmentReference
+    }
 
     func send(_ submission: TraySubmission) async throws -> TrayAcknowledgement {
         submissions.append(submission)
@@ -365,4 +447,8 @@ final class ScriptedTransport: TrayTransport {
     func emit(_ event: TrayTransportEvent) {
         continuation.yield(event)
     }
+}
+
+private enum AttachmentTestError: Error {
+    case refused
 }

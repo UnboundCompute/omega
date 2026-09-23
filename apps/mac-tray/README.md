@@ -49,9 +49,10 @@ persistent panel, or `Control–Option–C` to select and stage a screen area di
 shortcuts can be changed in Settings. The menu-bar fallback can capture, toggle the Privacy
 Veil, show a sample proactive peek, open Settings, or quit.
 
-Current M1 limitation: staged captures and files send stable identity, kind, and title, but not
-their contents. The tray labels this honestly; omega cannot inspect an attachment until the
-attachment-ingestion design is settled.
+Staged captures and files are uploaded into omega's content-addressed blob store before Send is
+enabled, then cited by digest, MIME type, and exact byte count in the message episode. The current
+provider seam is still text-only, so omega stores attachment contents durably but cannot inspect
+their contents yet; the tray labels that limitation honestly.
 
 For visual inspection during development, launch directly into a state with
 `OMEGA_TRAY_PREVIEW_STATE=expanded swift run OmegaTray` or use `peek`.
