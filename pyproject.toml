@@ -7,6 +7,12 @@ name = "omega"
 version = "0.1.0"
 description = "omega — a personal-assistant second brain"
 requires-python = ">=3.11"
+dependencies = [
+    # The only third-party runtime dependency. Imported lazily, inside
+    # OpenAIProvider's constructor, so the test suite never needs it installed
+    # and never needs a key -- see python/omega/provider.py.
+    "openai>=1.0",
+]
 classifiers = [
     "Programming Language :: Rust",
     "Programming Language :: Python :: Implementation :: CPython",
