@@ -53,7 +53,8 @@ from omega.channel import DEFAULT_HOST, DEFAULT_PORT, Channel
 from omega.executor import Executor, StartupReport
 from omega.memory import EPISODES_FILENAME, MemoryStore, PathLike
 from omega.queue import EventQueue
-from omega.turn import ActResult, TurnContext, no_act_loop_yet
+from omega.act import act_loop
+from omega.turn import ActResult, TurnContext
 
 __all__ = [
     "DEFAULT_POLL",
@@ -203,7 +204,12 @@ class Runtime:
         store_path: PathLike,
         *,
         complete: Optional[Callable[..., provider.Response]] = None,
-        act: Callable[[TurnContext], ActResult] = no_act_loop_yet,
+        # The real sub-loop, wired here rather than in `Executor` (M1 step 7).
+        # The executor keeps `no_act_loop_yet` as *its* default on purpose:
+        # `Runtime` is the assembled process, where acting for real is what a
+        # running omega does, while an `Executor` built directly in a test is
+        # a turn engine that should do nothing it was not handed.
+        act: Callable[[TurnContext], ActResult] = act_loop,
         listen: bool = True,
         host: str = DEFAULT_HOST,
         port: int = DEFAULT_PORT,
