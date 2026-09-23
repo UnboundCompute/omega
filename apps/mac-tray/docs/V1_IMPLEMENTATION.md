@@ -50,6 +50,15 @@ become a second brain or an undeclared wire protocol.
 - A reproducible `.app` packaging script that uses a stable local signing identity when one is
   available, preserving macOS privacy grants across rebuilds, with an explicit ad-hoc fallback.
 
+## Current implementation pass
+
+- Render agent replies as native structured Markdown while preserving selection and links.
+- Start a non-interactive omega runtime when the packaged tray launches, reuse an already-running
+  resident process, stop the owned process on app quit, and surface startup failures in the tray.
+- Add a lossless New Chat surface reset and a one-shot Teach Omega composer mode. Teaching notes
+  are durable episodes and current-recall instructions; they are not described as extracted
+  long-term facts before that memory layer exists.
+
 ## Deliberately waiting at the model-understanding boundary
 
 `LocalDemoTransport` is gone. `OmegaChannelClient` speaks the M1 channel and the tray remains a

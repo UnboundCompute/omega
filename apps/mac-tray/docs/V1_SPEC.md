@@ -63,8 +63,16 @@ The defining loop is:
 ### Conversation and delegation
 
 - v1 supports one active conversation well rather than exposing a history browser.
+- A New Chat action clears the local conversation surface without creating a second identity,
+  deleting episodes, or isolating omega from its durable history. It is unavailable while a
+  draft, staged context, or turn is active so nothing is silently discarded.
+- A one-shot Teach Omega composer mode accepts an explicit fact, preference, or working rule and
+  submits it as a durable learning instruction rather than a task. Until long-term extraction is
+  built, the UI describes this honestly as recorded history available to current recall.
 - User instructions are compact; omega responses are text-led rather than a wall of chat
   bubbles.
+- Omega responses render native Markdown structure—paragraphs, emphasis, links, lists, quotes,
+  headings, inline code, and fenced code—without exposing raw formatting markers.
 - The panel grows with the exchange to a safe maximum height, then scrolls internally.
 - The composer remains available at the bottom.
 - Delegated work has durable plain-language states: understood, working, blocked, failed,
@@ -103,6 +111,8 @@ v1 uses the relevant macOS conventions and capabilities:
   and Differentiate Without Color;
 - Notification Center and Focus awareness;
 - launch at login and a small menu-bar fallback for reopen, settings, and quit.
+- the packaged tray starts and owns the local omega runtime automatically; opening a terminal is
+  never part of the normal product flow.
 
 Widgets, Spotlight, Siri, Shortcuts, Finder and Share extensions, Handoff, iCloud sync, and
 Dock presence are not included merely to claim platform integration. They can earn their

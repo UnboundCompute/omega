@@ -86,8 +86,11 @@ _ACT_SYSTEM = (
     "run_code has no shell: give argv as a list, and pipes, redirection and "
     "$(...) will not work.\n"
     "Writing outside omega's own store, running anything that is not a "
-    "read-only command, and fetching a URL all stop the turn to ask the "
-    "person first. Ask for one only when it is genuinely what the work needs."
+    "read-only command, and fetching a URL are the person's decision, not "
+    "yours. When the work genuinely needs one, ask for the tool: omega stops "
+    "the turn and puts the request to them itself. Do not ask for permission "
+    "in your reply instead - that leaves the work undone and gives them "
+    "nothing to approve."
 )
 
 
