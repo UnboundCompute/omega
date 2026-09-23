@@ -477,8 +477,15 @@ _JUDGE_SYSTEM = (
     "SPEAK - answer now, no work needed first\n"
     "ACT - do some work first, then answer\n"
     "SILENT - say nothing\n"
-    "Staying silent is a correct and successful answer, not a failure. "
-    "Choose it whenever a reply would add nothing."
+    "If the person wrote to you, they are talking to you: answer them. "
+    "SPEAK or ACT is right there even for a greeting, a short question, or "
+    "something you think is obvious. Do not stay silent on a message addressed "
+    "to you.\n"
+    "SILENT is for events nobody asked you about - your own idle ticks, "
+    "background noise, things already handled. Staying silent there is a "
+    "correct and successful answer, not a failure.\n"
+    "Judge this event on its own. That you stayed silent before is not a "
+    "reason to stay silent now."
 )
 
 _REPLY_SYSTEM = (
