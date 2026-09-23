@@ -309,6 +309,50 @@ def test_context_previews_do_not_reach_a_client(
     assert "salary-review.pdf" not in json.dumps(update)
 
 
+def test_a_screenshot_with_no_words_is_a_message(
+    client: ChannelClient, q: EventQueue
+) -> None:
+    """Dropping something in and saying nothing is a real message — the thing
+    shown *is* the message. The tray already offers it (``canSend`` is
+    text-or-context) and the episode schema already permits it (``text`` must be
+    a string, not a non-empty one), so a socket that refused it made a
+    submission the UI accepts fail on the way out."""
+    answer = client.say("", context=[{"id": "shot-1", "kind": "screen", "title": "Area capture"}])
+    assert answer["op"] == "ack"
+
+    landed = q.recent(1)[0].payload
+    assert landed["text"] == ""
+    assert landed["context"] == [{"id": "shot-1", "kind": "screen", "title": "Area capture"}]
+
+
+def test_a_say_with_neither_text_nor_context_is_refused(
+    client: ChannelClient, q: EventQueue
+) -> None:
+    """Empty text is only *empty* when nothing came with it. With nothing at
+    all there is no message, and appending one would put an episode in the log
+    that no turn could act on."""
+    for request in (
+        {"v": PROTOCOL, "op": "say", "text": ""},
+        {"v": PROTOCOL, "op": "say", "text": "   \n "},
+        {"v": PROTOCOL, "op": "say", "text": "", "context": []},
+        {"v": PROTOCOL, "op": "say"},
+    ):
+        answer = client.request(request)
+        assert answer["op"] == "error", request
+        assert "text" in answer["error"] and "context" in answer["error"], request
+    assert q.head() == 0
+
+
+def test_a_context_that_is_not_a_list_is_refused(
+    client: ChannelClient, q: EventQueue
+) -> None:
+    answer = client.request(
+        {"v": PROTOCOL, "op": "say", "text": "hi", "context": {"id": "ctx-1"}}
+    )
+    assert answer["op"] == "error" and "list" in answer["error"]
+    assert q.head() == 0
+
+
 # --- red: bad input on the one port an untrusted sender can reach -----------
 
 

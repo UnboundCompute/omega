@@ -319,9 +319,22 @@ class Channel:
         which is the honest outcome, because nothing identified it as the same
         one.
         """
-        text = request.get("text")
-        if not isinstance(text, str) or not text.strip():
-            raise ValueError("say needs a non-empty 'text'")
+        text = request.get("text", "")
+        if not isinstance(text, str):
+            raise ValueError("'text' must be a string")
+        context = request.get("context") or []
+        if not isinstance(context, list):
+            raise ValueError("'context' must be a list")
+        if not text.strip() and not context:
+            # Empty text is only empty when nothing came with it. Dropping a
+            # screenshot in and saying nothing is a real message — the thing
+            # shown *is* the message — and the tray already treats it as one
+            # (``canSend`` is text-or-context). The episode schema agrees:
+            # ``message.inbound`` requires ``text`` to be a string but not a
+            # non-empty one, where it demands ``channel`` be non-empty right
+            # beside it. This check was the only place that disagreed, and it
+            # made a submission the UI accepts fail at the socket.
+            raise ValueError("say needs 'text', 'context', or both")
         write_key = request.get("id", "")
         if not isinstance(write_key, str):
             raise ValueError("'id' must be a string")
