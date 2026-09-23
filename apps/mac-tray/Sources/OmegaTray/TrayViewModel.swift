@@ -44,7 +44,8 @@ final class TrayViewModel: ObservableObject {
     @Published var composerFocusRequest = 0
     @Published var capturePermission: ScreenCapturePermission
     @Published var hotKeyRegistrationFailed = false
-    @Published var isPrivacyRestricted = false
+    @Published var isScreenLocked = false
+    @Published var manualPrivacyMode = false
 
     private let transport: TrayTransport
     private var failedSend: FailedSend?
@@ -75,6 +76,10 @@ final class TrayViewModel: ObservableObject {
             return "omega has something for you"
         }
         return proactivePeek ?? "omega has something for you"
+    }
+
+    var isPrivacyRestricted: Bool {
+        isScreenLocked || manualPrivacyMode
     }
 
     func send() {

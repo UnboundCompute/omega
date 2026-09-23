@@ -7,7 +7,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var panelController: OmegaPanelController?
     private var statusItem: NSStatusItem?
     private var hotKey: GlobalHotKey?
+    private var privacyMenuItem: NSMenuItem?
     private var settingsObservation: AnyCancellable?
+    private var notificationController: NotificationController?
     private let settings = AppSettings.shared
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -15,6 +17,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let panelController = OmegaPanelController(viewModel: viewModel)
         self.panelController = panelController
+        let notificationController = NotificationController { [weak panelController] in
+            panelController?.showExpanded()
+        }
+        self.notificationController = notificationController
+        panelController.timeSensitiveFallback = { [weak notificationController] message in
+            notificationController?.deliverTimeSensitiveFallback(message)
+        }
 
         switch ProcessInfo.processInfo.environment["OMEGA_TRAY_PREVIEW_STATE"] {
         case "expanded":
@@ -60,6 +69,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(withTitle: "Open omega", action: #selector(togglePanel), keyEquivalent: "")
         menu.addItem(withTitle: "Capture area…", action: #selector(captureArea), keyEquivalent: "")
         menu.addItem(withTitle: "Show proactive peek", action: #selector(showProactivePeek), keyEquivalent: "")
+        let privacyItem = menu.addItem(
+            withTitle: "Turn On Privacy Veil",
+            action: #selector(togglePrivacyMode),
+            keyEquivalent: ""
+        )
+        privacyMenuItem = privacyItem
         menu.addItem(.separator())
         menu.addItem(withTitle: "Settings…", action: #selector(openSettings), keyEquivalent: ",")
         menu.addItem(withTitle: "Quit omega", action: #selector(quit), keyEquivalent: "q")
@@ -94,12 +109,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func screenLocked() {
-        viewModel.isPrivacyRestricted = true
+        viewModel.isScreenLocked = true
         panelController?.showResting()
     }
 
     @objc private func screenUnlocked() {
-        viewModel.isPrivacyRestricted = false
+        viewModel.isScreenLocked = false
+    }
+
+    @objc private func togglePrivacyMode() {
+        viewModel.manualPrivacyMode.toggle()
+        privacyMenuItem?.title = viewModel.manualPrivacyMode
+            ? "Turn Off Privacy Veil"
+            : "Turn On Privacy Veil"
     }
 
     private func registerHotKey() {

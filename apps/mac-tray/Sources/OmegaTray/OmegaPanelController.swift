@@ -16,6 +16,7 @@ final class OmegaPanelController: NSWindowController {
     private var contentObservation: AnyCancellable?
     private var dropObservation: AnyCancellable?
     private weak var previouslyActiveApplication: NSRunningApplication?
+    var timeSensitiveFallback: ((String) -> Void)?
 
     private let restingSize = NSSize(width: 190, height: 38)
     private let peekSize = NSSize(width: 390, height: 108)
@@ -115,7 +116,7 @@ final class OmegaPanelController: NSWindowController {
         }
     }
 
-    func showProactivePeek(_ message: String) {
+    func showProactivePeek(_ message: String, urgency: ProactiveUrgency = .normal) {
         guard presentation != .expanded else {
             viewModel.receiveProactiveMessage(message)
             return
@@ -128,6 +129,10 @@ final class OmegaPanelController: NSWindowController {
         resize(to: peekSize, animate: true)
         updateContent()
         window?.orderFrontRegardless()
+
+        if urgency == .timeSensitive {
+            timeSensitiveFallback?(message)
+        }
 
         peekCollapseTask = Task { [weak self] in
             try? await Task.sleep(for: .seconds(7))

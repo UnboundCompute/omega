@@ -57,6 +57,14 @@ final class TraySnapshotTests: XCTestCase {
                 .frame(width: 320, height: 72),
             to: directory.appendingPathComponent("mac-drop-target.png")
         )
+
+        model.isDropTargeted = false
+        model.manualPrivacyMode = true
+        try write(
+            TrayRootView(viewModel: model, presentation: .expanded, close: {}, open: {})
+                .frame(width: 460, height: 380),
+            to: directory.appendingPathComponent("mac-privacy-veil.png")
+        )
     }
 
     @MainActor

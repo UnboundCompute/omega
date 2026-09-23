@@ -24,10 +24,12 @@ It does not own:
 - tool execution and verification;
 - cross-channel thread semantics.
 
-Until the real channel contract is designed, the app uses a visibly labelled local demo
-transport. Nothing in that demo interface is a stable agent protocol.
+Until the real channel contract is designed at omega M1, the app uses a visibly labelled local
+demo transport. Nothing in that demo interface is a stable agent protocol. The complete surface
+status and handoff conditions are recorded in
+[`docs/V1_IMPLEMENTATION.md`](docs/V1_IMPLEMENTATION.md).
 
-## Run the prototype
+## Run during development
 
 Requirements: macOS 14 or newer and the Swift toolchain included with Xcode.
 
@@ -36,9 +38,9 @@ cd apps/mac-tray
 swift run OmegaTray
 ```
 
-The prototype starts as a top-center resting capsule. Press `Control–Option–Space` to
-toggle the persistent panel. The menu-bar fallback can trigger an area capture or a sample
-proactive peek.
+The app starts as a top-center resting capsule. Press `Control–Option–Space` to toggle the
+persistent panel; the shortcut can be changed in Settings. The menu-bar fallback can capture,
+toggle the Privacy Veil, show a sample proactive peek, open Settings, or quit.
 
 For visual inspection during development, launch directly into a state with
 `OMEGA_TRAY_PREVIEW_STATE=expanded swift run OmegaTray` or use `peek`.
@@ -56,3 +58,15 @@ To write offscreen review renders when display capture is unavailable:
 OMEGA_SNAPSHOT_DIR="$PWD/../../.impeccable/review" swift test \
   --filter TraySnapshotTests
 ```
+
+## Package the local app
+
+```sh
+./scripts/package-app.sh
+open .build/app/omega.app
+```
+
+The script builds release, creates the application bundle, applies an ad-hoc local signature,
+and verifies both the bundle metadata and signature. Move the app to `/Applications` before
+testing launch at login. Distribution outside the local machine will require Developer ID
+signing and notarization.

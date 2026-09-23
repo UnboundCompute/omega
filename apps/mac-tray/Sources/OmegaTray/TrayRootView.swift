@@ -19,7 +19,11 @@ struct TrayRootView: View {
             case .peek:
                 ProactivePeekView(message: viewModel.displayedProactivePeek, open: open)
             case .expanded:
-                ExpandedTrayView(viewModel: viewModel, close: close)
+                if viewModel.isPrivacyRestricted {
+                    PrivacyRestrictedView(close: close)
+                } else {
+                    ExpandedTrayView(viewModel: viewModel, close: close)
+                }
             }
         }
         .onDrop(
@@ -27,6 +31,57 @@ struct TrayRootView: View {
             isTargeted: $viewModel.isDropTargeted,
             perform: viewModel.importProviders
         )
+    }
+}
+
+private struct PrivacyRestrictedView: View {
+    let close: () -> Void
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Spacer()
+                Capsule()
+                    .fill(Color.white.opacity(0.13))
+                    .frame(width: 34, height: 3)
+                Spacer()
+                Button(action: close) {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(TrayTheme.secondaryText)
+                        .frame(width: 26, height: 26)
+                        .background(Color.white.opacity(0.06), in: Circle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Close omega")
+                .padding(.trailing, 10)
+            }
+            .frame(height: 38)
+            .background(TrayTheme.shell)
+
+            VStack(spacing: 10) {
+                Image(systemName: "eye.slash")
+                    .font(.system(size: 21, weight: .light))
+                    .foregroundStyle(TrayTheme.signal)
+                Text("Privacy veil is on")
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(TrayTheme.primaryText)
+                Text("Conversation and context are hidden. Turn off Privacy Veil from the omega menu-bar item when you’re ready.")
+                    .font(.system(size: 12))
+                    .foregroundStyle(TrayTheme.secondaryText)
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: 300)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(TrayTheme.surface)
+        }
+        .clipShape(UnevenRoundedRectangle(bottomLeadingRadius: 22, bottomTrailingRadius: 22))
+        .overlay {
+            UnevenRoundedRectangle(bottomLeadingRadius: 22, bottomTrailingRadius: 22)
+                .stroke(Color.white.opacity(0.09), lineWidth: 0.75)
+        }
+        .shadow(color: .black.opacity(0.34), radius: 28, y: 14)
+        .accessibilityElement(children: .contain)
     }
 }
 
@@ -103,6 +158,7 @@ private struct ExpandedTrayView: View {
     let close: () -> Void
     @FocusState private var composerFocused: Bool
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.controlActiveState) private var controlActiveState
 
     var body: some View {
@@ -126,6 +182,10 @@ private struct ExpandedTrayView: View {
         }
         .shadow(color: .black.opacity(0.34), radius: 28, y: 14)
         .opacity(controlActiveState == .inactive ? 0.94 : 1)
+        .overlay(alignment: .bottom) {
+            WorkingSeam(isActive: viewModel.workState.isBusy)
+                .padding(.bottom, 2)
+        }
         .overlay {
             if viewModel.isDropTargeted {
                 dropOverlay
@@ -211,8 +271,12 @@ private struct ExpandedTrayView: View {
             }
             .onChange(of: viewModel.messages.count) {
                 guard let id = viewModel.messages.last?.id else { return }
-                withAnimation(.easeOut(duration: 0.2)) {
+                if reduceMotion {
                     proxy.scrollTo(id, anchor: .bottom)
+                } else {
+                    withAnimation(.timingCurve(0.22, 0.82, 0.2, 1, duration: 0.2)) {
+                        proxy.scrollTo(id, anchor: .bottom)
+                    }
                 }
             }
         }
@@ -528,6 +592,28 @@ private struct SignalSeam: View {
             .fill(isVisible ? TrayTheme.signal : Color.white.opacity(0.12))
             .frame(height: 2)
             .shadow(color: isVisible ? TrayTheme.signal.opacity(0.35) : .clear, radius: 4)
+    }
+}
+
+private struct WorkingSeam: View {
+    let isActive: Bool
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var bright = false
+
+    var body: some View {
+        Capsule()
+            .fill(isActive ? TrayTheme.signal : Color.clear)
+            .frame(width: bright ? 72 : 42, height: 2)
+            .opacity(isActive ? (bright ? 0.95 : 0.42) : 0)
+            .animation(
+                reduceMotion || !isActive
+                    ? nil
+                    : .timingCurve(0.22, 0.82, 0.2, 1, duration: 0.8).repeatForever(autoreverses: true),
+                value: bright
+            )
+            .onAppear { bright = isActive }
+            .onChange(of: isActive) { bright = isActive }
+            .accessibilityHidden(true)
     }
 }
 

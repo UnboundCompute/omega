@@ -1,6 +1,7 @@
 # Mac tray v1 — product and interface contract
 
-Status: confirmed for implementation on 2026-09-23.
+Status: confirmed on 2026-09-23; native surface implemented. See `V1_IMPLEMENTATION.md` for
+verification and the intentionally deferred M1 transport handoff.
 
 This document records the agreed v1 experience before code. Changes to the product shape
 should update this document and the private decision ledger in `AGENT.md`.

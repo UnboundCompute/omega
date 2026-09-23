@@ -90,11 +90,11 @@ enum WorkState: Equatable {
     var label: String {
         switch self {
         case .ready: "Ready"
-        case .sending: "Sending"
+        case .sending: "Understood"
         case .working(let detail): detail
-        case .blocked(let detail): detail
-        case .complete(let detail): detail
-        case .failed(let detail): detail
+        case .blocked: "Action needed"
+        case .complete: "Verified complete"
+        case .failed: "Not delivered"
         }
     }
 }
