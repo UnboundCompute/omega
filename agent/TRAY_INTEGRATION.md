@@ -55,6 +55,7 @@ other.
 
 ```jsonc
 {"op":"say","text":"…","id":"<uuid>","channel":"tray","context":[…],"urgency":"normal","resumes_seq":41}
+{"op":"attach","path":"/abs/path/to/file.png"}
 {"op":"subscribe","since":0}
 {"op":"ping"}
 ```
@@ -67,26 +68,74 @@ Fields:
 |---|---|
 | `id` | becomes the log's **write key**. Send a UUID. See §4 on retries. |
 | `channel` | defaults to `"tray"`; send it anyway. |
-| `context` | array of `{"id","kind","title"}` — **all three required**. |
+| `context` | array of `{"id","kind","title"}` — **all three required**; plus `{"blob","mime","bytes"}` if the item has bytes behind it, all three or none. See below. |
 | `urgency` | `"normal"` or `"timely"`. |
 | `resumes_seq` | the `for_seq` of a `blocked` update this message answers. |
 
-> ### ⚠ UNRESOLVED AND BLOCKING: context carries identity, not content
+#### Attachments: upload first, then reference the digest
+
+A context item carries identity. If it also has bytes behind it — a screenshot, a dropped
+file — those bytes go into omega **before** the message that mentions them, through a
+separate op, and the item then carries the *digest* of what was stored.
+
+**Upload.** One file per call, with an absolute path:
+
+```jsonc
+→ {"op":"attach","path":"/abs/path/to/file.png"}
+← {"v":1,"op":"attached","blob":"sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08","mime":"image/png","bytes":184320}
+```
+
+Omega copies the file into a content-addressed store beside the log and answers with the
+reference. `blob` is `sha256:` followed by exactly 64 lowercase hex characters — the prefix
+is part of the value, on the wire and in the log. `mime` is derived from the filename's
+extension, falling back to `application/octet-stream`. `bytes` is the size omega actually
+read and hashed, not what the filesystem claimed beforehand.
+
+Attaching the same content twice — the same file, or two files with identical contents — is
+stored once and answers the same digest both times. That is not a feature with a switch; it
+is what content addressing does. It also means `attach` is safe to retry: a second call for
+the same file costs a re-read and changes nothing.
+
+**Reference.** The `say` that follows puts the three fields on the context item alongside
+the identity fields:
+
+```jsonc
+{"op":"say","id":"<uuid>","channel":"tray","context":[
+  {"id":"ctx-1","kind":"image","title":"Area capture",
+   "blob":"sha256:9f86d081…","mime":"image/png","bytes":184320}
+]}
+```
+
+`blob`, `mime` and `bytes` are **all three or none**. A partial set is refused with a named
+error, not accepted with the rest inferred — a digest with no size and a size with no digest
+are both half a fact, and the log keeps what it is given forever. Items with no bytes behind
+them (selected text, a link) simply omit all three and are as ordinary as before.
+
+**Why two ops rather than one.** The tray captures long before the person hits send: the
+upload belongs at capture time, where its cost and its failures are visible and the person
+can still drop the item. Folding the bytes into `say` would move both onto the send path.
+And a bare path would not survive — the file can move, change or vanish between the message
+and the moment memory is re-derived from it, whereas a digest names content that cannot
+change under it. `attach` failing is an ordinary error envelope on the same connection; the
+connection lives and the draft is untouched.
+
+**Update the tray's staged-context model to carry the reference.** `StagedContext` needs the
+digest returned by `attach` so `say` can cite it; the response echoed back on an `update`
+still contains only `{id, kind}` (§5), which is unchanged and deliberate — the tray already
+has the previews, and a digest is not something the UI needs back.
+
+> ### ⚠ Still true: omega cannot look at an image
 >
-> A context item is `{id, kind, title}` and nothing else. There is **no field for the
-> screenshot's pixels, the file's path, the link's URL, or the selected text** — and no
-> ingestion mechanism keyed by `id` anywhere in omega. So omega learns that an item called
-> *"Area capture"* was attached and has no way to look at it.
+> This lands **storage and transport only**. The provider seam is text
+> (`complete(role, messages)`, DL-024) — there is no multimodal path, so a model omega calls
+> never receives the pixels. What omega knows about an attachment is its kind, its size and
+> its digest: enough to say *an image of 184 KB was attached and is still exactly the one
+> that was attached*, and nothing about what is in it.
 >
-> That is not an oversight in this brief; it is a hole in the protocol. **Do not invent a
-> field to paper over it** — where attachment bytes live is a real decision with a permanent
-> consequence, because memory is a graph *derived from the append-only log* and anything
-> written into an episode is re-derived forever.
->
-> Until it is decided, build the connection, the streaming, and the text path. Staged context
-> will round-trip its identity correctly and omega will not be able to inspect it. **Do not
-> ship screen capture as a working feature on top of this**, and do not let the UI imply
-> omega can see something it cannot.
+> So **screen capture must not be presented as a working feature** until multimodal exists.
+> Round-tripping a digest correctly is not seeing. Do not let the UI imply otherwise; the
+> bytes are safe and re-readable, which is the part that had to be decided permanently, and
+> the rest waits for the provider seam to grow.
 
 `context[].kind` must be one of **`file` `image` `text` `link` `screen`** — lowercase.
 `StagedContext.Kind`'s raw values are capitalised (`"File"`, `"Image"`, …), so **map the case,
@@ -109,6 +158,7 @@ Responses:
 ```jsonc
 {"v":1,"op":"ack","seq":42,"duplicate":false}
 {"v":1,"op":"ack","seq":42,"duplicate":true,"conflict":"that id is already in the log carrying a different message"}
+{"v":1,"op":"attached","blob":"sha256:9f86d081…","mime":"image/png","bytes":184320}
 {"v":1,"op":"subscribed","since":0,"head":41}
 {"v":1,"op":"pong","head":41}
 {"v":1,"op":"error","error":"…","request":"say"}
@@ -251,8 +301,9 @@ users' machines.
 
 ### `TrayModels.swift`
 - `TraySubmission` currently carries `contextDescriptions: [String]`. It needs **identity**:
-  the wire wants `{id, kind, title}` per item. Carry the `StagedContext` ids (or a small value
-  type), not display strings.
+  the wire wants `{id, kind, title}` per item, plus `{blob, mime, bytes}` for an item with
+  bytes behind it (§2). Carry the `StagedContext` ids and the digest `attach` returned (or a
+  small value type), not display strings.
 - `WorkState` maps from the five wire states. Decide deliberately where `silent` lands (§3).
 - Note the asymmetry: the tray **sends** `{id, kind, title}` and **receives back** only
   `{id, kind}`. Titles are deliberately stripped — they are user-visible text with no reader on
