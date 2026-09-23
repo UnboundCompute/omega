@@ -329,15 +329,58 @@ rather than bolting it on at step 8.** The remaining open piece is not *whether*
 projection filter admits* — a policy question, Python-side, cheap to change, and it needs real
 turns to tune. That is the part worth deferring; the envelope is not.
 
-## Q11 — is `judge` a model call at M1, or a stub?
+## Q11 — DECIDED: `judge` is a real model call, on OpenAI, behind a provider seam
 
-This decides whether M1 pulls in an LLM client, prompts, and cost, or whether M1 is purely
-the skeleton and the first model call lands in M2.
-
-**Recommendation: a real model call, smallest possible prompt.** A loop whose `judge` always
+**Answered 2026-09-23. See DL-024.** A real call, smallest possible prompt, provider OpenAI,
+API key read from `.env` at startup. The reasoning that stands: a loop whose `judge` always
 returns `speak` never exercises the one thing DL-011 calls load-bearing — deciding to say
-nothing — and M1 would ship with its most important property untested. A stubbed judge also
-cannot start a *useful* corpus, and the corpus is the point.
+nothing — and M1 would ship with its most important property untested behind a green suite.
+
+### The provider seam
+
+One function is the only place in omega that knows an LLM exists:
+
+```python
+complete(role: Role, messages: list[Message]) -> Response
+```
+
+`Role` is `JUDGE` or `ACT`. Nothing above this line ever names OpenAI, a model string, or a
+request shape — the same discipline as the memory seam, for the same reason: **a boundary
+crossed in exactly one place is a boundary you can move.** Swapping providers, or running
+`judge` locally while `act` stays remote, is one file.
+
+**Two roles because they have opposite cost profiles**, and this is the substantive part:
+
+| | `judge` | `act` |
+|---|---|---|
+| Fires on | **every** event, including every idle tick | only when `judge` says so |
+| Answer, usually | "nothing" | real work |
+| Wants | cheap, fast, small | capable |
+
+Wiring them apart on day one costs nothing. Unpicking a hardcoded model later touches every
+call site — and a `judge` sharing `act`'s expensive model is a per-tick cost on the one step
+designed to run constantly and return nothing.
+
+### Configuration
+
+`.env`, gitignored (`.gitignore:5`), read at startup — never baked into a default, a prompt,
+or a test fixture:
+
+```
+OPENAI_API_KEY=...
+OMEGA_MODEL_JUDGE=...     # small, fast
+OMEGA_MODEL_ACT=...       # capable
+```
+
+Model names live beside the key on purpose: **changing which model judges is a config edit,
+not a commit.** Tests never call the real seam — they inject a fake `complete`, which is what
+makes "judge chose silence" assertable without spending a token or needing a network.
+
+### Left open, deliberately
+
+Prompt content, token budgets, and tool error/retry policy (still deferred in `CLAUDE.md`).
+Those need a real corpus to argue from, which is the reason M1 is second in the build order
+rather than first.
 
 ## Q12 — one process or two at M1?
 
@@ -360,16 +403,17 @@ M0 makes that a hard failure by design (the singleton rule is physical, not advi
 5. **The outward projection of the episode stream** (§Q10) and the duplex localhost socket.
    Placed here, not last: the tray's five work states are already the turn's own alphabet, so
    the projection is a filter over what steps 1–4 emit rather than a protocol bolted on after.
-6. `judge` as a real call (§Q11, pending your answer).
+6. The provider seam (§Q11) and `judge` as a real OpenAI call. No longer blocked.
 7. The `act` sub-loop and its two questions (§1.5) — which is what makes *working*, *blocked*
    and *verified complete* real states rather than synthesised ones.
 8. Swift side: replace `TrayTransport` with a streaming connection, delete
    `LocalDemoTransport`, and re-prove `TrayViewModel`'s draft/context restoration against a
    stream instead of a single `await`.
 
-Steps 1–4 and 7 depend on **nothing that is open**, and touch no file M0 is currently
-editing. They are what can start in parallel today. Step 5 needs only the projection-filter
-policy, which is Python-side and cheap to change.
+**Nothing in this order is blocked any more.** Q10 and Q11 are both answered, so steps 1–4,
+6 and 7 can start immediately; step 5 needs only the projection-filter policy, which is
+Python-side and cheap to change; step 8 waits on step 5. Q12 is the last one outstanding and
+it gates nothing — one process or two changes where the code runs, not what it does.
 
 ## The M1 violation metric
 
@@ -390,3 +434,10 @@ Asserted against a real `kill -9`, not a mock, and **it fails closed**: a trial 
 zero episodes were processed, or in which the kill landed before the first append, does not
 pass — it reports *couldn't determine*. M0's crash suite already hit exactly that bug (2 of 20
 trials killed the child during interpreter startup), and a pass count would have read 20/20.
+
+**A second violation metric arrives with `judge` (DL-024): the count of turns ending in
+silence must be non-zero** on a realistic event stream. Every other M1 test is satisfied by a
+`judge` that always speaks — turns still complete, still land in the log, still survive a
+kill. Zero silences means the judge is a rubber stamp wearing a model's clothes, and that
+regression is invisible to the entire suite above. It fails closed the same way: a stream
+that gave the judge nothing worth staying quiet about reports *couldn't determine*, not pass.
