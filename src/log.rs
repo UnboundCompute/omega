@@ -50,6 +50,8 @@ pub struct Log {
     checkpoints_reset: bool,
     /// Where the unreadable sidecar was moved to, when it could be moved.
     damaged_checkpoints_path: Option<PathBuf>,
+    /// Where a truncated tail's bytes were kept, when they were not just zeros.
+    discarded_tail_path: Option<PathBuf>,
 }
 
 impl std::fmt::Debug for Log {
@@ -97,6 +99,7 @@ impl Log {
             recovered_bytes: 0,
             checkpoints_reset: false,
             damaged_checkpoints_path: None,
+            discarded_tail_path: None,
         };
         log.recover()?;
         crate::checkpoint::clear_stale_temp(path);
@@ -178,6 +181,14 @@ impl Log {
         // Step 6: if anything was truncated, set_len and fsync.
         if scan.good_end < len {
             self.recovered_bytes = len - scan.good_end;
+            // Recovery is the one moment these bytes would be destroyed, and a
+            // tail is only truncated because nothing in it verifies as a frame
+            // -- not because anyone knows what it was. Zeros hold no evidence,
+            // so they go silently; anything else is kept beside the log.
+            if !is_zero_to_eof(&self.file, scan.good_end, len)? {
+                self.discarded_tail_path =
+                    keep_discarded_tail(&self.file, &self.path, scan.good_end, len);
+            }
             self.file.set_len(scan.good_end)?;
             sync_file(&self.file)?;
             len = scan.good_end;
@@ -232,6 +243,11 @@ impl Log {
     /// would be the failure this whole rule exists to prevent.
     pub fn damaged_checkpoints_path(&self) -> Option<&Path> {
         self.damaged_checkpoints_path.as_deref()
+    }
+
+    /// Where a truncated non-zero tail was kept on this open, if there was one.
+    pub fn discarded_tail_path(&self) -> Option<&Path> {
+        self.discarded_tail_path.as_deref()
     }
 
     pub fn len_bytes(&self) -> u64 {
@@ -395,6 +411,138 @@ fn is_zero_to_eof(file: &File, from: u64, file_len: u64) -> std::io::Result<bool
     Ok(true)
 }
 
+/// Copy a tail that recovery is about to discard into a file beside the log.
+///
+/// The same reasoning as the checkpoint sidecar's `.damaged` file: a tail that
+/// does not verify is still evidence about what happened to this machine, and
+/// recovery destroying it silently means nobody ever gets to look. Written to a
+/// fresh name so a second recovery never clobbers the first.
+///
+/// Best effort by design. Refusing to open the log because the evidence could
+/// not be filed would recreate the exact failure this path exists to prevent,
+/// so every error here yields `None` and the log opens anyway.
+fn keep_discarded_tail(file: &File, path: &Path, from: u64, to: u64) -> Option<PathBuf> {
+    let mut bytes = vec![0u8; (to - from) as usize];
+    file.read_exact_at(&mut bytes, from).ok()?;
+
+    for n in 0..1000u32 {
+        let mut name = path.as_os_str().to_os_string();
+        name.push(".discarded-tail");
+        if n > 0 {
+            name.push(format!(".{n}"));
+        }
+        let candidate = PathBuf::from(name);
+        if candidate.exists() {
+            continue;
+        }
+        return match std::fs::write(&candidate, &bytes) {
+            Ok(()) => Some(candidate),
+            Err(_) => None,
+        };
+    }
+    None
+}
+
+/// Is the frame at `offset` whole apart from its length checksum?
+///
+/// Reached only when `len_crc` has failed. Four facts are then checked
+/// independently of that broken field: `body_len` is one we could have
+/// written, the body it names fits inside the file, that body matches the
+/// body CRC, and the `seq` inside it is the one we were expecting next. A
+/// half-landed write cannot produce all four — its body is the part that did
+/// not arrive, so the body CRC is the check it fails. When all four agree the
+/// frame was fully durable and a later bit-flip hit its length checksum, which
+/// is damage and not a torn write.
+fn frame_is_whole_but_for_its_length_crc(
+    file: &File,
+    file_len: u64,
+    offset: u64,
+    p: &frame::Prefix,
+    expected_seq: u64,
+) -> std::io::Result<bool> {
+    if !frame::body_len_is_plausible(p.body_len) {
+        return Ok(false);
+    }
+    let body_at = offset + PREFIX_LEN as u64;
+    if file_len.saturating_sub(body_at) < p.body_len as u64 {
+        return Ok(false);
+    }
+    let mut body = vec![0u8; p.body_len as usize];
+    file.read_exact_at(&mut body, body_at)?;
+    if frame::crc32(&body) != p.crc {
+        return Ok(false);
+    }
+    match frame::decode_meta(&body, offset) {
+        Ok(meta) => Ok(meta.seq == expected_seq),
+        Err(_) => Ok(false),
+    }
+}
+
+/// Does the region `from..file_len` hold no frame that was ever durable?
+///
+/// Reached when a prefix fails its own length checksum and the frame is not
+/// otherwise whole, so `body_len` says nothing about where the frame ends and
+/// every byte to EOF is unexplained. The spec's rule is that *data following a
+/// frame proves that frame was durable*. The precise form of "data" is a frame
+/// that verifies end to end; zeros are not one, and neither are the bytes of a
+/// write that half landed. Reading any non-zero byte as proof of durability is
+/// what made a log refuse to open forever when its only damage was its own
+/// interrupted final append.
+///
+/// An append writes exactly one frame and fsyncs before returning, so at most
+/// one frame is ever in flight. More unexplained non-zero bytes than one
+/// maximum frame is therefore more than a crash can account for.
+fn tail_holds_no_durable_frame(
+    file: &File,
+    from: u64,
+    file_len: u64,
+) -> std::io::Result<bool> {
+    if file_len - from > PREFIX_LEN as u64 + frame::MAX_BODY as u64 {
+        return Ok(false);
+    }
+
+    const CHUNK: usize = 64 * 1024;
+    let span = (file_len - from) as usize;
+    let mut buf = vec![0u8; std::cmp::min(CHUNK, span)];
+    let mut base = from;
+
+    while base + PREFIX_LEN as u64 <= file_len {
+        let want = std::cmp::min(buf.len() as u64, file_len - base) as usize;
+        file.read_exact_at(&mut buf[..want], base)?;
+        // Only candidates whose whole prefix is inside this chunk; the next
+        // pass starts back far enough to catch one straddling the edge.
+        let candidates = want.saturating_sub(PREFIX_LEN - 1);
+        if candidates == 0 {
+            break;
+        }
+        for i in 0..candidates {
+            let mut prefix = [0u8; PREFIX_LEN];
+            prefix.copy_from_slice(&buf[i..i + PREFIX_LEN]);
+            let p = frame::decode_prefix(&prefix);
+            // A 32-bit checksum plus a range check makes a chance match about
+            // one in four billion, so the positioned body read below is
+            // effectively never speculative.
+            if !p.len_is_intact() || !frame::body_len_is_plausible(p.body_len) {
+                continue;
+            }
+            let body_at = base + i as u64 + PREFIX_LEN as u64;
+            if file_len.saturating_sub(body_at) < p.body_len as u64 {
+                continue;
+            }
+            let mut body = vec![0u8; p.body_len as usize];
+            file.read_exact_at(&mut body, body_at)?;
+            if frame::crc32(&body) == p.crc {
+                return Ok(false); // a frame that verifies end to end
+            }
+        }
+        if want < buf.len() {
+            break;
+        }
+        base += candidates as u64;
+    }
+    Ok(true)
+}
+
 /// Read one complete frame at `offset`, verifying its CRC.
 pub fn read_record_at(file: &File, offset: u64) -> Result<frame::Record, Error> {
     let mut prefix = [0u8; PREFIX_LEN];
@@ -473,16 +621,43 @@ pub fn scan_frames(file: &File, file_len: u64) -> Result<Scan, Error> {
             if is_zero_to_eof(file, offset, file_len)? {
                 break; // zero-filled tail
             }
-            return Err(Error::CorruptFrame {
-                offset,
-                detail: format!(
-                    "body_len {} fails its own checksum (len_crc is {:#010x}, want {:#010x}), \
-                     and the bytes here are not a zero-filled tail",
-                    p.body_len,
-                    p.len_crc,
-                    frame::len_crc32(p.body_len),
-                ),
-            });
+
+            // The length is damaged, but the rest of the frame may not be. If
+            // `body_len` is plausible, its body fits, that body matches the
+            // body CRC and its seq is the one expected, then four independent
+            // facts say the frame was fully durable and only the length
+            // checksum was hit. That is damage, not an interrupted write.
+            if frame_is_whole_but_for_its_length_crc(file, file_len, offset, &p, expected_seq)? {
+                return Err(Error::CorruptFrame {
+                    offset,
+                    detail: format!(
+                        "body_len {} fails its own checksum (len_crc is {:#010x}, want {:#010x}) \
+                         in a frame that is otherwise whole",
+                        p.body_len,
+                        p.len_crc,
+                        frame::len_crc32(p.body_len),
+                    ),
+                });
+            }
+
+            // Otherwise the frame's extent is unknown and every byte to EOF is
+            // unexplained. Only something durable in there makes this damage.
+            // Non-zero bytes alone do not: a write that half landed leaves its
+            // own bytes behind, and they were never acknowledged.
+            if !tail_holds_no_durable_frame(file, offset, file_len)? {
+                return Err(Error::CorruptFrame {
+                    offset,
+                    detail: format!(
+                        "body_len {} fails its own checksum (len_crc is {:#010x}, want {:#010x}), \
+                         and a frame that verifies end to end follows it",
+                        p.body_len,
+                        p.len_crc,
+                        frame::len_crc32(p.body_len),
+                    ),
+                });
+            }
+
+            break; // torn tail: a write that landed in part
         }
 
         // A checksum-valid length we could never have written means the file was
@@ -1228,37 +1403,93 @@ mod tests {
             "a corrupt log must not be truncated"
         );
 
-        // (b) a zero run appended, then non-zero bytes after it
+        // (b) a zero run appended, then non-zero bytes after it, none of which
+        //     verify as a frame. This used to refuse, on the rule "any non-zero
+        //     byte after the damage is data, and data proves durability". Case
+        //     49 is what that rule cost: a write that half lands leaves its own
+        //     non-zero bytes behind, and reading them as durable data made the
+        //     log refuse forever over its own interrupted append. Nothing here
+        //     was ever acknowledged -- all three episodes are still readable --
+        //     so the tail is truncated and kept beside the log as evidence.
         let d = TempDir::new("zeros_then_garbage");
         let full = three_records(&d);
         let mut bytes = full.clone();
         bytes.extend(std::iter::repeat_n(0u8, 64));
         bytes.extend_from_slice(b"not zero");
         write_raw(&d, &bytes);
-        let err = reopen_err(&d);
-        assert!(matches!(err, Error::CorruptFrame { .. }), "got {err:?}");
-        assert_eq!(raw(&d).len(), bytes.len());
+        let log = open(&d);
+        assert_eq!(log.head(), 3);
+        assert_eq!(log.len_bytes(), full.len() as u64);
+        let kept = log.discarded_tail_path().expect("the tail must be kept");
+        assert_eq!(std::fs::read(kept).unwrap(), bytes[full.len()..]);
 
-        // (c) even a single non-zero byte at the very end is enough
+        // (c) a single non-zero byte at the very end: same reasoning.
         let d = TempDir::new("zeros_then_one_byte");
         let full = three_records(&d);
         let mut bytes = full.clone();
         bytes.extend(std::iter::repeat_n(0u8, 64));
         bytes.push(1);
         write_raw(&d, &bytes);
-        assert!(matches!(reopen_err(&d), Error::CorruptFrame { .. }));
+        let log = open(&d);
+        assert_eq!(log.head(), 3);
+        assert_eq!(log.len_bytes(), full.len() as u64);
     }
 
-    // Spec case 38, the other direction: non-zero garbage at a frame start is
-    // damage even when it runs to EOF, because we never wrote it.
+    // Spec case 38, the other direction. Non-zero garbage at a frame start that
+    // verifies as nothing is a tail we never acknowledged, so it is truncated
+    // and preserved -- but a whole frame after it still makes it corruption,
+    // which is what the first half of the test above pins down.
     #[test]
-    fn non_zero_garbage_tail_is_still_corruption() {
+    fn a_non_zero_garbage_tail_is_truncated_and_kept() {
         let d = TempDir::new("garbage_tail");
         let full = three_records(&d);
         let mut bytes = full.clone();
-        bytes.extend_from_slice(&[0xff; 64]); // body_len = 0xffffffff, > MAX_BODY
+        bytes.extend_from_slice(&[0xab; 64]);
         write_raw(&d, &bytes);
-        assert!(matches!(reopen_err(&d), Error::CorruptFrame { .. }));
+        let log = open(&d);
+        assert_eq!(log.head(), 3, "every acknowledged episode survives");
+        assert_eq!(log.len_bytes(), full.len() as u64);
+        assert_eq!(log.recovered_bytes(), 64);
+        let kept = log.discarded_tail_path().expect("the tail must be kept");
+        assert_eq!(std::fs::read(kept).unwrap(), vec![0xabu8; 64]);
+    }
+
+    /// An all-`0xff` run is the one garbage pattern that is *not* reached by
+    /// the rule above: `len_crc32(0xffffffff)` happens to be `0xffffffff`, so
+    /// the length vouches for itself and the scan moves on to the next test —
+    /// a checksum-valid length outside `18..=MAX_BODY`, which says the file was
+    /// written by something that is not this code. That stays a refusal, and it
+    /// is a different rule from case 49's. Pinned so the coincidence is on the
+    /// record rather than rediscovered as a surprise.
+    #[test]
+    fn a_self_validating_length_that_is_out_of_range_still_refuses() {
+        let d = TempDir::new("ff_tail");
+        let full = three_records(&d);
+        assert_eq!(frame::len_crc32(u32::MAX), u32::MAX, "the coincidence holds");
+        let mut bytes = full.clone();
+        bytes.extend_from_slice(&[0xff; 64]);
+        let err = assert_refuses_and_leaves_the_file_alone(&d, &bytes, "0xff tail");
+        assert!(matches!(err, Error::CorruptFrame { .. }), "got {err:?}");
+    }
+
+    /// A second recovery must not clobber the first tail it filed away.
+    #[test]
+    fn a_second_discarded_tail_gets_its_own_name() {
+        let d = TempDir::new("two_tails");
+        let full = three_records(&d);
+        let mut first = full.clone();
+        first.extend_from_slice(&[0xaa; 32]);
+        write_raw(&d, &first);
+        let a = open(&d).discarded_tail_path().unwrap().to_path_buf();
+
+        let mut second = full.clone();
+        second.extend_from_slice(&[0xbb; 32]);
+        write_raw(&d, &second);
+        let b = open(&d).discarded_tail_path().unwrap().to_path_buf();
+
+        assert_ne!(a, b, "the second tail must not overwrite the first");
+        assert_eq!(std::fs::read(&a).unwrap(), vec![0xaau8; 32]);
+        assert_eq!(std::fs::read(&b).unwrap(), vec![0xbbu8; 32]);
     }
 
     #[test]
@@ -1780,17 +2011,21 @@ mod tests {
         }
 
         // At the prefix length and past it: there is enough to read a length
-        // and its checksum, the checksum fails, the bytes are not zeros, so it
-        // is damage. Truncating here would discard whatever wrote them.
+        // and its checksum, and the checksum fails. That used to be the
+        // boundary between torn tail and damage, on the bytes' zero-ness
+        // alone. Case 49 retired that test -- a run of 0xab verifies as no
+        // frame, so nothing in it was ever acknowledged, and it is truncated
+        // rather than allowed to brick the log. The bytes are kept beside it.
         for n in [PREFIX_LEN, PREFIX_LEN + 1, PREFIX_LEN * 2] {
             let mut bytes = full.clone();
             bytes.extend(std::iter::repeat_n(0xabu8, n));
-            let err =
-                assert_refuses_and_leaves_the_file_alone(&d, &bytes, &format!("garbage run {n}"));
-            assert!(
-                matches!(err, Error::CorruptFrame { .. }),
-                "n={n}: got {err:?}"
-            );
+            write_raw(&d, &bytes);
+            let log = open(&d);
+            assert_eq!(log.head(), 3, "n={n}");
+            assert_eq!(log.len_bytes(), full.len() as u64, "n={n}");
+            assert_eq!(log.recovered_bytes(), n as u64, "n={n}");
+            let kept = log.discarded_tail_path().unwrap_or_else(|| panic!("n={n}"));
+            assert_eq!(std::fs::read(kept).unwrap(), vec![0xabu8; n], "n={n}");
         }
 
         // The zero-filled version of the same lengths takes the other branch at

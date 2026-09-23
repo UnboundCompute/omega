@@ -707,61 +707,95 @@ def test_case_46_the_rule_is_a_pure_function_of_the_path(tmp_path: Path) -> None
 GARBAGE = 0xAB  # non-zero, so this is never the zero-fill path
 
 
-@pytest.mark.parametrize("n_bytes", list(range(1, 17)) + [24, 32])
+def _only_discarded_tail(store_dir: Path) -> Path:
+    """The single file recovery kept the truncated bytes in.
+
+    Asserts there is exactly one, because "a tail was preserved" is only
+    evidence if we know which open preserved it.
+    """
+    kept = sorted(store_dir.glob("*.discarded-tail*"))
+    assert len(kept) == 1, f"expected one preserved tail, found {kept}"
+    return kept[0]
+
+
+@pytest.mark.parametrize("n_bytes", list(range(1, 17)) + [24, 32, 64])
 def test_case_47_non_zero_garbage_at_a_frame_start(
     store_dir: Path, log_path: Path, n_bytes: int
 ) -> None:
-    """Case 47 / audit finding 7 — behaviour changes at ``PREFIX_LEN``, and the
-    old suite tested 1, 2 and 7 bytes but never 8, so the point where it
-    changes was never exercised at all.
+    """Case 47 / audit finding 7 — the old suite tested 1, 2 and 7 bytes but
+    never 8, so the point where behaviour changed was never exercised at all.
 
-    The rule, and it is a real discontinuity rather than a gradient:
+    It changed at ``PREFIX_LEN``: below it there was no length field to read
+    and the tail was truncated; at it and above, the length failed its own
+    checksum, the bytes were not zeros, and the log refused.
 
-      * **fewer than a whole prefix** remains -> nothing can even be read, so
-        this is an interrupted write: torn tail, truncate, no loss.
-      * **a whole prefix or more** -> there is a length field to read, it fails
-        its own checksum, and the bytes are not zeros -> ``CorruptFrame``.
-
-    Every length from 1 to 16 is covered, so the boundary is tested on both
-    sides *and* the step happens exactly once across the range.
+    **Case 49 removed that step.** It was the cliff that made a half-landed
+    append fatal: the bytes a torn write leaves behind are non-zero, and
+    reading them as proof of durability refused the log forever over its own
+    interrupted final append. The rule is now the same on both sides — a tail
+    holding no frame that verifies end to end was never acknowledged, so it is
+    truncated and kept beside the log. This test still sweeps every length from
+    1 to 16, now asserting the opposite: that there is no step anywhere.
     """
     payloads = seed(store_dir, 3)
     clean = rawlog.read(log_path)
     rawlog.append_bytes(log_path, bytes([GARBAGE]) * n_bytes)
-    broken = rawlog.read(log_path)
 
-    if n_bytes < rawlog.PREFIX_LEN:
-        with MemoryStore.open(store_dir) as s:
-            assert s.head() == 3
-            assert [e.payload for e in s.episodes_since(0)] == payloads
-            assert s.diagnostics.recovered_bytes == n_bytes
-        assert rawlog.read(log_path) == clean, "the garbage must be truncated away"
-    else:
-        with pytest.raises(CorruptFrame):
-            MemoryStore.open(store_dir)
-        assert rawlog.read(log_path) == broken, "a failed open must not truncate"
-        # And nothing was lost: removing the garbage brings everything back.
-        rawlog.write(log_path, clean)
-        assert _episodes(store_dir) == payloads
+    with MemoryStore.open(store_dir) as s:
+        assert s.head() == 3
+        assert [e.payload for e in s.episodes_since(0)] == payloads
+        assert s.diagnostics.recovered_bytes == n_bytes
+    assert rawlog.read(log_path) == clean, "the garbage must be truncated away"
+
+    kept = _only_discarded_tail(store_dir)
+    assert kept.read_bytes() == bytes([GARBAGE]) * n_bytes, (
+        "truncation must never destroy the bytes it discarded"
+    )
 
 
 def test_case_47_the_boundary_is_exactly_the_prefix_length(
     store_dir: Path, log_path: Path
 ) -> None:
-    """Case 47 — the two sides stated as one assertion, so the boundary cannot
-    drift without this failing. ``PREFIX_LEN - 1`` truncates; ``PREFIX_LEN``
-    refuses."""
+    """Case 47, restated for case 49 — the two sides as one assertion, so the
+    absence of a boundary cannot drift back into a boundary without this
+    failing. ``PREFIX_LEN - 1`` and ``PREFIX_LEN`` must behave identically."""
     seed(store_dir, 2)
     clean = rawlog.read(log_path)
 
-    rawlog.append_bytes(log_path, bytes([GARBAGE]) * (rawlog.PREFIX_LEN - 1))
-    with MemoryStore.open(store_dir) as s:
-        assert s.head() == 2
-    assert rawlog.read(log_path) == clean
+    for n in (rawlog.PREFIX_LEN - 1, rawlog.PREFIX_LEN, rawlog.PREFIX_LEN + 1):
+        rawlog.write(log_path, clean)
+        for stale in store_dir.glob("*.discarded-tail*"):
+            stale.unlink()
+        rawlog.append_bytes(log_path, bytes([GARBAGE]) * n)
+        with MemoryStore.open(store_dir) as s:
+            assert s.head() == 2, f"n={n}"
+            assert s.diagnostics.recovered_bytes == n, f"n={n}"
+        assert rawlog.read(log_path) == clean, f"n={n}"
+        assert _only_discarded_tail(store_dir).read_bytes() == bytes([GARBAGE]) * n
 
-    rawlog.append_bytes(log_path, bytes([GARBAGE]) * rawlog.PREFIX_LEN)
+
+def test_case_49_a_frame_whole_but_for_its_length_crc_is_still_corruption(
+    store_dir: Path, log_path: Path
+) -> None:
+    """Case 49's other half — truncating an unverifiable tail must not become
+    an excuse to truncate a *verifiable* one.
+
+    Here the final frame's ``len_crc`` is damaged and nothing else is: the
+    length is plausible, the body it names matches the body CRC, and the seq is
+    the expected next one. Four independent facts say the frame was fully
+    durable and a later bit-flip hit its checksum. That is damage, and the log
+    must refuse rather than quietly drop an acknowledged episode.
+    """
+    seed(store_dir, 5)
+    rawlog.corrupt_len_crc(log_path, -1)
+    broken = rawlog.read(log_path)
+
     with pytest.raises(CorruptFrame):
         MemoryStore.open(store_dir)
+    assert rawlog.read(log_path) == broken, "a failed open must not truncate"
+    assert not list(store_dir.glob("*.discarded-tail*")), (
+        "a refusal files nothing away; the log is untouched"
+    )
 
 
 # ---------------------------------------------------------------------------

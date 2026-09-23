@@ -135,6 +135,20 @@ class _Diagnostics:
         """Bytes discarded by torn-tail truncation when this handle opened."""
         return self._log.recovered_bytes
 
+    @property
+    def discarded_tail_path(self) -> Optional[Path]:
+        """Where a truncated tail's bytes were kept on this open, or ``None``.
+
+        Recovery truncates a tail that holds no frame verifying end to end,
+        because nothing in it was ever acknowledged. That judgement is about
+        what the bytes *are*, not about what put them there, so the bytes
+        themselves are copied beside the log rather than destroyed. ``None``
+        means either nothing was truncated or what was truncated was only
+        zeros, which is a crash artifact with nothing in it to read.
+        """
+        kept = self._log.discarded_tail_path
+        return None if kept is None else Path(kept)
+
     def size_bytes(self) -> int:
         return self._log.size_bytes()
 

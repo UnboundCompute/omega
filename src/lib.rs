@@ -353,6 +353,15 @@ mod py {
             .map_err(to_py)
         }
 
+        /// Where a truncated non-zero tail was kept on this open, or None.
+        #[getter]
+        fn discarded_tail_path(&self) -> PyResult<Option<PathBuf>> {
+            with_log(&self.shared, |l| {
+                Ok(l.discarded_tail_path().map(|p| p.to_path_buf()))
+            })
+            .map_err(to_py)
+        }
+
         /// Seq of the last record, or 0 if the log is empty.
         fn head(&self) -> PyResult<u64> {
             with_log(&self.shared, |l| Ok(l.head())).map_err(to_py)
