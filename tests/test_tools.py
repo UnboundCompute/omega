@@ -518,6 +518,33 @@ def test_the_pin_returns_the_vetted_address_for_a_good_name() -> None:
     assert handler._address_for(request) == "93.184.216.34"
 
 
+def test_the_https_handler_builds_a_pinned_connection() -> None:
+    """``https_open`` is the one wiring path no end-to-end case reaches, since
+    a real TLS server would need a certificate — and a signature fault there
+    would break every https fetch with all of these still green.
+
+    So drive the factory ``do_open`` would call, with the arguments ``do_open``
+    passes it. That covers the address lookup, the factory's signature, the
+    forwarding of ``context`` and ``check_hostname``, and the construction
+    itself.
+    """
+    handler = tools._PinnedHTTPSHandler(lambda h, p: ["93.184.216.34"])
+    captured: dict[str, object] = {}
+
+    def fake_do_open(factory, req, **kw):
+        captured["conn"] = factory("example.com", timeout=5, **kw)
+        return "opened"
+
+    handler.do_open = fake_do_open  # type: ignore[assignment]
+    request = tools.urllib.request.Request("https://example.com/a")
+    assert handler.https_open(request) == "opened"
+
+    conn = captured["conn"]
+    assert isinstance(conn, tools._PinnedHTTPSConnection)
+    assert conn._address == "93.184.216.34"
+    assert conn.host == "example.com"
+
+
 def test_vetted_address_refuses_rather_than_returning_a_verdict() -> None:
     """It hands back an address precisely so the caller cannot forget to look
     at a boolean — the failure mode the predicate form invites."""
