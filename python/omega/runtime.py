@@ -5,10 +5,19 @@ them: one process that opens the store, recovers whatever the last stop left in
 flight, drains the queue on its own thread, and listens on the socket. Until it
 existed every module in the milestone was correct and nothing ran.
 
-**One process, two threads** (§Q12). Two processes would mean two openers of the
-log and M0 makes that a hard failure by design — the singleton rule is physical,
-not advisory. So the executor drain and the channel listener are threads inside
-one process, and the socket sits between that process and its *clients*.
+**One process, three threads** (§Q12). Two processes would mean two openers of
+the log and M0 makes that a hard failure by design — the singleton rule is
+physical, not advisory. So the executor drain, the heartbeat and the channel
+listener are threads inside one process, and the socket sits between that
+process and its *clients*.
+
+**The heartbeat is a producer, not an engine** (DL-035). It is the third thread
+and it is allowed to do exactly one thing the socket listener is also allowed to
+do: append an episode and nudge. It holds no queue of its own, it never calls
+``run_turn``, and a fire it appends is an ordinary ``message.inbound`` — so the
+drain below cannot tell a scheduled turn from a typed one, which is the whole
+design. The hour after this file learned to fire on its own is the hour omega
+stopped being purely reactive, and nothing in the loop changed to allow it.
 
 **`say` appends and then observes; it never runs a turn** (§1.6). That is the
 whole discipline of this file. The only way to cause a turn is to append an
@@ -54,6 +63,7 @@ from omega.executor import Executor, StartupReport
 from omega.memory import EPISODES_FILENAME, MemoryStore, PathLike
 from omega.queue import EventQueue
 from omega.act import act_loop
+from omega.schedule import TICK_SECONDS, Scheduler
 from omega.turn import ActResult, TurnContext
 
 __all__ = [
@@ -61,6 +71,7 @@ __all__ = [
     "DEFAULT_TURN_TIMEOUT",
     "DEFAULT_STOP_TIMEOUT",
     "NotRunning",
+    "ClockFailed",
     "DrainFailed",
     "DrainStuck",
     "TurnTimeout",
@@ -106,6 +117,22 @@ class DrainFailed(RuntimeError):
     verdict, a broken tool — into a recorded ``failed`` turn, so anything that
     gets this far is a defect in the loop, and continuing to drain past it would
     be guessing about an invariant we just watched break.
+    """
+
+
+class ClockFailed(RuntimeError):
+    """Something escaped the heartbeat thread and omega is no longer proactive.
+
+    Deliberately *not* as fatal as :class:`DrainFailed`, and the asymmetry is
+    the decision worth defending. A dead drain means nothing works at all; a
+    dead clock means only that nothing fires on its own, and refusing every
+    typed message because a schedule broke would turn a partial failure into a
+    total one.
+
+    But a dead clock is also the quietest failure in the system — from the
+    outside it is indistinguishable from "nothing was due" — so it is not
+    allowed to stay invisible either: :attr:`Runtime.clock_error` reports it
+    while the process runs, and :meth:`Runtime.stop` raises it at the end.
     """
 
 
@@ -211,20 +238,30 @@ class Runtime:
         # a turn engine that should do nothing it was not handed.
         act: Callable[[TurnContext], ActResult] = act_loop,
         listen: bool = True,
+        # On by default because DL-035's whole point is that omega acts on time
+        # without being asked, and a proactivity that has to be switched on is
+        # one that is off in every deployment nobody remembered to configure.
+        # Tests that want a still clock pass `clock=False` rather than racing it.
+        clock: bool = True,
         host: str = DEFAULT_HOST,
         port: int = DEFAULT_PORT,
         poll: float = DEFAULT_POLL,
+        tick: float = TICK_SECONDS,
         turn_timeout: float = DEFAULT_TURN_TIMEOUT,
     ) -> None:
         if poll <= 0:
             raise ValueError(f"poll must be positive, got {poll}")
+        if tick <= 0:
+            raise ValueError(f"tick must be positive, got {tick}")
         self._store_path = Path(os.fspath(store_path))
         self._complete = complete
         self._act = act
         self._listen = listen
+        self._clock = clock
         self._host = host
         self._port = port
         self._poll = poll
+        self._tick = tick
         self._turn_timeout = turn_timeout
 
         self._store: Optional[MemoryStore] = None
@@ -232,12 +269,16 @@ class Runtime:
         self._queue: Optional[EventQueue] = None
         self._executor: Optional[Executor] = None
         self._channel: Optional[Channel] = None
+        self._scheduler: Optional[Scheduler] = None
         self._thread: Optional[threading.Thread] = None
+        self._clock_thread: Optional[threading.Thread] = None
         self._report: Optional[StartupReport] = None
 
         self._stopping = threading.Event()
         self._woken = threading.Event()
         self._drain_error: Optional[BaseException] = None
+        self._clock_error: Optional[BaseException] = None
+        self._fires = 0
         self._turns = 0
         self._started = False
 
@@ -274,6 +315,16 @@ class Runtime:
                 target=self._drain_loop, name="omega-executor", daemon=True
             )
             self._thread.start()
+            if self._clock:
+                # After the drain, so a catch-up fire on the first tick has
+                # something to run it; before the listener, so the first thing
+                # omega does on waking from a sleep is discharge what it already
+                # owed rather than whatever arrives next.
+                self._scheduler = Scheduler(self._queue)
+                self._clock_thread = threading.Thread(
+                    target=self._clock_loop, name="omega-clock", daemon=True
+                )
+                self._clock_thread.start()
             if self._listen:
                 self._channel = Channel(
                     self._queue,
@@ -316,6 +367,15 @@ class Runtime:
             self._channel.stop()
             self._channel = None
 
+        # Before the drain, and for the same reason the listener is: stop the
+        # producers first, so the drain is given a queue that is no longer
+        # growing and a clean stop cannot be outrun by a fire landing during it.
+        clock, self._clock_thread = self._clock_thread, None
+        if clock is not None and clock is not threading.current_thread():
+            # Bounded by the tick, not the turn: the clock never waits on a
+            # turn, so this join is short however slow the model is.
+            clock.join(self._tick + 1.0)
+
         thread, self._thread = self._thread, None
         if thread is not None and thread is not threading.current_thread():
             thread.join(timeout)
@@ -333,6 +393,14 @@ class Runtime:
                 f"the executor drain stopped on {type(self._drain_error).__name__}: "
                 f"{self._drain_error}"
             ) from self._drain_error
+
+        # After the drain, because a dead drain is the larger fact and reporting
+        # the clock instead would name the symptom over the cause.
+        if self._clock_error is not None:
+            raise ClockFailed(
+                f"the heartbeat stopped on {type(self._clock_error).__name__}: "
+                f"{self._clock_error}"
+            ) from self._clock_error
 
     def _blobs_dir(self) -> Path:
         """The store *directory*, whichever way ``store_path`` was spelled.
@@ -358,6 +426,9 @@ class Runtime:
         self._blobs = None
         self._queue = None
         self._executor = None
+        # The table is a cache over the log (DL-036), so dropping it costs
+        # nothing a restart does not rebuild.
+        self._scheduler = None
 
     def __enter__(self) -> "Runtime":
         self.start()
@@ -403,9 +474,33 @@ class Runtime:
         return self._turns
 
     @property
+    def fires(self) -> int:
+        """Schedules this process has fired. Written only by the clock thread."""
+        return self._fires
+
+    @property
+    def scheduler(self) -> Optional[Scheduler]:
+        """The derived schedule table, or ``None`` when the clock is disabled.
+
+        Optional rather than raising, because "this omega has no clock" is a
+        configuration and not an error — unlike :attr:`queue`, whose absence
+        means the process is not running.
+        """
+        return self._scheduler
+
+    @property
     def drain_error(self) -> Optional[BaseException]:
         """What killed the drain, or ``None`` while it is alive."""
         return self._drain_error
+
+    @property
+    def clock_error(self) -> Optional[BaseException]:
+        """What killed the heartbeat, or ``None`` while it is alive.
+
+        Worth reading even when everything looks fine: a dead clock produces no
+        symptom at all, only an absence of fires nobody was counting.
+        """
+        return self._clock_error
 
     @property
     def running(self) -> bool:
@@ -457,6 +552,49 @@ class Runtime:
         while not self._stopping.is_set() and queue.claimed() < queue.head():
             if executor.step() is not None:
                 self._turns += 1
+
+    # --- the heartbeat thread ---------------------------------------------
+
+    def _clock_loop(self) -> None:
+        """Tick, sleep, tick. The sleep is interruptible; the tick is not.
+
+        Ticks immediately and only then waits, because the first tick after a
+        start is the one that matters most: a laptop that slept through a
+        schedule's slot should discharge it on waking, not one tick later. Every
+        subsequent tick is a dict lookup and a clock read.
+
+        ``self._stopping.wait(tick)`` rather than ``sleep``, so a stop is
+        observed at once instead of up to a tick later — otherwise a generous
+        ``TICK_SECONDS`` would become a floor on how long Ctrl-C takes.
+        """
+        try:
+            while not self._stopping.is_set():
+                self._tick_clock()
+                if self._stopping.wait(self._tick):
+                    return
+        except BaseException as exc:  # noqa: BLE001 - see ClockFailed
+            self._clock_error = exc
+
+    def _tick_clock(self) -> None:
+        """One heartbeat, appended through the same door everything else uses.
+
+        This is DL-035's constraint made literal, and it is three lines because
+        it is *allowed* to be: the clock appends and nudges, exactly as the
+        socket listener does, and the drain thread below decides what that
+        means. If this method ever grows a call into ``turn`` or ``executor``,
+        the clock has become a second engine and the docstring at the top of
+        this file describes what was lost.
+        """
+        scheduler = self._scheduler
+        if scheduler is None or self._stopping.is_set():  # pragma: no cover
+            return
+        seqs = scheduler.tick()
+        if seqs:
+            self._fires += len(seqs)
+            # One nudge for the batch. The drain re-reads the log rather than
+            # being handed anything, so waking it once per tick and waking it
+            # once per fire are the same instruction.
+            self.wake()
 
     # --- talking to it ----------------------------------------------------
 
@@ -539,4 +677,8 @@ class Runtime:
         where = self._store_path
         if self._queue is None:
             return f"<Runtime {str(where)!r} stopped>"
-        return f"<Runtime {str(where)!r} {self._queue!r} turns={self._turns}>"
+        clock = "clock=off" if self._scheduler is None else f"fires={self._fires}"
+        return (
+            f"<Runtime {str(where)!r} {self._queue!r} "
+            f"turns={self._turns} {clock}>"
+        )

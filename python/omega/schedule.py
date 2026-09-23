@@ -211,6 +211,7 @@ class Scheduler:
         self._queue = queue
         self._cursor = 0
         self._defs: dict[str, Schedule] = {}
+        self._broken: dict[str, str] = {}
         self._last_fire: dict[str, datetime] = {}
         # seq of the fire we most recently appended per schedule. The overlap
         # guard, and in memory on purpose: a fire in flight dies with the
@@ -230,15 +231,33 @@ class Scheduler:
     def _observe(self, payload: dict) -> None:
         kind = payload.get("kind")
         if kind == episodes.SCHEDULE_CREATED:
-            self._defs[payload["id"]] = Schedule(
-                id=payload["id"],
+            sid, cron = payload["id"], payload.get("cron")
+            if cron is not None:
+                # The episode schema checks that `cron` is a non-empty string,
+                # not that it is a *parseable* one — it cannot, because the
+                # parser lives here and `schedule` imports `episodes`. So an
+                # unparseable expression reaches the log, and quarantining it at
+                # fold time is what keeps it from being fatal: `previous_match`
+                # would otherwise raise on every tick forever, and one mistyped
+                # field would take the whole clock down with it rather than the
+                # one schedule that is wrong.
+                try:
+                    _parse_cron(cron)
+                except CronError as exc:
+                    self._defs.pop(sid, None)
+                    self._broken[sid] = str(exc)
+                    return
+            self._broken.pop(sid, None)
+            self._defs[sid] = Schedule(
+                id=sid,
                 instruction=payload["instruction"],
                 created_at=_parse_at(payload["at"]),
                 every=payload.get("every"),
-                cron=payload.get("cron"),
+                cron=cron,
             )
         elif kind == episodes.SCHEDULE_CANCELLED:
             self._defs.pop(payload["id"], None)
+            self._broken.pop(payload["id"], None)
         elif kind == episodes.MESSAGE_INBOUND:
             sid = payload.get("schedule_id")
             if sid:
@@ -254,6 +273,18 @@ class Scheduler:
     @property
     def schedules(self) -> list[Schedule]:
         return sorted(self._defs.values(), key=lambda s: s.id)
+
+    @property
+    def broken(self) -> dict[str, str]:
+        """Definitions that cannot be interpreted, by id, with the reason.
+
+        Held rather than discarded because a schedule that quietly does not
+        exist is precisely the failure :class:`CronError` was written to
+        prevent — it just moved from fire time to fold time. Kept in memory and
+        not written back as an episode: the fold is a read, and appending from
+        inside it would re-enter the fold on the next tick.
+        """
+        return dict(self._broken)
 
     def last_fire(self, schedule_id: str) -> Optional[datetime]:
         return self._last_fire.get(schedule_id)
@@ -349,6 +380,6 @@ class Scheduler:
 
     def __repr__(self) -> str:
         return (
-            f"<Scheduler schedules={len(self._defs)} "
+            f"<Scheduler schedules={len(self._defs)} broken={len(self._broken)} "
             f"cursor={self._cursor} in_flight={len(self._in_flight)}>"
         )

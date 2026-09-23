@@ -12,6 +12,7 @@ from __future__ import annotations
 import hashlib
 import threading
 import time
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Sequence
 
@@ -24,6 +25,7 @@ from omega.executor import INTERRUPTED_ERROR
 from omega.memory import EPISODES_FILENAME, MemoryStore
 from omega.queue import EVENT_KINDS, EventQueue
 from omega.runtime import (
+    ClockFailed,
     DrainFailed,
     NotRunning,
     Runtime,
@@ -60,6 +62,10 @@ def runtime_at(path: Path, fake: provider.FakeProvider, **kwargs) -> Runtime:
     """
     kwargs.setdefault("listen", False)
     kwargs.setdefault("poll", POLL)
+    # Off by default for the same reason the listener is: a running clock is a
+    # third thread folding the log while these cases hold the drain, and nothing
+    # here is about time. The clock's own cases turn it on explicitly.
+    kwargs.setdefault("clock", False)
     return Runtime(path, complete=fake.complete, **kwargs)
 
 
@@ -563,3 +569,156 @@ def test_said_is_built_from_the_projection_the_tray_also_reads(
     assert len(terminal) == 1
     assert Said.from_update(said.seq, terminal[0]) == said
     assert said.state in projection.STATES, "a Said carries a real wire state"
+
+
+# --- the heartbeat: omega acting without being asked (DL-035) ---------------
+
+
+def every_minute(instruction: str = "check the thing", sid: str = "s1") -> dict:
+    """A schedule already overdue by construction: created a day ago, so the
+    first tick has a slot to discharge and the test does not wait a minute."""
+    return episodes.schedule_created(
+        id=sid,
+        instruction=instruction,
+        every=episodes.MIN_EVERY_SECONDS,
+        at=(
+            datetime.fromisoformat(AT) - timedelta(days=1)
+        ).isoformat(),
+    )
+
+
+def test_a_schedule_fires_a_real_turn_with_nobody_typing(store_dir: Path) -> None:
+    """DL-035's whole claim, end to end on the real threads: an episode nobody
+    sent produces a reply nobody asked for. Everything else in this section is
+    about the ways that can go wrong."""
+    with runtime_at(store_dir, speaking("brief"), clock=False) as rt:
+        rt.append(every_minute("write the morning brief"))
+
+    with runtime_at(store_dir, speaking("brief"), clock=True, tick=0.05) as rt:
+        assert until(lambda: rt.turns >= 1), "no turn ran from the clock alone"
+        assert rt.fires == 1
+        fired = [
+            u
+            for u in projection.updates_since(rt.queue, 0)
+            if u.kind == episodes.MESSAGE_INBOUND
+        ]
+
+    assert [u.text for u in fired] == ["write the morning brief"]
+
+
+def test_the_clock_appends_and_does_not_run_the_turn_itself(store_dir: Path) -> None:
+    """The constraint `runtime.py` names in its own docstring. If the clock ran
+    the turn, the model call would happen on the clock thread — so the thread
+    name is the evidence, not the fact that a turn happened at all."""
+    judged_on: list[str] = []
+
+    def watch(role: str, messages: list) -> str:
+        judged_on.append(threading.current_thread().name)
+        return "SILENT"
+
+    fake = provider.FakeProvider({provider.JUDGE: watch})
+    with runtime_at(store_dir, fake, clock=False) as rt:
+        rt.append(every_minute())
+
+    with runtime_at(store_dir, fake, clock=True, tick=0.05) as rt:
+        assert until(lambda: bool(judged_on))
+
+    assert judged_on[0] == "omega-executor"
+    assert "omega-clock" not in judged_on
+
+
+def test_a_fire_is_indistinguishable_to_the_loop_from_a_typed_message(
+    store_dir: Path,
+) -> None:
+    """The drain must need no knowledge of the clock. It gets that for free only
+    because a fire is a `message.inbound`, so this asserts the kind rather than
+    trusting the design note."""
+    with runtime_at(store_dir, speaking("ok"), clock=False) as rt:
+        rt.append(every_minute())
+
+    with runtime_at(store_dir, speaking("ok"), clock=True, tick=0.05) as rt:
+        assert until(lambda: rt.fires >= 1)
+        seq = rt.queue.head()
+        while not rt.queue.at(seq).payload.get("schedule_id"):
+            seq -= 1
+        pending = rt.queue.at(seq)
+
+    assert pending.payload["kind"] == episodes.MESSAGE_INBOUND
+    assert pending.payload["kind"] in EVENT_KINDS
+    assert pending.is_event
+
+
+def test_a_clock_with_nothing_scheduled_fires_nothing(store_dir: Path) -> None:
+    """The control. A heartbeat that ticked something into existence on an empty
+    log would make every other case here unfalsifiable."""
+    with runtime_at(store_dir, speaking("x"), clock=True, tick=0.02) as rt:
+        assert until(lambda: False, 0.3) is False  # let it tick
+        assert rt.fires == 0
+        assert rt.turns == 0
+        assert rt.scheduler is not None
+        assert rt.scheduler.schedules == []
+
+
+def test_a_disabled_clock_leaves_no_scheduler_and_no_thread(store_dir: Path) -> None:
+    before = {t.name for t in threading.enumerate()}
+    with runtime_at(store_dir, speaking("x"), clock=False) as rt:
+        rt.append(every_minute())
+        assert rt.scheduler is None
+        during = {t.name for t in threading.enumerate()} - before
+
+    assert "omega-clock" not in during
+    assert rt.fires == 0
+
+
+def test_stopping_is_not_delayed_by_a_long_tick(store_dir: Path) -> None:
+    """A tick measured in minutes must not become a floor on how long Ctrl-C
+    takes — which it would if the clock slept instead of waiting on the stop."""
+    rt = runtime_at(store_dir, speaking("x"), clock=True, tick=300.0)
+    rt.start()
+    started = time.monotonic()
+    rt.stop()
+
+    assert time.monotonic() - started < 5.0
+
+
+def test_a_dead_clock_is_reported_and_does_not_take_the_loop_down(
+    store_dir: Path,
+) -> None:
+    """The asymmetry `ClockFailed` exists to state. A broken clock must not stop
+    omega answering, and must not stay invisible either — a heartbeat that died
+    looks exactly like one with nothing to do."""
+    rt = runtime_at(store_dir, speaking("still here"), clock=True, tick=0.02)
+    rt.start()
+    assert rt.scheduler is not None
+
+    def boom() -> list[int]:
+        raise RuntimeError("the clock broke")
+
+    rt.scheduler.tick = boom  # type: ignore[method-assign]
+    assert until(lambda: rt.clock_error is not None), "a dead clock said nothing"
+
+    said = rt.say("are you still there")
+    assert said.reply == "still here", "a dead clock must not stop the loop"
+
+    with pytest.raises(ClockFailed):
+        rt.stop()
+
+
+def test_an_unparseable_cron_breaks_one_schedule_and_not_the_clock(
+    store_dir: Path,
+) -> None:
+    """The schema checks `cron` is a string, not that it parses, so a bad one
+    reaches the log. Before quarantining, `previous_match` raised on every tick
+    forever and one mistyped field took the whole clock down with it."""
+    with runtime_at(store_dir, speaking("fine"), clock=False) as rt:
+        rt.append(
+            episodes.schedule_created(id="bad", instruction="never", cron="0 99 *")
+        )
+        rt.append(every_minute("the good one", sid="good"))
+
+    with runtime_at(store_dir, speaking("fine"), clock=True, tick=0.05) as rt:
+        assert until(lambda: rt.fires >= 1), "the good schedule never fired"
+        assert rt.clock_error is None, "one bad expression killed the heartbeat"
+        assert rt.scheduler is not None
+        assert list(rt.scheduler.broken) == ["bad"]
+        assert [s.id for s in rt.scheduler.schedules] == ["good"]

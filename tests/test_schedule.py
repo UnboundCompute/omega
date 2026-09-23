@@ -299,3 +299,43 @@ def test_a_schedule_definition_never_causes_a_turn(q: EventQueue) -> None:
     make(q, at=d(), cron="0 9 *")
 
     assert not q.at(q.head()).is_event
+
+
+# --- the definition that cannot be interpreted ------------------------------
+
+
+def test_an_unparseable_cron_is_quarantined_rather_than_raised_every_tick(
+    q: EventQueue,
+) -> None:
+    """The schema checks `cron` is a non-empty string, not that it parses — the
+    parser lives in this module and `schedule` imports `episodes`, so it cannot.
+    A bad expression therefore reaches the log, and if the fold let it through,
+    `previous_match` would raise on every tick forever: one mistyped field would
+    take the whole clock down instead of the one schedule that is wrong."""
+    make(q, "bad", at=d(-60), cron="0 99 *")
+    make(q, "good", at=d(-60), cron="0 9 *")
+    s = Scheduler(q)
+
+    assert s.tick(now=d()) != [], "the good schedule still fires"
+    assert list(s.broken) == ["bad"]
+    assert [sc.id for sc in s.schedules] == ["good"]
+    assert fired_ids(q) == ["good"]
+
+
+def test_a_broken_schedule_says_why(q: EventQueue) -> None:
+    """Held rather than discarded: a schedule that quietly does not exist is the
+    failure `CronError` was written to prevent, just moved to fold time."""
+    make(q, "bad", at=d(-60), cron="0 9 nope")
+    s = Scheduler(q)
+    s.refresh()
+
+    assert "nope" in s.broken["bad"]
+
+
+def test_redefining_a_broken_schedule_correctly_clears_it(q: EventQueue) -> None:
+    make(q, "bad", at=d(-60), cron="0 99 *")
+    make(q, "bad", at=d(-60), cron="0 9 *")
+    s = Scheduler(q)
+
+    assert s.tick(now=d()) != []
+    assert s.broken == {}
