@@ -56,7 +56,24 @@
 | 29 | Plugins importing internal symbols → 1,148 re-exports of compat scaffolding | Hermes | **AVOID** | DL-014 (the seam) |
 | 30 | Splitting god-files mechanically (one concern now spans 5 sibling modules) | Hermes | **AVOID** | *stay small and legible* |
 | 31 | Three different "the default is X" values for one setting in one codebase | Hermes | **AVOID** | — (scale smell) |
-| — | *Hermes memory & context rows pending — reader in flight* | Hermes | — | — |
+| 32 | Compaction publishes a **child** session; the parent's raw messages survive, linked | Hermes | **TAKE** | DL-013 (raw survives) |
+| 33 | System prompt ordered **by volatility** — stable → context → volatile — for prefix caching | Hermes | **TAKE** | DL-008 (resident set) |
+| 34 | Protect a head *and* a tail (first 3, last 20); summarize only the middle | Hermes | **TAKE** | DL-013 (`head_tail`) |
+| 35 | Derived memory **hard-capped in characters**, forcing consolidation instead of growth | Hermes | **ADAPT** | DL-008, DL-009 |
+| 36 | A background pass forks the agent every ~10 turns to ask "should memory change?" | Hermes | **ADAPT** | DL-009 (mutation points) |
+| 37 | Keyword/BM25 recall, plus a second tokenizer for scripts the default one silently breaks on | Hermes | **ADAPT** | DL-008 (recall) |
+| 38 | Two unrelated stores both named "memory", plus a third pluggable one | Hermes | **AVOID** | *the singleton rule* |
+| 39 | Transcript is mutable — hard `DELETE`, and past message content editable in place | Hermes | **AVOID** | DL-007 (lossless raw) |
+| 40 | Derived memory **frozen at session start**; what you say today lands tomorrow | Hermes | **AVOID** | Continuity |
+| 41 | No entity identity anywhere — `user_id` is plain TEXT, no persons table | Hermes | **AVOID** | DL-009 (knowing-you) |
+| 42 | Retention = binary archive + hard delete at 90d, off by default, no tiering | Hermes | **AVOID** | DL-008 (deletion ≠ demotion) |
+| 43 | Five separate "shrink the context now" trigger paths converging on one 5,299-line class | Hermes | **AVOID** | DL-013 |
+| 44 | Facade bypassed by raw SQL from ≥5 outside files; one table declared twice | Hermes | **AVOID** | DL-014 (the seam) |
+| 45 | The compressor **feeds its own prior summary back in** and updates it, session after session | Hermes | **AVOID** | *never re-summarize a summary* |
+| 46 | Two unrelated "survive compaction" paths — marker-tagged user message *and* prompt pinning | Hermes | **ADAPT** | DL-008 (one pinning rule) |
+| 47 | Instruction files merged **down the whole directory chain**, with per-directory provenance | Hermes | **ADAPT** | DL-008 (associative pull) |
+| 48 | Thresholds, caps and cooldowns scattered as constants across ≥4 files; no tunables module | Hermes | **AVOID** | *stay small and legible* |
+| 49 | Automatic associative recall — anything pulled in because it *became* relevant | both | **N/A** | — (the gap) |
 
 ---
 
@@ -334,6 +351,14 @@ Two second-order lessons:
 - **Cron as a first-class wake path.**
 - Redirecting growth **out of tree** to a reviewed, pinned catalog once in-tree growth stops
   being manageable. Better still would be not needing the freeze.
+- **The system prompt ordered by volatility** so the cacheable prefix stays stable.
+- **Compaction that publishes a child session and keeps the parent's raw messages**, linked by
+  lineage — the one place a read system got raw-survives-derivation right.
+- **A head *and* a tail protected**, middle summarized — independent corroboration of
+  `head_tail`.
+- **A character cap on curated memory** that forces consolidation rather than accretion.
+- **Merging instruction files down the whole directory chain with provenance**, rather than
+  letting the nearest file shadow the rest.
 
 ### Bad — avoid
 
@@ -346,11 +371,150 @@ Two second-order lessons:
 - **Splitting files without redrawing boundaries.**
 - Enormous investment in transport-failure recovery beside almost none in semantic-failure
   recovery.
+- **Three separate things called "memory."** Adding a new kind of remembered thing starts with
+  choosing which of three unrelated systems it belongs to.
+- **A mutable transcript** — hard deletes, and past messages editable in place.
+- **Derived memory frozen at session start**, so what you tell it today lands tomorrow.
+- **No entity identity at all** — strings remembered, never who or what they are about.
+- **Re-summarizing its own summaries** in an iterative-update loop.
+- **Two unrelated mechanisms for "must survive compaction"** with no shared abstraction.
+- **Tunables scattered as constants across four-plus files**, producing several unrelated
+  `0.85`s that even their own docs conflate.
 
-### Memory and context
+### Memory
 
-> **Pending** — reader still in flight. Given ~30 state modules and an explicit compression
-> layer, this is the section most likely to contain something we actually want.
+**There are two unrelated systems here, both called "memory," plus a third that's pluggable.**
+That is the headline finding, and it is the clearest single illustration of the bloat
+complaint in the whole codebase.
+
+*System A — the raw transcript, in SQLite.* One schema definition (`hermes_state_common.py`),
+sessions and messages tables plus operational tables for usage, routing, locks, leases and
+delegations. Sessions carry a `parent_session_id` self-foreign-key used for compaction and
+fork lineage. Crucially, **storage is mutable, not append-only**: the default delete path is a
+soft `active=0` flag, but hard `DELETE` is used routinely by pruning and clearing, and a past
+message's *content* can be updated in place after the fact. A transcript you can rewrite is
+not an audit trail, and DL-007's lossless raw log is a deliberate departure from this.
+
+*System B — curated facts, in flat files.* `MEMORY.md` and `USER.md` under `~/.hermes/`, not
+in the database at all, holding free-text entries joined by a separator. There is no entity
+schema — no person key, no project key, just strings. Entries get there two ways: the model
+calling a `memory` tool, or **a background reviewer that forks the live agent roughly every
+ten turns** and asks a model whether memory or skills should change. That's a real extra LLM
+call, self-documented at around 30K tokens an event.
+
+*System C — pluggable third-party vector/semantic memory* behind a provider interface,
+separate from both.
+
+Two things here are genuinely good. First, **A and B coexist rather than one overwriting the
+other** — the curated layer never touches the raw transcript, which is exactly the
+raw-survives-derivation property DL-013 insists on and the thing opencode gets wrong. Second,
+**both curated stores are hard-capped in characters** (about 2,200 and 1,375). A cap that small
+forces the model to *consolidate* — to decide what earns a slot — instead of appending
+forever. That is a much more interesting pressure than a token budget, and it is worth
+considering for omega's resident set independently of whether the numbers transfer.
+
+**Recall is keyword search, not embeddings.** There is no vector index in the core at all:
+recall is SQLite FTS5 with BM25 ranking, plus a second virtual table with a different
+tokenizer added specifically because the default one needs three-character terms and silently
+degrades to a full scan on CJK text. That second table is a good lesson in itself — a
+retrieval default that fails *quietly* on a whole class of input is worse than one that fails
+loudly.
+
+But recall is **explicit-tool-invoked only**. The model must decide to search. The one thing
+injected automatically is System B's `MEMORY.md`/`USER.md`, **frozen into the system prompt at
+session start** to protect the prompt cache and not refreshed mid-conversation except after a
+compaction event. The consequence is worth stating plainly, because it's the exact failure
+omega exists to avoid: *tell it something about yourself today and it does not take effect
+until tomorrow.* Continuity is traded away for a cache hit.
+
+**There is no entity identity.** `user_id`, `session_key` and `chat_id` are plain TEXT columns;
+there is no persons table, no projects table. Workspace identity is recomputed per query from
+the working directory rather than stored as a key. The only real relationship in the schema is
+session lineage. So the "knowing-you" half of omega has no prior art here either — Hermes
+remembers *strings*, not *who or what they are about*.
+
+**Eviction doesn't exist as a concept.** There's no hot/warm/cold tiering. Archiving and
+pruning both default to off; when enabled it's a binary archived flag plus a hard delete after
+a retention window, throttled by a stored timestamp rather than a scheduler. Everything is
+kept forever, or deleted — which is precisely the deletion-vs-demotion collapse DL-013 names.
+
+### Context
+
+Prompt assembly is the best-designed part of the memory/context half. `build_system_prompt_parts`
+composes **three explicitly ordered tiers, ordered by volatility** so the longest common prefix
+stays stable: *stable* (identity, guidance) → *context* (project files, workspace snapshot) →
+*volatile* (skills index, memory files, timestamp, runtime hints). The result is cached and
+rebuilt only at session start or after compaction, and a separate layer places the provider's
+cache breakpoints — four of them, with per-provider carve-outs for envelopes that relocate or
+reject part-level markers. Cache preservation is a stated project invariant.
+
+That ordering rule is worth taking directly. It is the same insight as opencode's unshipped V2
+epoch design, reached by a different route: *don't rebuild the prompt, and lay it out so the
+parts that change are at the end.*
+
+Compaction is two files totalling ~9,600 lines. Defaults protect the first 3 and last 20
+messages and summarize the middle at 50% occupancy — independent corroboration of the
+`head_tail` result in `harness-practices.md`, which is a useful confirmation since that finding
+was the basis for reversing DL-008's uncapped clause. And compaction **publishes a child
+session** rather than rewriting rows: the summary becomes the head of a `parent_session_id`
+chain while the original messages remain soft-archived in the parent. Compare opencode, which
+replaces old tool results with a "cleared" marker. Hermes keeps the raw. That is the right
+shape and we should take it.
+
+Three cautions sit against that, though, and the second is serious:
+
+- **Five distinct "shrink now" trigger paths** converge on the 5,299-line compressor — idle
+  wall-clock, preflight threshold, reactive provider-error, plus two off-by-default
+  sub-mechanisms living inside the same class. An earlier reading of their own docs suggested
+  a clean "gateway at 85%, agent at 50%" split; the code doesn't support it. There are at
+  least four unrelated `0.85` constants in the tree — a degenerate-window cap, a third-party
+  compaction threshold, a local-runtime window-growth policy — and they mean different things.
+  Their own documentation had flattened that into one tidy sentence that isn't true.
+- **The compressor re-summarizes its own prior output.** In iterative-update mode it feeds the
+  previous summary back in verbatim alongside new turns and asks the model to preserve, update
+  or retire items. Over a long session that is summary-of-summary compounding — the precise
+  failure our working method names as *never re-summarize a summary*. Finding it shipped in a
+  mature system is the strongest argument yet for regenerating derived views from raw instead
+  of patching them. It also explains why raw-survives matters so much: without the parent
+  chain, this would be unrecoverable drift.
+- **Thresholds, caps and cooldown seconds are scattered as module constants across at least
+  four files**, with no central tunables module. That is how you end up with four `0.85`s that
+  nobody can reconcile.
+
+One more structural finding worth carrying over: Hermes has **two unrelated mechanisms for
+"this must survive compaction."** Identity, memory and skills survive by being pinned in a
+system-prompt tier. Open to-do items survive by an entirely different route — in-memory state
+re-emitted as a synthetic *user* message behind a stable header marker that the compressor
+itself recognizes and strips. Same underlying need, two code paths, no shared abstraction.
+omega should have exactly one answer to "what survives," and both cases should use it.
+
+### Findability, as a bloat symptom
+
+Three concrete data points, all of them about names not matching jobs:
+
+- `hermes_state_schema.py` does not define the schema; it holds migration and column
+  reconciliation. The schema is in `hermes_state_common.py`.
+- `prompt_builder.py` (1,767 lines) is not the prompt orchestrator; `system_prompt.py` is.
+- Of ~30 `hermes_state_*.py` siblings, six hold nearly all the write paths; the other 24 are
+  SQLite operational hardening — justified by genuine multi-process access, but it means
+  answering "how does recall work" requires reading four files plus a fifth for the SQL.
+
+Their own contributor docs concede it: *"reading the facade first is the expensive way."* And
+the facade isn't even sole owner — at least five files outside the state family run raw SQL
+against `sessions` directly, and two tables are declared a second time elsewhere in the tree,
+flagged in a comment as a known drift source.
+
+Documentation drift is the independent corroboration that this is a maintenance-burden problem
+rather than an aesthetic one: the storage doc states a schema version seven behind its own
+migration table, and the prompt-assembly doc describes instruction-file discovery as
+current-directory-only when the code actually walks the whole chain from the repository root
+down and merges every level with per-directory provenance. That last one is a *feature* the
+documentation loses — which is its own argument for keeping the system small enough that the
+docs can stay true.
+
+(That chain-merge, incidentally, is a better idea than opencode's nearest-ancestor-wins rule,
+and it's row 47: merge the whole chain, keep provenance, rather than letting the closest file
+silently shadow everything above it.)
 
 ---
 
@@ -381,6 +545,12 @@ codebase.*
    omega about you) are two different things rather than one — DL-014 chose the second, and
    should probably carry both, distinguished by who wrote it.
 
+   **But note what Hermes's curator actually is:** *one* background pass that asks a single
+   question — "should memory **or skills** be updated?" — and writes to both. Storage is files;
+   the *decision* is one decision. That is real support for DL-014's "skills are memory, not
+   code," from the system that stores them as code. The split to make is by **author**, not by
+   substrate.
+
 4. **Both keep the model's live tool surface deliberately small, and the one that didn't had
    to retrofit a bridge.** opencode ships ~14 built-ins filtered per turn. Hermes ships ~58 on
    every call and subsequently built a three-tool search/describe/call bridge to hide the long
@@ -391,3 +561,30 @@ codebase.*
    plugin functions that need no core edits. The difference is that opencode had the seam from
    the start and Hermes had to declare a freeze — which is the whole argument for fixing the
    extension contract before the first external consumer exists.
+
+6. **Neither system models entity identity.** opencode has no cross-session memory to have
+   identity in. Hermes has memory, and its identity columns are plain TEXT with no persons or
+   projects table — it remembers *strings*, never who or what they are about. The only real
+   relationship either schema expresses is session lineage. So the "knowing-you" half of omega
+   — facts attached to people, projects and commitments that can be reconciled and superseded —
+   is, like verification, **unpaved road**. Two reads, zero prior art.
+
+7. **Neither gets the raw/derived relationship fully right, but they fail at opposite ends.**
+   opencode *replaces* old tool results with a "cleared" marker — derived text becomes
+   authoritative and the raw is gone. Hermes keeps the raw (soft-archived in the parent session,
+   reachable by lineage) but then **re-summarizes its own summaries**, compounding drift on top
+   of a raw log it no longer consults. The correct combination is neither: **keep raw
+   losslessly, and regenerate derived views from it rather than patching them.** DL-007 and
+   DL-013 already say exactly this; what's new is that both halves are now observed failing
+   separately, in production, in mature systems. That moves the rule from a principle we
+   reasoned to into one we've watched two codebases pay for.
+
+8. **In a large harness, the documentation stops being true — and the failure is silent.**
+   Hermes's storage doc is seven schema versions behind its own migration table; its
+   prompt-assembly doc describes a feature as narrower than the code actually implements; its
+   compaction docs flatten several unrelated constants into one tidy claim that direct reading
+   doesn't support. opencode's version of this is a live V1/V2 rewrite where neither is labelled
+   as the one that runs. In both cases *the code was fine and the map was wrong* — which is the
+   sharpest argument for `CLAUDE.md`'s "stay small and legible" that either read produced. Small
+   isn't an aesthetic preference; it's the condition under which the description of the system
+   can stay accurate.
