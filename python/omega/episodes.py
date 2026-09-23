@@ -275,9 +275,21 @@ def inbound(
     construction: the digest either resolves to exactly what was attached or
     does not resolve at all.
 
-    ``resumes_seq`` is set when this message answers an earlier
-    ``turn.blocked``. The answer is an ordinary turn, not a resumption of the
-    blocked one — the blocked record simply lands in its recall.
+    ``resumes_seq`` is set when this message answers a question omega stopped to
+    ask. **It is the seq of the event whose turn blocked — the ``for_seq`` of
+    the ``turn.blocked`` record, not that record's own seq.** The tray sets it
+    from ``update.forSeq`` (``TrayViewModel.swift:405``), so this is a wire
+    contract rather than a preference, and it is spelled out because the
+    shorter phrasing that stood here — "answers an earlier ``turn.blocked``" —
+    reads as the blocking record's seq and cost very nearly a real bug:
+    ``derive.OpenWork`` keyed the other way would typecheck, pass any test
+    written from this prose, and then never discharge anything in production.
+    ``test_the_key_is_the_event_seq_because_that_is_what_the_tray_sends`` fails
+    if the contract ever moves.
+
+    The answer is an ordinary turn, not a resumption of the blocked one — the
+    blocked record simply lands in its recall, and the obligation it opened is
+    discharged in the derived view (DL-041).
 
     ``schedule_id`` is set when the clock produced this rather than a person
     (DL-035). It is the *only* thing distinguishing a fire from a typed message,
