@@ -183,12 +183,23 @@ def load_env(path: Optional[Path] = None, *, override: bool = False) -> dict[str
 def model_for(role: str) -> str:
     """Which model serves ``role``, from the environment.
 
-    ``OMEGA_MODEL_JUDGE`` / ``OMEGA_MODEL_ACT``. They live in `.env` beside the
-    key on purpose: **changing which model judges is a config edit, not a
-    commit.**
+    ``OMEGA_MODEL_JUDGE`` / ``OMEGA_MODEL_ACT``, falling back to ``OMEGA_MODEL``
+    for both, then to the defaults. They live in `.env` beside the key on
+    purpose: **changing which model judges is a config edit, not a commit.**
+
+    The bare ``OMEGA_MODEL`` exists because the two-role split is ours, not
+    something a reader of `.env` can be expected to infer, and the failure mode
+    without it is the worst kind: setting it did nothing, said nothing, and
+    billed the defaults. A variable that is obviously meant to choose the model
+    should choose the model. Per-role names still win, so the cheap-judge design
+    (DL-024) is one line away rather than overridden.
     """
     _check_role(role)
-    return os.environ.get(f"OMEGA_MODEL_{role.upper()}") or _DEFAULT_MODELS[role]
+    return (
+        os.environ.get(f"OMEGA_MODEL_{role.upper()}")
+        or os.environ.get("OMEGA_MODEL")
+        or _DEFAULT_MODELS[role]
+    )
 
 
 def provider_from_env(*, env_path: Optional[Path] = None) -> "OpenAIProvider":

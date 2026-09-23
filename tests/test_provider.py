@@ -265,6 +265,35 @@ def test_defaults_are_explicit_rather_than_the_library_s():
     assert set(pv._DEFAULT_MODELS) == pv.ROLES, "a role with no default"
 
 
+def test_a_bare_omega_model_serves_both_roles():
+    """Setting the one variable whose name says "model" must choose the model.
+
+    The two-role split is ours and a reader of `.env` cannot infer it, so the
+    failure this prevents is the quiet one: `OMEGA_MODEL=` was accepted by the
+    file, read by nothing, and the defaults were billed instead.
+    """
+    os.environ["OMEGA_MODEL"] = "one-model"
+    assert pv.model_for(pv.JUDGE) == "one-model"
+    assert pv.model_for(pv.ACT) == "one-model"
+
+
+def test_a_per_role_model_outranks_the_bare_one():
+    """Otherwise the convenience would cost the cheap-judge design (DL-024):
+    one variable would make every idle tick pay act-model prices."""
+    os.environ["OMEGA_MODEL"] = "one-model"
+    os.environ["OMEGA_MODEL_JUDGE"] = "small-one"
+    assert pv.model_for(pv.JUDGE) == "small-one"
+    assert pv.model_for(pv.ACT) == "one-model", "act still falls back to the bare one"
+
+
+def test_an_empty_bare_model_is_not_a_model():
+    """Same rule as the key: `OMEGA_MODEL=` is someone clearing it, and an
+    empty model name reaches the API as a 404 about nothing."""
+    os.environ["OMEGA_MODEL"] = ""
+    assert pv.model_for(pv.JUDGE) == pv._DEFAULT_MODELS[pv.JUDGE]
+    assert pv.model_for(pv.ACT) == pv._DEFAULT_MODELS[pv.ACT]
+
+
 def test_an_empty_env_value_is_treated_as_unset():
     """`OPENAI_API_KEY=` in a .env is someone clearing it, not setting it to
     the empty string — and an empty key produces an opaque 401 rather than a
