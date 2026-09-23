@@ -38,7 +38,7 @@ Header, 32 bytes, written once at creation:
   reserved  20 bytes  zero
 
 Record frame, repeated:
-  body_len  u32       byte length of body, 1..=MAX_BODY
+  body_len  u32       byte length of body, 18..=MAX_BODY (18 = seq+ts+key_len, the real floor)
   crc32     u32       CRC-32/ISO-HDLC over the body bytes
   body:
     seq        u64    starts at 1, strictly +1 per record, no gaps ever
@@ -71,10 +71,19 @@ Distinguishing a **torn tail** (survivable, truncate) from **corruption** (not s
 closed) is the core of this milestone. The rule is:
 
 > A frame that is **incomplete** at EOF is a torn tail — truncate it and continue.
+> A run of **zeros** to EOF is a torn tail — truncate it and continue.
 > A frame that is **complete** but invalid, with data after it, is corruption — refuse to open.
 
 Data following a frame proves that frame was fully durable at some point, so a bad CRC there is
 real corruption and truncating it would silently destroy real episodes.
+
+**The zero-fill clause is not hypothetical and was added after it bit us.** A crash that is *not*
+a process kill — real power loss, a kernel panic — can leave a filesystem having persisted the
+*size extension* of a write without its data pages, so the tail reads back as zeros. An earlier
+version of this spec classified a zero `body_len` as corruption; the result was that a log which
+had survived exactly the crash this milestone promises to survive **refused to open, making every
+acknowledged episode unreachable.** That is a direct violation of this spec's own violation
+metric. A zero-filled tail is a crash artifact, not damage, and is truncated.
 
 Procedure:
 
@@ -85,8 +94,13 @@ Procedure:
 4. Bad magic → `NotAnOmegaLog`. Unknown version → `UnsupportedVersion`. Both refuse to open.
 5. Scan frames from offset 32, tracking `expected_seq` starting at 1:
    - fewer than 8 bytes remain → **torn tail**, truncate here.
-   - `body_len` is 0 or > `MAX_BODY` → `CorruptFrame`. (We wrote that field; it cannot be
-     legitimately out of range.)
+   - `body_len` is **implausible** — 0, below the 18-byte minimum body, or above `MAX_BODY`:
+     - if every byte from this frame's start to EOF is **zero** → **zero-filled tail**, truncate
+       here. (A frame header we wrote is never all zeros, so this is a crash artifact.)
+     - otherwise → `CorruptFrame`. Non-zero garbage at a frame start is damage.
+     
+     Note the 18-byte minimum is the real floor: `seq` + `ts_micros` + `key_len` alone is 18
+     bytes, so a body below that cannot be one we wrote.
    - fewer than `body_len` bytes remain → **torn tail**, truncate to the frame start.
    - CRC mismatch → **torn tail** if the frame ends exactly at EOF, else `CorruptFrame`.
    - `seq != expected_seq` → **torn tail** if the frame ends exactly at EOF, else `SequenceBreak`.
@@ -210,8 +224,22 @@ in-flight turn" waits for M1. M0 proves the durability half: *an append that ret
 30. Recover, crash, recover again → identical state. Recovery is idempotent.
 31. `kill -9` immediately after append returns → the episode is present after reopening.
 32. `kill -9` *during* an append → the episode is either fully present or fully absent, never
-    partial, and the log always reopens cleanly. Torn tails are expected here; corruption is not.
+    partial, and the log always reopens cleanly.
+    **Read this case honestly, and do not let it be mistaken for evidence it does not provide.**
+    Killing a process does **not** tear a write: the kernel completes an in-flight `pwrite` even
+    though the process is gone. This case therefore proves *acknowledged appends survive* and
+    proves **nothing** about torn-tail recovery. A green result here is not coverage of cases
+    25–28. Those paths are only reachable by mutating the file deliberately, which is what they
+    do. A test that passes without exercising what it claims is an eval bug.
 33. Cases 31 and 32 run **20 times each**. Passing once is not passing.
+37. **Zero-filled tail** — append N episodes, append a run of NUL bytes (what real power loss
+    leaves), reopen: the log opens, `head()` is N, all N episodes are readable, and the zeros are
+    truncated. This case exists because the spec originally got it wrong and the log refused to
+    open, losing everything.
+38. Zero-filled tail *inside* an otherwise valid frame region, i.e. zeros followed by real frame
+    bytes → `CorruptFrame`. Zeros only mean "crash artifact" when they run to EOF.
+39. A single NUL byte appended, and a run shorter than a frame header → both recover as a torn
+    tail with no loss.
 34. After any recovery, the rebuilt offset index matches a fresh full scan.
 35. Both indexes are caches: deleting them in memory and rescanning yields identical results.
 36. Concurrent readers in one process see a consistent view while appends happen.
