@@ -35,14 +35,16 @@ import threading
 from pathlib import Path
 from typing import Callable, Optional
 
-from omega import provider, runtime
+from omega import derive, learn, memory, provider, runtime, schedule as scheduling
 from omega.channel import DEFAULT_HOST, DEFAULT_PORT
+from omega.queue import EventQueue
 
 __all__ = [
     "DEFAULT_STORE",
     "SILENCE",
     "resolve_env",
     "render",
+    "review",
     "repl",
     "serve",
     "main",
@@ -120,6 +122,56 @@ def render(said: runtime.Said) -> str:
     if said.silent:
         return SILENCE
     return f"omega: {said.reply}"
+
+
+def review(store_dir: Path, *, write: Callable[[str], None]) -> int:
+    """Print what omega has been taught, without starting it (DL-048).
+
+    Offline by construction: it opens the log, folds the two derived views and
+    renders them. No provider, no key, no network, no turn — so a person can
+    audit omega's memory on a machine that could not run it, and reading the
+    record can never itself change the record.
+
+    **It cannot run while omega is running, and that is the store's design
+    rather than a gap here.** The log holds an exclusive advisory lock for the
+    lifetime of the open handle (``src/log.rs``), which is what makes DL-016's
+    single-writer rule true instead of aspirational. So this is the audit you
+    sit down to do, not the question you ask in passing — the in-conversation
+    form has to go through the resident process and is a separate decision
+    (DL-049). The lock message says which state the person is in, because
+    "omega is already running" and "something is wrong with your store" want
+    opposite next actions and the raw error distinguishes neither.
+    """
+    try:
+        store = memory.MemoryStore.open(store_dir)
+    except memory.AlreadyLocked:
+        write(f"omega is already running on {store_dir}.")
+        write("")
+        write("    Only one process may hold the log, so this cannot read it")
+        write("    while that one is up. Stop omega and run this again.")
+        return 2
+    except Exception as exc:  # noqa: BLE001 - a person's problem, not a traceback
+        write(f"omega could not open {store_dir}: {type(exc).__name__}: {exc}")
+        return 2
+
+    with store:
+        queue = EventQueue(store)
+        learned = derive.Learned.rebuild(store)
+        standing = scheduling.Scheduler(queue)
+        standing.refresh()
+        # Read after both folds, never before: a head taken first could only be
+        # stale in the direction that claims the views are behind when they are
+        # not. Nothing else writes to this log — the lock above is what
+        # guarantees that — so equality here really does mean *whole log seen*.
+        write(
+            learn.review(
+                learned.claims(),
+                running=standing.schedules,
+                broken=standing.broken,
+                current=learned.through >= queue.head(),
+            )
+        )
+    return 0
 
 
 def _startup_lines(rt: runtime.Runtime, *, interactive: bool = True) -> list[str]:
@@ -237,6 +289,14 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--learned",
+        action="store_true",
+        help=(
+            "print what omega has been taught and exit; reads the log, starts "
+            "nothing, and needs no API key"
+        ),
+    )
+    parser.add_argument(
         "--no-listen",
         dest="listen",
         action="store_false",
@@ -266,9 +326,18 @@ def main(argv: Optional[list[str]] = None) -> int:
     args = parser.parse_args(argv)
     if args.serve and not args.listen:
         parser.error("--serve requires the localhost listener")
+    if args.learned and args.serve:
+        parser.error("--learned reads the log and exits; it cannot also serve")
     write = _writer()
 
     store_dir = Path(args.store).expanduser()
+    if args.learned:
+        # Before the provider is touched on purpose. Reading what omega already
+        # knows must not depend on omega being able to think — a key that has
+        # expired is exactly when a person wants to check the record, and
+        # failing here for a missing key would be answering a question about
+        # the log with a question about the network.
+        return review(store_dir, write=write)
     env_path, env_hint = resolve_env(args.env, store_dir)
     if args.env is not None and env_path is None:
         # A named file that is not there is worth a word. Silently ignoring an

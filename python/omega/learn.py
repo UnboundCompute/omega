@@ -75,6 +75,7 @@ __all__ = [
     "retract_claims",
     "schedule_id",
     "receipt",
+    "review",
     "when_phrase",
 ]
 
@@ -732,6 +733,84 @@ def _cron_phrase(cron: Optional[str]) -> str:
         return scheduling.describe_cron(cron)
     except scheduling.CronError:
         return cron
+
+
+def review(
+    claims: Sequence[Claim],
+    *,
+    running: Sequence[Schedule] = (),
+    broken: Optional[dict[str, str]] = None,
+    current: Optional[bool] = None,
+) -> str:
+    """Everything omega is currently carrying, in the person's own words (DL-048).
+
+    The counterpart of :func:`receipt` and the opposite question. A receipt says
+    *what this note just changed*; this says *what is standing right now*. Until
+    it existed there was no answer to the second at all: the learned set reaches
+    the model only as the handful of claims whose triggers fire on the current
+    sentence (``turn.py:220``), so asking omega what it had learned was answered
+    from whatever happened to match that question — and the whole set was
+    visible nowhere.
+
+    **Ids are shown here although** :func:`receipt` **hides them.** Not a
+    contradiction: that rule is about *confirmations*, where "claim 41 has been
+    forgotten" is a sentence the person cannot check. In a listing the id sits
+    against the text it names, so it is checkable by construction, and it gives
+    the person and the model the same stable handle — the one ``supersedes`` and
+    ``retract`` already quote.
+
+    **Schedules are here too, and the broken ones especially.** A schedule whose
+    expression will not parse is quarantined at fold time (DL-035) and is
+    otherwise invisible: it was written down, it was confirmed, and it silently
+    never fires. Review is the only surface on which that is ever discoverable,
+    so leaving it out would have made this a report that hides its own worst
+    news.
+
+    ``current`` makes the empty answer three-valued in the way *fail closed on
+    empty* requires. "Folded the whole log and omega has been taught nothing"
+    and "folded none of it" are the same empty list, and only the first is an
+    answer. It is a claim about the *view*, not about the counts: a
+    default-constructed :class:`~omega.derive.Learned` reports ``through == 0``
+    and so does a rebuild over a log with nothing in it yet, and those two must
+    not render the same way. The caller holds both numbers, so the caller says.
+
+    ``None`` — the caller did not say — renders as the uncertain answer rather
+    than the reassuring one, so silence from a future caller cannot turn into
+    "omega has been taught nothing" on a view that was simply never advanced.
+    That case is live, not hypothetical: ``executor.learned`` is empty until the
+    first turn folds it.
+    """
+    broken = broken or {}
+    if not (claims or running or broken):
+        if current:
+            return "I have not been taught anything yet."
+        return "I have not read the whole log, so I cannot tell you what I know."
+
+    lines: list[str] = []
+    if claims:
+        lines.append("What I believe about you:")
+        for claim in claims:
+            lines.append(f"- [{claim.seq}] {claim.text} ({when_phrase(claim.trigger)})")
+            if claim.situation:
+                lines.append(f"    learned {claim.situation}")
+    if running:
+        if lines:
+            lines.append("")
+        lines.append("What I will wake up and do:")
+        for item in running:
+            # From the stored expression, never from the note that taught it —
+            # DL-044 #5's rule, and review is the place a person would catch the
+            # `0 9 *` / `9 0 *` transposition that a receipt read past weeks ago.
+            lines.append(
+                f"- [{item.id}] {item.instruction} ({_cron_phrase(item.cron)})"
+            )
+    if broken:
+        if lines:
+            lines.append("")
+        lines.append("Written down, but I cannot run these:")
+        for schedule_id_, reason in sorted(broken.items()):
+            lines.append(f"- [{schedule_id_}] {reason}")
+    return "\n".join(lines)
 
 
 def when_phrase(trigger: Optional[dict[str, Any]]) -> str:

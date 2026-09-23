@@ -55,10 +55,17 @@ milestone is built to measure.
 | `--env PATH` | the `.env` holding the key. Default: beside the store, then the repo root; **never** the working directory |
 | `--no-listen` | do not open the localhost socket; this terminal is the only client |
 | `--port PORT` | where the tray connects |
+| `--learned` | print what omega has been taught, then exit. Reads the log, starts nothing, needs no key |
 
 One process holds the log, because the log is opened exclusively by design — so the
 terminal, the socket and the loop are threads inside that one process rather than several
 of them.
+
+That exclusivity is why `--learned` is the audit you sit down to do rather than a question
+you ask in passing: it cannot read the log while omega is up, and says so plainly instead
+of failing with a lock error. It prints what omega currently believes, what it will wake up
+and do, and — the part visible nowhere else — any schedule that was written down but whose
+expression will not parse, so it has been silently never firing.
 
 ## Building and testing it
 
