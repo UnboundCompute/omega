@@ -91,8 +91,34 @@ final class TrayModelTests: XCTestCase {
     }
 
     @MainActor
+    func testPermissionRefreshClearsAResolvedBlock() {
+        let permission = PermissionState(granted: false)
+        let model = TrayViewModel(
+            transport: ImmediateTransport(),
+            preflightScreenCaptureAccess: { permission.granted },
+            requestScreenCaptureAccess: { permission.granted }
+        )
+        model.capturePermission = .denied
+        model.workState = .blocked("Screen Recording permission is needed. Open System Settings to allow it.")
+
+        permission.granted = true
+        model.refreshScreenCapturePermission()
+
+        XCTAssertEqual(model.capturePermission, .granted)
+        XCTAssertEqual(model.workState, .ready)
+    }
+
+    @MainActor
     private func settleTasks() async {
         for _ in 0..<12 { await Task.yield() }
+    }
+}
+
+private final class PermissionState {
+    var granted: Bool
+
+    init(granted: Bool) {
+        self.granted = granted
     }
 }
 

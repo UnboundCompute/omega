@@ -51,6 +51,14 @@ final class TraySnapshotTests: XCTestCase {
             to: directory.appendingPathComponent("mac-recovery.png")
         )
 
+        model.workState = .blocked("Screen Recording permission is needed. Open System Settings to allow it.")
+        model.capturePermission = .denied
+        try write(
+            TrayRootView(viewModel: model, presentation: .expanded, close: {}, open: {})
+                .frame(width: 460, height: 520),
+            to: directory.appendingPathComponent("mac-permission-recovery.png")
+        )
+
         model.isDropTargeted = true
         try write(
             TrayRootView(viewModel: model, presentation: .resting, close: {}, open: {})

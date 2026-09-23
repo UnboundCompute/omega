@@ -66,10 +66,12 @@ OMEGA_SNAPSHOT_DIR="$PWD/../../.impeccable/review" swift test \
 open .build/app/omega.app
 ```
 
-The script builds release, creates the application bundle, applies an ad-hoc local signature,
-and verifies both the bundle metadata and signature. Move the app to `/Applications` before
-testing launch at login. Distribution outside the local machine will require Developer ID
-signing and notarization.
+The script builds release, creates the application bundle, uses the first available macOS
+code-signing identity, and verifies both the bundle metadata and signature. Stable signing keeps
+privacy permissions valid across local rebuilds. If no identity exists, it falls back to an
+ad-hoc signature and warns that Screen Recording permission will need to be granted after each
+rebuild. Distribution outside the local machine still requires Developer ID signing and
+notarization.
 
 To build, replace `/Applications/omega.app`, and open the installed app in one command:
 

@@ -32,7 +32,8 @@ become a second brain or an undeclared wire protocol.
 - Menu-bar fallback for open, capture, privacy, settings, sample proactivity, and quit.
 - Keyboard semantics, VoiceOver labels, native type and controls, Reduced Motion, Reduced
   Transparency, inactive appearance, and state labels that do not rely on color.
-- A reproducible `.app` packaging script with an ad-hoc signature for local use.
+- A reproducible `.app` packaging script that uses a stable local signing identity when one is
+  available, preserving macOS privacy grants across rebuilds, with an explicit ad-hoc fallback.
 
 ## Deliberately waiting at the agent boundary
 

@@ -60,6 +60,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         DistributedNotificationCenter.default.removeObserver(self)
     }
 
+    func applicationDidBecomeActive(_ notification: Notification) {
+        viewModel.refreshScreenCapturePermission()
+    }
+
     private func installStatusItem() {
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         item.button?.image = OmegaStatusIcon.make()

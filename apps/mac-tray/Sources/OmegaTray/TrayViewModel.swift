@@ -54,6 +54,8 @@ final class TrayViewModel: ObservableObject {
     @Published var manualPrivacyMode = false
 
     private let transport: TrayTransport
+    private let preflightScreenCaptureAccess: () -> Bool
+    private let requestScreenCaptureAccess: () -> Bool
     private var failedSend: FailedSend?
     weak var capturePresentation: CapturePresentationControlling?
 
@@ -64,9 +66,15 @@ final class TrayViewModel: ObservableObject {
         let context: [StagedContext]
     }
 
-    init(transport: TrayTransport) {
+    init(
+        transport: TrayTransport,
+        preflightScreenCaptureAccess: @escaping () -> Bool = CGPreflightScreenCaptureAccess,
+        requestScreenCaptureAccess: @escaping () -> Bool = CGRequestScreenCaptureAccess
+    ) {
         self.transport = transport
-        capturePermission = CGPreflightScreenCaptureAccess() ? .granted : .unknown
+        self.preflightScreenCaptureAccess = preflightScreenCaptureAccess
+        self.requestScreenCaptureAccess = requestScreenCaptureAccess
+        capturePermission = preflightScreenCaptureAccess() ? .granted : .unknown
     }
 
     var canSend: Bool {
@@ -301,6 +309,22 @@ final class TrayViewModel: ObservableObject {
         NSWorkspace.shared.open(url)
     }
 
+    func refreshScreenCapturePermission() {
+        let granted = preflightScreenCaptureAccess()
+
+        if granted {
+            let wasDenied = capturePermission == .denied
+            capturePermission = .granted
+            if wasDenied,
+               case .blocked("Screen Recording permission is needed. Open System Settings to allow it.") = workState {
+                workState = .ready
+            }
+        } else if capturePermission == .granted {
+            capturePermission = .denied
+            workState = .blocked("Screen Recording permission is needed. Open System Settings to allow it.")
+        }
+    }
+
     func previewContext(_ selected: StagedContext) {
         guard let selectedURL = selected.fileURL else { return }
         let urls = stagedContext.compactMap(\.fileURL)
@@ -308,12 +332,12 @@ final class TrayViewModel: ObservableObject {
     }
 
     private func ensureScreenCapturePermission() -> Bool {
-        if CGPreflightScreenCaptureAccess() {
+        if preflightScreenCaptureAccess() {
             capturePermission = .granted
             return true
         }
 
-        let granted = CGRequestScreenCaptureAccess()
+        let granted = requestScreenCaptureAccess()
         capturePermission = granted ? .granted : .denied
         if !granted {
             workState = .blocked("Screen Recording permission is needed. Open System Settings to allow it.")

@@ -289,7 +289,7 @@ private struct ExpandedTrayView: View {
             RecoveryNotice(
                 icon: "rectangle.on.rectangle.slash",
                 title: "Screen capture is off",
-                detail: "Allow Screen Recording in System Settings, then try the capture again.",
+                detail: "Allow Screen & System Audio Recording in System Settings. If you just enabled it, quit and reopen omega once.",
                 actionTitle: "Open Settings",
                 action: viewModel.openScreenCaptureSettings
             )
