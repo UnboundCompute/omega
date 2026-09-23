@@ -1,4 +1,5 @@
 import AppKit
+import CoreGraphics
 import Foundation
 import UniformTypeIdentifiers
 
@@ -41,11 +42,23 @@ final class TrayViewModel: ObservableObject {
     @Published var hasUnread = false
     @Published var proactivePeek: String?
     @Published var composerFocusRequest = 0
+    @Published var capturePermission: ScreenCapturePermission
+    @Published var hotKeyRegistrationFailed = false
+    @Published var isPrivacyRestricted = false
 
     private let transport: TrayTransport
+    private var failedSend: FailedSend?
+
+    private struct FailedSend {
+        let messageID: UUID
+        let submission: TraySubmission
+        let draft: String
+        let context: [StagedContext]
+    }
 
     init(transport: TrayTransport) {
         self.transport = transport
+        capturePermission = CGPreflightScreenCaptureAccess() ? .granted : .unknown
     }
 
     var canSend: Bool {
@@ -53,8 +66,19 @@ final class TrayViewModel: ObservableObject {
             || !stagedContext.isEmpty
     }
 
+    var canSubmit: Bool {
+        canSend && !workState.isBusy
+    }
+
+    var displayedProactivePeek: String {
+        guard !isPrivacyRestricted, !AppSettings.shared.hideProactivePreviews else {
+            return "omega has something for you"
+        }
+        return proactivePeek ?? "omega has something for you"
+    }
+
     func send() {
-        guard canSend, workState != .sending else { return }
+        guard canSubmit else { return }
 
         let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
         let sentContext = stagedContext
@@ -64,19 +88,69 @@ final class TrayViewModel: ObservableObject {
         )
 
         let visibleInstruction = text.isEmpty ? "Use the attached context." : text
-        messages.append(.init(role: .user, text: visibleInstruction))
+        let messageID = UUID()
+        messages.append(
+            .init(
+                id: messageID,
+                role: .user,
+                text: visibleInstruction,
+                contextDescriptions: sentContext.map { $0.title },
+                delivery: .sending
+            )
+        )
         draft = ""
         stagedContext = []
         workState = .sending
+        failedSend = nil
 
+        deliver(
+            submission,
+            messageID: messageID,
+            originalDraft: text,
+            originalContext: sentContext
+        )
+    }
+
+    func retryLastSend() {
+        guard let failedSend, !workState.isBusy else { return }
+        stagedContext.removeAll { context in failedSend.context.contains { $0.id == context.id } }
+        if draft == failedSend.draft { draft = "" }
+        updateMessage(failedSend.messageID) { $0.delivery = .sending }
+        workState = .sending
+        self.failedSend = nil
+        deliver(
+            failedSend.submission,
+            messageID: failedSend.messageID,
+            originalDraft: failedSend.draft,
+            originalContext: failedSend.context
+        )
+    }
+
+    private func deliver(
+        _ submission: TraySubmission,
+        messageID: UUID,
+        originalDraft: String,
+        originalContext: [StagedContext]
+    ) {
         Task {
             do {
                 workState = .working("Working locally")
                 let response = try await transport.send(submission)
+                updateMessage(messageID) { $0.delivery = .sent }
                 messages.append(.init(role: .omega, text: response))
                 workState = .complete("Demo response received")
             } catch {
-                workState = .failed("Could not deliver the request. Try again.")
+                updateMessage(messageID) { $0.delivery = .failed }
+                if draft.isEmpty { draft = originalDraft }
+                let stagedIDs = Set(stagedContext.map(\.id))
+                stagedContext.append(contentsOf: originalContext.filter { !stagedIDs.contains($0.id) })
+                failedSend = .init(
+                    messageID: messageID,
+                    submission: submission,
+                    draft: originalDraft,
+                    context: originalContext
+                )
+                workState = .failed("Request not delivered. Your draft and context were restored.")
             }
         }
     }
@@ -88,6 +162,7 @@ final class TrayViewModel: ObservableObject {
     func receiveProactiveMessage(_ text: String) {
         messages.append(.init(role: .omega, text: text))
         hasUnread = false
+        proactivePeek = nil
     }
 
     func importProviders(_ providers: [NSItemProvider]) -> Bool {
@@ -132,7 +207,7 @@ final class TrayViewModel: ObservableObject {
         let pasteboard = NSPasteboard.general
 
         if let urls = pasteboard.readObjects(forClasses: [NSURL.self]) as? [URL], !urls.isEmpty {
-            urls.forEach(stageFile)
+            urls.forEach { $0.isFileURL ? stageFile($0) : stageURL($0) }
             return
         }
 
@@ -155,6 +230,8 @@ final class TrayViewModel: ObservableObject {
     }
 
     func captureScreen(_ mode: ScreenCaptureMode) {
+        guard ensureScreenCapturePermission() else { return }
+
         let destination = FileManager.default.temporaryDirectory
             .appendingPathComponent("omega-capture-\(UUID().uuidString).png")
         let process = Process()
@@ -190,6 +267,36 @@ final class TrayViewModel: ObservableObject {
         } catch {
             workState = .failed("Screen capture could not start.")
         }
+    }
+
+    func openScreenCaptureSettings() {
+        guard let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture") else { return }
+        NSWorkspace.shared.open(url)
+    }
+
+    func previewContext(_ selected: StagedContext) {
+        guard let selectedURL = selected.fileURL else { return }
+        let urls = stagedContext.compactMap(\.fileURL)
+        QuickLookController.shared.preview(urls, startingWith: selectedURL)
+    }
+
+    private func ensureScreenCapturePermission() -> Bool {
+        if CGPreflightScreenCaptureAccess() {
+            capturePermission = .granted
+            return true
+        }
+
+        let granted = CGRequestScreenCaptureAccess()
+        capturePermission = granted ? .granted : .denied
+        if !granted {
+            workState = .blocked("Screen Recording permission is needed. Open System Settings to allow it.")
+        }
+        return granted
+    }
+
+    private func updateMessage(_ id: UUID, change: (inout TrayMessage) -> Void) {
+        guard let index = messages.firstIndex(where: { $0.id == id }) else { return }
+        change(&messages[index])
     }
 
     private func stageFile(_ url: URL) {

@@ -33,6 +33,30 @@ final class TraySnapshotTests: XCTestCase {
                 .frame(width: 460, height: 380),
             to: directory.appendingPathComponent("mac-expanded.png")
         )
+
+        model.stagedContext = [
+            StagedContext(kind: .text, title: "Roadmap notes from the planning call", detail: "Text · Not sent"),
+            StagedContext(kind: .link, title: "developer.apple.com", detail: "Link · Not sent")
+        ]
+        try write(
+            TrayRootView(viewModel: model, presentation: .expanded, close: {}, open: {})
+                .frame(width: 460, height: 456),
+            to: directory.appendingPathComponent("mac-staged-context.png")
+        )
+
+        model.workState = .failed("Request not delivered. Your draft and context were restored.")
+        try write(
+            TrayRootView(viewModel: model, presentation: .expanded, close: {}, open: {})
+                .frame(width: 460, height: 520),
+            to: directory.appendingPathComponent("mac-recovery.png")
+        )
+
+        model.isDropTargeted = true
+        try write(
+            TrayRootView(viewModel: model, presentation: .resting, close: {}, open: {})
+                .frame(width: 320, height: 72),
+            to: directory.appendingPathComponent("mac-drop-target.png")
+        )
     }
 
     @MainActor

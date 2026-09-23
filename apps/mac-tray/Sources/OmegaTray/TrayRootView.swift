@@ -11,9 +11,13 @@ struct TrayRootView: View {
         Group {
             switch presentation {
             case .resting:
-                RestingView(hasUnread: viewModel.hasUnread, open: open)
+                RestingView(
+                    hasUnread: viewModel.hasUnread,
+                    isDropTargeted: viewModel.isDropTargeted,
+                    open: open
+                )
             case .peek:
-                ProactivePeekView(message: viewModel.proactivePeek ?? "omega has something for you", open: open)
+                ProactivePeekView(message: viewModel.displayedProactivePeek, open: open)
             case .expanded:
                 ExpandedTrayView(viewModel: viewModel, close: close)
             }
@@ -28,6 +32,7 @@ struct TrayRootView: View {
 
 private struct RestingView: View {
     let hasUnread: Bool
+    let isDropTargeted: Bool
     let open: () -> Void
 
     var body: some View {
@@ -39,13 +44,27 @@ private struct RestingView: View {
                 )
                 .fill(TrayTheme.shell)
 
-                SignalSeam(isVisible: hasUnread)
-                    .padding(.horizontal, 74)
-                    .padding(.bottom, 2)
+                if isDropTargeted {
+                    HStack(spacing: 8) {
+                        Image(systemName: "arrow.down.doc")
+                        Text("Drop to stage — nothing sends yet")
+                    }
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(TrayTheme.primaryText)
+                    .padding(.bottom, 18)
+                } else {
+                    SignalSeam(isVisible: hasUnread)
+                        .padding(.horizontal, 74)
+                        .padding(.bottom, 2)
+                }
             }
         }
         .buttonStyle(.plain)
-        .accessibilityLabel(hasUnread ? "Open omega, unread message" : "Open omega")
+        .accessibilityLabel(
+            isDropTargeted
+                ? "Drop context into omega. It will be staged, not sent."
+                : (hasUnread ? "Open omega, unread message" : "Open omega")
+        )
     }
 }
 
@@ -84,6 +103,7 @@ private struct ExpandedTrayView: View {
     let close: () -> Void
     @FocusState private var composerFocused: Bool
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    @Environment(\.controlActiveState) private var controlActiveState
 
     var body: some View {
         VStack(spacing: 0) {
@@ -105,6 +125,7 @@ private struct ExpandedTrayView: View {
                 .stroke(Color.white.opacity(0.09), lineWidth: 0.75)
         }
         .shadow(color: .black.opacity(0.34), radius: 28, y: 14)
+        .opacity(controlActiveState == .inactive ? 0.94 : 1)
         .overlay {
             if viewModel.isDropTargeted {
                 dropOverlay
@@ -176,6 +197,7 @@ private struct ExpandedTrayView: View {
         ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 14) {
+                    notices
                     if viewModel.messages.isEmpty {
                         emptyState
                     } else {
@@ -197,6 +219,39 @@ private struct ExpandedTrayView: View {
         .frame(maxHeight: .infinity)
     }
 
+    @ViewBuilder
+    private var notices: some View {
+        if viewModel.capturePermission == .denied {
+            RecoveryNotice(
+                icon: "rectangle.on.rectangle.slash",
+                title: "Screen capture is off",
+                detail: "Allow Screen Recording in System Settings, then try the capture again.",
+                actionTitle: "Open Settings",
+                action: viewModel.openScreenCaptureSettings
+            )
+        }
+
+        if viewModel.hotKeyRegistrationFailed {
+            RecoveryNotice(
+                icon: "keyboard.badge.exclamationmark",
+                title: "That shortcut is already in use",
+                detail: "Choose another shortcut in omega Settings.",
+                actionTitle: "Settings",
+                action: openAppSettings
+            )
+        }
+
+        if case .failed(let detail) = viewModel.workState {
+            RecoveryNotice(
+                icon: "arrow.clockwise",
+                title: "Not delivered",
+                detail: detail,
+                actionTitle: "Retry",
+                action: viewModel.retryLastSend
+            )
+        }
+    }
+
     private var emptyState: some View {
         VStack(alignment: .leading, spacing: 8) {
             Text("What are we doing?")
@@ -214,9 +269,11 @@ private struct ExpandedTrayView: View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 9) {
                 ForEach(viewModel.stagedContext) { context in
-                    ContextCard(context: context) {
-                        viewModel.removeContext(id: context.id)
-                    }
+                    ContextCard(
+                        context: context,
+                        preview: { viewModel.previewContext(context) },
+                        remove: { viewModel.removeContext(id: context.id) }
+                    )
                 }
             }
             .padding(.horizontal, 16)
@@ -247,14 +304,21 @@ private struct ExpandedTrayView: View {
                 .onSubmit(viewModel.send)
 
             Button(action: viewModel.send) {
-                Image(systemName: "arrow.up")
-                    .font(.system(size: 12, weight: .bold))
-                    .foregroundStyle(viewModel.canSend ? TrayTheme.shell : TrayTheme.tertiaryText)
-                    .frame(width: 29, height: 29)
-                    .background(viewModel.canSend ? TrayTheme.signal : TrayTheme.raised, in: Circle())
+                Group {
+                    if viewModel.workState.isBusy {
+                        ProgressView()
+                            .controlSize(.small)
+                    } else {
+                        Image(systemName: "arrow.up")
+                            .font(.system(size: 12, weight: .bold))
+                    }
+                }
+                .foregroundStyle(viewModel.canSubmit ? TrayTheme.shell : TrayTheme.tertiaryText)
+                .frame(width: 29, height: 29)
+                .background(viewModel.canSubmit ? TrayTheme.signal : TrayTheme.raised, in: Circle())
             }
             .buttonStyle(.plain)
-            .disabled(!viewModel.canSend)
+            .disabled(!viewModel.canSubmit)
             .accessibilityLabel("Send to omega")
         }
         .padding(10)
@@ -297,6 +361,11 @@ private struct ExpandedTrayView: View {
         case .ready: TrayTheme.secondaryText
         }
     }
+
+    private func openAppSettings() {
+        NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
 }
 
 private struct MessageView: View {
@@ -305,13 +374,28 @@ private struct MessageView: View {
     var body: some View {
         switch message.role {
         case .user:
-            Text(message.text)
-                .font(.system(size: 13))
-                .foregroundStyle(TrayTheme.primaryText)
-                .padding(.horizontal, 12)
-                .padding(.vertical, 9)
-                .background(TrayTheme.instruction, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
-                .frame(maxWidth: .infinity, alignment: .trailing)
+            VStack(alignment: .trailing, spacing: 6) {
+                Text(message.text)
+                    .font(.system(size: 13))
+                    .foregroundStyle(TrayTheme.primaryText)
+
+                if !message.contextDescriptions.isEmpty {
+                    Text(message.contextDescriptions.joined(separator: " · "))
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundStyle(TrayTheme.secondaryText)
+                        .lineLimit(2)
+                }
+
+                if message.delivery == .failed {
+                    Label("Not delivered", systemImage: "exclamationmark.circle")
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundStyle(.red)
+                }
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 9)
+            .background(TrayTheme.instruction, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+            .frame(maxWidth: .infinity, alignment: .trailing)
         case .omega:
             VStack(alignment: .leading, spacing: 7) {
                 Text("omega")
@@ -333,23 +417,29 @@ private struct MessageView: View {
 
 private struct ContextCard: View {
     let context: StagedContext
+    let preview: () -> Void
     let remove: () -> Void
 
     var body: some View {
         HStack(spacing: 9) {
-            Group {
-                if let preview = context.preview {
-                    Image(nsImage: preview)
-                        .resizable()
-                        .scaledToFill()
-                } else {
-                    Image(systemName: context.kind == .link ? "link" : "text.alignleft")
-                        .foregroundStyle(TrayTheme.signal)
+            Button(action: preview) {
+                Group {
+                    if let preview = context.preview {
+                        Image(nsImage: preview)
+                            .resizable()
+                            .scaledToFill()
+                    } else {
+                        Image(systemName: context.kind == .link ? "link" : "text.alignleft")
+                            .foregroundStyle(TrayTheme.signal)
+                    }
                 }
+                .frame(width: 34, height: 34)
+                .background(TrayTheme.surface, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
             }
-            .frame(width: 34, height: 34)
-            .background(TrayTheme.surface, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .buttonStyle(.plain)
+            .disabled(context.fileURL == nil)
+            .accessibilityLabel("Preview \(context.title)")
 
             VStack(alignment: .leading, spacing: 2) {
                 Text(context.title)
@@ -371,8 +461,36 @@ private struct ContextCard: View {
         .padding(8)
         .frame(width: 190)
         .background(TrayTheme.instruction, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
-        .accessibilityElement(children: .combine)
-        .accessibilityLabel("\(context.kind.rawValue), \(context.title), not sent")
+    }
+}
+
+private struct RecoveryNotice: View {
+    let icon: String
+    let title: String
+    let detail: String
+    let actionTitle: String
+    let action: () -> Void
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: icon)
+                .foregroundStyle(TrayTheme.signal)
+                .frame(width: 18)
+            VStack(alignment: .leading, spacing: 3) {
+                Text(title)
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(TrayTheme.primaryText)
+                Text(detail)
+                    .font(.system(size: 11))
+                    .foregroundStyle(TrayTheme.secondaryText)
+                    .fixedSize(horizontal: false, vertical: true)
+                Button(actionTitle, action: action)
+                    .buttonStyle(.link)
+                    .font(.system(size: 11, weight: .medium))
+            }
+        }
+        .padding(12)
+        .background(TrayTheme.raised, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
     }
 }
 

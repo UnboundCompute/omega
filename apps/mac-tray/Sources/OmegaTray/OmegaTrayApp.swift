@@ -6,23 +6,59 @@ struct OmegaTrayApp: App {
 
     var body: some Scene {
         Settings {
-            SettingsView()
+            SettingsView(settings: .shared)
         }
     }
 }
 
 private struct SettingsView: View {
+    @ObservedObject var settings: AppSettings
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text("omega")
-                .font(.title2.weight(.semibold))
-            Text("The first prototype uses Control–Option–Space to open or close the tray.")
-                .foregroundStyle(.secondary)
-            Text("Shortcut customization and launch-at-login controls are part of the v1 contract and will land after the core panel behavior is verified.")
-                .font(.callout)
-                .foregroundStyle(.secondary)
+        Form {
+            Section("Presence") {
+                Picker("Open or close omega", selection: $settings.hotKeyID) {
+                    ForEach(HotKeyChoice.choices) { choice in
+                        Text(choice.title).tag(choice.id)
+                    }
+                }
+
+                Toggle(
+                    "Open omega when I log in",
+                    isOn: Binding(
+                        get: { settings.launchAtLogin },
+                        set: settings.setLaunchAtLogin
+                    )
+                )
+
+                if let message = settings.launchAtLoginMessage {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text(message)
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                        Button("Open Login Items") {
+                            settings.openLoginItemSettings()
+                        }
+                    }
+                }
+            }
+
+            Section("Privacy") {
+                Toggle("Hide proactive message previews", isOn: $settings.hideProactivePreviews)
+                Text("When enabled, the camera-area peek only says that omega has something for you. Open the tray to read it.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
+
+            Section {
+                Text("The tray collects context and shows omega’s replies. Memory, judgement, and tool execution remain in the single agent core.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
         }
-        .frame(width: 420)
-        .padding(24)
+        .formStyle(.grouped)
+        .frame(width: 480)
+        .fixedSize(horizontal: false, vertical: true)
+        .onAppear { settings.refreshLaunchAtLogin() }
     }
 }

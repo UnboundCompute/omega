@@ -1,5 +1,5 @@
 import AppKit
-import Carbon.HIToolbox
+import Combine
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -7,6 +7,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var panelController: OmegaPanelController?
     private var statusItem: NSStatusItem?
     private var hotKey: GlobalHotKey?
+    private var settingsObservation: AnyCancellable?
+    private let settings = AppSettings.shared
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -23,22 +25,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             panelController.showResting()
         }
 
-        hotKey = GlobalHotKey(keyCode: UInt32(kVK_Space), modifiers: UInt32(controlKey | optionKey)) { [weak self] in
-            Task { @MainActor in
-                self?.panelController?.toggle()
-            }
-        }
+        registerHotKey()
+        settingsObservation = settings.$hotKeyID
+            .dropFirst()
+            .sink { [weak self] _ in self?.registerHotKey() }
+
+        DistributedNotificationCenter.default.addObserver(
+            self,
+            selector: #selector(screenLocked),
+            name: .init("com.apple.screenIsLocked"),
+            object: nil
+        )
+        DistributedNotificationCenter.default.addObserver(
+            self,
+            selector: #selector(screenUnlocked),
+            name: .init("com.apple.screenIsUnlocked"),
+            object: nil
+        )
 
         installStatusItem()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
         hotKey = nil
+        DistributedNotificationCenter.default.removeObserver(self)
     }
 
     private func installStatusItem() {
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
-        item.button?.image = NSImage(systemSymbolName: "circle.bottomhalf.filled", accessibilityDescription: "omega")
+        item.button?.image = OmegaStatusIcon.make()
         item.button?.toolTip = "omega"
 
         let menu = NSMenu()
@@ -76,5 +91,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func quit() {
         NSApp.terminate(nil)
+    }
+
+    @objc private func screenLocked() {
+        viewModel.isPrivacyRestricted = true
+        panelController?.showResting()
+    }
+
+    @objc private func screenUnlocked() {
+        viewModel.isPrivacyRestricted = false
+    }
+
+    private func registerHotKey() {
+        hotKey = nil
+        let configuration = settings.hotKey
+        hotKey = GlobalHotKey(
+            keyCode: configuration.keyCode,
+            modifiers: configuration.modifiers
+        ) { [weak self] in
+            Task { @MainActor in self?.panelController?.toggle() }
+        }
+        viewModel.hotKeyRegistrationFailed = hotKey == nil
     }
 }

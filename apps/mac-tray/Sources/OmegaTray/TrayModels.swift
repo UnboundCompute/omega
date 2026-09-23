@@ -11,11 +11,28 @@ struct TrayMessage: Identifiable, Equatable {
     let id: UUID
     let role: Role
     let text: String
+    let contextDescriptions: [String]
+    var delivery: Delivery
 
-    init(id: UUID = UUID(), role: Role, text: String) {
+    enum Delivery: Equatable {
+        case none
+        case sending
+        case sent
+        case failed
+    }
+
+    init(
+        id: UUID = UUID(),
+        role: Role,
+        text: String,
+        contextDescriptions: [String] = [],
+        delivery: Delivery = .none
+    ) {
         self.id = id
         self.role = role
         self.text = text
+        self.contextDescriptions = contextDescriptions
+        self.delivery = delivery
     }
 }
 
@@ -63,6 +80,13 @@ enum WorkState: Equatable {
     case complete(String)
     case failed(String)
 
+    var isBusy: Bool {
+        switch self {
+        case .sending, .working: true
+        default: false
+        }
+    }
+
     var label: String {
         switch self {
         case .ready: "Ready"
@@ -73,6 +97,12 @@ enum WorkState: Equatable {
         case .failed(let detail): detail
         }
     }
+}
+
+enum ScreenCapturePermission: Equatable {
+    case unknown
+    case granted
+    case denied
 }
 
 struct TraySubmission: Equatable {

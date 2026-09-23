@@ -14,6 +14,8 @@ final class OmegaPanelController: NSWindowController {
     private var presentation: Presentation = .resting
     private var peekCollapseTask: Task<Void, Never>?
     private var contentObservation: AnyCancellable?
+    private var dropObservation: AnyCancellable?
+    private weak var previouslyActiveApplication: NSRunningApplication?
 
     private let restingSize = NSSize(width: 190, height: 38)
     private let peekSize = NSSize(width: 390, height: 108)
@@ -46,6 +48,14 @@ final class OmegaPanelController: NSWindowController {
                 self.resize(to: self.expandedSize(), animate: true)
             }
 
+        dropObservation = viewModel.$isDropTargeted
+            .removeDuplicates()
+            .dropFirst()
+            .sink { [weak self] targeted in
+                guard let self, self.presentation == .resting else { return }
+                self.resize(to: targeted ? NSSize(width: 320, height: 72) : self.restingSize, animate: true)
+            }
+
         NotificationCenter.default.addObserver(
             self,
             selector: #selector(screenParametersChanged),
@@ -64,24 +74,41 @@ final class OmegaPanelController: NSWindowController {
     }
 
     func showResting() {
+        let shouldRestoreFocus = NSWorkspace.shared.frontmostApplication?.processIdentifier
+            == ProcessInfo.processInfo.processIdentifier
         presentation = .resting
         viewModel.isExpanded = false
-        viewModel.proactivePeek = nil
+        if !viewModel.hasUnread {
+            viewModel.proactivePeek = nil
+        }
         resize(to: restingSize, animate: true)
         updateContent()
         window?.orderFrontRegardless()
+
+        if shouldRestoreFocus {
+            previouslyActiveApplication?.activate(options: [])
+        }
     }
 
     func showExpanded(focusComposer: Bool = true) {
         peekCollapseTask?.cancel()
+        let pendingProactiveMessage = viewModel.hasUnread ? viewModel.proactivePeek : nil
         presentation = .expanded
         viewModel.isExpanded = true
-        viewModel.proactivePeek = nil
+        if let pendingProactiveMessage {
+            viewModel.receiveProactiveMessage(pendingProactiveMessage)
+        } else {
+            viewModel.proactivePeek = nil
+        }
         resize(to: expandedSize(), animate: true)
         updateContent()
         window?.orderFrontRegardless()
 
         if focusComposer {
+            let frontmost = NSWorkspace.shared.frontmostApplication
+            if frontmost?.processIdentifier != ProcessInfo.processInfo.processIdentifier {
+                previouslyActiveApplication = frontmost
+            }
             NSApp.activate(ignoringOtherApps: true)
             window?.makeKey()
             viewModel.composerFocusRequest += 1
