@@ -22,6 +22,9 @@ from omega import _log
 __all__ = [
     "Episode",
     "MemoryStore",
+    # Durability, made observable. Part of the hatch, not the interface.
+    "file_syncs",
+    "dir_syncs",
     # Limits and names that callers legitimately need to reason about episodes.
     "EPISODES_FILENAME",
     "MAX_BODY",
@@ -61,6 +64,34 @@ SequenceBreak = _log.SequenceBreak
 TooLarge = _log.TooLarge
 UnsupportedVersion = _log.UnsupportedVersion
 WriteKeyConflict = _log.WriteKeyConflict
+
+
+# --- durability, made observable ------------------------------------------
+# Spec case 44 / audit finding 4: the entire suite — 115 tests including 40
+# `kill -9` trials — passed with every durability call deleted, 94x faster.
+# `kill -9` cannot test `fsync`, because the kernel completes an in-flight
+# write and the page cache outlives the process. A rule no test can fail is not
+# a rule, so the rule is held by observing the *call*.
+#
+# These two are part of the diagnostics hatch, not the episode interface: they
+# exist for the M0 suite and case 24 fails if production code reaches for them.
+
+
+def file_syncs() -> int:
+    """File ``fsync``s completed **on the calling thread** since it started.
+
+    Read it before an operation and after it; the difference is how many times
+    that operation actually reached the disk. Thread-local and monotonic on
+    purpose — a process-wide count under a parallel runner is either flaky or
+    satisfied by some *other* thread's append, and the latter is exactly the
+    mutant this exists to catch. Never read it from a worker thread.
+    """
+    return _log.file_syncs()
+
+
+def dir_syncs() -> int:
+    """Directory ``fsync``s completed on the calling thread since it started."""
+    return _log.dir_syncs()
 
 
 @dataclass(frozen=True)
@@ -126,18 +157,54 @@ class MemoryStore:
         self._diagnostics = _Diagnostics(raw)
 
     # --- opening ----------------------------------------------------------
+    @staticmethod
+    def log_path_for(path: PathLike) -> Path:
+        """Where ``MemoryStore.open(path)`` puts the log. A pure function.
+
+        The rule, spec case 46: **the path decides, never the disk.**
+
+            ``path`` ends in ``EPISODES_FILENAME``  ->  that is the log file
+            anything else                           ->  ``path`` is the store
+                                                        directory and the log is
+                                                        ``path/EPISODES_FILENAME``
+
+        It reads only the string a caller handed in, so the same argument names
+        the same file forever — before the store exists, after it exists, and
+        after it has been deleted. The two spellings converge: ``open(d)`` and
+        ``open(d / EPISODES_FILENAME)`` are the same store, not two.
+
+        This replaces an ``is_dir()`` test, which was order-dependent (audit
+        finding 6). Under it the same argument meant ``p`` when ``p`` did not
+        exist and ``p/episodes.log`` when someone had made the directory first
+        — and the file form then permanently blocked the directory form, because
+        a path already occupied by a file can never be made into one.
+        """
+        p = Path(os.fspath(path))
+        if p.name == EPISODES_FILENAME:
+            return p
+        return p / EPISODES_FILENAME
+
     @classmethod
     def open(cls, path: PathLike) -> "MemoryStore":
         """Open (creating if needed) the store at ``path``.
 
-        ``path`` may be the log **file** or a **directory**; an existing
-        directory gets ``EPISODES_FILENAME`` joined onto it, so callers never
-        have to know the log's filename.
+        ``path`` may be the log **file** or the store **directory**; see
+        :meth:`log_path_for` for the rule, which depends only on ``path``
+        itself.
+
+        When ``path`` is the **directory** form it is created if it is missing,
+        so the log lands in the same place whether or not ``path`` already
+        existed — that is what case 46 asserts. Exactly the one directory the
+        caller named is created; a missing *parent* above it is still an error
+        rather than a guess, and the **file** form creates nothing at all,
+        because there the caller named a file and not the directory holding it
+        (case 23).
         """
-        p = Path(os.fspath(path))
-        if p.is_dir():
-            p = p / EPISODES_FILENAME
-        return cls(_log.Log(p))
+        log_path = cls.log_path_for(path)
+        store_dir = Path(os.fspath(path))
+        if log_path != store_dir and not store_dir.exists():
+            store_dir.mkdir(parents=False, exist_ok=True)
+        return cls(_log.Log(log_path))
 
     # --- writing ----------------------------------------------------------
     def append_episode(
@@ -179,6 +246,31 @@ class MemoryStore:
 
     def checkpoint_names(self) -> list[str]:
         return self._log.checkpoint_names()
+
+    @property
+    def checkpoints_reset(self) -> bool:
+        """True when this open found an unreadable checkpoint sidecar.
+
+        Spec case 42. Checkpoints are derived state, so a damaged sidecar must
+        never be the reason acknowledged episodes become unreachable: it is set
+        aside and every checkpoint reads 0, exactly as a *missing* sidecar
+        always has. That is survivable but not silent — consumers will replay,
+        and they are entitled to know why. So it is reported here rather than
+        raised.
+        """
+        return self._log.checkpoints_reset
+
+    @property
+    def damaged_checkpoints_path(self) -> Optional[Path]:
+        """Where an unreadable sidecar was moved on this open, or ``None``.
+
+        The evidence is preserved, never deleted. ``None`` while
+        :attr:`checkpoints_reset` is true means the move itself failed (a
+        read-only directory, say) — the log still opened, which is the whole
+        point of the rule.
+        """
+        moved = self._log.damaged_checkpoints_path
+        return None if moved is None else Path(moved)
 
     # --- lifetime ---------------------------------------------------------
     @property

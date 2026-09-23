@@ -88,9 +88,20 @@ def _imports_private(path: Path) -> list[str]:
 #: convention that the rest of this file exists to replace, so it is a test too.
 DIAGNOSTICS = "diagnostics"
 
+#: The fsync counters are the same kind of thing: spec case 44 needs the
+#: durability *call* observed, because `kill -9` cannot observe it, and that is
+#: a fact about the write path rather than about episodes. They are imported
+#: from the seam rather than reached through a store, so the detector has to
+#: see the import form too.
+HATCH_NAMES = (DIAGNOSTICS, "file_syncs", "dir_syncs")
+
 #: Production source. Tests are deliberately excluded: they are the one caller
 #: the hatch is for.
 PRODUCTION_ROOT = "python"
+
+#: The module the hatch is exported from — an import of a hatch name *from
+#: here* is the form a plain attribute check would miss.
+SEAM_MODULE = "omega.memory"
 
 
 def _touches_diagnostics(path: Path) -> list[str]:
@@ -99,17 +110,23 @@ def _touches_diagnostics(path: Path) -> list[str]:
     reasons: list[str] = []
 
     for node in ast.walk(tree):
-        if isinstance(node, ast.Attribute) and node.attr == DIAGNOSTICS:
-            reasons.append(f"line {node.lineno}: attribute access .{DIAGNOSTICS}")
+        if isinstance(node, ast.Attribute) and node.attr in HATCH_NAMES:
+            reasons.append(f"line {node.lineno}: attribute access .{node.attr}")
         elif (
             isinstance(node, ast.Call)
             and isinstance(node.func, ast.Name)
             and node.func.id == "getattr"
             and len(node.args) >= 2
             and isinstance(node.args[1], ast.Constant)
-            and node.args[1].value == DIAGNOSTICS
+            and node.args[1].value in HATCH_NAMES
         ):
-            reasons.append(f"line {node.lineno}: getattr(..., {DIAGNOSTICS!r})")
+            reasons.append(f"line {node.lineno}: getattr(..., {node.args[1].value!r})")
+        elif isinstance(node, ast.ImportFrom) and (node.module or "") == SEAM_MODULE:
+            for alias in node.names:
+                if alias.name in HATCH_NAMES:
+                    reasons.append(
+                        f"line {node.lineno}: from {SEAM_MODULE} import {alias.name}"
+                    )
 
     return reasons
 
@@ -151,6 +168,9 @@ def test_case_24_the_diagnostics_detector_is_not_a_no_op(tmp_path: Path) -> None
         "attribute": "store.diagnostics.offsets()\n",
         "chained": "get_store().diagnostics.rebuild_indexes()\n",
         "getattr": "getattr(store, 'diagnostics')\n",
+        "fsync-import": "from omega.memory import file_syncs\n",
+        "dirsync-import": "from omega.memory import MemoryStore, dir_syncs\n",
+        "fsync-attribute": "import omega.memory\nomega.memory.file_syncs()\n",
     }
     for name, source in caught.items():
         probe = tmp_path / f"diag_{name}.py"
