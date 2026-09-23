@@ -45,4 +45,18 @@ final class AppSettingsTests: XCTestCase {
         XCTAssertEqual(settings.captureAreaHotKeyID, "control-option-c")
         XCTAssertEqual(defaults.string(forKey: "captureAreaHotKeyID"), "control-option-c")
     }
+
+    @MainActor
+    func testProjectionCursorPersistsAndCanReset() {
+        let suiteName = "OmegaTrayTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let settings = AppSettings(defaults: defaults)
+
+        settings.projectionCursor = 42
+        XCTAssertEqual(AppSettings(defaults: defaults).projectionCursor, 42)
+
+        settings.projectionCursor = nil
+        XCTAssertNil(AppSettings(defaults: defaults).projectionCursor)
+    }
 }

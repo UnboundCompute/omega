@@ -43,6 +43,8 @@ struct StagedContext: Identifiable {
         case text = "Text"
         case link = "Link"
         case screen = "Screen"
+
+        var wireValue: String { rawValue.lowercased() }
     }
 
     let id: UUID
@@ -75,6 +77,7 @@ struct StagedContext: Identifiable {
 enum WorkState: Equatable {
     case ready
     case sending
+    case understood
     case working(String)
     case blocked(String)
     case complete(String)
@@ -82,7 +85,7 @@ enum WorkState: Equatable {
 
     var isBusy: Bool {
         switch self {
-        case .sending, .working: true
+        case .sending, .understood, .working: true
         default: false
         }
     }
@@ -90,7 +93,8 @@ enum WorkState: Equatable {
     var label: String {
         switch self {
         case .ready: "Ready"
-        case .sending: "Understood"
+        case .sending: "Sending"
+        case .understood: "Understood"
         case .working(let detail): detail
         case .blocked: "Action needed"
         case .complete: "Verified complete"
@@ -106,6 +110,112 @@ enum ScreenCapturePermission: Equatable {
 }
 
 struct TraySubmission: Equatable {
+    let id: UUID
     let text: String
-    let contextDescriptions: [String]
+    let context: [TrayContextReference]
+    let urgency: String
+    let resumesSeq: Int?
+
+    init(
+        id: UUID = UUID(),
+        text: String,
+        context: [TrayContextReference] = [],
+        urgency: String = "normal",
+        resumesSeq: Int? = nil
+    ) {
+        self.id = id
+        self.text = text
+        self.context = context
+        self.urgency = urgency
+        self.resumesSeq = resumesSeq
+    }
+}
+
+struct TrayContextReference: Codable, Equatable, Sendable {
+    let id: UUID
+    let kind: String
+    let title: String
+}
+
+struct TrayAcknowledgement: Equatable, Sendable {
+    let seq: Int
+    let duplicate: Bool
+    let bufferedUpdates: [TrayUpdate]
+
+    init(seq: Int, duplicate: Bool, bufferedUpdates: [TrayUpdate] = []) {
+        self.seq = seq
+        self.duplicate = duplicate
+        self.bufferedUpdates = bufferedUpdates
+    }
+}
+
+struct TrayUpdateContext: Codable, Equatable, Sendable {
+    let id: UUID
+    let kind: String
+}
+
+struct TrayUpdate: Equatable, Sendable {
+    let seq: Int
+    let forSeq: Int
+    let state: String
+    let kind: String
+    let text: String?
+    let urgency: String?
+    let context: [TrayUpdateContext]
+    let tool: String?
+    let ok: Bool?
+    let needs: String?
+    let outcome: String?
+    let reply: String?
+    let error: String?
+
+    init(
+        seq: Int,
+        forSeq: Int,
+        state: String,
+        kind: String,
+        text: String? = nil,
+        urgency: String? = nil,
+        context: [TrayUpdateContext] = [],
+        tool: String? = nil,
+        ok: Bool? = nil,
+        needs: String? = nil,
+        outcome: String? = nil,
+        reply: String? = nil,
+        error: String? = nil
+    ) {
+        self.seq = seq
+        self.forSeq = forSeq
+        self.state = state
+        self.kind = kind
+        self.text = text
+        self.urgency = urgency
+        self.context = context
+        self.tool = tool
+        self.ok = ok
+        self.needs = needs
+        self.outcome = outcome
+        self.reply = reply
+        self.error = error
+    }
+}
+
+enum TrayTransportEvent: Equatable, Sendable {
+    case connected(head: Int)
+    case disconnected
+    case update(TrayUpdate)
+}
+
+enum TrayConnectionState: Equatable {
+    case connecting
+    case connected
+    case disconnected
+
+    var label: String {
+        switch self {
+        case .connecting: "Connecting to agent"
+        case .connected: "Ready"
+        case .disconnected: "Agent offline"
+        }
+    }
 }

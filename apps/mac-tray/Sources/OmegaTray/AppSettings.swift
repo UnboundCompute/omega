@@ -83,6 +83,17 @@ final class AppSettings: ObservableObject {
     @Published private(set) var launchAtLogin = false
     @Published private(set) var launchAtLoginMessage: String?
 
+    var projectionCursor: Int? {
+        get { defaults.object(forKey: Keys.projectionCursor) as? Int }
+        set {
+            if let newValue {
+                defaults.set(newValue, forKey: Keys.projectionCursor)
+            } else {
+                defaults.removeObject(forKey: Keys.projectionCursor)
+            }
+        }
+    }
+
     private let defaults: UserDefaults
 
     var hotKey: HotKeyChoice {
@@ -97,6 +108,7 @@ final class AppSettings: ObservableObject {
         static let hotKeyID = "hotKeyID"
         static let captureAreaHotKeyID = "captureAreaHotKeyID"
         static let hideProactivePreviews = "hideProactivePreviews"
+        static let projectionCursor = "projectionCursor"
     }
 
     init(defaults: UserDefaults = .standard) {

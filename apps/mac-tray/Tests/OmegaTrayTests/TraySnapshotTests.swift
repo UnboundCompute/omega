@@ -13,7 +13,11 @@ final class TraySnapshotTests: XCTestCase {
         let directory = URL(fileURLWithPath: outputDirectory, isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
 
-        let model = TrayViewModel(transport: SnapshotTransport())
+        let model = TrayViewModel(
+            transport: ScriptedTransport(),
+            loadCursor: { nil },
+            persistCursor: { _ in }
+        )
         try write(
             TrayRootView(viewModel: model, presentation: .resting, close: {}, open: {})
                 .frame(width: 190, height: 38),
@@ -28,6 +32,7 @@ final class TraySnapshotTests: XCTestCase {
         )
 
         model.proactivePeek = nil
+        model.connectionState = .connected
         try write(
             TrayRootView(viewModel: model, presentation: .expanded, close: {}, open: {})
                 .frame(width: 460, height: 380),
@@ -44,14 +49,14 @@ final class TraySnapshotTests: XCTestCase {
             to: directory.appendingPathComponent("mac-staged-context.png")
         )
 
-        model.workState = .failed("Request not delivered. Your draft and context were restored.")
+        model.turnState = .failed("Request not delivered. Your draft and context were restored.")
         try write(
             TrayRootView(viewModel: model, presentation: .expanded, close: {}, open: {})
                 .frame(width: 460, height: 520),
             to: directory.appendingPathComponent("mac-recovery.png")
         )
 
-        model.workState = .blocked("Screen Recording permission is needed. Open System Settings to allow it.")
+        model.localWorkState = .blocked("Screen Recording permission is needed. Open System Settings to allow it.")
         model.capturePermission = .denied
         try write(
             TrayRootView(viewModel: model, presentation: .expanded, close: {}, open: {})
@@ -72,6 +77,18 @@ final class TraySnapshotTests: XCTestCase {
             TrayRootView(viewModel: model, presentation: .expanded, close: {}, open: {})
                 .frame(width: 460, height: 380),
             to: directory.appendingPathComponent("mac-privacy-veil.png")
+        )
+
+        model.manualPrivacyMode = false
+        model.stagedContext = []
+        model.turnState = .ready
+        model.localWorkState = nil
+        model.capturePermission = .granted
+        model.connectionState = .disconnected
+        try write(
+            TrayRootView(viewModel: model, presentation: .expanded, close: {}, open: {})
+                .frame(width: 460, height: 420),
+            to: directory.appendingPathComponent("mac-agent-offline.png")
         )
     }
 
@@ -94,11 +111,5 @@ final class TraySnapshotTests: XCTestCase {
         }
 
         try data.write(to: destination, options: .atomic)
-    }
-}
-
-private struct SnapshotTransport: TrayTransport {
-    func send(_ submission: TraySubmission) async throws -> String {
-        "Snapshot"
     }
 }

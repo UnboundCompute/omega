@@ -3,7 +3,8 @@ import Combine
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
-    private let viewModel = TrayViewModel(transport: LocalDemoTransport())
+    private let transport = OmegaChannelClient()
+    private lazy var viewModel = TrayViewModel(transport: transport)
     private var panelController: OmegaPanelController?
     private var statusItem: NSStatusItem?
     private var panelHotKey: GlobalHotKey?
@@ -24,6 +25,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         self.notificationController = notificationController
         panelController.timeSensitiveFallback = { [weak notificationController] message in
             notificationController?.deliverTimeSensitiveFallback(message)
+        }
+        viewModel.proactivePresentation = { [weak panelController] message, urgency in
+            panelController?.showProactivePeek(message, urgency: urgency)
         }
 
         switch ProcessInfo.processInfo.environment["OMEGA_TRAY_PREVIEW_STATE"] {
@@ -57,11 +61,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
 
         installStatusItem()
+        viewModel.start()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
         panelHotKey = nil
         captureAreaHotKey = nil
+        viewModel.stop()
         DistributedNotificationCenter.default.removeObserver(self)
     }
 

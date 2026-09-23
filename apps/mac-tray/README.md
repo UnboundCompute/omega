@@ -14,7 +14,7 @@ This package owns:
 - keyboard, focus, display, drag-and-drop, and accessibility behavior;
 - explicit screen/file/text/URL capture and staging;
 - rendering inbound messages and delegated-task state;
-- forwarding deliberate user submissions through a replaceable transport seam.
+- forwarding deliberate user submissions through omega’s localhost channel.
 
 It does not own:
 
@@ -24,14 +24,20 @@ It does not own:
 - tool execution and verification;
 - cross-channel thread semantics.
 
-Until the real channel contract is designed at omega M1, the app uses a visibly labelled local
-demo transport. Nothing in that demo interface is a stable agent protocol. The complete surface
-status and handoff conditions are recorded in
+The tray connects to omega on `127.0.0.1:7717` and renders the projected episode stream. It
+does not run a second agent or fall back to a demo responder when omega is offline. The complete
+surface status and current attachment limitation are recorded in
 [`docs/V1_IMPLEMENTATION.md`](docs/V1_IMPLEMENTATION.md).
 
 ## Run during development
 
 Requirements: macOS 14 or newer and the Swift toolchain included with Xcode.
+
+Start omega from the repository root, then run the tray in another terminal:
+
+```sh
+.venv/bin/python -m omega
+```
 
 ```sh
 cd apps/mac-tray
@@ -42,6 +48,10 @@ The app starts as a top-center resting capsule. Press `Control–Option–Space`
 persistent panel, or `Control–Option–C` to select and stage a screen area directly. Both
 shortcuts can be changed in Settings. The menu-bar fallback can capture, toggle the Privacy
 Veil, show a sample proactive peek, open Settings, or quit.
+
+Current M1 limitation: staged captures and files send stable identity, kind, and title, but not
+their contents. The tray labels this honestly; omega cannot inspect an attachment until the
+attachment-ingestion design is settled.
 
 For visual inspection during development, launch directly into a state with
 `OMEGA_TRAY_PREVIEW_STATE=expanded swift run OmegaTray` or use `peek`.

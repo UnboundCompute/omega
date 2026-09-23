@@ -198,9 +198,9 @@ The v1 UI is a native macOS application because the defining experience depends 
 focus, display, capture, drag-and-drop, and accessibility behavior that should feel native.
 The app lives entirely under `apps/mac-tray`.
 
-The initial implementation may include a local demo responder to verify the interaction
-loop. It must be named and documented as a demo transport, remain replaceable behind one
-small seam, and never become the inferred cross-channel or agent contract.
+The shipping implementation connects to omega’s localhost channel and renders its projected
+episode stream. The tray never falls back to a local responder, runs an agent loop, or becomes
+a second source of memory, judgement, task execution, or completion state.
 
 ## v1 acceptance bar
 

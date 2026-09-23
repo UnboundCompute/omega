@@ -1,6 +1,6 @@
 # Mac tray v1 — implementation status
 
-Status: native surface complete; agent transport intentionally waiting for omega M1.
+Status: native surface and M1 streaming transport complete; attachment ingestion unresolved.
 
 This file maps the confirmed contract in `V1_SPEC.md` to the implementation. It separates
 tray work from the agent-core work under `agent/` so the first transport cannot accidentally
@@ -22,6 +22,13 @@ become a second brain or an undeclared wire protocol.
 - Explicit submission only; capture and drop never imply send.
 - Quick Look for staged file-backed context.
 - Sent-context receipts, durable plain-language work state, and recoverable failed delivery.
+- Long-lived JSON-lines connection to omega on `127.0.0.1:7717`, with unsolicited greeting,
+  subscription replay, persisted cursor, bounded reconnect backoff, and a 1 MiB line limit.
+- Stream-driven understood, working, blocked, complete, failed, spoken, and silent outcomes;
+  no locally invented agent progress.
+- Stable submission ids and duplicate acknowledgements for at-most-once retry behavior.
+- Post-ack disconnect recovery that resumes from the projection before restoring a draft.
+- Forward-compatible decoding of unknown update states and kinds without losing the cursor.
 - Exact draft and context restoration after a failed send; retry does not create a duplicate
   visible instruction.
 - One active in-memory conversation that survives close/reopen during the app process.
@@ -36,14 +43,18 @@ become a second brain or an undeclared wire protocol.
 - A reproducible `.app` packaging script that uses a stable local signing identity when one is
   available, preserving macOS privacy grants across rebuilds, with an explicit ad-hoc fallback.
 
-## Deliberately waiting at the agent boundary
+## Deliberately waiting at the attachment boundary
 
-`LocalDemoTransport` remains visibly named and honest. It will be replaced at omega M1, when
-the core loop exists and DL-016's channel envelope is designed. The tray does not invent that
-format early, persist its own transcript as a second source of truth, or implement memory,
-initiative judgement, task execution, or verification.
+`LocalDemoTransport` is gone. `OmegaChannelClient` speaks the M1 channel and the tray remains a
+projection client: it does not persist a second transcript or implement memory, initiative
+judgement, task execution, or verification.
 
-The transport replacement must preserve these tray-side guarantees:
+Attachment ingestion is still unresolved. Context currently crosses the wire only as stable
+`id`, lowercase `kind`, and `title`; screenshot pixels, file bytes or paths, URL values, and
+selected text do not. The UI discloses this whenever context is staged. Screen capture remains
+useful for local staging and preview, but must not be described as visible to omega yet.
+
+The transport preserves these tray-side guarantees:
 
 1. A user submission is acknowledged once and routed to the single omega queue.
 2. Context items retain stable identity through delivery and failure recovery.
@@ -61,10 +72,11 @@ swift test
 ./scripts/package-app.sh
 ```
 
-The test suite covers empty submission, both shortcut preferences, capture-mode arguments, sent
-context receipts, failed-send restoration, and proactive-message consumption. Opt-in review
-renders cover resting, peek, empty, staged-context, delivery-recovery, drop-target, and privacy
-states.
+The test suite covers framing and wire codecs, interleaved request/update demultiplexing,
+unknown updates, spoken and silent turns, blocked-turn resume, cursor persistence, duplicate
+replay suppression, post-ack reconnect recovery, context identity, capture/turn state
+arbitration, both shortcut preferences, and proactive presentation. Opt-in review renders cover
+resting, peek, empty, staged-context disclosure, delivery recovery, drop target, and privacy.
 
 Manual acceptance on a signed app bundle:
 
@@ -77,5 +89,7 @@ Manual acceptance on a signed app bundle:
 - Switch applications while open; verify omega persists without retaining keyboard focus.
 - Enable launch at login, log out/in, and verify the packaged app returns.
 - Turn on Privacy Veil during screen sharing and verify no conversation content is visible.
-- Once M1 lands, replace the demo transport and run repeated end-to-end delivery and restart
-  tests against real logged turns.
+- Run repeated text-only delivery, disconnect, restart, silent, blocked/resume, and proactive
+  tests against the real omega listener.
+- Do not mark capture/file understanding complete until attachment contents have a designed and
+  tested ingestion path.

@@ -42,7 +42,9 @@ final class TrayViewModel: ObservableObject {
     @Published var draft = ""
     @Published var messages: [TrayMessage] = []
     @Published var stagedContext: [StagedContext] = []
-    @Published var workState: WorkState = .ready
+    @Published var turnState: WorkState = .ready
+    @Published var localWorkState: WorkState?
+    @Published var connectionState: TrayConnectionState = .connecting
     @Published var isDropTargeted = false
     @Published var isExpanded = false
     @Published var hasUnread = false
@@ -56,8 +58,19 @@ final class TrayViewModel: ObservableObject {
     private let transport: TrayTransport
     private let preflightScreenCaptureAccess: () -> Bool
     private let requestScreenCaptureAccess: () -> Bool
+    private let loadCursor: @MainActor () -> Int?
+    private let persistCursor: @MainActor (Int) -> Void
+    private let terminalTimeout: Duration
     private var failedSend: FailedSend?
+    private var activeTurn: ActiveTurn?
+    private var eventTask: Task<Void, Never>?
+    private var terminalTask: Task<Void, Never>?
+    private var lastProcessedSeq: Int?
+    private var pendingResumeSeq: Int?
+    private var urgencyByTurn: [Int: String] = [:]
+    private var didStart = false
     weak var capturePresentation: CapturePresentationControlling?
+    var proactivePresentation: ((String, ProactiveUrgency) -> Void)?
 
     private struct FailedSend {
         let messageID: UUID
@@ -66,15 +79,40 @@ final class TrayViewModel: ObservableObject {
         let context: [StagedContext]
     }
 
+    private struct ActiveTurn {
+        let seq: Int
+        let messageID: UUID
+        let submission: TraySubmission
+        let draft: String
+        let context: [StagedContext]
+        var awaitingResume = false
+    }
+
     init(
         transport: TrayTransport,
         preflightScreenCaptureAccess: @escaping () -> Bool = CGPreflightScreenCaptureAccess,
-        requestScreenCaptureAccess: @escaping () -> Bool = CGRequestScreenCaptureAccess
+        requestScreenCaptureAccess: @escaping () -> Bool = CGRequestScreenCaptureAccess,
+        loadCursor: @escaping @MainActor () -> Int? = { AppSettings.shared.projectionCursor },
+        persistCursor: @escaping @MainActor (Int) -> Void = { AppSettings.shared.projectionCursor = $0 },
+        terminalTimeout: Duration = .seconds(120)
     ) {
         self.transport = transport
         self.preflightScreenCaptureAccess = preflightScreenCaptureAccess
         self.requestScreenCaptureAccess = requestScreenCaptureAccess
+        self.loadCursor = loadCursor
+        self.persistCursor = persistCursor
+        self.terminalTimeout = terminalTimeout
+        lastProcessedSeq = loadCursor()
         capturePermission = preflightScreenCaptureAccess() ? .granted : .unknown
+    }
+
+    deinit {
+        eventTask?.cancel()
+        terminalTask?.cancel()
+    }
+
+    var workState: WorkState {
+        localWorkState ?? turnState
     }
 
     var canSend: Bool {
@@ -83,7 +121,16 @@ final class TrayViewModel: ObservableObject {
     }
 
     var canSubmit: Bool {
-        canSend && !workState.isBusy
+        canSend && !workState.isBusy && connectionState == .connected
+    }
+
+    var canRetryLastSend: Bool { failedSend != nil }
+
+    var hasStagedContextWithoutContentTransport: Bool { !stagedContext.isEmpty }
+
+    var statusLabel: String {
+        if workState != .ready { return workState.label }
+        return connectionState.label
     }
 
     var displayedProactivePeek: String {
@@ -97,6 +144,28 @@ final class TrayViewModel: ObservableObject {
         isScreenLocked || manualPrivacyMode
     }
 
+    func start() {
+        guard !didStart else { return }
+        didStart = true
+        connectionState = .connecting
+        eventTask = Task { [weak self, transport] in
+            for await event in transport.events {
+                guard !Task.isCancelled else { return }
+                self?.handleTransportEvent(event)
+            }
+        }
+        transport.start(since: lastProcessedSeq)
+    }
+
+    func stop() {
+        eventTask?.cancel()
+        eventTask = nil
+        terminalTask?.cancel()
+        terminalTask = nil
+        transport.stop()
+        didStart = false
+    }
+
     func send() {
         guard canSubmit else { return }
 
@@ -104,7 +173,10 @@ final class TrayViewModel: ObservableObject {
         let sentContext = stagedContext
         let submission = TraySubmission(
             text: text,
-            contextDescriptions: sentContext.map { $0.title }
+            context: sentContext.map {
+                TrayContextReference(id: $0.id, kind: $0.kind.wireValue, title: $0.title)
+            },
+            resumesSeq: pendingResumeSeq
         )
 
         let visibleInstruction = text.isEmpty ? "Use the attached context." : text
@@ -120,8 +192,9 @@ final class TrayViewModel: ObservableObject {
         )
         draft = ""
         stagedContext = []
-        workState = .sending
+        turnState = .sending
         failedSend = nil
+        pendingResumeSeq = nil
 
         deliver(
             submission,
@@ -132,11 +205,11 @@ final class TrayViewModel: ObservableObject {
     }
 
     func retryLastSend() {
-        guard let failedSend, !workState.isBusy else { return }
+        guard let failedSend, !workState.isBusy, connectionState == .connected else { return }
         stagedContext.removeAll { context in failedSend.context.contains { $0.id == context.id } }
         if draft == failedSend.draft { draft = "" }
         updateMessage(failedSend.messageID) { $0.delivery = .sending }
-        workState = .sending
+        turnState = .sending
         self.failedSend = nil
         deliver(
             failedSend.submission,
@@ -154,25 +227,198 @@ final class TrayViewModel: ObservableObject {
     ) {
         Task {
             do {
-                workState = .working("Working locally")
-                let response = try await transport.send(submission)
+                let acknowledgement = try await transport.send(submission)
                 updateMessage(messageID) { $0.delivery = .sent }
-                messages.append(.init(role: .omega, text: response))
-                workState = .complete("Demo response received")
-            } catch {
-                updateMessage(messageID) { $0.delivery = .failed }
-                if draft.isEmpty { draft = originalDraft }
-                let stagedIDs = Set(stagedContext.map(\.id))
-                stagedContext.append(contentsOf: originalContext.filter { !stagedIDs.contains($0.id) })
-                failedSend = .init(
+                activeTurn = ActiveTurn(
+                    seq: acknowledgement.seq,
                     messageID: messageID,
                     submission: submission,
                     draft: originalDraft,
                     context: originalContext
                 )
-                workState = .failed("Request not delivered. Your draft and context were restored.")
+                scheduleTerminalTimeout(for: acknowledgement.seq)
+                for update in acknowledgement.bufferedUpdates {
+                    handleTransportEvent(.update(update))
+                }
+            } catch {
+                restoreFailedSend(
+                    messageID: messageID,
+                    submission: submission,
+                    draft: originalDraft,
+                    context: originalContext,
+                    detail: "Request not delivered. Your draft and context were restored."
+                )
             }
         }
+    }
+
+    private func handleTransportEvent(_ event: TrayTransportEvent) {
+        switch event {
+        case .connected:
+            connectionState = .connected
+            if var activeTurn, activeTurn.awaitingResume {
+                activeTurn.awaitingResume = false
+                self.activeTurn = activeTurn
+                scheduleTerminalTimeout(for: activeTurn.seq)
+            }
+        case .disconnected:
+            connectionState = .disconnected
+            terminalTask?.cancel()
+            terminalTask = nil
+            if var activeTurn {
+                activeTurn.awaitingResume = true
+                self.activeTurn = activeTurn
+            }
+        case .update(let update):
+            guard lastProcessedSeq.map({ update.seq > $0 }) ?? true else { return }
+            handleUpdate(update)
+            lastProcessedSeq = update.seq
+            persistCursor(update.seq)
+            transport.setResumeCursor(update.seq)
+        }
+    }
+
+    private func handleUpdate(_ update: TrayUpdate) {
+        let belongsToActiveTurn = activeTurn?.seq == update.forSeq
+
+        switch update.state {
+        case "understood":
+            urgencyByTurn[update.forSeq] = update.urgency ?? "normal"
+            if belongsToActiveTurn {
+                turnState = .understood
+                if let messageID = activeTurn?.messageID {
+                    updateMessage(messageID) { $0.delivery = .sent }
+                }
+            } else if update.kind == "message.inbound" {
+                let visibleText = update.text?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                messages.append(
+                    .init(
+                        role: .user,
+                        text: visibleText.isEmpty ? "Context shared with omega" : visibleText,
+                        contextDescriptions: update.context.map { "\($0.kind.capitalized) context" },
+                        delivery: .sent
+                    )
+                )
+            }
+        case "working":
+            let detail: String
+            if let tool = update.tool, !tool.isEmpty {
+                detail = update.kind == "tool.returned" ? "Finished \(tool)" : "Using \(tool)"
+            } else {
+                detail = update.text.flatMap { $0.isEmpty ? nil : $0 } ?? "Working"
+            }
+            turnState = .working(detail)
+        case "blocked":
+            finishActiveTurn(for: update.forSeq)
+            pendingResumeSeq = update.forSeq
+            let needs = update.needs?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let detail = needs.isEmpty ? "omega needs more information." : needs
+            turnState = .blocked(detail)
+            if !belongsToActiveTurn {
+                if isExpanded {
+                    messages.append(.init(role: .status, text: detail))
+                } else {
+                    proactivePresentation?(detail, urgency(for: update.forSeq))
+                }
+            }
+            urgencyByTurn.removeValue(forKey: update.forSeq)
+        case "complete":
+            finishActiveTurn(for: update.forSeq)
+            switch update.outcome {
+            case "spoke":
+                if let reply = update.reply, !reply.isEmpty {
+                    if belongsToActiveTurn || isExpanded {
+                        messages.append(.init(role: .omega, text: reply))
+                    } else if let proactivePresentation {
+                        proactivePresentation(reply, urgency(for: update.forSeq))
+                    } else {
+                        proactivePeek = reply
+                        hasUnread = true
+                    }
+                }
+                turnState = .complete("Complete")
+            case "silent":
+                messages.append(.init(role: .status, text: "omega stayed quiet."))
+                turnState = .complete("Complete — no reply needed")
+            default:
+                turnState = .complete("Complete")
+            }
+            urgencyByTurn.removeValue(forKey: update.forSeq)
+        case "failed":
+            let detail = update.error.flatMap { $0.isEmpty ? nil : $0 } ?? "The turn failed."
+            if let activeTurn, activeTurn.seq == update.forSeq {
+                restoreFailedSend(
+                    messageID: activeTurn.messageID,
+                    submission: activeTurn.submission,
+                    draft: activeTurn.draft,
+                    context: activeTurn.context,
+                    detail: detail
+                )
+            } else {
+                turnState = .failed(detail)
+                messages.append(.init(role: .status, text: detail))
+            }
+        default:
+            break
+        }
+    }
+
+    private func urgency(for seq: Int) -> ProactiveUrgency {
+        urgencyByTurn[seq] == "timely" ? .timeSensitive : .normal
+    }
+
+    private func finishActiveTurn(for seq: Int) {
+        guard activeTurn?.seq == seq else { return }
+        terminalTask?.cancel()
+        terminalTask = nil
+        activeTurn = nil
+        failedSend = nil
+    }
+
+    private func scheduleTerminalTimeout(for seq: Int) {
+        terminalTask?.cancel()
+        terminalTask = Task { [weak self, terminalTimeout] in
+            try? await Task.sleep(for: terminalTimeout)
+            guard !Task.isCancelled else { return }
+            self?.terminalOutcomeWasNotRecovered(for: seq)
+        }
+    }
+
+    private func terminalOutcomeWasNotRecovered(for seq: Int) {
+        guard connectionState == .connected,
+              let activeTurn,
+              activeTurn.seq == seq
+        else { return }
+        restoreFailedSend(
+            messageID: activeTurn.messageID,
+            submission: activeTurn.submission,
+            draft: activeTurn.draft,
+            context: activeTurn.context,
+            detail: "omega did not record an outcome. Your draft and context were restored."
+        )
+    }
+
+    private func restoreFailedSend(
+        messageID: UUID,
+        submission: TraySubmission,
+        draft originalDraft: String,
+        context originalContext: [StagedContext],
+        detail: String
+    ) {
+        terminalTask?.cancel()
+        terminalTask = nil
+        activeTurn = nil
+        updateMessage(messageID) { $0.delivery = .failed }
+        if draft.isEmpty { draft = originalDraft }
+        let stagedIDs = Set(stagedContext.map(\.id))
+        stagedContext.append(contentsOf: originalContext.filter { !stagedIDs.contains($0.id) })
+        failedSend = .init(
+            messageID: messageID,
+            submission: submission,
+            draft: originalDraft,
+            context: originalContext
+        )
+        turnState = .failed(detail)
     }
 
     func removeContext(id: UUID) {
@@ -250,6 +496,7 @@ final class TrayViewModel: ObservableObject {
     }
 
     func captureScreen(_ mode: ScreenCaptureMode) {
+        localWorkState = nil
         guard ensureScreenCapturePermission() else { return }
 
         let start: @MainActor () -> Void = { [weak self] in
@@ -270,7 +517,7 @@ final class TrayViewModel: ObservableObject {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
         process.arguments = mode.arguments + [destination.path]
-        workState = .working(mode == .display ? "Capturing active display" : "Choose a \(mode == .area ? "region" : "window")")
+        localWorkState = .working(mode == .display ? "Capturing active display" : "Choose a \(mode == .area ? "region" : "window")")
 
         process.terminationHandler = { [weak self] process in
             Task { @MainActor in
@@ -279,7 +526,7 @@ final class TrayViewModel: ObservableObject {
                       FileManager.default.fileExists(atPath: destination.path),
                       let image = NSImage(contentsOf: destination)
                 else {
-                    self?.workState = .ready
+                    self?.localWorkState = nil
                     return
                 }
 
@@ -292,14 +539,14 @@ final class TrayViewModel: ObservableObject {
                         fileURL: destination
                     )
                 )
-                self?.workState = .ready
+                self?.localWorkState = nil
             }
         }
 
         do {
             try process.run()
         } catch {
-            workState = .failed("Screen capture could not start.")
+            localWorkState = .failed("Screen capture could not start.")
             capturePresentation?.restoreAfterCapture()
         }
     }
@@ -316,12 +563,12 @@ final class TrayViewModel: ObservableObject {
             let wasDenied = capturePermission == .denied
             capturePermission = .granted
             if wasDenied,
-               case .blocked("Screen Recording permission is needed. Open System Settings to allow it.") = workState {
-                workState = .ready
+               case .blocked("Screen Recording permission is needed. Open System Settings to allow it.") = localWorkState {
+                localWorkState = nil
             }
         } else if capturePermission == .granted {
             capturePermission = .denied
-            workState = .blocked("Screen Recording permission is needed. Open System Settings to allow it.")
+            localWorkState = .blocked("Screen Recording permission is needed. Open System Settings to allow it.")
         }
     }
 
@@ -340,7 +587,7 @@ final class TrayViewModel: ObservableObject {
         let granted = requestScreenCaptureAccess()
         capturePermission = granted ? .granted : .denied
         if !granted {
-            workState = .blocked("Screen Recording permission is needed. Open System Settings to allow it.")
+            localWorkState = .blocked("Screen Recording permission is needed. Open System Settings to allow it.")
         }
         return granted
     }

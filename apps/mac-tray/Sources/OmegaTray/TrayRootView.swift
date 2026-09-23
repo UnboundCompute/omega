@@ -227,7 +227,7 @@ private struct ExpandedTrayView: View {
                 Text("omega")
                     .font(.system(size: 13, weight: .semibold))
                     .foregroundStyle(TrayTheme.primaryText)
-                Text(viewModel.workState.label)
+                Text(viewModel.statusLabel)
                     .font(.system(size: 11))
                     .foregroundStyle(statusColor)
             }
@@ -285,6 +285,26 @@ private struct ExpandedTrayView: View {
 
     @ViewBuilder
     private var notices: some View {
+        if viewModel.connectionState == .disconnected {
+            RecoveryNotice(
+                icon: "bolt.horizontal.circle",
+                title: "The agent is offline",
+                detail: "Start omega’s local agent. The tray will reconnect automatically.",
+                actionTitle: nil,
+                action: nil
+            )
+        }
+
+        if viewModel.hasStagedContextWithoutContentTransport {
+            RecoveryNotice(
+                icon: "eye.slash",
+                title: "Attachment viewing isn’t connected yet",
+                detail: "omega will receive item names and types, but cannot read their contents yet. Add the important details in your message.",
+                actionTitle: nil,
+                action: nil
+            )
+        }
+
         if viewModel.capturePermission == .denied {
             RecoveryNotice(
                 icon: "rectangle.on.rectangle.slash",
@@ -292,6 +312,16 @@ private struct ExpandedTrayView: View {
                 detail: "Allow Screen & System Audio Recording in System Settings. If you just enabled it, quit and reopen omega once.",
                 actionTitle: "Open Settings",
                 action: viewModel.openScreenCaptureSettings
+            )
+        }
+
+        if case .failed(let detail) = viewModel.localWorkState {
+            RecoveryNotice(
+                icon: "viewfinder.circle",
+                title: "Capture failed",
+                detail: detail,
+                actionTitle: nil,
+                action: nil
             )
         }
 
@@ -305,14 +335,24 @@ private struct ExpandedTrayView: View {
             )
         }
 
-        if case .failed(let detail) = viewModel.workState {
-            RecoveryNotice(
-                icon: "arrow.clockwise",
-                title: "Not delivered",
-                detail: detail,
-                actionTitle: "Retry",
-                action: viewModel.retryLastSend
-            )
+        if case .failed(let detail) = viewModel.turnState {
+            if viewModel.canRetryLastSend {
+                RecoveryNotice(
+                    icon: "arrow.clockwise",
+                    title: "Not delivered",
+                    detail: detail,
+                    actionTitle: "Retry",
+                    action: viewModel.retryLastSend
+                )
+            } else {
+                RecoveryNotice(
+                    icon: "exclamationmark.circle",
+                    title: "Agent task failed",
+                    detail: detail,
+                    actionTitle: nil,
+                    action: nil
+                )
+            }
         }
     }
 
@@ -321,7 +361,7 @@ private struct ExpandedTrayView: View {
             Text("What are we doing?")
                 .font(.system(size: 19, weight: .semibold))
                 .foregroundStyle(TrayTheme.primaryText)
-            Text("Capture what you see, drop in context, or delegate directly. Nothing is sent until you submit it.")
+            Text("Ask or delegate directly, or stage context to keep with your message. Nothing is sent until you submit it.")
                 .font(.system(size: 13))
                 .foregroundStyle(TrayTheme.secondaryText)
                 .fixedSize(horizontal: false, vertical: true)
@@ -421,8 +461,9 @@ private struct ExpandedTrayView: View {
         case .failed: .red
         case .blocked: .orange
         case .complete: .green
-        case .working, .sending: TrayTheme.signal
-        case .ready: TrayTheme.secondaryText
+        case .working, .sending, .understood: TrayTheme.signal
+        case .ready:
+            viewModel.connectionState == .disconnected ? .orange : TrayTheme.secondaryText
         }
     }
 
@@ -532,8 +573,8 @@ private struct RecoveryNotice: View {
     let icon: String
     let title: String
     let detail: String
-    let actionTitle: String
-    let action: () -> Void
+    let actionTitle: String?
+    let action: (() -> Void)?
 
     var body: some View {
         HStack(alignment: .top, spacing: 10) {
@@ -548,9 +589,11 @@ private struct RecoveryNotice: View {
                     .font(.system(size: 11))
                     .foregroundStyle(TrayTheme.secondaryText)
                     .fixedSize(horizontal: false, vertical: true)
+            if let actionTitle, let action {
                 Button(actionTitle, action: action)
                     .buttonStyle(.link)
                     .font(.system(size: 11, weight: .medium))
+            }
             }
         }
         .padding(12)
