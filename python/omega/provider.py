@@ -32,6 +32,28 @@ no tools produces exactly the request it produced before — the ``tools`` key i
 not even present — so the widening cannot regress the one property M1 exists to
 measure.
 
+**The transport is the Responses API, for every role.** Chat completions cannot
+carry function tools for a reasoning model at all — it answers ``Function tools
+with reasoning_effort are not supported ... use /v1/responses`` — and ``act`` is
+both the role that calls tools *and* the role DL-024 reserves for the capable
+model. Those two facts together mean chat completions cannot serve omega's core
+loop, so the choice was never "which endpoint per model": it was to demote
+``act`` to a weaker model, or to speak the endpoint that does the job. Demoting
+the loop to keep the transport is the tail wagging the dog.
+
+One transport rather than two, chosen per model, on purpose. A seam that picked
+an endpoint by sniffing the model name would be wrong the day a name changed,
+and one that tried chat first and fell back on a 400 would be the silent retry
+this file refuses everywhere else. The Responses API serves the non-reasoning
+models too, so the second path buys nothing and costs a branch that only the
+live API can test.
+
+**Messages stay in the shape callers already write.** :func:`system`,
+:func:`assistant_tool_calls` and :func:`tool_result` are unchanged, and the
+translation into Responses' item vocabulary happens here — which is the seam
+doing exactly its job: the wire format moved and nothing above this line was
+edited.
+
 *Why not parse tool calls out of the text.* ``judge`` already parses model text
 and survives only because its whole grammar is one word from a closed set of
 three. Tool arguments are structured and adversarial in the way a verdict is
@@ -342,40 +364,143 @@ def temperature_for(role: str) -> Optional[float]:
         ) from None
 
 
-def _tool_hint(
+def reasoning_effort_for(role: str) -> Optional[str]:
+    """``reasoning.effort`` for ``role``, or ``None`` to send no ``reasoning``.
+
+    ``OMEGA_REASONING_EFFORT_JUDGE`` / ``_ACT``. Unset means omit the parameter
+    entirely and let the model use its own default, because the alternative —
+    picking one here — would silently apply to non-reasoning models that reject
+    the field, and an invisible default is a decision nobody made.
+
+    This is the reasoning models' replacement for :func:`temperature_for`: they
+    reject ``temperature`` outright rather than ignoring it, and effort is the
+    knob that actually moves cost. It is the lever DL-024's cheap/capable split
+    reaches for once *both* roles are reasoning models and the model name is no
+    longer the only thing separating them.
+    """
+    _check_role(role)
+    raw = os.environ.get(f"OMEGA_REASONING_EFFORT_{role.upper()}", "").strip()
+    return raw or None
+
+
+def _as_input(messages: Sequence[Message]) -> list[dict[str, Any]]:
+    """Canonical messages as Responses input items.
+
+    Three shapes go in and three come out. A plain ``{role, content}`` passes
+    through untouched — Responses takes it verbatim. The other two are the ones
+    chat completions expresses as *fields on a message* and Responses expresses
+    as *items in a list*:
+
+    * an assistant turn carrying ``tool_calls`` becomes its text (when it said
+      anything) followed by one ``function_call`` item per call;
+    * a ``tool`` message becomes a ``function_call_output``.
+
+    ``call_id`` is the join in both directions and is why :class:`ToolCall`
+    keeps the id the wire gave it. Responses also hands back an item ``id``
+    that is *not* the same string; pairing results by that one would look right
+    and answer every call with the wrong output.
+    """
+    items: list[dict[str, Any]] = []
+    for message in messages:
+        if message.get("role") == "tool":
+            items.append(
+                {
+                    "type": "function_call_output",
+                    "call_id": message["tool_call_id"],
+                    "output": message.get("content") or "",
+                }
+            )
+            continue
+
+        calls = message.get("tool_calls")
+        if not calls:
+            items.append({"role": message["role"], "content": message.get("content") or ""})
+            continue
+
+        # A model may reason aloud *and* call a tool in one turn; dropping the
+        # text would delete the only record of why it chose those calls.
+        if message.get("content"):
+            items.append({"role": message["role"], "content": message["content"]})
+        for call in calls:
+            function = call.get("function", {})
+            items.append(
+                {
+                    "type": "function_call",
+                    "call_id": call["id"],
+                    "name": function.get("name", ""),
+                    "arguments": function.get("arguments", "{}"),
+                }
+            )
+    return items
+
+
+def _as_tool_schemas(tools: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Tool declarations flattened for Responses.
+
+    Chat completions nests the declaration under a ``function`` key; Responses
+    puts ``name``, ``description`` and ``parameters`` at the top level beside
+    ``type``. Sending the nested shape is not an error the API explains well —
+    it reports a missing ``name`` on a payload that plainly has one — so the
+    flattening happens here rather than being spelled into every schema in
+    `omega.tools`, which has no business knowing which endpoint is in use.
+    """
+    flattened: list[dict[str, Any]] = []
+    for tool in tools:
+        function = tool.get("function")
+        if function is None:
+            flattened.append(dict(tool))
+            continue
+        flattened.append({"type": tool.get("type", "function"), **function})
+    return flattened
+
+
+def _config_hint(
     role: str,
     model: str,
     tools: Optional[Sequence[dict[str, Any]]],
     exc: BaseException,
 ) -> str:
-    """A sentence naming the fix when a model cannot do function tools.
+    """A sentence naming the variable to edit, when a 400 is really a config bug.
 
-    This exists because of a real, silent trap. ``act`` is the **only** role
-    offered tools, and a bare ``OMEGA_MODEL`` applies to both roles — so
-    pointing ``OMEGA_MODEL`` at a model that rejects function tools on
-    ``/v1/chat/completions`` disables every tool omega has, and the only symptom
-    is a raw 400 arriving one layer below anything that knows what a tool is.
+    Model choice is config, so a model rejecting a parameter is a config error —
+    but it arrives as a raw 400 one layer below anything that knows a role
+    exists, naming neither the role nor the variable that chose the model.
     Measured on a real store: every act pass failed and the turn was recorded
-    ``failed`` with the provider's own wording, which names neither the role nor
-    the variable that chose the model.
+    ``failed`` with the provider's own wording, which is unactionable.
+
+    Two traps, both from the same root: **a bare ``OMEGA_MODEL`` applies to
+    every role**, so one edit silently re-points a role with different needs.
 
     Kept to a hint on an existing error rather than a preflight check. omega
     cannot know what a model supports without asking, and asking on startup
-    would spend a call on every boot to answer a question that only matters when
-    something has already gone wrong.
+    would spend a call on every boot to answer a question that only matters
+    when something has already gone wrong.
     """
-    if not tools:
-        return ""
     text = str(exc).lower()
-    if "tool" not in text and "function" not in text:
-        return ""
-    return (
-        f"\n\n{model} was offered {len(tools)} tools and rejected them. The "
-        f"{role} role is the one that calls tools, so it needs a model that "
-        f"supports function calling on chat completions. Set "
-        f"OMEGA_MODEL_{role.upper()} to one — a bare OMEGA_MODEL applies to "
-        f"every role, including this one."
-    )
+
+    if "temperature" in text:
+        # Reasoning models reject `temperature` outright instead of ignoring
+        # it, and the judge is *pinned* to 0 for determinism — so the pin and
+        # the model are in direct conflict and only a human can say which one
+        # gives. `reasoning.effort` is that model's equivalent knob.
+        return (
+            f"\n\n{model} rejects the temperature parameter — reasoning models "
+            f"do. The {role} role sends {temperature_for(role)!r}. Either set "
+            f"OMEGA_TEMPERATURE_{role.upper()}=none to stop sending it (and "
+            f"OMEGA_REASONING_EFFORT_{role.upper()} instead), or point "
+            f"OMEGA_MODEL_{role.upper()} at a non-reasoning model. A bare "
+            f"OMEGA_MODEL applies to every role, including this one."
+        )
+
+    if tools and ("tool" in text or "function" in text):
+        return (
+            f"\n\n{model} was offered {len(tools)} tools and rejected them. The "
+            f"{role} role is the one that calls tools, so it needs a model that "
+            f"supports function calling. Set OMEGA_MODEL_{role.upper()} to one "
+            f"— a bare OMEGA_MODEL applies to every role, including this one."
+        )
+
+    return ""
 
 
 def provider_from_env(*, env_path: Optional[Path] = None) -> "OpenAIProvider":
@@ -462,61 +587,99 @@ class OpenAIProvider:
             raise ValueError("messages must not be empty")
 
         model = self.model_for(role)
-        request: dict[str, Any] = {"model": model, "messages": list(messages)}
+        request: dict[str, Any] = {"model": model, "input": _as_input(messages)}
         temperature = temperature_for(role)
         if temperature is not None:
             request["temperature"] = temperature
+        effort = reasoning_effort_for(role)
+        if effort is not None:
+            request["reasoning"] = {"effort": effort}
         if tools:
-            # Added only when there are tools to offer. A caller that passes
-            # none sends the request it sent before the seam was widened, key
-            # for key — which is what makes DL-028's "bit-for-bit unchanged"
-            # a fact about the wire rather than an intention.
-            request["tools"] = list(tools)
+            # Added only when there are tools to offer, so a caller that passes
+            # none sends no `tools` key at all — the property DL-028 rests on,
+            # kept true across the change of transport.
+            request["tools"] = _as_tool_schemas(tools)
         try:
-            raw = self._client.chat.completions.create(**request)
+            raw = self._client.responses.create(**request)
         except Exception as exc:  # noqa: BLE001 - every remote failure is one class
             raise ProviderError(
-                f"{role} call to {model} failed: {exc}{_tool_hint(role, model, tools, exc)}"
+                f"{role} call to {model} failed: {exc}"
+                f"{_config_hint(role, model, tools, exc)}"
             ) from exc
 
-        try:
-            choice = raw.choices[0]
-            text = choice.message.content
-            raw_calls = getattr(choice.message, "tool_calls", None) or ()
-        except (AttributeError, IndexError, TypeError) as exc:
+        text, tool_calls = _read_output(role, model, raw)
+
+        if text is None and not tool_calls:
+            # Never let this become an empty string: `judge` reading "" would be
+            # indistinguishable from a model choosing to stay silent, and that
+            # distinction is the whole point of measuring silence.
+            #
+            # A model that answered with tool calls and no words *has* said
+            # something — "run these" — so the guard is narrowed to "nothing at
+            # all came back" rather than "no text". Nothing reaching `judge` can
+            # take that escape, because `judge` offers no tools and so can never
+            # come back with any.
             raise ProviderError(
-                f"{role} call to {model} returned an unreadable response"
-            ) from exc
-
-        tool_calls = tuple(_read_tool_call(role, model, c) for c in raw_calls)
-
-        if text is None:
-            if not tool_calls:
-                # Never let this become an empty string: `judge` reading "" would
-                # be indistinguishable from a model choosing to stay silent, and
-                # that distinction is the whole point of measuring silence.
-                raise ProviderError(
-                    f"{role} call to {model} returned no content "
-                    f"(finish_reason={getattr(choice, 'finish_reason', None)!r})"
-                )
-            # ...but the API returns `content: null` *exactly when* the model
-            # answered with tool calls instead of words, and that is not a model
-            # that said nothing — it is a model that said "run these". The
-            # reasoning above is untouched and the guard is narrowed, not
-            # removed: with no tool calls either, it still raises. Nothing that
-            # reaches `judge` can take this branch, because `judge` offers no
-            # tools and so can never come back with any.
-            text = ""
+                f"{role} call to {model} returned no content "
+                f"(status={getattr(raw, 'status', None)!r})"
+            )
 
         usage = getattr(raw, "usage", None)
         return Response(
-            text=text,
+            # Only reachable as `None` when tool calls came back instead of
+            # words, which is the model saying "run these", not saying nothing.
+            text=text or "",
             model=getattr(raw, "model", model),
-            finish_reason=getattr(choice, "finish_reason", None),
-            prompt_tokens=getattr(usage, "prompt_tokens", None),
-            completion_tokens=getattr(usage, "completion_tokens", None),
+            finish_reason=getattr(raw, "status", None),
+            # Responses counts the same two things under different names.
+            prompt_tokens=getattr(usage, "input_tokens", None),
+            completion_tokens=getattr(usage, "output_tokens", None),
             tool_calls=tool_calls,
         )
+
+
+def _read_output(
+    role: str, model: str, raw: Any
+) -> tuple[Optional[str], tuple[ToolCall, ...]]:
+    """The response's ``output`` list as text plus tool calls.
+
+    Responses returns a *list of items* where chat completions returned one
+    message with optional fields, so reading it is a walk rather than two
+    attribute lookups. Three item types matter and the rest are skipped by
+    design — a reasoning model emits ``reasoning`` items omega has no use for,
+    and a transport that raised on an item type it did not recognise would
+    break on the next one the API adds.
+
+    Text is joined across message items rather than taking the first, because
+    nothing promises there is only one, and dropping the others would lose part
+    of an answer silently — the failure mode that is hardest to notice.
+    """
+    items = getattr(raw, "output", None)
+    if items is None:
+        raise ProviderError(
+            f"{role} call to {model} returned an unreadable response"
+        )
+
+    parts: list[str] = []
+    calls: list[ToolCall] = []
+    spoke = False
+    for item in items:
+        kind = getattr(item, "type", None)
+        if kind == "function_call":
+            calls.append(_read_tool_call(role, model, item))
+        elif kind == "message":
+            # Seen at all, even carrying no text. That is the distinction the
+            # caller's guard turns on: a model that produced a message and put
+            # nothing in it *answered*, emptily; a model that produced no
+            # message item at all did not answer. Collapsing those two makes an
+            # outage read as a deliberate silence, which DL-024 exists to count
+            # separately.
+            spoke = True
+            for block in getattr(item, "content", None) or ():
+                chunk = getattr(block, "text", None)
+                if chunk:
+                    parts.append(chunk)
+    return ("".join(parts) if spoke else None), tuple(calls)
 
 
 def _read_tool_call(role: str, model: str, raw: Any) -> ToolCall:
@@ -527,12 +690,17 @@ def _read_tool_call(role: str, model: str, raw: Any) -> ToolCall:
     an object — are each a failed call rather than a guess. Guessing here would
     put a half-decoded argument in front of the approval classifier, which is
     the one place in omega that must never be handed something it cannot read.
+
+    The id taken is ``call_id``, **not** ``id``. Responses carries both and they
+    are different strings: ``id`` identifies the output item, ``call_id`` is
+    what a ``function_call_output`` must quote to answer it. Taking the wrong
+    one produces a request the API rejects as answering no call — or, worse, a
+    pass where results and calls are paired by something that is not their join.
     """
     try:
-        call_id = raw.id
-        function = raw.function
-        name = function.name
-        arguments = function.arguments
+        call_id = raw.call_id
+        name = raw.name
+        arguments = raw.arguments
     except AttributeError as exc:
         raise ProviderError(
             f"{role} call to {model} returned an unreadable tool call"

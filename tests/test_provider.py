@@ -10,6 +10,7 @@ for would go effectively untested.
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 from types import SimpleNamespace
@@ -31,17 +32,27 @@ def _isolate_environment(monkeypatch, tmp_path):
     pv.set_provider(previous)
 
 
-def _fake_openai_response(content, *, model="m", finish="stop", usage=(3, 5)):
+def _message_item(text):
+    """One ``message`` output item. ``text=None`` means the item exists and
+    carries no text — which is *not* the same as no item at all, and the
+    difference is what separates an empty answer from an outage."""
+    blocks = [] if text is None else [SimpleNamespace(type="output_text", text=text)]
+    return SimpleNamespace(type="message", content=blocks)
+
+
+def _fake_openai_response(content, *, model="m", finish="completed", usage=(3, 5)):
     """The shape the real client returns, reproduced from the spec of the API
-    rather than imported — so this stays a test of *our* mapping."""
+    rather than imported — so this stays a test of *our* mapping.
+
+    ``content=None`` reproduces a response whose ``output`` holds **no message
+    item**: the shape a filtered or truncated call comes back as, and the one
+    the seam must refuse rather than pass on as an empty string.
+    """
     return SimpleNamespace(
         model=model,
-        choices=[
-            SimpleNamespace(
-                message=SimpleNamespace(content=content), finish_reason=finish
-            )
-        ],
-        usage=SimpleNamespace(prompt_tokens=usage[0], completion_tokens=usage[1]),
+        status=finish,
+        output=[] if content is None else [_message_item(content)],
+        usage=SimpleNamespace(input_tokens=usage[0], output_tokens=usage[1]),
     )
 
 
@@ -49,7 +60,7 @@ class _StubClient:
     def __init__(self, response=None, error=None):
         self._response, self._error = response, error
         self.seen = []
-        self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
+        self.responses = SimpleNamespace(create=self._create)
 
     def _create(self, **kwargs):
         self.seen.append(kwargs)
@@ -86,7 +97,7 @@ def test_the_real_provider_maps_a_response():
 
     assert response.text == "hello"
     assert response.model == "gpt-4o-2024", "reports what was used, not what was asked"
-    assert response.finish_reason == "stop"
+    assert response.finish_reason == "completed"
     assert response.total_tokens == 8
     assert client.seen[0]["model"] == "gpt-4o"
 
@@ -366,24 +377,31 @@ def test_recorded_messages_are_not_aliased_to_the_caller_s_list():
 
 def _tool_call(name="read_file", args='{"path": "/tmp/x"}', call_id="call_1"):
     """The wire shape of one tool call, reproduced from the API's spec rather
-    than imported — so this stays a test of *our* mapping."""
+    than imported — so this stays a test of *our* mapping.
+
+    ``id`` and ``call_id`` differ on purpose, because they differ on the wire.
+    Only ``call_id`` may be quoted back to answer the call, so a mapping that
+    grabbed the nearer-looking ``id`` would pass a test where both were the
+    same string and fail against the real API.
+    """
     return SimpleNamespace(
-        id=call_id,
-        type="function",
-        function=SimpleNamespace(name=name, arguments=args),
+        id=f"fc_{call_id}",
+        call_id=call_id,
+        type="function_call",
+        name=name,
+        arguments=args,
     )
 
 
-def _with_tool_calls(calls, content=None, model="m", finish="tool_calls"):
+def _with_tool_calls(calls, content=None, model="m", finish="completed"):
+    output = list(calls)
+    if content is not None:
+        output.insert(0, _message_item(content))
     return SimpleNamespace(
         model=model,
-        choices=[
-            SimpleNamespace(
-                message=SimpleNamespace(content=content, tool_calls=calls),
-                finish_reason=finish,
-            )
-        ],
-        usage=SimpleNamespace(prompt_tokens=3, completion_tokens=5),
+        status=finish,
+        output=output,
+        usage=SimpleNamespace(input_tokens=3, output_tokens=5),
     )
 
 
@@ -399,7 +417,7 @@ def test_a_caller_offering_no_tools_sends_no_tools_key():
     """
     client = _StubClient(_fake_openai_response("SILENT"))
     pv.OpenAIProvider(client=client).complete(pv.JUDGE, [pv.user("x")])
-    assert set(client.seen[0]) == {"model", "messages", "temperature"}
+    assert set(client.seen[0]) == {"model", "input", "temperature"}
     assert "tools" not in client.seen[0]
 
 
@@ -465,10 +483,154 @@ def test_no_hint_when_the_failure_had_nothing_to_do_with_tools(monkeypatch):
 
 
 def test_offered_tools_reach_the_request_untouched():
-    schema = {"type": "function", "function": {"name": "read_file"}}
+    schema = {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "read a file",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    }
     client = _StubClient(_fake_openai_response("ok"))
     pv.OpenAIProvider(client=client).complete(pv.ACT, [pv.user("x")], [schema])
-    assert client.seen[0]["tools"] == [schema]
+
+    # Flattened, not nested: Responses wants name/description/parameters beside
+    # `type`. The nested form is not rejected legibly — the API reports a
+    # missing `name` on a payload that visibly has one — so this is pinned
+    # here rather than left to be rediscovered at a live call.
+    assert client.seen[0]["tools"] == [
+        {
+            "type": "function",
+            "name": "read_file",
+            "description": "read a file",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        }
+    ]
+    assert "function" not in client.seen[0]["tools"][0]
+
+
+def test_a_tool_round_trip_becomes_responses_items_joined_by_call_id():
+    """The translation the seam now owns, over a full act pass: ask, result,
+    ask again. Chat completions carried the call as a *field on a message* and
+    the result as a ``tool`` message; Responses carries both as items in the
+    input list. Callers were not changed to say this — which is the seam
+    working — so this is the only place it is checked.
+    """
+    client = _StubClient(_fake_openai_response("done"))
+    pv.OpenAIProvider(client=client).complete(
+        pv.ACT,
+        [
+            pv.system("be useful"),
+            pv.user("read it"),
+            pv.assistant_tool_calls(
+                [pv.ToolCall(id="call_a", name="read_file", arguments={"path": "/a"})],
+                "I will look.",
+            ),
+            pv.tool_result("call_a", "contents of a"),
+        ],
+    )
+    sent = client.seen[0]["input"]
+
+    assert [item.get("type") or item["role"] for item in sent] == [
+        "system",
+        "user",
+        # The text it reasoned aloud survives as its own item; dropping it
+        # would delete the only record of why it asked for that call.
+        "assistant",
+        "function_call",
+        "function_call_output",
+    ]
+    assert sent[3]["name"] == "read_file"
+    assert json.loads(sent[3]["arguments"]) == {"path": "/a"}
+    assert sent[4]["output"] == "contents of a"
+    assert sent[3]["call_id"] == sent[4]["call_id"] == "call_a", "the join"
+    assert "tool_calls" not in sent[2], "a Responses item never carries that field"
+
+
+def test_a_silent_tool_request_sends_no_empty_assistant_item():
+    """The common case: a model that asks for a tool and says nothing. An empty
+    assistant message is not free — it is a turn in the history asserting the
+    model said something — so it is omitted rather than sent blank."""
+    client = _StubClient(_fake_openai_response("done"))
+    pv.OpenAIProvider(client=client).complete(
+        pv.ACT,
+        [
+            pv.user("read it"),
+            pv.assistant_tool_calls(
+                [pv.ToolCall(id="c1", name="read_file", arguments={"path": "/a"})]
+            ),
+        ],
+    )
+    sent = client.seen[0]["input"]
+    assert [item.get("type") or item["role"] for item in sent] == [
+        "user",
+        "function_call",
+    ]
+
+
+def test_the_id_quoted_back_is_call_id_and_not_the_item_id():
+    """Responses carries both and they are different strings. ``id`` names the
+    output item; ``call_id`` is what a ``function_call_output`` must quote. A
+    mapping that took ``id`` would pair every result with a call the API does
+    not recognise — and would pass any test where the two were equal."""
+    raw = _tool_call("read_file", '{"path": "/a"}', "call_real")
+    assert raw.id != raw.call_id, "the fixture must not hide the difference"
+
+    client = _StubClient(_with_tool_calls([raw]))
+    response = pv.OpenAIProvider(client=client).complete(pv.ACT, [pv.user("x")])
+    assert response.tool_calls[0].id == "call_real"
+
+
+def test_output_items_the_seam_does_not_know_are_skipped_not_fatal():
+    """A reasoning model emits `reasoning` items omega has no use for, and the
+    API adds item types over time. Raising on an unrecognised one would make
+    every future addition an outage."""
+    client = _StubClient(
+        SimpleNamespace(
+            model="m",
+            status="completed",
+            output=[
+                SimpleNamespace(type="reasoning", summary=[]),
+                _message_item("the answer"),
+            ],
+            usage=SimpleNamespace(input_tokens=1, output_tokens=2),
+        )
+    )
+    assert pv.OpenAIProvider(client=client).complete(
+        pv.ACT, [pv.user("x")]
+    ).text == "the answer"
+
+
+def test_reasoning_effort_is_sent_only_when_asked_for(monkeypatch):
+    """Reasoning models reject `temperature`; effort is the knob that replaces
+    it. Unset means send nothing — picking a default here would apply it to
+    non-reasoning models that reject the field."""
+    client = _StubClient(_fake_openai_response("ok"))
+    pv.OpenAIProvider(client=client).complete(pv.ACT, [pv.user("x")])
+    assert "reasoning" not in client.seen[0]
+
+    monkeypatch.setenv("OMEGA_REASONING_EFFORT_ACT", "minimal")
+    client = _StubClient(_fake_openai_response("ok"))
+    pv.OpenAIProvider(client=client).complete(pv.ACT, [pv.user("x")])
+    assert client.seen[0]["reasoning"] == {"effort": "minimal"}
+
+
+def test_a_model_rejecting_temperature_names_both_ways_out(monkeypatch):
+    """The trap that replaced the tool one: the judge is *pinned* to 0 for
+    determinism and a reasoning model refuses the parameter outright, so the
+    pin and the model are in direct conflict. Only a human can say which gives,
+    so the error names both levers rather than choosing."""
+    monkeypatch.setenv("OMEGA_MODEL_JUDGE", "a-reasoning-model")
+    client = _StubClient(
+        error=RuntimeError("400 Unsupported parameter: 'temperature' is not supported")
+    )
+    with pytest.raises(pv.ProviderError) as exc:
+        pv.OpenAIProvider(client=client).complete(pv.JUDGE, [pv.user("x")])
+
+    message = str(exc.value)
+    assert "OMEGA_TEMPERATURE_JUDGE=none" in message
+    assert "OMEGA_REASONING_EFFORT_JUDGE" in message
+    assert "a bare OMEGA_MODEL applies to every role" in message.replace("A bare", "a bare")
 
 
 def test_tool_calls_come_back_decoded_with_their_ids():
