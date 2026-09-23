@@ -309,16 +309,35 @@ def test_an_open_question_reaches_the_prompt(store):
     assert "may I overwrite notes.md?" in watched.last()
 
 
-def test_nothing_open_renders_no_heading_at_all(store):
-    """Not an empty section. A heading that is usually empty teaches the model
-    to skip the section by the time it matters."""
+def test_nothing_open_leaves_the_prompt_byte_for_byte_as_it_was(store):
+    """Not an empty section — and not a stray blank line either.
+
+    Two claims in one case. The first is the design one: a heading that is
+    usually empty teaches the model to skip the section before the day it
+    matters, so nothing is rendered at all.
+
+    The second is why the eval baselines taken before this change are still
+    comparable with ones taken after it. With nothing open the section
+    contributes the empty string, so the transcript runs straight into the new
+    event exactly as it did before — the prompt is unchanged, not merely
+    similar. Asserting the junction rather than the absence of a heading is the
+    difference between those two claims, and only the stronger one licenses
+    comparing the numbers.
+    """
     q = EventQueue(store)
     q.append(_typed("just a message"))
 
     watched = _Watched()
     _drained(q, watched)
+    prompt = watched.last()
 
-    assert OPEN_HEADING not in watched.last()
+    assert OPEN_HEADING not in prompt
+    assert "just a message\n\nNew event:" not in prompt, (
+        "sanity: the new event is not also the last line of the transcript"
+    )
+    assert "(nothing yet)\n\nNew event:" in prompt, (
+        "an empty section must contribute nothing, not a blank line"
+    )
 
 
 def test_an_answer_is_discharged_before_the_turn_carrying_it_runs(store):
