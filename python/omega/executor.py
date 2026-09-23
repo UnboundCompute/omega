@@ -417,6 +417,10 @@ class Executor:
                 channel=str(pending.payload.get("channel", "")),
                 at=str(pending.payload.get("at", "")),
             ),
+            # The whole set, not the matched subset: this one answers "what
+            # does a newly taught claim replace" (DL-043 #6), and a claim is
+            # contradicted by one it was never going to fire alongside.
+            known=self._learned.claims(),
         )
         self._queue.finish(pending.seq)
         return result

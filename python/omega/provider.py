@@ -75,6 +75,7 @@ from typing import Any, Callable, Optional, Protocol, Sequence
 __all__ = [
     "JUDGE",
     "ACT",
+    "LEARN",
     "ROLES",
     "Message",
     "Part",
@@ -103,7 +104,13 @@ JUDGE = "judge"
 #: Do the work. Runs rarely; wants the capable model.
 ACT = "act"
 
-ROLES = frozenset({JUDGE, ACT})
+#: Turn a teaching note into claims (DL-043). Its own role rather than a second
+#: consumer of ``judge``: the two want the same *kind* of model, but a model
+#: change made for extraction must not silently re-calibrate the router that
+#: runs on every event.
+LEARN = "learn"
+
+ROLES = frozenset({JUDGE, ACT, LEARN})
 
 #: Default models if `.env` does not name one. Deliberately explicit rather than
 #: "whatever the client library defaults to" — an invisible default is a
@@ -111,6 +118,7 @@ ROLES = frozenset({JUDGE, ACT})
 _DEFAULT_MODELS = {
     JUDGE: "gpt-4o-mini",
     ACT: "gpt-4o",
+    LEARN: "gpt-4o-mini",
 }
 
 #: Default sampling temperature per role, and ``None`` means *do not send the
@@ -126,9 +134,15 @@ _DEFAULT_MODELS = {
 #: ``act`` stays ``None``: composing a reply is not a classification, and the
 #: role's model is the one most likely to be a reasoning model that rejects the
 #: parameter outright. Omitting it keeps that request byte-for-byte what it was.
+#:
+#: ``learn`` is pinned to 0 for the judge's reason rather than the judge's job:
+#: it reads one note and returns a fixed shape, and a sampled extraction would
+#: file different claims from the same sentence on two runs — which makes the
+#: receipt in DL-043 a check on a coin flip instead of on omega.
 _DEFAULT_TEMPERATURES: dict[str, Optional[float]] = {
     JUDGE: 0.0,
     ACT: None,
+    LEARN: 0.0,
 }
 
 

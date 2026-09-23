@@ -32,7 +32,7 @@ import base64
 from dataclasses import dataclass
 from typing import Any, Callable, Optional, Sequence
 
-from omega import blobs, derive, episodes, provider
+from omega import blobs, derive, episodes, learn, provider
 from omega.queue import EVENT_KINDS, EventQueue, Pending
 
 __all__ = [
@@ -400,6 +400,53 @@ def write_memory(
 # --- the turn ---------------------------------------------------------------
 
 
+def _teach(
+    ctx: TurnContext,
+    pending: Pending,
+    *,
+    known: Sequence[derive.Claim],
+    at: Optional[str],
+) -> Optional[str]:
+    """Extract a teach drop and return its receipt, or ``None`` if it was not one.
+
+    **Never raises.** DL-043 #5: the reply is already composed and is real
+    work, and losing it to a failed second call would make teaching strictly
+    worse than talking. A failure becomes a receipt that says so, which is the
+    one place the person can act on it, and the turn still records ``spoke``.
+    This is the only step in the turn whose failure is not
+    ``outcome: "failed"``.
+    """
+    note = learn.teaching_note(str(pending.payload.get("text", "")))
+    if note is None:
+        return None
+
+    where = str(pending.payload.get("channel", "")).strip()
+    when = str(pending.payload.get("at", "")).strip()
+    context = " ".join(
+        part
+        for part in (
+            f"The note arrived on the {where} channel." if where else "",
+            f"It is {when}." if when else "",
+        )
+        if part
+    )
+    try:
+        extracted = learn.extract(
+            ctx.complete, note=note, known=known, context=context
+        )
+        written = learn.file_claims(
+            ctx.queue,
+            extracted,
+            for_seq=pending.seq,
+            source_seq=pending.seq,
+            at=at,
+        )
+    except Exception as exc:  # noqa: BLE001 - see the docstring
+        reason = str(exc) or type(exc).__name__
+        return learn.receipt((), error=reason)
+    return learn.receipt(written, known=known)
+
+
 def run_turn(
     queue: EventQueue,
     pending: Pending,
@@ -409,6 +456,7 @@ def run_turn(
     recall_n: int = RECALL_N,
     open_work: Sequence[derive.OpenBlock] = (),
     learned: Sequence[derive.Claim] = (),
+    known: Sequence[derive.Claim] = (),
     at: Optional[str] = None,
 ) -> TurnResult:
     """Run one turn over an already-claimed episode and record how it ended.
@@ -439,6 +487,12 @@ def run_turn(
     Matching here instead would mean a turn could not be driven without a store,
     and would put the decision about what applies inside the thing that renders
     it — the same separation recall has kept since M1.
+
+    ``known`` is the *whole* learned set and is used for one thing: deciding
+    what a newly taught claim replaces (DL-043 #6). It is separate from
+    ``learned`` because the two ask opposite questions — ``learned`` is what
+    fires on this event, and a claim can only be contradicted by one that was
+    never going to fire alongside it.
     """
     complete = complete or provider.complete
     event = perceive(pending)
@@ -497,7 +551,14 @@ def run_turn(
             verdict=verdict,
         )
 
-    if text is None:
+    # DL-043: a teach drop is extracted here, between the reply and the record.
+    # After the `except` because a turn that already failed has nothing to show
+    # a receipt with; before `write_memory` because `claim.extracted` is not
+    # projected (DL-042), so the receipt has nowhere to ride but the one reply
+    # this turn is about to record.
+    receipt = _teach(ctx, pending, known=known, at=at)
+
+    if text is None and receipt is None:
         # Silence. A success, recorded as one, with `reply` null rather than
         # empty so that "said nothing" can never be read as "said ''".
         record = write_memory(
@@ -510,6 +571,14 @@ def run_turn(
             tools=tuple(acted.tools),
             verdict=verdict,
         )
+
+    if receipt is not None:
+        # The receipt is not conversation, so it does not replace a reply that
+        # exists — and when the judge chose silence on a teach drop it *is* the
+        # reply, because a teach omega says nothing about is indistinguishable
+        # from one it dropped, which is the failure DL-034's done bar exists to
+        # catch. The judge still governs every other turn.
+        text = receipt if text is None else f"{text}\n\n{receipt}"
 
     record = write_memory(
         queue,
