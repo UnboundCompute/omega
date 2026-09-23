@@ -9,6 +9,16 @@ This check is AST-based, so it is not fooled by an alias, a ``from``-form, or a
 dynamic ``import_module``. It is deliberately written so that the name it hunts
 for never appears as a literal in this file — otherwise the checker would flag
 itself.
+
+**An import statement is not the only way in**, and matching only import
+statements left two doors open. The extension becomes a live *attribute* of the
+``omega`` package the moment anything imports ``omega.memory``, so ``import
+omega`` followed by an attribute access needs no import of it at all; and a
+module name that is computed rather than written leaves no constant to compare.
+Both gave full frame-level access — raw append, offsets — with this suite
+green. So the checker also reads attribute access and folds the strings it can,
+and treats a module name the source does not fix as a violation rather than as
+safe: a check that only sees the spellings someone thought of is not a check.
 """
 
 from __future__ import annotations
@@ -43,6 +53,60 @@ def _python_files() -> list[Path]:
     return found
 
 
+#: The two builtins that import a module named at runtime. What they import is
+#: whatever their first argument says, so that argument is what gets read.
+DYNAMIC_IMPORTERS = ("import_module", "__import__")
+
+
+def _constant_str(node: ast.AST) -> str | None:
+    """The string ``node`` evaluates to, when the source alone decides it.
+
+    A plain constant folds, a ``+`` chain of constants folds, and an f-string
+    with no substitutions folds — so ``"omega" + "." + "_log"`` is read for what
+    it is rather than passed over for having no matching literal.
+
+    Anything else returns ``None``, which every caller must read as
+    **undecidable**, never as safe. That is the fail-closed half of the rule:
+    the private module is exactly the one a bypass would compute.
+    """
+    if isinstance(node, ast.Constant):
+        return node.value if isinstance(node.value, str) else None
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        left = _constant_str(node.left)
+        right = _constant_str(node.right)
+        return None if left is None or right is None else left + right
+    if isinstance(node, ast.JoinedStr):
+        parts: list[str] = []
+        for value in node.values:
+            text = _constant_str(value)
+            if text is None:
+                return None
+            parts.append(text)
+        return "".join(parts)
+    return None
+
+
+def _call_reasons(node: ast.Call) -> list[str]:
+    """Reaching the extension through a call rather than an import statement."""
+    func = node.func
+    name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
+    reasons: list[str] = []
+
+    if name in DYNAMIC_IMPORTERS and node.args:
+        if _constant_str(node.args[0]) is None:
+            reasons.append(
+                f"line {node.lineno}: {name}() with a module name the source does "
+                f"not fix — it cannot be shown not to be {PRIVATE_MODULE}"
+            )
+
+    if name == "getattr" and len(node.args) >= 2:
+        target = _constant_str(node.args[1])
+        if target in (PRIVATE_LEAF, PRIVATE_MODULE):
+            reasons.append(f"line {node.lineno}: getattr(..., {target!r})")
+
+    return reasons
+
+
 def _imports_private(path: Path) -> list[str]:
     """Every way ``path`` reaches the private extension, as readable reasons."""
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
@@ -70,13 +134,26 @@ def _imports_private(path: Path) -> list[str]:
             elif node.level > 0 and module.split(".")[-1] == PRIVATE_LEAF:
                 reasons.append(f"line {node.lineno}: relative from .{module} import ...")
 
-        elif isinstance(node, ast.Constant) and isinstance(node.value, str):
-            # Catches importlib.import_module("omega._log") and __import__ too.
-            # Exact match only: a docstring that *mentions* the module is fine.
-            if node.value == PRIVATE_MODULE:
-                reasons.append(
-                    f"line {node.lineno}: dynamic reference to {PRIVATE_MODULE!r}"
-                )
+        elif isinstance(node, ast.Attribute):
+            # The extension is a live attribute of the package as soon as
+            # anything has imported the seam, so `import omega` and then
+            # `omega._log.Log(p)` reaches it with no import of it anywhere.
+            # Matched by name alone, exactly as the diagnostics hatch below is:
+            # the seam is the one file that legitimately holds the handle, and
+            # it is the one file excluded from this scan.
+            if node.attr == PRIVATE_LEAF:
+                reasons.append(f"line {node.lineno}: attribute access .{node.attr}")
+
+        elif isinstance(node, ast.Call):
+            reasons.extend(_call_reasons(node))
+
+        else:
+            # Catches importlib.import_module("omega._log"), __import__, and
+            # the same name assembled from pieces. Exact match only: a
+            # docstring that *mentions* the module is fine.
+            text = _constant_str(node)
+            if text is not None and text in (PRIVATE_MODULE, f".{PRIVATE_LEAF}"):
+                reasons.append(f"line {node.lineno}: dynamic reference to {text!r}")
 
     return reasons
 
@@ -243,5 +320,85 @@ def test_case_24_the_checker_catches_every_import_form(tmp_path: Path) -> None:
     }
     for name, source in allowed.items():
         probe = tmp_path / f"ok_{name}.py"
+        probe.write_text(source, encoding="utf-8")
+        assert _imports_private(probe) == [], f"{name} was a false positive"
+
+
+def test_case_24_the_checker_catches_the_bypasses_an_import_scan_misses(
+    tmp_path: Path,
+) -> None:
+    """Case 24 — the two doors that stayed open while this suite was green.
+
+    Both give exactly what the seam exists to withhold: the raw handle, and
+    with it frame-level append and the offset index. Neither needs an import
+    *statement* naming the extension, which is all the checker used to read.
+
+    1. The extension is an attribute of the ``omega`` package as soon as
+       anything imports ``omega.memory`` — which importing the seam does. So
+       ``import omega`` and then ``omega._log.Log(p)`` is a complete bypass.
+    2. A computed module name has no constant to compare against, so
+       ``import_module("omega" + "." + "_log")`` read as an ordinary call.
+
+    Asserted against the checker on source snippets rather than against the
+    tree, because the tree is clean either way: "the real files do not do this"
+    passes just as well when the detector is blind, which is how these two
+    survived. This is the detector's control, and it is the test that matters.
+    """
+    p = "path"
+    bypasses = {
+        # 1 - attribute access on the package, in its plain, aliased and
+        #     through-the-seam spellings.
+        "package-attribute": f"import {PACKAGE}\nraw = {PACKAGE}.{PRIVATE_LEAF}.Log({p})\n",
+        "package-attribute-aliased": (
+            f"import {PACKAGE} as pkg\nraw = pkg.{PRIVATE_LEAF}.Log({p})\n"
+        ),
+        "submodule-attribute": (
+            f"import {PACKAGE}.memory\nraw = {PACKAGE}.memory.{PRIVATE_LEAF}.Log({p})\n"
+        ),
+        "through-a-store": (
+            f"from {PACKAGE}.memory import MemoryStore\n"
+            f"raw = MemoryStore.open({p}).{PRIVATE_LEAF}\n"
+        ),
+        "getattr-on-the-package": (
+            f"import {PACKAGE}\nraw = getattr({PACKAGE}, {PRIVATE_LEAF!r})\n"
+        ),
+        # 2 - the module name assembled, or simply not written down.
+        "concatenated-name": (
+            "import importlib\n"
+            f"raw = importlib.import_module({PACKAGE!r} + '.' + {PRIVATE_LEAF!r})\n"
+        ),
+        "name-from-a-variable": (
+            "import importlib\n"
+            f"leaf = {PRIVATE_LEAF!r}\n"
+            f"raw = importlib.import_module({PACKAGE!r} + '.' + leaf)\n"
+        ),
+        "dunder-import-concatenated": (
+            f"raw = __import__({PACKAGE!r} + '.' + {PRIVATE_LEAF!r})\n"
+        ),
+        "relative-dynamic-import": (
+            "import importlib\n"
+            f"raw = importlib.import_module('.' + {PRIVATE_LEAF!r}, {PACKAGE!r})\n"
+        ),
+    }
+    for name, source in bypasses.items():
+        probe = tmp_path / f"bypass_{name}.py"
+        probe.write_text(source, encoding="utf-8")
+        assert _imports_private(probe), f"{name} bypass was not detected"
+
+    # And the widened net still does not catch ordinary code. A similar name is
+    # not the name, and an import of the seam is what every caller should do.
+    allowed = {
+        "similar-attribute": "self._logger.info(x)\nself._log_path = p\n",
+        "similar-constant": "name = 'omega.logging'\nleaf = 'log'\n",
+        "seam-usage": (
+            "from omega.memory import MemoryStore\n"
+            "with MemoryStore.open(p) as s:\n    s.append_episode(b'x')\n"
+        ),
+        "unrelated-dynamic-import": (
+            "import importlib\nmod = importlib.import_module('json')\n"
+        ),
+    }
+    for name, source in allowed.items():
+        probe = tmp_path / f"okbypass_{name}.py"
         probe.write_text(source, encoding="utf-8")
         assert _imports_private(probe) == [], f"{name} was a false positive"
