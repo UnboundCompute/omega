@@ -224,6 +224,64 @@ def test_case_21_set_checkpoint_ahead_of_head(store: MemoryStore) -> None:
     assert store.checkpoint("graph") == 3
 
 
+@pytest.mark.parametrize("bad", [-1, -(2**63), 2**64, 2**70])
+def test_cases_20_21_a_seq_that_is_not_a_sequence_number(
+    store: MemoryStore, bad: int
+) -> None:
+    """Cases 20/21 — an impossible seq is a ValueError that names the argument.
+
+    Sequence numbers are u64, so -1 and 2**64 are not "ahead of head", they
+    are not sequence numbers at all. Both used to reach the boundary and come
+    back as ``OverflowError`` ("can't convert negative int to unsigned"),
+    which is outside the declared taxonomy and names neither the argument nor
+    the rule. Both readers and both writers must agree on that.
+    """
+    store.append_episode(b"e")
+
+    with pytest.raises(ValueError) as exc:
+        store.episodes_since(bad)
+    assert "seq" in str(exc.value) and str(bad) in str(exc.value)
+    assert not isinstance(exc.value, OverflowError), "OverflowError is not declared"
+
+    with pytest.raises(ValueError) as exc:
+        store.set_checkpoint("graph", bad)
+    assert "seq" in str(exc.value) and str(bad) in str(exc.value)
+    assert not isinstance(exc.value, OverflowError)
+
+    # The refusal happened before the log was touched.
+    assert store.head() == 1
+    assert store.checkpoint("graph") == 0
+
+
+@pytest.mark.parametrize("bad", [2**63, -(2**63) - 1, 2**70])
+def test_case_17_a_ts_micros_wider_than_the_log_stores(
+    store: MemoryStore, bad: int
+) -> None:
+    """Case 17 — ``ts_micros`` has the same hole and gets the same answer.
+
+    Timestamps are i64 in the frame body. An int outside that is an argument
+    that cannot be stored, so it is refused by name here rather than becoming
+    an ``OverflowError`` at the conversion.
+    """
+    with pytest.raises(ValueError) as exc:
+        store.append_episode(b"e", "", bad)
+    assert "ts_micros" in str(exc.value) and str(bad) in str(exc.value)
+    assert not isinstance(exc.value, OverflowError)
+    assert store.head() == 0, "nothing was appended"
+
+
+def test_a_non_integer_seq_is_still_a_clear_type_error(store: MemoryStore) -> None:
+    """The range rule must not swallow the *type* rule, or restate it worse.
+
+    Only the range is checked in Python; a str or a float keeps falling
+    through to the boundary, which already says which argument and why.
+    """
+    for bad in ("1", 1.5, None):
+        with pytest.raises(TypeError) as exc:
+            store.episodes_since(bad)
+        assert "integer" in str(exc.value), str(exc.value)
+
+
 def test_case_22_second_process_is_locked_out(store_dir: Path) -> None:
     """Case 22 — a second *process* opening the same log → AlreadyLocked.
 

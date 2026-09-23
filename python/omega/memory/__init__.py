@@ -46,6 +46,29 @@ __all__ = [
 
 PathLike = Union[str, "os.PathLike[str]"]
 
+# The widths the log is written in: sequence numbers are u64, timestamps i64.
+_MAX_SEQ = (1 << 64) - 1
+_MIN_TS, _MAX_TS = -(1 << 63), (1 << 63) - 1
+
+
+def _in_range(value: object, low: int, high: int, argument: str, what: str) -> None:
+    """Refuse an out-of-range integer here, where the argument still has a name.
+
+    An ``int`` Python is happy with may still not fit the width the log is
+    written in, and the conversion at the boundary then raises
+    ``OverflowError`` — "can't convert negative int to unsigned" — which is
+    outside the declared taxonomy and names neither the argument nor the rule
+    it broke. ``seq=-1`` is not an arithmetic accident; it is an argument that
+    cannot mean anything, so it is a ``ValueError`` (the declared mapping for
+    an invalid argument) that says which argument and what was allowed.
+
+    Only the *range* is checked. A non-integer keeps falling through to the
+    boundary, which already raises a clear ``TypeError`` naming the argument,
+    and duplicating that here would be a second opinion, not a check.
+    """
+    if isinstance(value, int) and not low <= value <= high:
+        raise ValueError(f"{argument} must be {what} in {low}..{high}, not {value}")
+
 # --- constants ------------------------------------------------------------
 EPISODES_FILENAME: str = _log.EPISODES_FILENAME
 MAX_BODY: int = _log.MAX_BODY
@@ -247,7 +270,11 @@ class MemoryStore:
         An empty ``write_key`` means "no key" and is never deduplicated. A
         non-empty key that is already stored returns the existing seq when the
         payload is identical and raises ``WriteKeyConflict`` when it is not.
+
+        A ``ts_micros`` outside the i64 the log stores is a ``ValueError``.
         """
+        if ts_micros is not None:
+            _in_range(ts_micros, _MIN_TS, _MAX_TS, "ts_micros", "a microsecond time")
         return self._log.append(payload, write_key, ts_micros)
 
     # --- reading ----------------------------------------------------------
@@ -261,7 +288,12 @@ class MemoryStore:
         ``seq > head()`` raises ``CheckpointAhead`` here and now — never an
         empty iterator. The raise is eager on purpose: a check that passes on
         empty is not a check.
+
+        A ``seq`` that is not a sequence number at all — negative, or wider
+        than the u64 they are written in — is a ``ValueError`` naming the
+        argument, not an ``OverflowError`` from the boundary.
         """
+        _in_range(seq, 0, _MAX_SEQ, "seq", "a sequence number")
         records = self._log.episodes_since(seq)
         return (Episode(*record) for record in records)
 
@@ -271,6 +303,14 @@ class MemoryStore:
         return self._log.checkpoint(name)
 
     def set_checkpoint(self, name: str, seq: int) -> None:
+        """Record that ``name`` has consumed up to ``seq``.
+
+        ``seq > head()`` raises ``CheckpointAhead``; a ``seq`` that is not a
+        sequence number at all — negative, or wider than u64 — is a
+        ``ValueError`` naming the argument, on the same rule as
+        :meth:`episodes_since`.
+        """
+        _in_range(seq, 0, _MAX_SEQ, "seq", "a sequence number")
         self._log.set_checkpoint(name, seq)
 
     def checkpoint_names(self) -> list[str]:
