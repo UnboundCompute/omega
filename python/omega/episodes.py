@@ -38,7 +38,9 @@ __all__ = [
     "WORK_FINISHED",
     "SCHEDULE_CREATED",
     "SCHEDULE_CANCELLED",
+    "CLAIM_EXTRACTED",
     "MIN_EVERY_SECONDS",
+    "TRIGGER_FIELDS",
     "BadPayload",
     "UnsupportedPayloadVersion",
     "encode",
@@ -53,6 +55,7 @@ __all__ = [
     "work_finished",
     "schedule_created",
     "schedule_cancelled",
+    "claim_extracted",
     "now",
 ]
 
@@ -69,6 +72,7 @@ TOOL_RETURNED = "tool.returned"
 WORK_FINISHED = "work.finished"
 SCHEDULE_CREATED = "schedule.created"
 SCHEDULE_CANCELLED = "schedule.cancelled"
+CLAIM_EXTRACTED = "claim.extracted"
 
 #: The complete M1 kind set (§2.1: "and that is all of them").
 #:
@@ -87,6 +91,7 @@ KINDS = frozenset(
         WORK_FINISHED,
         SCHEDULE_CREATED,
         SCHEDULE_CANCELLED,
+        CLAIM_EXTRACTED,
     }
 )
 
@@ -100,6 +105,26 @@ KINDS = frozenset(
 # tray message does and the executor needs no knowledge of the clock at all.
 # That also makes "when did this last fire?" derivable from episodes that
 # already exist, which is what lets DL-036's table stay a droppable cache.
+#
+# `claim.extracted` is a record for the same reason and one of its own. Learning
+# something must not itself run a turn, or teaching omega one thing costs a model
+# call per claim for the rest of the log. The reason of its own is DL-042: the
+# learned set is a *derived view* of these records, rebuilt from the log and
+# stored nowhere, so a claim has to be an episode or DL-017's rebuild-from-log
+# stops being true for the one kind of memory that changes behaviour silently.
+
+#: The trigger vocabulary (DL-042), deliberately too weak to be interesting.
+#: Every field optional and ANDed; a claim with no trigger is always active,
+#: which is the right shape for tone and working style — they have no situation
+#: because they apply to all of them.
+#:
+#: What is missing is missing on purpose. No regex, because that makes a claim a
+#: program and a misfiring program changes turns it has nothing to do with. No
+#: negation, because "when I am *not* doing X" fires constantly and teaches the
+#: model to skip the section. And nothing needing a model, because DL-034 has
+#: triggers evaluated on *every* turn: a per-turn model price that scales with
+#: how much omega has learned is exactly backwards.
+TRIGGER_FIELDS = frozenset({"any", "channel", "hours"})
 
 #: The two kinds that end a claimed turn and let ``DONE`` advance (§1.2).
 #:
@@ -485,6 +510,75 @@ def schedule_cancelled(*, id: str, at: Optional[str] = None) -> dict[str, Any]:
     return payload
 
 
+def claim_extracted(
+    *,
+    for_seq: int,
+    text: str,
+    source_seq: int,
+    situation: str,
+    explicit: bool,
+    trigger: Optional[dict[str, Any]] = None,
+    supersedes: Optional[int] = None,
+    at: Optional[str] = None,
+) -> dict[str, Any]:
+    """Something omega learned, filed where a rebuild can reach it (DL-042).
+
+    A **record**, not an event: writing one down must not run a turn. It is
+    attached to the turn that produced it (``for_seq``) and *also* names the
+    episode it was learned from (``source_seq``) — usually the same turn's
+    event, but not always, since a claim can be extracted from material that
+    arrived earlier. Keeping both means "what did this turn learn" and "where
+    did this belief come from" are separate questions with separate answers.
+
+    ``situation`` is the situational provenance DL-034 asked for and it is
+    captured *here*, at ingest, because it is the one field that cannot be
+    reconstructed later. Span provenance answers *where did this claim come
+    from*; this answers *what was going on when I was taught it*, which is what
+    a person needs months afterwards to re-decide a contradiction. A claim with
+    an empty situation is refused rather than stored, because the moment to
+    collect it has passed by the time anyone notices it is missing.
+
+    ``explicit`` is whether the person authored this deliberately or omega
+    inferred it from ordinary conversation, and it is the whole of DL-042's
+    answer to "what is core memory". It decides escalation: contradicting
+    something you were *told* is worth interrupting for, and contradicting
+    omega's own inference is routine. Static, known now, free to evaluate —
+    which is what keeps importance out of model judgement (DL-014, DL-033).
+
+    ``supersedes`` names a claim this one replaces. Replacement is an append,
+    never a mutation: the superseded claim stays in the log, re-derivation can
+    always reach the earlier state, and "destroy core memory" is impossible by
+    construction rather than by a model getting a criticality test right.
+    """
+    payload = {
+        "v": VERSION,
+        "kind": CLAIM_EXTRACTED,
+        "for_seq": for_seq,
+        "text": text,
+        "source_seq": source_seq,
+        "situation": situation,
+        "explicit": explicit,
+        # Copied, including the one nested list, for the reason every other
+        # constructor here copies: a caller who reuses the dict must not be able
+        # to edit an episode that has already been written.
+        "trigger": None if trigger is None else _copy_trigger(trigger),
+        "at": at or now(),
+    }
+    if supersedes is not None:
+        payload["supersedes"] = supersedes
+    _validate(payload)
+    return payload
+
+
+def _copy_trigger(trigger: dict[str, Any]) -> dict[str, Any]:
+    copied = dict(trigger)
+    if isinstance(copied.get("any"), list):
+        copied["any"] = list(copied["any"])
+    if isinstance(copied.get("hours"), list):
+        copied["hours"] = list(copied["hours"])
+    return copied
+
+
 # --- validation -------------------------------------------------------------
 
 _REQUIRED: dict[str, tuple[str, ...]] = {
@@ -496,6 +590,15 @@ _REQUIRED: dict[str, tuple[str, ...]] = {
     WORK_FINISHED: ("for_seq", "summary", "ok", "at"),
     SCHEDULE_CREATED: ("id", "instruction", "every", "cron", "at"),
     SCHEDULE_CANCELLED: ("id", "at"),
+    CLAIM_EXTRACTED: (
+        "for_seq",
+        "text",
+        "source_seq",
+        "situation",
+        "explicit",
+        "trigger",
+        "at",
+    ),
 }
 
 #: The kinds that are *not* about one turn. Everything else names the inbound
@@ -606,7 +709,81 @@ def _validate(payload: dict[str, Any]) -> None:
         if cron is not None:
             _require_str(payload, "cron", non_empty=True)
 
+    if kind == CLAIM_EXTRACTED:
+        _require_str(payload, "text", non_empty=True)
+        # Refused rather than defaulted. A claim with no situation is one nobody
+        # can re-decide later, and the moment to collect it is gone by the time
+        # that matters (DL-034's provenance requirement, DL-042's reason).
+        _require_str(payload, "situation", non_empty=True)
+        _require_seq(payload, "source_seq")
+        if not isinstance(payload["explicit"], bool):
+            raise BadPayload("explicit must be a bool")
+        if "supersedes" in payload:
+            _require_seq(payload, "supersedes")
+            if payload["supersedes"] == payload["source_seq"]:
+                # A claim superseding the episode it was learned from is a
+                # confusion of the two seqs, not a fact anyone meant to record.
+                raise BadPayload("supersedes must name a claim, not the source")
+        _validate_trigger(payload["trigger"])
+
     _require_str(payload, "at", non_empty=True)
+
+
+def _validate_trigger(trigger: Any) -> None:
+    """Check a claim's activation condition (DL-042).
+
+    ``None`` is valid and means *always active*. The check is strict about
+    unknown fields, unlike the rest of this module, and that is the one place
+    the additive-fields rule in :data:`VERSION` is deliberately not followed: an
+    unrecognised trigger field would be **silently ignored at match time**, so a
+    claim that looks conditional would fire on everything. Failing to decode is
+    recoverable; a habit quietly applying to every turn is not.
+    """
+    if trigger is None:
+        return
+    if not isinstance(trigger, dict):
+        raise BadPayload(f"trigger must be an object or null, got {trigger!r}")
+    if not trigger:
+        # `{}` matches everything, which is what `None` already says. Two
+        # spellings of always-active is one more than the matcher should have
+        # to agree with the person about.
+        raise BadPayload("trigger must be null rather than empty to mean always")
+    unknown = sorted(set(trigger) - TRIGGER_FIELDS)
+    if unknown:
+        raise BadPayload(
+            f"trigger has unknown field(s) {unknown}; "
+            f"the vocabulary is {sorted(TRIGGER_FIELDS)}"
+        )
+
+    if "any" in trigger:
+        phrases = trigger["any"]
+        if not isinstance(phrases, list) or not phrases:
+            raise BadPayload("trigger.any must be a non-empty list of phrases")
+        for i, phrase in enumerate(phrases):
+            if not isinstance(phrase, str) or not phrase.strip():
+                raise BadPayload(f"trigger.any[{i}] must be a non-blank string")
+
+    if "channel" in trigger:
+        if not isinstance(trigger["channel"], str) or not trigger["channel"]:
+            raise BadPayload("trigger.channel must be a non-empty string")
+
+    if "hours" in trigger:
+        hours = trigger["hours"]
+        ok = (
+            isinstance(hours, list)
+            and len(hours) == 2
+            and all(
+                isinstance(h, int) and not isinstance(h, bool) and 0 <= h <= 24
+                for h in hours
+            )
+        )
+        if not ok:
+            raise BadPayload("trigger.hours must be [start, end] with 0 <= h <= 24")
+        if hours[0] == hours[1]:
+            # Half-open, so start == end is the empty window: a claim that can
+            # never fire. Refused, because it reads as "all day" to everyone
+            # except the matcher.
+            raise BadPayload("trigger.hours start and end must differ")
 
 
 def _validate_context(context: Any) -> None:

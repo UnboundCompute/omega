@@ -139,7 +139,21 @@ class Update:
 #: *fire* visible instead. A fire is a `message.inbound`, so it projects as
 #: ``understood`` like any other arriving message — which is what makes omega
 #: acting on its own show up in the tray rather than happening invisibly.
-NOT_PROJECTED = frozenset({episodes.SCHEDULE_CREATED, episodes.SCHEDULE_CANCELLED})
+#:
+#: `claim.extracted` is here for a different reason, and it is not "learning is
+#: invisible". DL-042 makes the *receipt* — what omega now believes and when it
+#: will fire — part of the turn's reply, which already projects. Giving claims
+#: their own wire update on top of that would be a second way for one turn to
+#: reach the person, which `act.py` §1.6 refuses for the agent's output and
+#: which would be no better arriving through the projection. One turn, one
+#: outward voice; a turn that learns four things says so once.
+NOT_PROJECTED = frozenset(
+    {
+        episodes.SCHEDULE_CREATED,
+        episodes.SCHEDULE_CANCELLED,
+        episodes.CLAIM_EXTRACTED,
+    }
+)
 
 
 def project(payload: dict[str, Any], seq: int) -> Optional[Update]:

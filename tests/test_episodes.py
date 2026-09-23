@@ -61,6 +61,15 @@ def test_every_kind_round_trips():
             at="2026-09-23T10:00:00+00:00",
         ),
         ep.schedule_cancelled(id="brief", at="2026-09-23T10:00:00+00:00"),
+        ep.claim_extracted(
+            for_seq=41,
+            text="prefers short replies",
+            source_seq=41,
+            situation="said so while reviewing a long answer",
+            explicit=True,
+            trigger={"any": ["review"]},
+            at="2026-09-23T10:00:00+00:00",
+        ),
     ]
     assert {p["kind"] for p in built} == ep.KINDS, "a kind has no round-trip test"
     for payload in built:
@@ -524,3 +533,117 @@ def test_the_required_table_covers_every_kind():
     """A new kind with no required-field row would validate vacuously -- it
     would pass because nothing was declared, not because nothing was missing."""
     assert set(ep._REQUIRED) == ep.KINDS
+
+
+# --- learned claims (DL-042) -------------------------------------------------
+
+
+def _claim(**over):
+    """A valid `claim.extracted`, so each case below can vary one field."""
+    fields = dict(
+        for_seq=1,
+        text="prefers short replies",
+        source_seq=1,
+        situation="said so while reviewing a long answer",
+        explicit=True,
+    )
+    fields.update(over)
+    return ep.claim_extracted(**fields)
+
+
+def test_a_claim_round_trips_with_its_trigger():
+    payload = _claim(trigger={"any": ["deploy"], "hours": [9, 18]})
+    back = ep.decode(ep.encode(payload))
+    assert back["trigger"] == {"any": ["deploy"], "hours": [9, 18]}
+    assert back["explicit"] is True
+    assert back["situation"]
+
+
+def test_a_claim_is_a_record_and_never_an_event():
+    """The load-bearing property of the kind. If `claim.extracted` were an
+    event, the drain would pick up omega's own learning as new input and every
+    filed claim would cost a turn -- and a turn that files claims would feed
+    itself forever."""
+    from omega import queue
+
+    assert ep.CLAIM_EXTRACTED in queue.RECORD_KINDS
+    assert ep.CLAIM_EXTRACTED not in queue.EVENT_KINDS
+
+
+def test_a_claim_with_no_trigger_is_valid_and_means_always():
+    """Tone and working style have no situation because they apply to all of
+    them, so always-active has to be representable -- and `None` is the single
+    spelling for it."""
+    assert _claim(trigger=None)["trigger"] is None
+    with pytest.raises(ep.BadPayload) as exc:
+        _claim(trigger={})
+    assert "null" in str(exc.value)
+
+
+def test_an_unknown_trigger_field_is_refused():
+    """The one place the tolerate-unknown-fields rule is deliberately reversed.
+    An ignored trigger field makes a conditional-looking claim fire on
+    *everything*; failing to decode is recoverable, a habit silently applying to
+    every turn is not."""
+    with pytest.raises(ep.BadPayload) as exc:
+        _claim(trigger={"unless": ["x"]})
+    assert "unknown field" in str(exc.value)
+
+
+def test_a_claim_with_no_situation_is_refused():
+    """DL-034's provenance requirement, enforced at the only moment it can be
+    met. Nobody can re-decide a contradiction from a claim that never recorded
+    what was going on."""
+    with pytest.raises(ep.BadPayload):
+        _claim(situation="")
+
+
+def test_explicit_must_be_a_real_bool_because_it_decides_escalation():
+    """`explicit` is the whole of DL-042's answer to "what is core memory". A
+    truthy string would make every claim count as deliberately authored, and
+    the escalation it drives would fire on omega's own inferences."""
+    with pytest.raises(ep.BadPayload):
+        _claim(explicit="yes")
+
+
+def test_an_empty_phrase_list_is_refused():
+    """`{"any": []}` matches nothing, so the claim can never fire -- but it
+    reads at a glance as a claim that has a trigger."""
+    with pytest.raises(ep.BadPayload):
+        _claim(trigger={"any": []})
+    with pytest.raises(ep.BadPayload):
+        _claim(trigger={"any": ["  "]})
+
+
+def test_an_empty_hour_window_is_refused():
+    """The window is half-open, so start == end can never match. It reads as
+    "all day" to everyone except the matcher."""
+    with pytest.raises(ep.BadPayload):
+        _claim(trigger={"hours": [9, 9]})
+    assert _claim(trigger={"hours": [22, 6]})  # wrapping is a real window
+
+
+def test_true_is_not_hour_one():
+    """`bool` is an `int` in Python, and the log is permanent."""
+    with pytest.raises(ep.BadPayload):
+        _claim(trigger={"hours": [True, 6]})
+
+
+def test_supersedes_is_optional_and_cannot_name_the_source():
+    """Two seqs on one record is a shape that invites confusing them, and the
+    confusion would typecheck: a claim superseding the episode it was learned
+    from is not a fact anyone meant to record."""
+    assert "supersedes" not in _claim()
+    assert _claim(supersedes=4)["supersedes"] == 4
+    with pytest.raises(ep.BadPayload):
+        _claim(source_seq=7, supersedes=7)
+
+
+def test_a_claim_copies_the_trigger_it_was_handed():
+    """Same rule as every other constructor here, and it matters more: a caller
+    editing the list afterwards would change what omega fires on, in a record
+    that has already been written."""
+    phrases = ["deploy"]
+    payload = _claim(trigger={"any": phrases})
+    phrases.append("everything")
+    assert payload["trigger"]["any"] == ["deploy"]

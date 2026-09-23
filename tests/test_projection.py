@@ -282,6 +282,9 @@ def test_every_m1_kind_is_accounted_for() -> None:
             id="s", instruction="i", cron="0 9 *", at=AT
         ),
         episodes.SCHEDULE_CANCELLED: episodes.schedule_cancelled(id="s", at=AT),
+        episodes.CLAIM_EXTRACTED: episodes.claim_extracted(
+            for_seq=1, text="c", source_seq=1, situation="s", explicit=True, at=AT
+        ),
     }
     assert set(made) == set(episodes.KINDS)
     for kind, payload in made.items():
