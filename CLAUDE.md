@@ -10,11 +10,14 @@ It is **not** a fork of Hermes. **We build omega from scratch.** Do not read Her
 from it, or propose borrowing from it **unless I explicitly ask**. It is a reference to be
 opened on request, never a base we build on top of and never a default source of parts.
 
-## Status: design-first (no code yet)
+## Status: design closed, building M0
 
-We are defining the design in docs **before** writing any code. Do **not** scaffold
-code, choose frameworks, or lock in architecture until the design is finalized
-together.
+The design pass is **finished** — concept (Q0, Q3–Q7) and tech (Q1, Q2) are both closed, and
+`AGENT.md` DL-019 sets the v1 build order. **M0 is what gets built now:** the store, the
+append-only log, the memory seam, and the restart test.
+
+Design-first still governs anything *new*: a decision that isn't in the ledger gets made
+together, in the ledger, before it gets code. What ended is the blanket freeze, not the rule.
 
 - **`CLAUDE.md` = operating rules (how we work); `AGENT.md` = project state & design
   (what we're building).**
@@ -26,11 +29,11 @@ together.
 - **`docs/reference-implementations.md`** (tracked) is the running register of harnesses
   we've read — what each does well, what to avoid, and which specific ideas omega takes or
   rejects. Add a row whenever we read another system; don't let a finding live only in chat.
-- Order of work: **talk → finalize docs → then code.** Code comes last.
-- **Design talk stays at the concept level** — *what it does and why*. Tech choices
-  (stores, indexes, embeddings, libraries, the Python/Rust split) are a **separate later
-  pass**; don't drift into them mid-design, and don't treat agreement on an idea as
-  agreement on its implementation.
+- Order of work: **talk → finalize docs → then code.** Both passes are done; code is now the
+  work. A *new* question still goes talk → ledger → code, in that order.
+- **Still deferred, and not to be settled by whatever the first implementation happens to do:**
+  the store engine under the graph, the channel wire format, local vs API embeddings, tool
+  error/retry policy. Each gets a ledger entry when it is actually reached.
 
 ## Guiding principle: stay small and legible
 

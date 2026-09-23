@@ -1,10 +1,37 @@
 # omega agent core
 
 Reserved for omega's agent runtime, memory, initiative, tools, and reliability machinery.
-Still empty — the memory and loop designs are settled at the concept level but not yet built.
+Still empty — design is complete and **M0 is the next thing built**.
 
 The Mac tray under `apps/mac-tray` must not place agent logic here by accident or grow its
 own competing implementation.
+
+## Build order
+
+Not layer-cake. Two properties of the design set the order: the append-only log is the only
+component whose value is **time-dependent** (a day not logging is evidence lost for good), and
+three of the five features — recall quality, knowing-you, initiative — **cannot be evaluated
+without a corpus**. So: reach honest daily use early, with deliberately dumb recall, and spend
+the accumulated history on the hard features afterwards.
+
+| | Milestone | Done-bar |
+|---|---|---|
+| **M0** | Store, log, the memory seam, restart test | `kill -9` mid-turn → lose only the in-flight turn, green in CI |
+| **M1** | One turn end to end: queue, executor, dumb recall | **Daily use starts**; every exchange lands in the log |
+| **M2** | Identity, continuity, opinions | Reopen after 3 days and it resumes cold; voice holds under pressure |
+| **M3** | The derived graph + retrieval policy | Drop the graph, re-derive, identical projection |
+| **M4** | Knowing you | States something true about how you work that you were never told |
+| **M5** | Initiative | ≥1 unprompted item worth seeing; most ticks produce nothing |
+| **M6** | Reach: second surface + one integration | A real external task, verified end to end |
+
+Rust lands at **M0**, on the log — the simplest component to carry it, and it makes the seam a
+real cross-language boundary from the first commit. A seam that isn't crossed isn't tested.
+
+**M1 is where `apps/mac-tray` converges.** It is the point at which the real transport replaces
+`LocalDemoTransport`, under the three constraints below. Nothing before M1 should depend on the
+stub's shape, and the stub is deleted — not adapted — when M1 lands.
+
+Rationale, alternatives rejected, and the named risk in this sequence: `AGENT.md` (DL-019).
 
 ## Memory (decided)
 
