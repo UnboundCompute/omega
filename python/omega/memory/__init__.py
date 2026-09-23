@@ -82,8 +82,12 @@ class _Diagnostics:
     The offset index, the file size and the truncation count are frame-level
     facts. They exist here only so the M0 suite can assert the spec's
     index-is-a-cache cases (34, 35) without importing ``omega._log`` — which
-    would defeat the seam it is testing. Nothing in ``omega`` outside the tests
-    should touch this.
+    would defeat the seam it is testing.
+
+    This is the one hole in the seam, so it is the one most worth enforcing:
+    case 24 fails if anything under ``python/`` other than this module reaches
+    for ``.diagnostics``. The tests are the only permitted caller, and that is
+    a build failure rather than a request.
     """
 
     __slots__ = ("_log",)

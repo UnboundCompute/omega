@@ -81,6 +81,92 @@ def _imports_private(path: Path) -> list[str]:
     return reasons
 
 
+#: The seam's escape hatch for frame-level facts. Cases 34 and 35 assert things
+#: about the offset index, which is vocabulary the seam exists to keep out of
+#: the rest of the tree — so the hatch has to exist for the suite, and has to be
+#: shut for everything else. A docstring saying "tests only" is the same kind of
+#: convention that the rest of this file exists to replace, so it is a test too.
+DIAGNOSTICS = "diagnostics"
+
+#: Production source. Tests are deliberately excluded: they are the one caller
+#: the hatch is for.
+PRODUCTION_ROOT = "python"
+
+
+def _touches_diagnostics(path: Path) -> list[str]:
+    """Every way ``path`` reaches the diagnostics hatch, as readable reasons."""
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    reasons: list[str] = []
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute) and node.attr == DIAGNOSTICS:
+            reasons.append(f"line {node.lineno}: attribute access .{DIAGNOSTICS}")
+        elif (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "getattr"
+            and len(node.args) >= 2
+            and isinstance(node.args[1], ast.Constant)
+            and node.args[1].value == DIAGNOSTICS
+        ):
+            reasons.append(f"line {node.lineno}: getattr(..., {DIAGNOSTICS!r})")
+
+    return reasons
+
+
+def test_case_24_production_code_does_not_use_the_diagnostics_hatch() -> None:
+    """Case 24 — the hatch is open to the suite and shut to everything else.
+
+    ``diagnostics`` exposes offsets and index rebuilds: frame vocabulary that
+    the seam is otherwise built to stop. It is the one hole in the seam, so it
+    is the one most worth a test. The seam itself is skipped because it defines
+    the hatch.
+    """
+    base = REPO_ROOT / PRODUCTION_ROOT
+    assert base.is_dir(), f"production root {base} does not exist"
+
+    files = [
+        p
+        for p in sorted(base.rglob("*.py"))
+        if not SKIP_DIRS & set(p.parts) and p.relative_to(REPO_ROOT) != THE_SEAM
+    ]
+
+    violations: dict[str, list[str]] = {}
+    for path in files:
+        reasons = _touches_diagnostics(path)
+        if reasons:
+            violations[str(path.relative_to(REPO_ROOT))] = reasons
+
+    assert not violations, (
+        f"MemoryStore.{DIAGNOSTICS} is for the M0 suite only — it speaks frames, "
+        f"not episodes. Offenders:\n"
+        + "\n".join(f"  {f}: {'; '.join(r)}" for f, r in sorted(violations.items()))
+    )
+
+
+def test_case_24_the_diagnostics_detector_is_not_a_no_op(tmp_path: Path) -> None:
+    """Case 24 — its control. An empty walk over production code is the expected
+    result, so the detector must be shown to fire on something."""
+    caught = {
+        "attribute": "store.diagnostics.offsets()\n",
+        "chained": "get_store().diagnostics.rebuild_indexes()\n",
+        "getattr": "getattr(store, 'diagnostics')\n",
+    }
+    for name, source in caught.items():
+        probe = tmp_path / f"diag_{name}.py"
+        probe.write_text(source, encoding="utf-8")
+        assert _touches_diagnostics(probe), f"{name} form was not detected"
+
+    allowed = {
+        "episode-level": "store.append_episode(b'x')\nstore.head()\n",
+        "similar-name": "store.diagnostics_report\nx = 'diagnostics'\n",
+    }
+    for name, source in allowed.items():
+        probe = tmp_path / f"okdiag_{name}.py"
+        probe.write_text(source, encoding="utf-8")
+        assert _touches_diagnostics(probe) == [], f"{name} was a false positive"
+
+
 def test_case_24_only_the_seam_imports_the_private_extension() -> None:
     """Case 24 — any module outside omega.memory importing the extension fails."""
     files = _python_files()
