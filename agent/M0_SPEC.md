@@ -411,6 +411,29 @@ later deletes as redundant.
     judgement being made is about what the bytes* are *— no frame verifies here — and never about
     what put them there. The bytes themselves remain, for whoever wants to look.*
 
+### What the checksums are for, and what they are not for
+
+M0's threat model is **crashes and bad disks, not tampering**, and that is a decision rather than
+an oversight, so it is written down here next to the rules it governs.
+
+`len_crc` closes the accidental-corruption hole. It does not close the adversarial one. A
+**forged** `body_len` — one whose `len_crc` has been recomputed to match, sized so the frame ends
+exactly at EOF — passes the length check, passes plausibility, has enough bytes behind it, and
+fails only the body CRC. Recovery then classifies it as a torn tail and truncates, which is the
+right call under this threat model: a matching `len_crc` is strong evidence the length is real,
+and something shaped exactly like a half-written final frame should be treated as one. But it
+means anyone who can write the file can still make the tail disappear.
+
+That is accepted. CRC-32 is a bit-rot defence, not a MAC; making it a tamper defence needs a keyed
+MAC and somewhere to keep the key, and M0 provides neither. The log is a local file under the
+user's own account, and an attacker who can write it can also delete it — so integrity checking is
+not the control that would save us. **Revisit if the log ever syncs, leaves the machine, or is
+shared between users**, each of which changes who can write it.
+
+The same reasoning covers the rest of the format: `write_key` dedup and `seq` continuity are
+**consistency** mechanisms, not **authenticity** ones. Nothing in M0 may be cited as evidence that
+an episode is *genuine* — only that it is *intact*.
+
 ### The violation metric
 
 Capability here is "episodes go in and come back." The paired violation that must never regress
