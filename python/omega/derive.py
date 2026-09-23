@@ -11,18 +11,29 @@ quarter of a million episodes a second, so a year of heavy use rebuilds in
 about a third of a second. The benchmark lives in ``bench/replay.py`` so the
 number can be re-taken rather than believed.
 
-What is derived here is *what's open*: the half of DL-019's "recent N + what's
+Two views live here.
+
+:class:`OpenWork` derives *what's open*: the half of DL-019's "recent N + what's
 open" that :func:`omega.turn.recall` has always named in its docstring and
 never had. Recall is the last ``RECALL_N`` episodes, so until now a question
 omega stopped to ask simply **aged out of its own context** once forty episodes
 went by — and DL-035 requires the opposite, that a block "survive until they
 look", because after the clock landed there may be nobody watching when it is
 raised.
+
+:class:`Learned` derives *what omega has been taught* (DL-042). Same shape, and
+it is the same shape for a reason that is not tidiness: a learned habit changes
+how omega behaves on turns that have nothing to do with the material that taught
+it, so of everything in the system it is the thing that least deserves to live
+somewhere a rebuild cannot reach. Deriving it from ``claim.extracted`` records
+means there is no learned state to migrate, no learned state to corrupt, and no
+way for what omega believes to drift from what the log says it was told.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Iterable, Optional
 
 from . import episodes
@@ -30,7 +41,7 @@ from . import episodes
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from .memory import MemoryStore
 
-__all__ = ["OpenBlock", "OpenWork"]
+__all__ = ["OpenBlock", "OpenWork", "Claim", "Learned", "local_hour"]
 
 
 @dataclass(frozen=True)
@@ -176,4 +187,223 @@ class OpenWork:
         view that advanced them would be the second writer the queue's design
         exists to exclude.
         """
+        return cls().advance(store)
+
+
+# --- what omega has been taught (DL-042) -------------------------------------
+
+
+def local_hour(at: str) -> Optional[int]:
+    """The local-clock hour of an episode timestamp, or ``None`` if unreadable.
+
+    ``None`` is a real answer, and the caller must treat it as *does not match*
+    rather than as *matches anything*. An hour window that cannot be evaluated
+    falling open would turn "only while I'm working" into "always", which is
+    precisely the spurious activation DL-042 pairs against the capability — and
+    `CLAUDE.md`'s fail-closed-on-empty rule says which way an undeterminable
+    check has to break.
+
+    Timestamps are written in UTC by :func:`omega.episodes.now`, and the window
+    is a *human* one — "while I'm at work" is a statement about the clock on the
+    wall, not about UTC. So this converts. A naive timestamp is read as UTC,
+    because that is what the log writes; it is not read as local, which would
+    silently shift every window by the machine's offset.
+    """
+    try:
+        parsed = datetime.fromisoformat(at)
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone().hour
+
+
+@dataclass(frozen=True)
+class Claim:
+    """One thing omega has been taught, and the condition it applies under.
+
+    ``seq`` is the ``claim.extracted`` record. ``source_seq`` is the episode it
+    was learned *from*, which is usually the event of the same turn and not
+    always. ``situation`` is what was going on at the time — the provenance
+    DL-034 asked for, kept because a contradiction cannot be re-decided without
+    it and it cannot be reconstructed after the fact.
+
+    ``explicit`` says the person authored this deliberately rather than omega
+    inferring it, and it is what decides whether a contradiction is worth
+    interrupting for (DL-042). It is carried on the claim rather than computed
+    later because it is a fact about how the claim arrived, and that fact is
+    only available while it is arriving.
+    """
+
+    seq: int
+    text: str
+    trigger: Optional[dict[str, Any]]
+    situation: str
+    source_seq: int
+    explicit: bool
+    supersedes: Optional[int] = None
+
+    def fires_on(self, *, text: str, channel: str, hour: Optional[int]) -> bool:
+        """Does this claim apply to the situation described?
+
+        No trigger means always — the right representation for tone and working
+        style, which have no situation because they apply to all of them. A
+        trigger's fields are ANDed: a claim that names both a phrase and an hour
+        window means *both*, because a person who names two conditions has
+        narrowed, not widened.
+
+        Matching is substring over a lowercased form, and that is as clever as
+        it gets on purpose (DL-042). It will miss a situation described in words
+        the claim did not anticipate. The mitigation is not a better matcher
+        here — it is that the person sees the trigger in the receipt while they
+        still remember what they meant, and can say so.
+        """
+        trigger = self.trigger
+        if not trigger:
+            return True
+
+        phrases = trigger.get("any")
+        if phrases is not None:
+            haystack = text.lower()
+            if not any(p.strip().lower() in haystack for p in phrases):
+                return False
+
+        wanted = trigger.get("channel")
+        if wanted is not None and wanted != channel:
+            return False
+
+        window = trigger.get("hours")
+        if window is not None:
+            if hour is None:
+                # Undeterminable, so it does not fire. See `local_hour`.
+                return False
+            start, end = int(window[0]), int(window[1])
+            # Half-open, and wrapping is a real window: [22, 6] is the night,
+            # which is a thing people say and would otherwise need two claims.
+            inside = start <= hour < end if start < end else (hour >= start or hour < end)
+            if not inside:
+                return False
+
+        return True
+
+
+class Learned:
+    """Everything omega has been taught that has not been superseded.
+
+    Folded from ``claim.extracted`` records the same way :class:`OpenWork` is
+    folded from blocks, and kept as a separate view rather than a second field
+    on that one because the two answer different questions and have different
+    lifetimes: an obligation is discharged by an answer and gone, a claim
+    persists until something contradicts it.
+
+    **Supersession removes a claim from the active set and from nowhere else.**
+    The superseded record stays in the log, so re-derivation can always reach
+    the earlier state and "destroy core memory" is impossible by construction
+    rather than by a model getting a criticality test right (DL-034, DL-042).
+    That is the property that lets ``explicit`` be a cheap static flag about
+    *escalation* instead of a safety mechanism carrying weight it could not
+    hold.
+    """
+
+    __slots__ = ("_claims", "_through")
+
+    def __init__(self) -> None:
+        self._claims: dict[int, Claim] = {}
+        self._through = 0
+
+    @property
+    def through(self) -> int:
+        """The last seq folded in. 0 means nothing has been applied.
+
+        Same reason :attr:`OpenWork.through` exists: "rebuilt and found nothing
+        learned" and "never rebuilt" must be distinguishable, or the empty
+        answer is a check that passes on empty.
+        """
+        return self._through
+
+    def apply(self, seq: int, payload: dict[str, Any]) -> None:
+        """Fold one episode in. Must be called in seq order.
+
+        Order matters here for the same reason it does in :class:`OpenWork` and
+        with a worse failure: a superseding claim applied before the claim it
+        replaces would leave both active, so omega would hold two contradictory
+        beliefs and act on whichever the renderer happened to reach first.
+        """
+        if seq <= self._through:
+            raise ValueError(
+                f"episodes must be folded in order: got seq {seq} after "
+                f"{self._through}"
+            )
+        if payload.get("kind") == episodes.CLAIM_EXTRACTED:
+            supersedes = payload.get("supersedes")
+            if supersedes is not None:
+                # ``pop`` with a default, as in ``OpenWork``: a claim naming a
+                # supersession target that is not currently active is not an
+                # error a derived view should adjudicate. The target may itself
+                # have been superseded already, which is an ordinary race in an
+                # append-only log and not a corruption.
+                self._claims.pop(int(supersedes), None)
+            self._claims[seq] = Claim(
+                seq=seq,
+                text=str(payload["text"]),
+                trigger=payload.get("trigger"),
+                situation=str(payload.get("situation", "")),
+                source_seq=int(payload["source_seq"]),
+                explicit=bool(payload.get("explicit", False)),
+                supersedes=None if supersedes is None else int(supersedes),
+            )
+        self._through = seq
+
+    def claims(self) -> list[Claim]:
+        """Every active claim, oldest first."""
+        return sorted(self._claims.values(), key=lambda c: c.seq)
+
+    def matching(
+        self, *, text: str, channel: str, at: str
+    ) -> list[Claim]:
+        """The claims that fire on this event, oldest first.
+
+        This runs on **every** turn (DL-034), which is the whole reason the
+        trigger vocabulary is structural: it is a few substring tests per claim
+        against text omega already has in hand, with no model call and no
+        retrieval. What it costs is proportional to how much omega has learned,
+        which is the one growth curve that is affordable here.
+        """
+        hour = local_hour(at)
+        return [
+            claim
+            for claim in self.claims()
+            if claim.fires_on(text=text, channel=channel, hour=hour)
+        ]
+
+    def __len__(self) -> int:
+        return len(self._claims)
+
+    @classmethod
+    def fold(cls, decoded: Iterable[tuple[int, dict[str, Any]]]) -> "Learned":
+        """Build from ``(seq, payload)`` pairs. The pure core, for tests."""
+        view = cls()
+        for seq, payload in decoded:
+            view.apply(seq, payload)
+        return view
+
+    def advance(self, store: "MemoryStore", *, upto: Optional[int] = None) -> "Learned":
+        """Fold what the log gained since :attr:`through`, to ``upto``. Returns self.
+
+        ``upto`` carries the same meaning and the same warning as it does on
+        :meth:`OpenWork.advance`: a turn handling a backlog passes its own
+        episode's seq, so the claims it is shown are the ones omega had actually
+        been taught by that point. Folding to the head would apply a claim to a
+        turn that happened before it was learned — which, unlike a stale view,
+        looks entirely correct from the outside.
+        """
+        for episode in store.episodes_since(self._through):
+            if upto is not None and episode.seq > upto:
+                break
+            self.apply(episode.seq, episodes.decode(episode.payload))
+        return self
+
+    @classmethod
+    def rebuild(cls, store: "MemoryStore") -> "Learned":
+        """Replay the whole log. The boot path, and the only one."""
         return cls().advance(store)

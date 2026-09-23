@@ -29,7 +29,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
 from omega import episodes, provider
-from omega.derive import OpenWork
+from omega.derive import Learned, OpenWork
 from omega.memory import WriteKeyConflict
 from omega.queue import EVENT_KINDS, EventQueue, Pending
 from omega.turn import ActResult, TurnContext, TurnResult, no_act_loop_yet, run_turn
@@ -137,7 +137,7 @@ class StartupReport:
 class Executor:
     """The one consumer. Claims, runs, records, releases — in that order."""
 
-    __slots__ = ("_queue", "_complete", "_act", "_recovered", "_open")
+    __slots__ = ("_queue", "_complete", "_act", "_recovered", "_open", "_learned")
 
     def __init__(
         self,
@@ -151,6 +151,7 @@ class Executor:
         self._act = act
         self._recovered = False
         self._open = OpenWork()
+        self._learned = Learned()
 
     @property
     def queue(self) -> EventQueue:
@@ -180,6 +181,18 @@ class Executor:
         (DL-041) and cannot be made stale by a reader that does not advance it.
         """
         return self._open
+
+    @property
+    def learned(self) -> Learned:
+        """What omega has been taught (DL-042).
+
+        Owned, advanced and bounded exactly like :attr:`open_work`, and kept as
+        a second view rather than folded into the first because the two have
+        different lifetimes: an obligation is discharged and gone, a claim
+        stands until something supersedes it. Sharing one fold would mean every
+        change to either one's rules had to be reasoned about against both.
+        """
+        return self._learned
 
     # --- startup ----------------------------------------------------------
 
@@ -387,12 +400,23 @@ class Executor:
         # because on a backlog the log's head is ahead of the turn: folding to
         # it would show this turn questions omega had not asked yet.
         self._open.advance(self._queue.store, upto=pending.seq)
+        # Bounded identically, and for a sharper version of the same reason: a
+        # claim folded past this episode would be applied to a turn that
+        # happened before omega was taught it. An over-eager *question* looks
+        # wrong; an over-eager *habit* looks like omega simply behaving that
+        # way, which is the failure DL-042 pairs its violation metric against.
+        self._learned.advance(self._queue.store, upto=pending.seq)
         result = run_turn(
             self._queue,
             pending,
             complete=self._complete,
             act=self._act,
             open_work=self._open.blocks(),
+            learned=self._learned.matching(
+                text=str(pending.payload.get("text", "")),
+                channel=str(pending.payload.get("channel", "")),
+                at=str(pending.payload.get("at", "")),
+            ),
         )
         self._queue.finish(pending.seq)
         return result

@@ -45,6 +45,7 @@ __all__ = [
     "MAX_NEW_EVENT_CHARS",
     "MAX_RECALL_CHARS",
     "MAX_OPEN_CHARS",
+    "MAX_LEARNED_CHARS",
     "MAX_ACT_PASSES",
     "JudgeUndecided",
     "NotAnEvent",
@@ -106,6 +107,15 @@ MAX_RECALL_CHARS = 24_000
 #: question from months ago is likelier to be dead than overdue. The drop is
 #: announced, for the same reason recall's is (DL-039).
 MAX_OPEN_CHARS = 2_000
+
+#: What omega has been taught that applies to this turn, after per-line elision
+#: (DL-042). Larger than the open-questions budget and far smaller than recall,
+#: because a learned claim is one sentence and forty of them firing at once is
+#: already a sign the triggers are too loose rather than a sign the budget is too
+#: small. The drop is announced, like every other budget here, and its order is
+#: the one thing about this section that is a *judgement* — see
+#: :func:`_learned_section`.
+MAX_LEARNED_CHARS = 3_000
 
 #: §2.3 — a fixed cap on `act` passes. Not an answer to "where does the stop
 #: threshold sit"; a floor that makes the question answerable with real stalls
@@ -200,6 +210,14 @@ class TurnContext:
     #: view (``OpenWork.through``), not to a prompt that can only render what
     #: it is handed.
     open_work: Sequence[derive.OpenBlock] = ()
+
+    #: The claims that fire on *this* event (DL-042) — already matched, not the
+    #: whole learned set. Matching happens outside the prompt for the same
+    #: reason recall does: the prompt renders what it is handed, and a section
+    #: that decided for itself what applied would be a second place where
+    #: retrieval policy lived. Empty means nothing fired, which is the common
+    #: case and renders as nothing at all.
+    learned: Sequence[derive.Claim] = ()
 
 
 @dataclass(frozen=True)
@@ -390,6 +408,7 @@ def run_turn(
     act: Callable[[TurnContext], ActResult] = no_act_loop_yet,
     recall_n: int = RECALL_N,
     open_work: Sequence[derive.OpenBlock] = (),
+    learned: Sequence[derive.Claim] = (),
     at: Optional[str] = None,
 ) -> TurnResult:
     """Run one turn over an already-claimed episode and record how it ended.
@@ -415,6 +434,11 @@ def run_turn(
     caller already has. It defaults to empty so a test can drive one turn
     without a view — which is also why the default is a silent empty section
     rather than a claim that nothing is open: see :func:`_open_section`.
+
+    ``learned`` arrives the same way and **already matched** against this event.
+    Matching here instead would mean a turn could not be driven without a store,
+    and would put the decision about what applies inside the thing that renders
+    it — the same separation recall has kept since M1.
     """
     complete = complete or provider.complete
     event = perceive(pending)
@@ -426,6 +450,7 @@ def run_turn(
         queue=queue,
         complete=complete,
         open_work=tuple(open_work),
+        learned=tuple(learned),
     )
 
     verdict: Optional[Verdict] = None
@@ -604,6 +629,7 @@ def _event_turn(
     # turn rather than a failed request.
     event = _elide(_render_event(ctx.event), MAX_NEW_EVENT_CHARS)
     text = (
+        f"{_learned_section(ctx.learned)}"
         f"Recent history:\n{_transcript(ctx.recalled)}\n\n"
         f"{_open_section(ctx.open_work)}"
         f"New event:\n{event}{suffix}"
@@ -627,6 +653,42 @@ def _reply_messages(ctx: TurnContext, acted: ActResult) -> list[provider.Message
         provider.system(_REPLY_SYSTEM),
         _event_turn(ctx, images=True, suffix=work),
     ]
+
+
+def _learned_section(learned: Sequence[derive.Claim]) -> str:
+    """What omega has been taught that applies here, above the history (DL-042).
+
+    **Above** it, not below, and that is the placement decision. These are
+    standing instructions about *how to behave*, not facts about what happened,
+    and recall's budget is twelve times this one — putting them after the
+    transcript would bury a rule about tone under twenty-four thousand
+    characters of conversation.
+
+    Absent when nothing fires, for DL-041's reason: a heading that is usually
+    empty teaches the model to skip it. It also means a person who has taught
+    omega nothing gets a prompt that is **byte-identical** to the one before
+    this existed, which is what keeps earlier eval numbers comparable.
+
+    It states the claims and stops, per DL-033 — no explanation of what a
+    learned claim is, no instruction about how strongly to weigh one. A prompt
+    that explains its own mechanism is one the model reasons about instead of
+    from.
+
+    *Ordering is least-important-first, which is also the drop order.*
+    ``_within`` drops from the front, so putting inferred claims before
+    explicit ones and older before newer means that when the budget bites, what
+    omega merely *inferred* goes before what the person actually **said** — the
+    only ranking available here that is a fact rather than a guess, and the one
+    DL-042 already gave meaning to. It has a second effect worth having: the
+    claims the person stated sit nearest the event they apply to.
+    """
+    if not learned:
+        return ""
+    ordered = sorted(learned, key=lambda c: (c.explicit, c.seq))
+    lines = [_elide(f"- {claim.text}", MAX_EVENT_CHARS, at=claim.seq) for claim in ordered]
+    lines = _within(lines, MAX_LEARNED_CHARS, noun="learned item")
+    body = "\n".join(lines)
+    return f"What you have learned about working with this person:\n{body}\n\n"
 
 
 def _open_section(open_work: Sequence[derive.OpenBlock]) -> str:
