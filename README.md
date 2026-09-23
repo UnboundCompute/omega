@@ -28,13 +28,37 @@ their own corruption, and a memory seam (`python/omega/memory/`) that is the onl
 in the tree allowed to know frames and offsets exist. Its contract is
 [`agent/M0_SPEC.md`](agent/M0_SPEC.md) and every case in it has a test.
 
-**M1 — one turn, end to end — is partly built.** The episode codec and the provider seam
-are in; the queue, the turn loop and the outward projection are being written now. The
-build order is in [`agent/M1_SPEC.md`](agent/M1_SPEC.md).
+**M1 — one turn, end to end — runs.** The episode codec, the provider seam, the queue, the
+turn loop, the outward projection, the socket channel and the resident process are all in.
+The build order and what each step owes is in [`agent/M1_SPEC.md`](agent/M1_SPEC.md). The
+Swift tray (step 8) is the part still outstanding.
 
-**There is no command that runs omega yet.** The first version you can actually talk to
-arrives when M1 closes. Until then the honest answer to "can I try it" is: you can run the
-test suite, and you can read what it proves.
+## Talking to it
+
+```sh
+.venv/bin/python -m omega
+```
+
+That opens the store, says what the last stop left behind, and gives you a prompt. Every
+line you type becomes an episode in the log; the loop reads it back off the log and
+answers. Ctrl-D or Ctrl-C leaves — between turns, never inside one, so the next start has
+nothing to report.
+
+Three answers are possible and they read differently on purpose: a reply, `(omega chose
+not to speak)`, and a logged error. **Staying silent is a success**, not a failure to
+answer, and a UI that showed them the same way would erase the distinction the whole
+milestone is built to measure.
+
+| flag | what it does |
+| --- | --- |
+| `--store PATH` | the store directory. Default `~/.omega` — a dotdir in `$HOME`, so two checkouts are not two omegas |
+| `--env PATH` | the `.env` holding the key. Default: beside the store, then the repo root; **never** the working directory |
+| `--no-listen` | do not open the localhost socket; this terminal is the only client |
+| `--port PORT` | where the tray connects |
+
+One process holds the log, because the log is opened exclusively by design — so the
+terminal, the socket and the loop are threads inside that one process rather than several
+of them.
 
 ## Building and testing it
 
@@ -56,7 +80,7 @@ enough in a debug build to look like a hang.
 
 ## Configuring it
 
-One secret, and it is only needed once there is a turn loop to spend it:
+One secret:
 
 ```sh
 cp .env.example .env    # then put your key in it
@@ -65,6 +89,11 @@ cp .env.example .env    # then put your key in it
 `.env` is gitignored and `.env.example` documents every variable omega reads. A value
 already exported in your shell wins over the file. **The test suite never reads the key and
 never touches the network** — if a test ever needs one, that is a bug in the test.
+
+`python -m omega` looks for that file beside the store first (`~/.omega/.env`), then at the
+repo root — and deliberately not in whatever directory you happened to run it from, because
+"it works from the repo and nowhere else" is a rule nobody can see. Without a key it prints
+one sentence naming the exact file to put it in, and exits.
 
 ## Boundary rule
 
