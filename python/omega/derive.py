@@ -23,7 +23,7 @@ raised.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Iterable
+from typing import TYPE_CHECKING, Any, Iterable, Optional
 
 from . import episodes
 
@@ -140,6 +140,33 @@ class OpenWork:
             view.apply(seq, payload)
         return view
 
+    def advance(self, store: "MemoryStore", *, upto: Optional[int] = None) -> "OpenWork":
+        """Fold what the log gained since :attr:`through`, to ``upto``. Returns self.
+
+        This is the steady-state path, and it is what keeps the view off the
+        per-turn cost sheet: ``episodes_since`` is exclusive of its argument, so
+        a turn folds only what actually arrived rather than replaying the log —
+        the difference between O(new) and O(log) on every turn, next to
+        durability code where the second asymptote would not stay unnoticed.
+
+        **``upto`` is not an optimisation.** Without it the fold runs to the
+        head of the log, and a turn handling a backlog would be shown questions
+        omega had not asked yet at that point in the conversation — worse than
+        stale, because a view that runs ahead of the turn reading it is wrong in
+        a direction nobody checks for. A caller handling one episode passes that
+        episode's seq; a caller that genuinely wants "everything so far" omits
+        it and says so by omitting it.
+
+        Idempotent when nothing new is in range: the iterator yields nothing or
+        is cut at once, no ``apply`` runs, and ``through`` does not move. So a
+        caller may advance as often as it likes.
+        """
+        for episode in store.episodes_since(self._through):
+            if upto is not None and episode.seq > upto:
+                break
+            self.apply(episode.seq, episodes.decode(episode.payload))
+        return self
+
     @classmethod
     def rebuild(cls, store: "MemoryStore") -> "OpenWork":
         """Replay the whole log. This is the boot path, and the only one.
@@ -149,7 +176,4 @@ class OpenWork:
         view that advanced them would be the second writer the queue's design
         exists to exclude.
         """
-        view = cls()
-        for episode in store.episodes_since(0):
-            view.apply(episode.seq, episodes.decode(episode.payload))
-        return view
+        return cls().advance(store)

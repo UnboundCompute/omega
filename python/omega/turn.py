@@ -32,7 +32,7 @@ import base64
 from dataclasses import dataclass
 from typing import Any, Callable, Optional, Sequence
 
-from omega import blobs, episodes, provider
+from omega import blobs, derive, episodes, provider
 from omega.queue import EVENT_KINDS, EventQueue, Pending
 
 __all__ = [
@@ -44,6 +44,7 @@ __all__ = [
     "MAX_EVENT_CHARS",
     "MAX_NEW_EVENT_CHARS",
     "MAX_RECALL_CHARS",
+    "MAX_OPEN_CHARS",
     "MAX_ACT_PASSES",
     "JudgeUndecided",
     "NotAnEvent",
@@ -96,6 +97,15 @@ MAX_NEW_EVENT_CHARS = 32_000
 #: oldest-first, because when something has to go the least recent thing is the
 #: one whose absence is least likely to be the answer.
 MAX_RECALL_CHARS = 24_000
+
+#: What's open, after per-line elision. Small next to recall, and deliberately:
+#: this section is a *list of unanswered questions*, not a transcript, and a
+#: person who has accumulated enough open questions to fill 24k characters has a
+#: problem no budget fixes. Dropped oldest-first like recall, which here means
+#: the questions that survive are the ones asked most recently — an unanswered
+#: question from months ago is likelier to be dead than overdue. The drop is
+#: announced, for the same reason recall's is (DL-039).
+MAX_OPEN_CHARS = 2_000
 
 #: §2.3 — a fixed cap on `act` passes. Not an answer to "where does the stop
 #: threshold sit"; a floor that makes the question answerable with real stalls
@@ -179,6 +189,17 @@ class TurnContext:
     recalled: Sequence[Pending]
     queue: EventQueue
     complete: Callable[..., provider.Response]
+
+    #: The other half of DL-019's "recent N + what's open" — questions omega
+    #: asked and has no answer to yet, derived from the log rather than stored
+    #: (DL-041). Defaulted to empty so every existing caller keeps working and
+    #: so a step can be driven without a store; empty means *nothing is open*,
+    #: which is also what it means when the view has genuinely found nothing.
+    #: Those two are the same claim here on purpose — the difference between
+    #: "rebuilt and empty" and "never rebuilt" belongs to whoever builds the
+    #: view (``OpenWork.through``), not to a prompt that can only render what
+    #: it is handed.
+    open_work: Sequence[derive.OpenBlock] = ()
 
 
 @dataclass(frozen=True)
@@ -368,6 +389,7 @@ def run_turn(
     complete: Optional[Callable[..., provider.Response]] = None,
     act: Callable[[TurnContext], ActResult] = no_act_loop_yet,
     recall_n: int = RECALL_N,
+    open_work: Sequence[derive.OpenBlock] = (),
     at: Optional[str] = None,
 ) -> TurnResult:
     """Run one turn over an already-claimed episode and record how it ended.
@@ -386,6 +408,13 @@ def run_turn(
     The one exception is a failure to *append the record itself*: there is
     nothing left to write it with, so it propagates and the turn is genuinely
     in-flight for the startup report to find.
+
+    ``open_work`` is passed in rather than derived here. The view is a fold over
+    the whole log and its whole value is that it is *kept*, so a turn that built
+    its own would replay the log once per turn and pay O(log) for a fact its
+    caller already has. It defaults to empty so a test can drive one turn
+    without a view — which is also why the default is a silent empty section
+    rather than a claim that nothing is open: see :func:`_open_section`.
     """
     complete = complete or provider.complete
     event = perceive(pending)
@@ -396,6 +425,7 @@ def run_turn(
         recalled=recalled,
         queue=queue,
         complete=complete,
+        open_work=tuple(open_work),
     )
 
     verdict: Optional[Verdict] = None
@@ -575,6 +605,7 @@ def _event_turn(
     event = _elide(_render_event(ctx.event), MAX_NEW_EVENT_CHARS)
     text = (
         f"Recent history:\n{_transcript(ctx.recalled)}\n\n"
+        f"{_open_section(ctx.open_work)}"
         f"New event:\n{event}{suffix}"
     )
     parts = _image_parts(ctx) if images else []
@@ -596,6 +627,38 @@ def _reply_messages(ctx: TurnContext, acted: ActResult) -> list[provider.Message
         provider.system(_REPLY_SYSTEM),
         _event_turn(ctx, images=True, suffix=work),
     ]
+
+
+def _open_section(open_work: Sequence[derive.OpenBlock]) -> str:
+    """What's open, as its own block between history and the new event.
+
+    Absent entirely when nothing is open, rather than present and empty. A
+    standing heading with nothing under it teaches the model that the section is
+    usually noise, and by the time it matters it has been trained to skip it.
+
+    **It states the fact and stops.** No instruction to chase the answer, no
+    explanation of what being blocked means for what it may do next. DL-033 is
+    the reason: a prompt that explains a mechanism is a prompt the model reasons
+    *about* rather than from, and the failure there was a model that talked
+    around a gate instead of using it. What omega does about an unanswered
+    question is a judgement made from the fact, so the fact is all that is
+    supplied.
+
+    A block still inside the recall window is rendered twice — once in the
+    transcript as something omega asked, once here. That redundancy is the
+    point: the transcript says the question was asked, and only this section
+    says it was never answered. The two lines together are the distinction, and
+    suppressing the duplicate would delete it.
+    """
+    if not open_work:
+        return ""
+    lines = [
+        _elide(f"- {block.needs}", MAX_EVENT_CHARS, at=block.seq)
+        for block in open_work
+    ]
+    lines = _within(lines, MAX_OPEN_CHARS, noun="question")
+    body = "\n".join(lines)
+    return f"You asked these and have had no answer yet:\n{body}\n\n"
 
 
 def _transcript(recalled: Sequence[Pending]) -> str:
@@ -621,7 +684,7 @@ def _transcript(recalled: Sequence[Pending]) -> str:
     return "\n".join(lines) if lines else "(nothing yet)"
 
 
-def _within(lines: list[str], budget: int) -> list[str]:
+def _within(lines: list[str], budget: int, noun: str = "event") -> list[str]:
     """Drop whole lines, oldest first, until the transcript fits.
 
     Dropping *whole* lines rather than shaving every line proportionally: a
@@ -632,6 +695,11 @@ def _within(lines: list[str], budget: int) -> list[str]:
     of a model confidently answering "you never mentioned that" — and it would
     be right about its context and wrong about the conversation, which is the
     worst combination available.
+
+    ``noun`` only names what was dropped. It exists because this is shared with
+    the what's-open section, where "earlier event(s) not shown" would describe
+    the lines as history — and a dropped *question* read as a dropped event is
+    exactly the misreading the announcement is here to prevent.
     """
     total = sum(len(line) + 1 for line in lines)
     if total <= budget:
@@ -642,7 +710,7 @@ def _within(lines: list[str], budget: int) -> list[str]:
         lines.pop(0)
         dropped += 1
     return [
-        f"[{dropped} earlier event(s) not shown here — they are in the log]",
+        f"[{dropped} earlier {noun}(s) not shown here — they are in the log]",
         *lines,
     ]
 

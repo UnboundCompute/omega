@@ -29,6 +29,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
 from omega import episodes, provider
+from omega.derive import OpenWork
 from omega.memory import WriteKeyConflict
 from omega.queue import EVENT_KINDS, EventQueue, Pending
 from omega.turn import ActResult, TurnContext, TurnResult, no_act_loop_yet, run_turn
@@ -136,7 +137,7 @@ class StartupReport:
 class Executor:
     """The one consumer. Claims, runs, records, releases — in that order."""
 
-    __slots__ = ("_queue", "_complete", "_act", "_recovered")
+    __slots__ = ("_queue", "_complete", "_act", "_recovered", "_open")
 
     def __init__(
         self,
@@ -149,6 +150,7 @@ class Executor:
         self._complete = complete
         self._act = act
         self._recovered = False
+        self._open = OpenWork()
 
     @property
     def queue(self) -> EventQueue:
@@ -157,6 +159,27 @@ class Executor:
     @property
     def recovered(self) -> bool:
         return self._recovered
+
+    @property
+    def open_work(self) -> OpenWork:
+        """What omega is still waiting on a person for (DL-041).
+
+        Owned here because the executor is the single consumer: one view
+        advanced by the one thread that runs turns needs no lock, and any second
+        owner would need one.
+
+        **Not built by** :meth:`recover`, and that is a decision rather than an
+        omission. Recovery would have to fold to the head of the log, and a view
+        that has already reached the head cannot be pulled back to the episode a
+        turn is actually handling — the fold only goes forwards. The first turn
+        after a start therefore folds the log itself, which is the same work
+        deferred by one event, and buys the property that matters: the prompt
+        for an episode is a function of the log up to that episode, not of how
+        far behind the drain happened to be. Anything wanting "open as of now"
+        instead builds its own with :meth:`OpenWork.rebuild`, which is cheap
+        (DL-041) and cannot be made stale by a reader that does not advance it.
+        """
+        return self._open
 
     # --- startup ----------------------------------------------------------
 
@@ -356,11 +379,20 @@ class Executor:
         # Claim, then act. Everything after this line is covered by the
         # startup report if the process dies (§1.2).
         self._queue.claim(pending.seq)
+        # Advanced *through this event*, and no further. Through, because an
+        # answer discharges the question it answers and a turn that still listed
+        # it as open would go on asking about something the person had just
+        # settled — which is the one place this deliberately differs from
+        # recall, which stops short of the triggering episode. No further,
+        # because on a backlog the log's head is ahead of the turn: folding to
+        # it would show this turn questions omega had not asked yet.
+        self._open.advance(self._queue.store, upto=pending.seq)
         result = run_turn(
             self._queue,
             pending,
             complete=self._complete,
             act=self._act,
+            open_work=self._open.blocks(),
         )
         self._queue.finish(pending.seq)
         return result
