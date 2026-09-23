@@ -45,6 +45,7 @@ final class TrayViewModel: ObservableObject {
     @Published var turnState: WorkState = .ready
     @Published var localWorkState: WorkState?
     @Published var connectionState: TrayConnectionState = .connecting
+    @Published var agentStartupFailure: String?
     @Published var isDropTargeted = false
     @Published var isExpanded = false
     @Published var hasUnread = false
@@ -274,6 +275,7 @@ final class TrayViewModel: ObservableObject {
         switch event {
         case .connected:
             connectionState = .connected
+            agentStartupFailure = nil
             if var activeTurn, activeTurn.awaitingResume {
                 activeTurn.awaitingResume = false
                 self.activeTurn = activeTurn

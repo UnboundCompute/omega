@@ -29,7 +29,9 @@ from __future__ import annotations
 
 import argparse
 import os
+import signal
 import sys
+import threading
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -42,6 +44,7 @@ __all__ = [
     "resolve_env",
     "render",
     "repl",
+    "serve",
     "main",
 ]
 
@@ -119,7 +122,7 @@ def render(said: runtime.Said) -> str:
     return f"omega: {said.reply}"
 
 
-def _startup_lines(rt: runtime.Runtime) -> list[str]:
+def _startup_lines(rt: runtime.Runtime, *, interactive: bool = True) -> list[str]:
     """What omega says when it opens.
 
     The startup report is printed **first and always**, because it is where an
@@ -135,7 +138,8 @@ def _startup_lines(rt: runtime.Runtime) -> list[str]:
     out.extend(f"omega: {line}" for line in rt.report.lines())
     if rt.report.clean:
         out.append("(nothing was left in flight last time)")
-    out.append("type a line to talk; ctrl-d or ctrl-c to leave")
+    if interactive:
+        out.append("type a line to talk; ctrl-d or ctrl-c to leave")
     return out
 
 
@@ -180,6 +184,35 @@ def repl(
             return 1
 
 
+def serve(
+    rt: runtime.Runtime,
+    *,
+    write: Callable[[str], None],
+    wait: Optional[Callable[[], None]] = None,
+) -> int:
+    """Keep the resident runtime alive without reading a terminal.
+
+    The tray owns this mode. SIGTERM asks for the same clean, between-turn stop
+    as Ctrl-C in the REPL; the outer ``main`` finally block performs that stop.
+    ``wait`` is injectable so the lifecycle can be proven without parking a
+    test process forever.
+    """
+    stopping = threading.Event()
+
+    def request_stop(_signum: int, _frame: object) -> None:
+        stopping.set()
+
+    previous_term = signal.signal(signal.SIGTERM, request_stop)
+    previous_int = signal.signal(signal.SIGINT, request_stop)
+    try:
+        write("omega agent is running")
+        (wait or stopping.wait)()
+        return 0
+    finally:
+        signal.signal(signal.SIGTERM, previous_term)
+        signal.signal(signal.SIGINT, previous_int)
+
+
 # --- entry point ------------------------------------------------------------
 
 
@@ -210,6 +243,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="do not open the localhost socket; this terminal is the only client",
     )
     parser.add_argument(
+        "--serve",
+        action="store_true",
+        help="run the resident listener without opening an interactive terminal",
+    )
+    parser.add_argument(
         "--host", default=DEFAULT_HOST, metavar="HOST", help=argparse.SUPPRESS
     )
     parser.add_argument(
@@ -224,7 +262,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Optional[list[str]] = None) -> int:
     """Open one omega, talk to it, close it. Ctrl-C and EOF both leave cleanly."""
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.serve and not args.listen:
+        parser.error("--serve requires the localhost listener")
     write = _writer()
 
     store_dir = Path(args.store).expanduser()
@@ -268,9 +309,12 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     code = 0
     try:
-        for line in _startup_lines(rt):
+        for line in _startup_lines(rt, interactive=not args.serve):
             write(line)
-        code = repl(rt, read_line=lambda: input(_PROMPT), write=write)
+        if args.serve:
+            code = serve(rt, write=write)
+        else:
+            code = repl(rt, read_line=lambda: input(_PROMPT), write=write)
     except KeyboardInterrupt:
         # Ctrl-C lands on this thread; the drain is untouched and finishes the
         # turn it is holding while stop() waits for it. Not a crash, so not a

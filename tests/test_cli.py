@@ -154,6 +154,37 @@ def test_main_runs_a_whole_session_and_leaves_the_log_clean(
     assert check, str(check)
 
 
+def test_service_mode_starts_without_reading_a_terminal(
+    store_dir: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    fake = speaking("unused")
+    entered: list[tuple[str, int]] = []
+    monkeypatch.setattr(provider, "provider_from_env", lambda *, env_path=None: fake)
+    monkeypatch.setattr(
+        cli,
+        "serve",
+        lambda rt, *, write: entered.append(rt.address) or 0,
+    )
+    monkeypatch.setattr(
+        "builtins.input",
+        lambda *_args: pytest.fail("service mode must not read stdin"),
+    )
+
+    code = cli.main([
+        "--store", str(store_dir),
+        "--env", str(tmp_path / "absent.env"),
+        "--port", "0",
+        "--serve",
+    ])
+
+    assert code == 0
+    assert len(entered) == 1 and entered[0][1] > 0
+    assert "omega agent is running" not in "\n".join(lines_of(capsys))
+
+
 def test_ctrl_c_leaves_the_same_way_eof_does(
     store_dir: Path,
     tmp_path: Path,

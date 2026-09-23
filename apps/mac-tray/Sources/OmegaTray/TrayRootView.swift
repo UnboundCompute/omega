@@ -289,7 +289,8 @@ private struct ExpandedTrayView: View {
             RecoveryNotice(
                 icon: "bolt.horizontal.circle",
                 title: "The agent is offline",
-                detail: "Start omega’s local agent. The tray will reconnect automatically.",
+                detail: viewModel.agentStartupFailure
+                    ?? "omega is restarting its local agent and will reconnect automatically.",
                 actionTitle: nil,
                 action: nil
             )

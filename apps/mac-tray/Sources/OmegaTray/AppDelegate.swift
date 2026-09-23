@@ -5,6 +5,7 @@ import Combine
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private let transport = OmegaChannelClient()
     private lazy var viewModel = TrayViewModel(transport: transport)
+    private let agentProcessController = AgentProcessController()
     private var panelController: OmegaPanelController?
     private var statusItem: NSStatusItem?
     private var panelHotKey: GlobalHotKey?
@@ -16,6 +17,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
+
+        agentProcessController.onFailure = { [weak self] detail in
+            self?.viewModel.agentStartupFailure = detail
+        }
+        agentProcessController.start()
 
         let panelController = OmegaPanelController(viewModel: viewModel)
         self.panelController = panelController
@@ -68,6 +74,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         panelHotKey = nil
         captureAreaHotKey = nil
         viewModel.stop()
+        agentProcessController.stop()
         DistributedNotificationCenter.default.removeObserver(self)
     }
 
