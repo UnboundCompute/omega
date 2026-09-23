@@ -39,6 +39,40 @@ final class TraySnapshotTests: XCTestCase {
             to: directory.appendingPathComponent("mac-expanded.png")
         )
 
+        model.messages = [
+            .init(
+                role: .omega,
+                text: """
+                ## What I found
+
+                The **capture path works**, including [native links](https://example.com).
+
+                - Images reach the model
+                - Replies keep their structure
+
+                ```swift
+                let status = "ready"
+                ```
+                """
+            )
+        ]
+        try write(
+            TrayRootView(viewModel: model, presentation: .expanded, close: {}, open: {})
+                .frame(width: 460, height: 500),
+            to: directory.appendingPathComponent("mac-markdown-response.png")
+        )
+
+        model.messages = []
+        model.beginTeaching()
+        model.draft = "Prefer concise status updates."
+        try write(
+            TrayRootView(viewModel: model, presentation: .expanded, close: {}, open: {})
+                .frame(width: 460, height: 400),
+            to: directory.appendingPathComponent("mac-teach-mode.png")
+        )
+        model.cancelTeaching()
+        model.draft = ""
+
         model.stagedContext = [
             StagedContext(kind: .text, title: "Roadmap notes from the planning call", detail: "Text · Not sent"),
             StagedContext(kind: .link, title: "developer.apple.com", detail: "Link · Not sent")

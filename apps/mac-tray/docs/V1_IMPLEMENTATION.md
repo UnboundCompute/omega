@@ -1,7 +1,7 @@
 # Mac tray v1 — implementation status
 
-Status: native surface, M1 streaming transport, and durable attachment ingestion complete;
-model-side attachment understanding unresolved.
+Status: native surface, M1 streaming transport, image understanding, and durable attachment
+ingestion complete; non-image attachment understanding unresolved.
 
 This file maps the confirmed contract in `V1_SPEC.md` to the implementation. It separates
 tray work from the agent-core work under `agent/` so the first transport cannot accidentally
@@ -49,9 +49,6 @@ become a second brain or an undeclared wire protocol.
   Transparency, inactive appearance, and state labels that do not rely on color.
 - A reproducible `.app` packaging script that uses a stable local signing identity when one is
   available, preserving macOS privacy grants across rebuilds, with an explicit ad-hoc fallback.
-
-## Current implementation pass
-
 - Render agent replies as native structured Markdown while preserving selection and links.
 - Start a non-interactive omega runtime when the packaged tray launches, reuse an already-running
   resident process, stop the owned process on app quit, and surface startup failures in the tray.
@@ -70,10 +67,11 @@ pasted image while it is staged; omega copies the bytes into `<store>/blobs`, re
 content digest, and the tray sends that immutable reference with the message. Upload errors are
 visible and retryable, and cannot silently degrade into metadata-only delivery.
 
-The provider seam remains text-only. Screenshot pixels and file contents are durable and
-re-readable by omega, but no model receives them yet. URL values and selected text also remain
-display context rather than model-readable content. The UI discloses this whenever context is
-staged; durable ingestion must not be described as visual or document understanding.
+Image attachments, including screen captures, reach the capable model as bounded multimodal input.
+Non-image file contents are durable and re-readable by omega but do not reach the model yet. URL
+values and selected text also remain display context rather than model-readable content. The UI
+discloses this only when reference-only context is staged; durable ingestion must not be described
+as document understanding.
 
 The transport preserves these tray-side guarantees:
 
@@ -114,5 +112,5 @@ Manual acceptance on a signed app bundle:
 - Turn on Privacy Veil during screen sharing and verify no conversation content is visible.
 - Run repeated text-only delivery, disconnect, restart, silent, blocked/resume, and proactive
   tests against the real omega listener.
-- Do not mark capture/file understanding complete until the provider receives and can interpret
-  attachment contents; durable ingestion alone is not seeing.
+- Verify capture/image understanding with real pixels, and keep non-image files labeled
+  reference-only until the provider can interpret their contents.

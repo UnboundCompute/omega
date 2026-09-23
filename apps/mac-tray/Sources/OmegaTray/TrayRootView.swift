@@ -248,6 +248,25 @@ private struct ExpandedTrayView: View {
                     .font(.system(size: 11, weight: .medium))
             }
             .buttonStyle(QuietButtonStyle())
+            Menu {
+                Button("New chat", systemImage: "square.and.pencil") {
+                    viewModel.startNewChat()
+                }
+                .disabled(!viewModel.canStartNewChat)
+
+                Divider()
+
+                Button("Teach omega…", systemImage: "graduationcap") {
+                    viewModel.beginTeaching()
+                }
+                .disabled(!viewModel.canBeginTeaching)
+            } label: {
+                Image(systemName: "ellipsis")
+                    .font(.system(size: 11, weight: .semibold))
+                    .frame(width: 18)
+            }
+            .buttonStyle(QuietButtonStyle())
+            .accessibilityLabel("Conversation actions")
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 12)
@@ -299,8 +318,8 @@ private struct ExpandedTrayView: View {
         if viewModel.hasStagedContentWithoutModelUnderstanding {
             RecoveryNotice(
                 icon: "eye.slash",
-                title: "Attachment understanding isn’t connected yet",
-                detail: "omega preserves file-backed items before sending, but the model cannot inspect staged contents yet. Add the important details in your message.",
+                title: "Some context is reference-only",
+                detail: "omega can inspect staged images. Other files and links are preserved, but their contents are not read yet—add the important details in your message.",
                 actionTitle: nil,
                 action: nil
             )
@@ -401,40 +420,62 @@ private struct ExpandedTrayView: View {
     }
 
     private var composer: some View {
-        HStack(alignment: .bottom, spacing: 10) {
-            Button(action: viewModel.pasteFromClipboard) {
-                Image(systemName: "paperclip")
-                    .frame(width: 28, height: 28)
-            }
-            .buttonStyle(.plain)
-            .foregroundStyle(TrayTheme.secondaryText)
-            .accessibilityLabel("Add from clipboard")
-
-            TextField("Ask or delegate…", text: $viewModel.draft, axis: .vertical)
-                .textFieldStyle(.plain)
-                .font(.system(size: 13))
-                .foregroundStyle(TrayTheme.primaryText)
-                .lineLimit(1...5)
-                .focused($composerFocused)
-                .onSubmit(viewModel.send)
-
-            Button(action: viewModel.send) {
-                Group {
-                    if viewModel.workState.isBusy {
-                        ProgressView()
-                            .controlSize(.small)
-                    } else {
-                        Image(systemName: "arrow.up")
-                            .font(.system(size: 12, weight: .bold))
+        VStack(alignment: .leading, spacing: 7) {
+            if viewModel.composerMode == .teach {
+                HStack(spacing: 7) {
+                    Image(systemName: "graduationcap")
+                    Text("Teach omega")
+                        .fontWeight(.semibold)
+                    Text("Saved in history · available to current recall")
+                        .foregroundStyle(TrayTheme.secondaryText)
+                    Spacer(minLength: 0)
+                    Button(action: viewModel.cancelTeaching) {
+                        Image(systemName: "xmark")
+                            .frame(width: 22, height: 22)
                     }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Cancel teaching")
                 }
-                .foregroundStyle(viewModel.canSubmit ? TrayTheme.shell : TrayTheme.tertiaryText)
-                .frame(width: 29, height: 29)
-                .background(viewModel.canSubmit ? TrayTheme.signal : TrayTheme.raised, in: Circle())
+                .font(.system(size: 10))
+                .foregroundStyle(TrayTheme.signal)
             }
-            .buttonStyle(.plain)
-            .disabled(!viewModel.canSubmit)
-            .accessibilityLabel("Send to omega")
+
+            HStack(alignment: .bottom, spacing: 10) {
+                Button(action: viewModel.pasteFromClipboard) {
+                    Image(systemName: "paperclip")
+                        .frame(width: 28, height: 28)
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(TrayTheme.secondaryText)
+                .disabled(viewModel.composerMode == .teach)
+                .accessibilityLabel("Add from clipboard")
+
+                TextField(viewModel.composerPlaceholder, text: $viewModel.draft, axis: .vertical)
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 13))
+                    .foregroundStyle(TrayTheme.primaryText)
+                    .lineLimit(1...5)
+                    .focused($composerFocused)
+                    .onSubmit(viewModel.send)
+
+                Button(action: viewModel.send) {
+                    Group {
+                        if viewModel.workState.isBusy {
+                            ProgressView()
+                                .controlSize(.small)
+                        } else {
+                            Image(systemName: "arrow.up")
+                                .font(.system(size: 12, weight: .bold))
+                        }
+                    }
+                    .foregroundStyle(viewModel.canSubmit ? TrayTheme.shell : TrayTheme.tertiaryText)
+                    .frame(width: 29, height: 29)
+                    .background(viewModel.canSubmit ? TrayTheme.signal : TrayTheme.raised, in: Circle())
+                }
+                .buttonStyle(.plain)
+                .disabled(!viewModel.canSubmit)
+                .accessibilityLabel(viewModel.composerMode == .teach ? "Teach omega" : "Send to omega")
+            }
         }
         .padding(10)
         .background(TrayTheme.instruction, in: RoundedRectangle(cornerRadius: 14, style: .continuous))

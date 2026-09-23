@@ -16,6 +16,78 @@ final class TrayModelTests: XCTestCase {
     }
 
     @MainActor
+    func testTeachModeSendsLearningInstructionButShowsOnlyTheNote() async throws {
+        let (model, transport) = connectedModel()
+        model.beginTeaching()
+        model.draft = "Prefer concise status updates."
+
+        model.send()
+        await settleTasks()
+
+        let submission = try XCTUnwrap(transport.submissions.first)
+        XCTAssertTrue(submission.text.contains("remember and apply in future conversations"))
+        XCTAssertTrue(submission.text.contains("Prefer concise status updates."))
+        XCTAssertEqual(model.messages.first?.text, "Prefer concise status updates.")
+        XCTAssertEqual(model.composerMode, .ask)
+    }
+
+    @MainActor
+    func testTeachModeRequiresTextAndRejectsStagedContext() {
+        let (model, _) = connectedModel()
+        model.beginTeaching()
+        XCTAssertFalse(model.canSend)
+
+        model.draft = "A useful preference"
+        XCTAssertTrue(model.canSend)
+
+        model.stagedContext = [.init(kind: .text, title: "Context", detail: "Text · Not sent")]
+        XCTAssertFalse(model.canSend)
+    }
+
+    @MainActor
+    func testImageContextDoesNotClaimThatModelUnderstandingIsUnavailable() {
+        let model = TrayViewModel(transport: ScriptedTransport(), loadCursor: { nil }, persistCursor: { _ in })
+        model.stagedContext = [.init(kind: .screen, title: "Area capture", detail: "Screen · Not sent")]
+        XCTAssertFalse(model.hasStagedContentWithoutModelUnderstanding)
+
+        model.stagedContext = [.init(kind: .file, title: "Brief.pdf", detail: "File · Not sent")]
+        XCTAssertTrue(model.hasStagedContentWithoutModelUnderstanding)
+    }
+
+    @MainActor
+    func testNewChatClearsOnlyASettledVisibleConversation() {
+        let (model, _) = connectedModel()
+        model.messages = [.init(role: .omega, text: "Previous answer")]
+        model.turnState = .complete("Complete")
+
+        model.startNewChat()
+
+        XCTAssertTrue(model.messages.isEmpty)
+        XCTAssertEqual(model.turnState, .ready)
+    }
+
+    @MainActor
+    func testNewChatDoesNotDiscardDraftOrStagedContext() {
+        let (model, _) = connectedModel()
+        model.messages = [.init(role: .omega, text: "Previous answer")]
+        model.draft = "Do not lose this"
+
+        model.startNewChat()
+        XCTAssertFalse(model.messages.isEmpty)
+
+        model.draft = ""
+        model.stagedContext = [.init(kind: .text, title: "Keep me", detail: "Text · Not sent")]
+        model.startNewChat()
+        XCTAssertFalse(model.messages.isEmpty)
+
+        model.stagedContext = []
+        model.turnState = .blocked("Which file?")
+        model.startNewChat()
+        XCTAssertFalse(model.messages.isEmpty)
+        XCTAssertFalse(model.canBeginTeaching)
+    }
+
+    @MainActor
     func testFileIsAttachedBeforeItsContextCanBeSent() async throws {
         let (model, transport) = connectedModel()
         let file = FileManager.default.temporaryDirectory

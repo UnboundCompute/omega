@@ -33,16 +33,17 @@ surface status and current attachment limitation are recorded in
 
 Requirements: macOS 14 or newer and the Swift toolchain included with Xcode.
 
-Start omega from the repository root, then run the tray in another terminal:
-
-```sh
-.venv/bin/python -m omega
-```
+For the complete local app, including automatic agent startup, package and open it from the tray
+directory:
 
 ```sh
 cd apps/mac-tray
-swift run OmegaTray
+./scripts/package-app.sh
+open .build/app/omega.app
 ```
+
+`swift run OmegaTray` remains useful for UI-only development, but it does not contain the packaged
+agent launch configuration.
 
 The app starts as a top-center resting capsule. Press `Control–Option–Space` to toggle the
 persistent panel, or `Control–Option–C` to select and stage a screen area directly. Both
@@ -50,9 +51,9 @@ shortcuts can be changed in Settings. The menu-bar fallback can capture, toggle 
 Veil, show a sample proactive peek, open Settings, or quit.
 
 Staged captures and files are uploaded into omega's content-addressed blob store before Send is
-enabled, then cited by digest, MIME type, and exact byte count in the message episode. The current
-provider seam is still text-only, so omega stores attachment contents durably but cannot inspect
-their contents yet; the tray labels that limitation honestly.
+enabled, then cited by digest, MIME type, and exact byte count in the message episode. Image and
+screen-capture pixels reach the capable model. Other file contents and links remain reference-only,
+and the tray labels that limitation when relevant.
 
 For visual inspection during development, launch directly into a state with
 `OMEGA_TRAY_PREVIEW_STATE=expanded swift run OmegaTray` or use `peek`.

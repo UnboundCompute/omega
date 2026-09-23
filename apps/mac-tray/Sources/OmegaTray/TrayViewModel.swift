@@ -11,6 +11,11 @@ protocol CapturePresentationControlling: AnyObject {
 
 @MainActor
 final class TrayViewModel: ObservableObject {
+    enum ComposerMode: Equatable {
+        case ask
+        case teach
+    }
+
     enum ScreenCaptureMode {
         case area
         case window
@@ -51,6 +56,7 @@ final class TrayViewModel: ObservableObject {
     @Published var hasUnread = false
     @Published var proactivePeek: String?
     @Published var composerFocusRequest = 0
+    @Published var composerMode: ComposerMode = .ask
     @Published var capturePermission: ScreenCapturePermission
     @Published var hotKeyRegistrationFailure: String?
     @Published var isScreenLocked = false
@@ -79,6 +85,7 @@ final class TrayViewModel: ObservableObject {
         let submission: TraySubmission
         let draft: String
         let context: [StagedContext]
+        let composerMode: ComposerMode
     }
 
     private struct ActiveTurn {
@@ -87,6 +94,7 @@ final class TrayViewModel: ObservableObject {
         let submission: TraySubmission
         let draft: String
         let context: [StagedContext]
+        let composerMode: ComposerMode
         var awaitingResume = false
     }
 
@@ -118,8 +126,11 @@ final class TrayViewModel: ObservableObject {
     }
 
     var canSend: Bool {
-        !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            || !stagedContext.isEmpty
+        let hasText = !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        return switch composerMode {
+        case .ask: hasText || !stagedContext.isEmpty
+        case .teach: hasText && stagedContext.isEmpty
+        }
     }
 
     var canSubmit: Bool {
@@ -131,7 +142,35 @@ final class TrayViewModel: ObservableObject {
 
     var canRetryLastSend: Bool { failedSend != nil }
 
-    var hasStagedContentWithoutModelUnderstanding: Bool { !stagedContext.isEmpty }
+    var canStartNewChat: Bool {
+        !messages.isEmpty
+            && draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && stagedContext.isEmpty
+            && isConversationSettled
+            && failedSend == nil
+    }
+
+    var canBeginTeaching: Bool {
+        stagedContext.isEmpty && isConversationSettled && failedSend == nil
+    }
+
+    var composerPlaceholder: String {
+        composerMode == .teach ? "What should omega learn?" : "Ask or delegate…"
+    }
+
+    private var isConversationSettled: Bool {
+        switch turnState {
+        case .ready, .complete, .failed: true
+        case .sending, .understood, .working, .blocked: false
+        }
+    }
+
+    var hasStagedContentWithoutModelUnderstanding: Bool {
+        stagedContext.contains { context in
+            if context.kind == .image || context.kind == .screen { return false }
+            return context.attachment?.mime.lowercased().hasPrefix("image/") != true
+        }
+    }
 
     var attachmentFailure: String? {
         for context in stagedContext {
@@ -185,8 +224,9 @@ final class TrayViewModel: ObservableObject {
 
         let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
         let sentContext = stagedContext
+        let sentMode = composerMode
         let submission = TraySubmission(
-            text: text,
+            text: sentMode == .teach ? teachingInstruction(for: text) : text,
             context: sentContext.map {
                 TrayContextReference(
                     id: $0.id,
@@ -211,6 +251,7 @@ final class TrayViewModel: ObservableObject {
         )
         draft = ""
         stagedContext = []
+        composerMode = .ask
         turnState = .sending
         failedSend = nil
         pendingResumeSeq = nil
@@ -219,14 +260,41 @@ final class TrayViewModel: ObservableObject {
             submission,
             messageID: messageID,
             originalDraft: text,
-            originalContext: sentContext
+            originalContext: sentContext,
+            originalComposerMode: sentMode
         )
+    }
+
+    func startNewChat() {
+        guard canStartNewChat else { return }
+        messages.removeAll()
+        turnState = .ready
+        pendingResumeSeq = nil
+        urgencyByTurn.removeAll()
+        proactivePeek = nil
+        hasUnread = false
+        composerMode = .ask
+        composerFocusRequest += 1
+    }
+
+    func beginTeaching() {
+        guard canBeginTeaching else { return }
+        composerMode = .teach
+        composerFocusRequest += 1
+    }
+
+    func cancelTeaching() {
+        composerMode = .ask
+        composerFocusRequest += 1
     }
 
     func retryLastSend() {
         guard let failedSend, !workState.isBusy, connectionState == .connected else { return }
         stagedContext.removeAll { context in failedSend.context.contains { $0.id == context.id } }
-        if draft == failedSend.draft { draft = "" }
+        if draft == failedSend.draft {
+            draft = ""
+            composerMode = .ask
+        }
         updateMessage(failedSend.messageID) { $0.delivery = .sending }
         turnState = .sending
         self.failedSend = nil
@@ -234,7 +302,8 @@ final class TrayViewModel: ObservableObject {
             failedSend.submission,
             messageID: failedSend.messageID,
             originalDraft: failedSend.draft,
-            originalContext: failedSend.context
+            originalContext: failedSend.context,
+            originalComposerMode: failedSend.composerMode
         )
     }
 
@@ -242,7 +311,8 @@ final class TrayViewModel: ObservableObject {
         _ submission: TraySubmission,
         messageID: UUID,
         originalDraft: String,
-        originalContext: [StagedContext]
+        originalContext: [StagedContext],
+        originalComposerMode: ComposerMode
     ) {
         Task {
             do {
@@ -253,7 +323,8 @@ final class TrayViewModel: ObservableObject {
                     messageID: messageID,
                     submission: submission,
                     draft: originalDraft,
-                    context: originalContext
+                    context: originalContext,
+                    composerMode: originalComposerMode
                 )
                 scheduleTerminalTimeout(for: acknowledgement.seq)
                 for update in acknowledgement.bufferedUpdates {
@@ -265,6 +336,7 @@ final class TrayViewModel: ObservableObject {
                     submission: submission,
                     draft: originalDraft,
                     context: originalContext,
+                    composerMode: originalComposerMode,
                     detail: "Request not delivered. Your draft and context were restored."
                 )
             }
@@ -372,6 +444,7 @@ final class TrayViewModel: ObservableObject {
                     submission: activeTurn.submission,
                     draft: activeTurn.draft,
                     context: activeTurn.context,
+                    composerMode: activeTurn.composerMode,
                     detail: detail
                 )
             } else {
@@ -414,6 +487,7 @@ final class TrayViewModel: ObservableObject {
             submission: activeTurn.submission,
             draft: activeTurn.draft,
             context: activeTurn.context,
+            composerMode: activeTurn.composerMode,
             detail: "omega did not record an outcome. Your draft and context were restored."
         )
     }
@@ -423,22 +497,35 @@ final class TrayViewModel: ObservableObject {
         submission: TraySubmission,
         draft originalDraft: String,
         context originalContext: [StagedContext],
+        composerMode originalComposerMode: ComposerMode,
         detail: String
     ) {
         terminalTask?.cancel()
         terminalTask = nil
         activeTurn = nil
         updateMessage(messageID) { $0.delivery = .failed }
-        if draft.isEmpty { draft = originalDraft }
+        if draft.isEmpty {
+            draft = originalDraft
+            composerMode = originalComposerMode
+        }
         let stagedIDs = Set(stagedContext.map(\.id))
         stagedContext.append(contentsOf: originalContext.filter { !stagedIDs.contains($0.id) })
         failedSend = .init(
             messageID: messageID,
             submission: submission,
             draft: originalDraft,
-            context: originalContext
+            context: originalContext,
+            composerMode: originalComposerMode
         )
         turnState = .failed(detail)
+    }
+
+    private func teachingInstruction(for note: String) -> String {
+        """
+        Teaching note from me. Treat this as something to remember and apply in future conversations, not as a task to execute. Briefly confirm what you learned.
+
+        \(note)
+        """
     }
 
     func removeContext(id: UUID) {
