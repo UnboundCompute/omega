@@ -286,6 +286,28 @@ impl Log {
     }
 }
 
+/// Is every byte from `from` to `file_len` zero?
+///
+/// This is the test that separates a zero-filled tail (crash artifact,
+/// truncate) from damage (refuse to open). Zeros only mean "crash artifact"
+/// when they run all the way to EOF: zeros followed by real frame bytes are
+/// corruption, because whatever wrote those later bytes proves the zeroed
+/// region was once something else.
+fn is_zero_to_eof(file: &File, from: u64, file_len: u64) -> std::io::Result<bool> {
+    const CHUNK: usize = 64 * 1024;
+    let mut buf = vec![0u8; CHUNK];
+    let mut at = from;
+    while at < file_len {
+        let want = std::cmp::min(CHUNK as u64, file_len - at) as usize;
+        file.read_exact_at(&mut buf[..want], at)?;
+        if buf[..want].iter().any(|b| *b != 0) {
+            return Ok(false);
+        }
+        at += want as u64;
+    }
+    Ok(true)
+}
+
 /// `fsync` a directory so a newly created or renamed entry in it is durable.
 pub(crate) fn fsync_dir(dir: &Path) -> std::io::Result<()> {
     File::open(dir)?.sync_all()
@@ -344,11 +366,29 @@ pub fn scan_frames(file: &File, file_len: u64) -> Result<Scan, Error> {
         file.read_exact_at(&mut prefix, offset)?;
         let (body_len, crc) = frame::decode_prefix(&prefix);
 
-        // We wrote that field; it cannot legitimately be out of range.
+        // An implausible body_len is one we could never have written. Whether
+        // that is a crash artifact or damage depends on what follows it:
+        //
+        //   * all zeros to EOF -> a crash that persisted a write's size
+        //     extension without its data pages. A frame header we wrote is
+        //     never all zeros, so this is a zero-filled tail: truncate.
+        //   * anything else -> non-zero garbage at a frame start is damage,
+        //     and truncating it would silently discard real episodes.
+        //
+        // The zero clause is not hypothetical: classifying it as corruption
+        // made a log that had survived exactly the crash this milestone
+        // promises to survive refuse to open, losing every episode in it.
         if !frame::body_len_is_plausible(body_len) {
+            if is_zero_to_eof(file, offset, file_len)? {
+                break; // zero-filled tail
+            }
             return Err(Error::CorruptFrame {
                 offset,
-                detail: format!("body_len {body_len} out of range (1..={})", frame::MAX_BODY),
+                detail: format!(
+                    "body_len {body_len} out of range ({}..={}), and the bytes here are not a zero-filled tail",
+                    frame::FIXED_BODY_LEN,
+                    frame::MAX_BODY
+                ),
             });
         }
 
@@ -888,6 +928,133 @@ mod tests {
         let log = open(&d);
         assert_eq!(log.head(), 2);
         assert_eq!(log.len_bytes(), last as u64);
+    }
+
+    // Spec case 37. A crash that is not a process kill can persist a write's
+    // size extension without its data pages, leaving the tail reading as
+    // zeros. That is a crash artifact, not damage: the log must open.
+    #[test]
+    fn zero_filled_tail_recovers_with_no_loss() {
+        // 1 and 7 bytes take the "fewer than 8 bytes remain" path; 8, 18 and 64
+        // take the new implausible-body_len-but-all-zeros path. Both must end
+        // in the same place.
+        for zeros in [1usize, 7, 8, 18, 64, 4096] {
+            let d = TempDir::new(&format!("zerotail_{zeros}"));
+            let full = three_records(&d);
+            let mut bytes = full.clone();
+            bytes.extend(std::iter::repeat_n(0u8, zeros));
+            write_raw(&d, &bytes);
+
+            let log = open(&d);
+            assert_eq!(log.head(), 3, "zeros={zeros}");
+            assert_eq!(log.len_bytes(), full.len() as u64, "zeros={zeros}");
+            assert_eq!(log.recovered_bytes(), zeros as u64, "zeros={zeros}");
+            let all = log.records_since(0).unwrap();
+            assert_eq!(all.iter().map(|r| r.seq).collect::<Vec<_>>(), vec![1, 2, 3]);
+            for (i, r) in all.iter().enumerate() {
+                assert_eq!(r.payload, format!("payload-{i}").as_bytes(), "zeros={zeros}");
+            }
+            drop(log);
+
+            // the zeros are gone from the file, and reopening is a no-op
+            assert_eq!(raw(&d), full, "zeros={zeros}");
+            let log = open(&d);
+            assert_eq!(log.recovered_bytes(), 0, "zeros={zeros}");
+            assert_eq!(log.head(), 3, "zeros={zeros}");
+        }
+    }
+
+    // Spec case 37, on an empty log: nothing to lose, but it must still open.
+    #[test]
+    fn zero_filled_tail_on_an_empty_log_recovers() {
+        let d = TempDir::new("zerotail_empty");
+        open(&d);
+        let mut bytes = raw(&d);
+        assert_eq!(bytes.len(), HEADER_LEN);
+        bytes.extend(std::iter::repeat_n(0u8, 64));
+        write_raw(&d, &bytes);
+
+        let log = open(&d);
+        assert_eq!(log.head(), 0);
+        assert_eq!(log.len_bytes(), HEADER_LEN as u64);
+        assert_eq!(log.recovered_bytes(), 64);
+    }
+
+    // Spec case 37, continued: after a zero-filled tail is truncated the next
+    // append continues the sequence with no gap (the case-29 invariant).
+    #[test]
+    fn append_after_a_zero_filled_tail_continues_the_sequence() {
+        let d = TempDir::new("zerotail_append");
+        let full = three_records(&d);
+        let mut bytes = full.clone();
+        bytes.extend(std::iter::repeat_n(0u8, 64));
+        write_raw(&d, &bytes);
+
+        let mut log = open(&d);
+        assert_eq!(log.append(b"next", "", 9).unwrap(), 4);
+        drop(log);
+        let log = open(&d);
+        assert_eq!(log.head(), 4);
+        assert_eq!(
+            log.records_since(0).unwrap().iter().map(|r| r.seq).collect::<Vec<_>>(),
+            vec![1, 2, 3, 4]
+        );
+        assert_eq!(log.read(4).unwrap().payload, b"next");
+    }
+
+    // Spec case 38. Zeros only mean "crash artifact" when they run to EOF.
+    // Zeros with real frame bytes after them are damage: refuse to open, and
+    // do not truncate.
+    #[test]
+    fn zeros_followed_by_real_frame_bytes_are_corruption() {
+        // (a) a zero run written over the start of a middle frame, with a
+        //     whole valid frame still after it
+        let d = TempDir::new("zeros_mid");
+        let full = three_records(&d);
+        let frame2 = {
+            let bl = u32::from_le_bytes(full[HEADER_LEN..HEADER_LEN + 4].try_into().unwrap()) as usize;
+            HEADER_LEN + PREFIX_LEN + bl
+        };
+        let mut bytes = full.clone();
+        for b in bytes[frame2..frame2 + 16].iter_mut() {
+            *b = 0;
+        }
+        write_raw(&d, &bytes);
+        let err = reopen_err(&d);
+        assert!(matches!(err, Error::CorruptFrame { .. }), "got {err:?}");
+        assert_eq!(raw(&d).len(), bytes.len(), "a corrupt log must not be truncated");
+
+        // (b) a zero run appended, then non-zero bytes after it
+        let d = TempDir::new("zeros_then_garbage");
+        let full = three_records(&d);
+        let mut bytes = full.clone();
+        bytes.extend(std::iter::repeat_n(0u8, 64));
+        bytes.extend_from_slice(b"not zero");
+        write_raw(&d, &bytes);
+        let err = reopen_err(&d);
+        assert!(matches!(err, Error::CorruptFrame { .. }), "got {err:?}");
+        assert_eq!(raw(&d).len(), bytes.len());
+
+        // (c) even a single non-zero byte at the very end is enough
+        let d = TempDir::new("zeros_then_one_byte");
+        let full = three_records(&d);
+        let mut bytes = full.clone();
+        bytes.extend(std::iter::repeat_n(0u8, 64));
+        bytes.push(1);
+        write_raw(&d, &bytes);
+        assert!(matches!(reopen_err(&d), Error::CorruptFrame { .. }));
+    }
+
+    // Spec case 38, the other direction: non-zero garbage at a frame start is
+    // damage even when it runs to EOF, because we never wrote it.
+    #[test]
+    fn non_zero_garbage_tail_is_still_corruption() {
+        let d = TempDir::new("garbage_tail");
+        let full = three_records(&d);
+        let mut bytes = full.clone();
+        bytes.extend_from_slice(&[0xff; 64]); // body_len = 0xffffffff, > MAX_BODY
+        write_raw(&d, &bytes);
+        assert!(matches!(reopen_err(&d), Error::CorruptFrame { .. }));
     }
 
     #[test]

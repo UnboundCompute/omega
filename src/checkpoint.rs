@@ -162,22 +162,22 @@ fn decode(bytes: &[u8]) -> Result<BTreeMap<String, u64>, Error> {
     if version != CKPT_VERSION {
         return Err(Error::UnsupportedVersion(version));
     }
-    let body_end = bytes.len() - 4;
-    let stored_crc = u32::from_le_bytes(bytes[body_end..].try_into().unwrap());
-    if crc32(&bytes[..body_end]) != stored_crc {
-        return Err(bad("checkpoint file CRC mismatch".into()));
-    }
-
+    // `count` locates the CRC, rather than the CRC being wherever the file
+    // happens to end. That is what lets a zero-filled tail be recognised and
+    // ignored here, exactly as the log recognises one (M0_SPEC.md "Recovery",
+    // the zero-fill clause): the checkpoint file's real length is a fact it
+    // carries, not a fact about its size on disk.
     let count = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
+    let entries_limit = bytes.len() - 4;
     let mut map = BTreeMap::new();
     let mut at = CKPT_HEADER_LEN;
     for _ in 0..count {
-        if at + 2 > body_end {
+        if at + 2 > entries_limit {
             return Err(bad("checkpoint entry truncated".into()));
         }
         let name_len = u16::from_le_bytes(bytes[at..at + 2].try_into().unwrap()) as usize;
         at += 2;
-        if name_len == 0 || name_len > MAX_KEY || at + name_len + 8 > body_end {
+        if name_len == 0 || name_len > MAX_KEY || at + name_len + 8 > entries_limit {
             return Err(bad(format!("checkpoint entry has bad name_len {name_len}")));
         }
         let name = std::str::from_utf8(&bytes[at..at + name_len])
@@ -188,10 +188,19 @@ fn decode(bytes: &[u8]) -> Result<BTreeMap<String, u64>, Error> {
         at += 8;
         map.insert(name, seq);
     }
-    if at != body_end {
+
+    let stored_crc = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+    if crc32(&bytes[..at]) != stored_crc {
+        return Err(bad("checkpoint file CRC mismatch".into()));
+    }
+
+    // Same rule as the log: zeros to EOF are a crash artifact and are ignored;
+    // anything non-zero after a complete, CRC-valid file is damage.
+    let tail = &bytes[at + 4..];
+    if tail.iter().any(|b| *b != 0) {
         return Err(bad(format!(
-            "checkpoint file has {} trailing bytes",
-            body_end - at
+            "checkpoint file has {} non-zero trailing bytes",
+            tail.len()
         )));
     }
     Ok(map)
@@ -275,6 +284,59 @@ mod tests {
 
         let mut bytes = read_sidecar(&p).unwrap();
         bytes[0] = b'X';
+        fs::write(sidecar_path(&p), &bytes).unwrap();
+        assert!(matches!(
+            CheckpointStore::load(&p),
+            Err(Error::CorruptFrame { .. })
+        ));
+    }
+
+    /// The sidecar is replaced atomically (write-temp, fsync, rename,
+    /// fsync-dir), so our own writes can never leave a zero-filled tail on it.
+    /// Tolerate one anyway: the cost is a few lines, and the alternative is
+    /// that reconstructible derived state makes the whole log refuse to open.
+    #[test]
+    fn zero_filled_tail_on_the_sidecar_is_ignored() {
+        let d = TempDir::new("ckpt_zerotail");
+        let p = log_path(&d);
+        {
+            let mut store = CheckpointStore::load(&p).unwrap();
+            store.set("graph", 7).unwrap();
+            store.set("user-model", 3).unwrap();
+        }
+        let clean = read_sidecar(&p).unwrap();
+        for zeros in [1usize, 4, 64, 4096] {
+            let mut bytes = clean.clone();
+            bytes.extend(std::iter::repeat_n(0u8, zeros));
+            fs::write(sidecar_path(&p), &bytes).unwrap();
+            let store = CheckpointStore::load(&p).unwrap();
+            assert_eq!(store.get("graph"), 7, "zeros={zeros}");
+            assert_eq!(store.get("user-model"), 3, "zeros={zeros}");
+        }
+    }
+
+    #[test]
+    fn non_zero_trailing_bytes_on_the_sidecar_are_still_rejected() {
+        let d = TempDir::new("ckpt_garbagetail");
+        let p = log_path(&d);
+        {
+            let mut store = CheckpointStore::load(&p).unwrap();
+            store.set("graph", 7).unwrap();
+        }
+        let clean = read_sidecar(&p).unwrap();
+
+        let mut bytes = clean.clone();
+        bytes.extend_from_slice(b"garbage");
+        fs::write(sidecar_path(&p), &bytes).unwrap();
+        assert!(matches!(
+            CheckpointStore::load(&p),
+            Err(Error::CorruptFrame { .. })
+        ));
+
+        // zeros followed by a non-zero byte is damage, same as in the log
+        let mut bytes = clean.clone();
+        bytes.extend(std::iter::repeat_n(0u8, 32));
+        bytes.push(1);
         fs::write(sidecar_path(&p), &bytes).unwrap();
         assert!(matches!(
             CheckpointStore::load(&p),
