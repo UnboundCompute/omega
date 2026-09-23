@@ -70,3 +70,12 @@ The script builds release, creates the application bundle, applies an ad-hoc loc
 and verifies both the bundle metadata and signature. Move the app to `/Applications` before
 testing launch at login. Distribution outside the local machine will require Developer ID
 signing and notarization.
+
+To build, replace `/Applications/omega.app`, and open the installed app in one command:
+
+```sh
+./scripts/install-app.sh
+```
+
+The installer asks a running omega instance to quit cleanly and refuses to overwrite the app if
+it does not exit. It only removes the exact `/Applications/omega.app` destination.
