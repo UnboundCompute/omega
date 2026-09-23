@@ -9,7 +9,7 @@ struct HotKeyChoice: Identifiable, Equatable {
     let keyCode: UInt32
     let modifiers: UInt32
 
-    static let choices = [
+    static let panelChoices = [
         HotKeyChoice(
             id: "control-option-space",
             title: "Control–Option–Space",
@@ -36,7 +36,35 @@ struct HotKeyChoice: Identifiable, Equatable {
         )
     ]
 
-    static let fallback = choices[0]
+    static let captureAreaChoices = [
+        HotKeyChoice(
+            id: "control-option-4",
+            title: "Control–Option–4",
+            keyCode: UInt32(kVK_ANSI_4),
+            modifiers: UInt32(controlKey | optionKey)
+        ),
+        HotKeyChoice(
+            id: "control-shift-4",
+            title: "Control–Shift–4",
+            keyCode: UInt32(kVK_ANSI_4),
+            modifiers: UInt32(controlKey | shiftKey)
+        ),
+        HotKeyChoice(
+            id: "option-shift-4",
+            title: "Option–Shift–4",
+            keyCode: UInt32(kVK_ANSI_4),
+            modifiers: UInt32(optionKey | shiftKey)
+        ),
+        HotKeyChoice(
+            id: "command-option-4",
+            title: "Command–Option–4",
+            keyCode: UInt32(kVK_ANSI_4),
+            modifiers: UInt32(cmdKey | optionKey)
+        )
+    ]
+
+    static let panelFallback = panelChoices[0]
+    static let captureAreaFallback = captureAreaChoices[0]
 }
 
 @MainActor
@@ -45,6 +73,9 @@ final class AppSettings: ObservableObject {
 
     @Published var hotKeyID: String {
         didSet { defaults.set(hotKeyID, forKey: Keys.hotKeyID) }
+    }
+    @Published var captureAreaHotKeyID: String {
+        didSet { defaults.set(captureAreaHotKeyID, forKey: Keys.captureAreaHotKeyID) }
     }
     @Published var hideProactivePreviews: Bool {
         didSet { defaults.set(hideProactivePreviews, forKey: Keys.hideProactivePreviews) }
@@ -55,17 +86,23 @@ final class AppSettings: ObservableObject {
     private let defaults: UserDefaults
 
     var hotKey: HotKeyChoice {
-        HotKeyChoice.choices.first { $0.id == hotKeyID } ?? .fallback
+        HotKeyChoice.panelChoices.first { $0.id == hotKeyID } ?? .panelFallback
+    }
+
+    var captureAreaHotKey: HotKeyChoice {
+        HotKeyChoice.captureAreaChoices.first { $0.id == captureAreaHotKeyID } ?? .captureAreaFallback
     }
 
     private enum Keys {
         static let hotKeyID = "hotKeyID"
+        static let captureAreaHotKeyID = "captureAreaHotKeyID"
         static let hideProactivePreviews = "hideProactivePreviews"
     }
 
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
-        hotKeyID = defaults.string(forKey: Keys.hotKeyID) ?? HotKeyChoice.fallback.id
+        hotKeyID = defaults.string(forKey: Keys.hotKeyID) ?? HotKeyChoice.panelFallback.id
+        captureAreaHotKeyID = defaults.string(forKey: Keys.captureAreaHotKeyID) ?? HotKeyChoice.captureAreaFallback.id
         hideProactivePreviews = defaults.object(forKey: Keys.hideProactivePreviews) as? Bool ?? true
         refreshLaunchAtLogin()
     }

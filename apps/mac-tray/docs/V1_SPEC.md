@@ -31,6 +31,7 @@ The defining loop is:
 ### Opening, focus, and closing
 
 - A configurable global hotkey toggles the panel.
+- A second configurable global hotkey starts area capture directly.
 - Opening focuses the composer immediately.
 - The open panel stays above other windows and remains visible across app switches.
 - Clicking outside gives focus back to the underlying app but never closes omega.
@@ -43,6 +44,8 @@ The defining loop is:
 
 - The user can capture an area, window, or display through the native macOS selection
   experience.
+- The default area-capture shortcut is `Control–Option–4`; it opens the tray, removes omega
+  from the screen during selection, and returns with the capture staged but unsent.
 - omega temporarily leaves the screen while capture is active, then restores the exact prior
   tray state after selection or cancellation, so content behind it remains selectable.
 - Files, images, screenshots, selected text, URLs, and clipboard content can be dragged or

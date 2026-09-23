@@ -295,11 +295,11 @@ private struct ExpandedTrayView: View {
             )
         }
 
-        if viewModel.hotKeyRegistrationFailed {
+        if let failure = viewModel.hotKeyRegistrationFailure {
             RecoveryNotice(
                 icon: "keyboard.badge.exclamationmark",
-                title: "That shortcut is already in use",
-                detail: "Choose another shortcut in omega Settings.",
+                title: "A shortcut is already in use",
+                detail: failure,
                 actionTitle: "Settings",
                 action: openAppSettings
             )

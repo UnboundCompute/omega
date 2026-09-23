@@ -39,8 +39,9 @@ swift run OmegaTray
 ```
 
 The app starts as a top-center resting capsule. Press `Control–Option–Space` to toggle the
-persistent panel; the shortcut can be changed in Settings. The menu-bar fallback can capture,
-toggle the Privacy Veil, show a sample proactive peek, open Settings, or quit.
+persistent panel, or `Control–Option–4` to select and stage a screen area directly. Both
+shortcuts can be changed in Settings. The menu-bar fallback can capture, toggle the Privacy
+Veil, show a sample proactive peek, open Settings, or quit.
 
 For visual inspection during development, launch directly into a state with
 `OMEGA_TRAY_PREVIEW_STATE=expanded swift run OmegaTray` or use `peek`.

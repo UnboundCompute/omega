@@ -4,9 +4,11 @@ final class GlobalHotKey {
     private var hotKeyReference: EventHotKeyRef?
     private var eventHandlerReference: EventHandlerRef?
     private let action: () -> Void
+    private let identifier: EventHotKeyID
 
-    init?(keyCode: UInt32, modifiers: UInt32, action: @escaping () -> Void) {
+    init?(id: UInt32, keyCode: UInt32, modifiers: UInt32, action: @escaping () -> Void) {
         self.action = action
+        identifier = EventHotKeyID(signature: Self.fourCharacterCode("OMG1"), id: id)
 
         var eventType = EventTypeSpec(
             eventClass: OSType(kEventClassKeyboard),
@@ -15,9 +17,23 @@ final class GlobalHotKey {
 
         let installStatus = InstallEventHandler(
             GetApplicationEventTarget(),
-            { _, _, userData in
-                guard let userData else { return noErr }
+            { _, event, userData in
+                guard let event, let userData else { return OSStatus(eventNotHandledErr) }
                 let hotKey = Unmanaged<GlobalHotKey>.fromOpaque(userData).takeUnretainedValue()
+                var pressedIdentifier = EventHotKeyID()
+                let status = GetEventParameter(
+                    event,
+                    EventParamName(kEventParamDirectObject),
+                    EventParamType(typeEventHotKeyID),
+                    nil,
+                    MemoryLayout<EventHotKeyID>.size,
+                    nil,
+                    &pressedIdentifier
+                )
+                guard status == noErr,
+                      pressedIdentifier.signature == hotKey.identifier.signature,
+                      pressedIdentifier.id == hotKey.identifier.id
+                else { return OSStatus(eventNotHandledErr) }
                 hotKey.action()
                 return noErr
             },
@@ -29,7 +45,6 @@ final class GlobalHotKey {
 
         guard installStatus == noErr else { return nil }
 
-        let identifier = EventHotKeyID(signature: fourCharacterCode("OMG1"), id: 1)
         let registerStatus = RegisterEventHotKey(
             keyCode,
             modifiers,
@@ -56,7 +71,7 @@ final class GlobalHotKey {
         }
     }
 
-    private func fourCharacterCode(_ value: String) -> OSType {
+    private static func fourCharacterCode(_ value: String) -> OSType {
         value.utf8.reduce(0) { ($0 << 8) + OSType($1) }
     }
 }

@@ -6,7 +6,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let viewModel = TrayViewModel(transport: LocalDemoTransport())
     private var panelController: OmegaPanelController?
     private var statusItem: NSStatusItem?
-    private var hotKey: GlobalHotKey?
+    private var panelHotKey: GlobalHotKey?
+    private var captureAreaHotKey: GlobalHotKey?
     private var privacyMenuItem: NSMenuItem?
     private var settingsObservation: AnyCancellable?
     private var notificationController: NotificationController?
@@ -34,10 +35,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             panelController.showResting()
         }
 
-        registerHotKey()
-        settingsObservation = settings.$hotKeyID
+        registerHotKeys()
+        settingsObservation = Publishers.CombineLatest(
+            settings.$hotKeyID,
+            settings.$captureAreaHotKeyID
+        )
             .dropFirst()
-            .sink { [weak self] _ in self?.registerHotKey() }
+            .sink { [weak self] _ in self?.registerHotKeys() }
 
         DistributedNotificationCenter.default.addObserver(
             self,
@@ -56,7 +60,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        hotKey = nil
+        panelHotKey = nil
+        captureAreaHotKey = nil
         DistributedNotificationCenter.default.removeObserver(self)
     }
 
@@ -93,8 +98,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func captureArea() {
-        panelController?.showExpanded(focusComposer: false)
-        viewModel.captureArea()
+        panelController?.captureArea()
     }
 
     @objc private func showProactivePeek() {
@@ -128,15 +132,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             : "Turn On Privacy Veil"
     }
 
-    private func registerHotKey() {
-        hotKey = nil
-        let configuration = settings.hotKey
-        hotKey = GlobalHotKey(
-            keyCode: configuration.keyCode,
-            modifiers: configuration.modifiers
+    private func registerHotKeys() {
+        panelHotKey = nil
+        captureAreaHotKey = nil
+
+        let panelConfiguration = settings.hotKey
+        panelHotKey = GlobalHotKey(
+            id: 1,
+            keyCode: panelConfiguration.keyCode,
+            modifiers: panelConfiguration.modifiers
         ) { [weak self] in
             Task { @MainActor in self?.panelController?.toggle() }
         }
-        viewModel.hotKeyRegistrationFailed = hotKey == nil
+
+        let captureConfiguration = settings.captureAreaHotKey
+        captureAreaHotKey = GlobalHotKey(
+            id: 2,
+            keyCode: captureConfiguration.keyCode,
+            modifiers: captureConfiguration.modifiers
+        ) { [weak self] in
+            Task { @MainActor in self?.captureArea() }
+        }
+
+        let failures = [
+            panelHotKey == nil ? "Open or close omega (\(panelConfiguration.title))" : nil,
+            captureAreaHotKey == nil ? "Capture area (\(captureConfiguration.title))" : nil
+        ].compactMap { $0 }
+        viewModel.hotKeyRegistrationFailure = failures.isEmpty
+            ? nil
+            : "\(failures.joined(separator: " and ")) could not be registered. Choose another shortcut in omega Settings."
     }
 }

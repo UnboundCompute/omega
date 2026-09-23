@@ -18,7 +18,13 @@ private struct SettingsView: View {
         Form {
             Section("Presence") {
                 Picker("Open or close omega", selection: $settings.hotKeyID) {
-                    ForEach(HotKeyChoice.choices) { choice in
+                    ForEach(HotKeyChoice.panelChoices) { choice in
+                        Text(choice.title).tag(choice.id)
+                    }
+                }
+
+                Picker("Capture an area", selection: $settings.captureAreaHotKeyID) {
+                    ForEach(HotKeyChoice.captureAreaChoices) { choice in
                         Text(choice.title).tag(choice.id)
                     }
                 }

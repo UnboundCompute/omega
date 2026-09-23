@@ -10,7 +10,8 @@ become a second brain or an undeclared wire protocol.
 
 - Top-center resting capsule, expanded panel, and non-focus-stealing proactive peek.
 - Persistent `NSPanel` behavior across app switches, Spaces, full-screen apps, and displays.
-- Configurable global shortcut with registration-conflict recovery.
+- Configurable global shortcuts for panel toggle and direct area capture, with independent
+  registration-conflict recovery.
 - Focus enters the composer on open and returns to the prior app on explicit close.
 - Area, window, and active-display capture through the macOS capture tool.
 - The panel is removed before capture begins and restored after success, cancellation, or launch
@@ -60,7 +61,7 @@ swift test
 ./scripts/package-app.sh
 ```
 
-The test suite covers empty submission, shortcut persistence, capture-mode arguments, sent
+The test suite covers empty submission, both shortcut preferences, capture-mode arguments, sent
 context receipts, failed-send restoration, and proactive-message consumption. Opt-in review
 renders cover resting, peek, empty, staged-context, delivery-recovery, drop-target, and privacy
 states.

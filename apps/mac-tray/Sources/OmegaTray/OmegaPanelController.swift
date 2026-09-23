@@ -166,6 +166,12 @@ final class OmegaPanelController: NSWindowController, CapturePresentationControl
         }
     }
 
+    func captureArea() {
+        guard !isCaptureSuspended else { return }
+        showExpanded(focusComposer: false)
+        viewModel.captureArea()
+    }
+
     func hideForCapture(then start: @escaping @MainActor () -> Void) {
         guard !isCaptureSuspended else { return }
         isCaptureSuspended = true

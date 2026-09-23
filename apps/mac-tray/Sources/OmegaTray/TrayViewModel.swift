@@ -49,7 +49,7 @@ final class TrayViewModel: ObservableObject {
     @Published var proactivePeek: String?
     @Published var composerFocusRequest = 0
     @Published var capturePermission: ScreenCapturePermission
-    @Published var hotKeyRegistrationFailed = false
+    @Published var hotKeyRegistrationFailure: String?
     @Published var isScreenLocked = false
     @Published var manualPrivacyMode = false
 
