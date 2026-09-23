@@ -32,6 +32,10 @@ pub struct Scan {
     pub dedup: HashMap<String, u64>,
     /// Offset just past the last good frame.
     pub good_end: u64,
+    /// `(offset, body_len)` for each frame whose length field was damaged but
+    /// whose true length its own content identified. Recovery writes these
+    /// back; see `recoverable_body_len`.
+    pub repairs: Vec<(u64, u32)>,
 }
 
 pub struct Log {
@@ -45,6 +49,10 @@ pub struct Log {
     checkpoints: CheckpointStore,
     /// Bytes truncated by recovery on this open. Diagnostic only.
     recovered_bytes: u64,
+    /// Length fields recovery proved wrong and rewrote on this open. A
+    /// non-zero value means the file was damaged and is now correct, which is
+    /// survivable but worth knowing about. Diagnostic only.
+    repaired_lengths: u64,
     /// Set when the sidecar could not be decoded and every checkpoint was reset
     /// to 0 on this open. The damaged file is preserved, not deleted.
     checkpoints_reset: bool,
@@ -97,6 +105,7 @@ impl Log {
             dedup: HashMap::new(),
             checkpoints: CheckpointStore::empty(path),
             recovered_bytes: 0,
+            repaired_lengths: 0,
             checkpoints_reset: false,
             damaged_checkpoints_path: None,
             discarded_tail_path: None,
@@ -178,7 +187,25 @@ impl Log {
         // Step 5: scan the frames.
         let scan = scan_frames(&self.file, len)?;
 
-        // Step 6: if anything was truncated, set_len and fsync.
+        // Step 6a: write back any length field the scan proved wrong, before
+        // anything else can append. The evidence that identifies the true
+        // length -- the body CRC, and for the last frame the distance to EOF --
+        // is available now and may not be later: one more append puts that
+        // frame in the middle, where EOF says nothing about where it ends. A
+        // log that opens today and refuses forever after the next write is a
+        // worse outcome than either, so the repair is not deferred.
+        if !scan.repairs.is_empty() {
+            for &(offset, body_len) in &scan.repairs {
+                let mut fixed = [0u8; 8];
+                fixed[0..4].copy_from_slice(&body_len.to_le_bytes());
+                fixed[4..8].copy_from_slice(&frame::len_crc32(body_len).to_le_bytes());
+                self.file.write_all_at(&fixed, offset)?;
+            }
+            sync_file(&self.file)?;
+            self.repaired_lengths = scan.repairs.len() as u64;
+        }
+
+        // Step 6b: if anything was truncated, set_len and fsync.
         if scan.good_end < len {
             self.recovered_bytes = len - scan.good_end;
             // Recovery is the one moment these bytes would be destroyed, and a
@@ -223,6 +250,11 @@ impl Log {
     /// Bytes discarded by torn-tail truncation on this open (0 if none).
     pub fn recovered_bytes(&self) -> u64 {
         self.recovered_bytes
+    }
+
+    /// How many damaged length fields recovery rewrote on this open.
+    pub fn repaired_lengths(&self) -> u64 {
+        self.repaired_lengths
     }
 
     /// True when the checkpoint sidecar could not be decoded on this open, so
@@ -443,29 +475,37 @@ fn keep_discarded_tail(file: &File, path: &Path, from: u64, to: u64) -> Option<P
     None
 }
 
-/// Is the frame at `offset` whole apart from its length checksum?
+/// The true length of the frame at `offset`, when its own content identifies
+/// it despite a damaged length field. `None` when nothing does.
 ///
-/// Reached only when `len_crc` has failed. Four facts are then checked
-/// independently of that broken field: `body_len` is one we could have
-/// written, the body it names fits inside the file, that body matches the
-/// body CRC, and the `seq` inside it is the one we were expecting next. A
-/// half-landed write cannot produce all four — its body is the part that did
-/// not arrive, so the body CRC is the check it fails. When all four agree the
-/// frame was fully durable and a later bit-flip hit its length checksum, which
-/// is damage and not a torn write.
-fn frame_is_whole_but_for_its_length_crc(
+/// Reached only when `len_crc` has failed, so `body_len` cannot be believed.
+/// A candidate length is accepted only when four facts agree *independently*
+/// of the broken field: it is a length we could have written, the body it
+/// names fits inside the file, that body matches the body CRC, and the `seq`
+/// inside it is the one recovery was expecting next. A 32-bit checksum over
+/// the exact bytes plus the expected sequence number is the same standard of
+/// evidence every other frame in the file is read under.
+///
+/// **Why this repairs rather than refuses.** Refusing loses nothing but leaves
+/// a log that will not open, and truncating destroys an episode that is
+/// provably whole. Both are worse than writing back the four bytes we can
+/// prove. The repair is not optional bookkeeping either: the length implied by
+/// EOF only identifies the *last* frame, so a log left unrepaired would open
+/// today and refuse forever after the next append pushed that frame into the
+/// middle. Recovery therefore fixes it on disk before anything else runs.
+fn recoverable_body_len(
     file: &File,
     file_len: u64,
     offset: u64,
     p: &frame::Prefix,
     expected_seq: u64,
-) -> std::io::Result<bool> {
+) -> std::io::Result<Option<u32>> {
     let body_at = offset + PREFIX_LEN as u64;
 
     // The length the prefix claims. This catches a `body_len` that was
     // rewritten on disk while the rest of the frame stayed whole.
     if body_of_len_verifies(file, file_len, offset, p.body_len, p, expected_seq)? {
-        return Ok(true);
+        return Ok(Some(p.body_len));
     }
 
     // The length implied by the end of the file. This catches bit rot in the
@@ -483,10 +523,10 @@ fn frame_is_whole_but_for_its_length_crc(
     if implied != p.body_len
         && body_of_len_verifies(file, file_len, offset, implied, p, expected_seq)?
     {
-        return Ok(true);
+        return Ok(Some(implied));
     }
 
-    Ok(false)
+    Ok(None)
 }
 
 /// Does a body of exactly `body_len` bytes at `body_at` verify end to end --
@@ -517,6 +557,71 @@ fn body_of_len_verifies(
     }
 }
 
+/// Starting from a frame that already verifies, does an unbroken run of frames
+/// with consecutive sequence numbers reach *exactly* the end of the file?
+///
+/// One verifying frame is not evidence that anything was durable, because a
+/// payload is opaque bytes by design: an episode may legitimately contain an
+/// attachment, an export, or a re-ingested record that is itself frame-shaped.
+/// Stale disk blocks are worse, because the blocks most likely to be recycled
+/// near a log are older generations of that same log. Either way the bytes are
+/// frame-shaped without ever having been a durable frame *here*.
+///
+/// What a genuine trailing run of durable frames always has, and what neither
+/// of those has, is continuity: each frame ends exactly where the next begins,
+/// the sequence numbers step by one, and the last one ends exactly at EOF with
+/// nothing left over. An embedded frame is followed by the rest of its
+/// enclosing payload, so it does not chain. A stale run ends where the old file
+/// ended, not where this one does.
+fn chain_reaches_eof(
+    file: &File,
+    file_len: u64,
+    at: u64,
+    head: &frame::Prefix,
+    head_body: &[u8],
+    expected_seq: u64,
+) -> std::io::Result<bool> {
+    let mut seq = match frame::decode_meta(head_body, at) {
+        Ok(meta) => meta.seq,
+        Err(_) => return Ok(false),
+    };
+    // A durable frame sitting after the damaged one carries a *later* sequence
+    // number. One carrying an earlier number is from some previous life of
+    // these bytes, not from this log's tail.
+    if seq < expected_seq {
+        return Ok(false);
+    }
+
+    let mut cursor = at + PREFIX_LEN as u64 + head.body_len as u64;
+    while cursor < file_len {
+        if file_len - cursor < PREFIX_LEN as u64 {
+            return Ok(false);
+        }
+        let mut prefix = [0u8; PREFIX_LEN];
+        file.read_exact_at(&mut prefix, cursor)?;
+        let p = frame::decode_prefix(&prefix);
+        if !p.len_is_intact() || !frame::body_len_is_plausible(p.body_len) {
+            return Ok(false);
+        }
+        let body_at = cursor + PREFIX_LEN as u64;
+        if file_len.saturating_sub(body_at) < p.body_len as u64 {
+            return Ok(false);
+        }
+        let mut body = vec![0u8; p.body_len as usize];
+        file.read_exact_at(&mut body, body_at)?;
+        if frame::crc32(&body) != p.crc {
+            return Ok(false);
+        }
+        match frame::decode_meta(&body, cursor) {
+            Ok(meta) if meta.seq == seq + 1 => seq = meta.seq,
+            _ => return Ok(false),
+        }
+        cursor = body_at + p.body_len as u64;
+    }
+
+    Ok(cursor == file_len)
+}
+
 /// Does the region `from..file_len` hold no frame that was ever durable?
 ///
 /// Reached when a prefix fails its own length checksum and the frame is not
@@ -535,6 +640,7 @@ fn tail_holds_no_durable_frame(
     file: &File,
     from: u64,
     file_len: u64,
+    expected_seq: u64,
 ) -> std::io::Result<bool> {
     if file_len - from > PREFIX_LEN as u64 + frame::MAX_BODY as u64 {
         return Ok(false);
@@ -558,9 +664,11 @@ fn tail_holds_no_durable_frame(
             let mut prefix = [0u8; PREFIX_LEN];
             prefix.copy_from_slice(&buf[i..i + PREFIX_LEN]);
             let p = frame::decode_prefix(&prefix);
-            // A 32-bit checksum plus a range check makes a chance match about
-            // one in four billion, so the positioned body read below is
-            // effectively never speculative.
+            // A cheap filter, not a proof. The one-in-four-billion reading of a
+            // 32-bit checksum assumes uniformly random bytes, and this region
+            // holds neither: payloads are opaque by design and recycled blocks
+            // are usually older generations of this same log. So a match here
+            // only earns the candidate a look at whether it *chains* to EOF.
             if !p.len_is_intact() || !frame::body_len_is_plausible(p.body_len) {
                 continue;
             }
@@ -570,7 +678,9 @@ fn tail_holds_no_durable_frame(
             }
             let mut body = vec![0u8; p.body_len as usize];
             file.read_exact_at(&mut body, body_at)?;
-            if frame::crc32(&body) == p.crc {
+            if frame::crc32(&body) == p.crc
+                && chain_reaches_eof(file, file_len, base + i as u64, &p, &body, expected_seq)?
+            {
                 return Ok(false); // a frame that verifies end to end
             }
         }
@@ -641,7 +751,9 @@ pub fn scan_frames(file: &File, file_len: u64) -> Result<Scan, Error> {
 
         let mut prefix = [0u8; PREFIX_LEN];
         file.read_exact_at(&mut prefix, offset)?;
-        let p = frame::decode_prefix(&prefix);
+        // Mutable because a damaged length field that the frame's own content
+        // identifies is corrected here and written back after the scan.
+        let mut p = frame::decode_prefix(&prefix);
 
         // FIRST, before `body_len` is used for anything at all: is it the
         // number we wrote? This ordering is the entire version-2 fix. A length
@@ -662,28 +774,21 @@ pub fn scan_frames(file: &File, file_len: u64) -> Result<Scan, Error> {
             }
 
             // The length is damaged, but the rest of the frame may not be. If
-            // `body_len` is plausible, its body fits, that body matches the
-            // body CRC and its seq is the one expected, then four independent
-            // facts say the frame was fully durable and only the length
-            // checksum was hit. That is damage, not an interrupted write.
-            if frame_is_whole_but_for_its_length_crc(file, file_len, offset, &p, expected_seq)? {
-                return Err(Error::CorruptFrame {
-                    offset,
-                    detail: format!(
-                        "body_len {} fails its own checksum (len_crc is {:#010x}, want {:#010x}) \
-                         in a frame that is otherwise whole",
-                        p.body_len,
-                        p.len_crc,
-                        frame::len_crc32(p.body_len),
-                    ),
-                });
-            }
-
+            // the frame's own body and seq identify a length unambiguously,
+            // the frame is whole and only these four bytes are wrong: repair
+            // them and carry on reading. Nothing is lost and nothing is
+            // refused, which is strictly better than both of the alternatives.
+            if let Some(body_len) = recoverable_body_len(file, file_len, offset, &p, expected_seq)?
+            {
+                scan.repairs.push((offset, body_len));
+                p.body_len = body_len;
+                p.len_crc = frame::len_crc32(body_len);
+            } else {
             // Otherwise the frame's extent is unknown and every byte to EOF is
             // unexplained. Only something durable in there makes this damage.
             // Non-zero bytes alone do not: a write that half landed leaves its
             // own bytes behind, and they were never acknowledged.
-            if !tail_holds_no_durable_frame(file, offset, file_len)? {
+            if !tail_holds_no_durable_frame(file, offset, file_len, expected_seq)? {
                 return Err(Error::CorruptFrame {
                     offset,
                     detail: format!(
@@ -696,7 +801,8 @@ pub fn scan_frames(file: &File, file_len: u64) -> Result<Scan, Error> {
                 });
             }
 
-            break; // torn tail: a write that landed in part
+                break; // torn tail: a write that landed in part
+            }
         }
 
         // A checksum-valid length we could never have written means the file was
@@ -1648,13 +1754,40 @@ mod tests {
         let full = three_records(&d);
         let offsets = frame_offsets(&full);
 
-        // (a) non-zero data present -> corruption, file untouched. The length
-        //     field is intact here and the *checksum* is the flipped one; the
-        //     conclusion is the same, because neither is trustworthy alone.
+        // (a) the *checksum* is the flipped field and `body_len` is intact.
+        //     `body_len` is not trusted on its own here -- it is trusted
+        //     because the body it names checksums and carries the sequence
+        //     number expected next, which a wrong length cannot fake. So the
+        //     frame is whole, only these four bytes are damaged, and recovery
+        //     rewrites them: no episode is lost and nothing is refused.
         let mut bytes = full.clone();
         let at = offsets[1];
         bytes[at + 4] ^= 0x01;
-        let err = assert_refuses_and_leaves_the_file_alone(&d, &bytes, "flipped len_crc");
+        write_raw(&d, &bytes);
+        let log = open(&d);
+        assert_eq!(log.head(), 3, "every episode still readable");
+        assert_eq!(log.repaired_lengths(), 1, "the damaged field was rewritten");
+        assert_eq!(log.len_bytes(), full.len() as u64, "nothing was truncated");
+        drop(log);
+
+        // The repair is on disk, not merely in memory. That is the point: the
+        // evidence identifying the true length is available now and might not
+        // be after another append, so a second open must find nothing to fix.
+        let log = open(&d);
+        assert_eq!(log.head(), 3);
+        assert_eq!(log.repaired_lengths(), 0, "already correct on disk");
+        assert_eq!(raw(&d), full, "the file is byte-identical to the healthy one");
+        drop(log);
+
+        // (a2) but a damaged length on a *middle* frame is still corruption.
+        //      Only the last frame's extent is implied by EOF, so here nothing
+        //      identifies the true length and there is no repair to make.
+        let d2 = TempDir::new("case41_middle");
+        let full2 = three_records(&d2);
+        let mut bytes = full2.clone();
+        let at = frame_offsets(&full2)[1];
+        damage_body_len(&mut bytes, at, 7);
+        let err = assert_refuses_and_leaves_the_file_alone(&d2, &bytes, "middle body_len");
         assert!(matches!(err, Error::CorruptFrame { .. }), "got {err:?}");
 
         // (b) zeros to EOF -> a zero-filled tail, which must keep working after

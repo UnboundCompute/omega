@@ -143,31 +143,44 @@ def test_case_40_a_length_stretched_to_end_exactly_at_eof(
 
 
 @pytest.mark.parametrize("index", [0, 2, 4], ids=["first", "middle", "last-at-eof"])
-def test_case_41_a_length_that_fails_its_checksum_with_data_present(
+def test_case_41_a_length_that_fails_its_checksum_is_repaired_not_believed(
     store_dir: Path, log_path: Path, index: int
 ) -> None:
-    """Case 41 — the length's checksum is consulted first, and a failure is
-    judged on the bytes' own evidence.
+    """Case 41 — the length's checksum is consulted before the length is used.
 
-    Here only ``len_crc`` is damaged; ``body_len`` itself still names the real
+    Only ``len_crc`` is damaged here; ``body_len`` itself still names the real
     frame. That is deliberate: it isolates the *ordering*. If the length were
-    used before its checksum were checked, every one of these would open
-    perfectly and the check would be dead code.
+    used without its checksum being checked, the log would open with nothing
+    recorded as damaged and the check would be dead code. So
+    ``repaired_lengths == 1`` is what proves the check fired — a sharper
+    discriminator than a raise, which several unrelated rules can also produce.
 
-    ``last-at-eof`` is the discriminating one. A bad *body* CRC at exact EOF is
-    a torn tail (spec step 5) — but a bad *length* CRC has no such escape,
-    because a length that cannot vouch for itself gives no grounds for
-    believing the frame ends at EOF in the first place. Non-zero bytes are
-    present, so it is corruption wherever it sits.
+    The frame is whole, so recovery rewrites the four damaged bytes rather than
+    refusing. The body checksums and carries the sequence number recovery
+    expects next, and a wrong length cannot fake either; refusing would strand
+    five provably intact episodes to protect nothing. Repair applies at every
+    position because nothing about this evidence depends on where the frame
+    sits — which is why all three ids behave identically.
     """
-    seed(store_dir, 5)
+    payloads = seed(store_dir, 5)
+    healthy = rawlog.read(log_path)
     rawlog.corrupt_len_crc(log_path, index)
-    broken = rawlog.read(log_path)
+    assert rawlog.read(log_path) != healthy, "the damage was actually applied"
 
-    with pytest.raises(CorruptFrame):
-        MemoryStore.open(store_dir)
+    with MemoryStore.open(store_dir) as store:
+        assert store.head() == 5
+        assert store.diagnostics.repaired_lengths == 1, "the ordering check fired"
+        assert store.diagnostics.recovered_bytes == 0, "nothing was truncated"
+    assert _episodes(store_dir) == payloads
+    assert rawlog.read(log_path) == healthy, (
+        "a repaired file is byte-identical to one that was never damaged"
+    )
 
-    assert rawlog.read(log_path) == broken, "a failed open must not truncate"
+    # The repair went to disk, not just to memory. That is the whole point:
+    # for a trailing frame the evidence that identifies the true length is
+    # partly its distance to EOF, and one more append would take that away.
+    with MemoryStore.open(store_dir) as store:
+        assert store.diagnostics.repaired_lengths == 0, "nothing left to fix"
 
 
 def test_case_41_the_zero_filled_tail_still_works_after_the_format_change(
@@ -774,7 +787,7 @@ def test_case_47_the_boundary_is_exactly_the_prefix_length(
         assert _only_discarded_tail(store_dir).read_bytes() == bytes([GARBAGE]) * n
 
 
-def test_case_49_a_frame_whole_but_for_its_length_crc_is_still_corruption(
+def test_case_49_a_frame_whole_but_for_its_length_crc_is_never_dropped(
     store_dir: Path, log_path: Path
 ) -> None:
     """Case 49's other half — truncating an unverifiable tail must not become
@@ -783,18 +796,26 @@ def test_case_49_a_frame_whole_but_for_its_length_crc_is_still_corruption(
     Here the final frame's ``len_crc`` is damaged and nothing else is: the
     length is plausible, the body it names matches the body CRC, and the seq is
     the expected next one. Four independent facts say the frame was fully
-    durable and a later bit-flip hit its checksum. That is damage, and the log
-    must refuse rather than quietly drop an acknowledged episode.
-    """
-    seed(store_dir, 5)
-    rawlog.corrupt_len_crc(log_path, -1)
-    broken = rawlog.read(log_path)
+    durable and a later bit-flip hit its checksum.
 
-    with pytest.raises(CorruptFrame):
-        MemoryStore.open(store_dir)
-    assert rawlog.read(log_path) == broken, "a failed open must not truncate"
+    An earlier version of this rule refused the whole log on that evidence,
+    which protected the episode from being dropped by making every episode
+    unreachable instead. Since the four facts identify the true length exactly,
+    there is a third option that gives up nothing: write the length back.
+    """
+    payloads = seed(store_dir, 5)
+    healthy = rawlog.read(log_path)
+    rawlog.corrupt_len_crc(log_path, -1)
+
+    with MemoryStore.open(store_dir) as store:
+        assert store.head() == 5, "the acknowledged episode is still there"
+        assert store.diagnostics.repaired_lengths == 1
+        assert store.diagnostics.recovered_bytes == 0
+        assert store.diagnostics.discarded_tail_path is None
+    assert _episodes(store_dir) == payloads
+    assert rawlog.read(log_path) == healthy
     assert not list(store_dir.glob("*.discarded-tail*")), (
-        "a refusal files nothing away; the log is untouched"
+        "a repair discards nothing, so there is nothing to file away"
     )
 
 

@@ -159,6 +159,20 @@ class _Diagnostics:
         return self._log.recovered_bytes
 
     @property
+    def repaired_lengths(self) -> int:
+        """Damaged frame length fields recovery rewrote on this open.
+
+        A frame whose length field is wrong but whose body still checksums and
+        carries the expected sequence number is whole: only those four bytes
+        are damaged, and the body itself says what they should have been. So
+        recovery writes them back rather than refusing to open (which loses
+        nothing but strands everything) or truncating (which destroys an
+        episode that is provably intact). Non-zero means the file was damaged
+        and is now correct — survivable, but worth knowing happened.
+        """
+        return self._log.repaired_lengths
+
+    @property
     def discarded_tail_path(self) -> Optional[Path]:
         """Where a truncated tail's bytes were kept on this open, or ``None``.
 

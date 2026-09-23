@@ -337,6 +337,13 @@ mod py {
             with_log(&self.shared, |l| Ok(l.recovered_bytes())).map_err(to_py)
         }
 
+        /// Damaged frame length fields recovery rewrote when this handle
+        /// opened. Non-zero means the file was damaged and is now correct.
+        #[getter]
+        fn repaired_lengths(&self) -> PyResult<u64> {
+            with_log(&self.shared, |l| Ok(l.repaired_lengths())).map_err(to_py)
+        }
+
         /// True when the checkpoint sidecar could not be decoded on this open,
         /// so it was set aside and every checkpoint now reads 0.
         #[getter]
