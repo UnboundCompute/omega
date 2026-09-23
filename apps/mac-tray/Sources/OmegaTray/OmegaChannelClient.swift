@@ -337,18 +337,26 @@ final class OmegaChannelClient: TrayTransport {
                     case .ready:
                         self.completeReadyWaiter(id: id)
                         connection.stateUpdateHandler = nil
-                    case .failed(let error):
-                        self.completeReadyWaiter(id: id, throwing: error)
-                        connection.stateUpdateHandler = nil
-                    case .cancelled:
-                        self.completeReadyWaiter(id: id, throwing: OmegaChannelError.disconnected)
-                        connection.stateUpdateHandler = nil
                     default:
-                        break
+                        if let error = Self.readinessFailure(for: state) {
+                            self.completeReadyWaiter(id: id, throwing: error)
+                            connection.stateUpdateHandler = nil
+                        }
                     }
                 }
             }
             connection.start(queue: .global(qos: .userInitiated))
+        }
+    }
+
+    static func readinessFailure(for state: NWConnection.State) -> Error? {
+        switch state {
+        case .waiting(let error), .failed(let error):
+            error
+        case .cancelled:
+            OmegaChannelError.disconnected
+        default:
+            nil
         }
     }
 

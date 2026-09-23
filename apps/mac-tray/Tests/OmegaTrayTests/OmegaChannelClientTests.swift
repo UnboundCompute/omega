@@ -1,4 +1,5 @@
 import Foundation
+import Network
 import XCTest
 @testable import OmegaTray
 
@@ -121,6 +122,15 @@ final class OmegaChannelClientTests: XCTestCase {
              .seconds(4), .seconds(8), .seconds(8)]
         )
         XCTAssertEqual(backoff.nextDelay(afterStableSession: true), .milliseconds(250))
+    }
+
+    @MainActor
+    func testWaitingConnectionFailsTheAttemptInsteadOfHanging() {
+        let refused = NWError.posix(.ECONNREFUSED)
+
+        XCTAssertNotNil(OmegaChannelClient.readinessFailure(for: .waiting(refused)))
+        XCTAssertNil(OmegaChannelClient.readinessFailure(for: .preparing))
+        XCTAssertNil(OmegaChannelClient.readinessFailure(for: .ready))
     }
 
     @MainActor
