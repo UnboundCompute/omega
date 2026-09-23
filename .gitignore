@@ -43,3 +43,9 @@ xcuserdata/
 
 # --- generated design review renders ---
 .impeccable/review/
+
+# --- omega-log crate build / local env (M0) ---
+# target/, .venv/, __pycache__/ and .pytest_cache/ are already covered above;
+# the compiled PyO3 extension that `maturin develop` drops into python/omega/
+# is the only new one.
+*.so

@@ -1,0 +1,30 @@
+[package]
+name = "omega-log"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.89"
+description = "Durable append-only episodic log for omega (M0)"
+license = "MIT"
+publish = false
+
+[lib]
+# The PyO3 module is `omega._log`, so the cdylib / init symbol must be `_log`.
+name = "_log"
+crate-type = ["cdylib", "rlib"]
+
+[features]
+# Not enabled by default: with `extension-module` on, the crate does not link
+# libpython, which breaks `cargo test` (the test harness is an executable and
+# needs the symbols). maturin turns it on via `[tool.maturin] features`.
+extension-module = ["pyo3/extension-module"]
+
+[dependencies]
+pyo3 = "0.29"
+crc32fast = "1.5"
+# No file-lock crate: std::fs::File::try_lock (stable since Rust 1.89) is
+# flock(2) on unix and conflicts across file descriptors in the same process,
+# which is exactly the AlreadyLocked semantics M0 needs. fs2/fs4 would add a
+# dependency for something std now does.
+
+[profile.release]
+opt-level = 3

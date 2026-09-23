@@ -1,0 +1,6 @@
+# Pin the interpreter PyO3 builds against. Without this, plain `cargo build` /
+# `cargo test` would pick up whatever `python3` is first on PATH (3.9 on this
+# machine), while the project targets 3.11. `force = false` means an explicitly
+# exported PYO3_PYTHON still wins.
+[env]
+PYO3_PYTHON = { value = ".venv/bin/python3.11", relative = true, force = false }
