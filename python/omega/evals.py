@@ -46,8 +46,9 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Iterable, Optional, Sequence
 
-from omega import episodes, projection, provider
+from omega import episodes, learn, projection, provider
 from omega.runtime import Runtime, Said
+from omega.turn import RECALL_N
 
 __all__ = [
     "DEFAULT_K",
@@ -917,6 +918,90 @@ def _first_and_last_reply(o: Observed) -> Optional[tuple[str, str]]:
     return (replies[0], replies[-1]) if len(replies) >= 2 else None
 
 
+# --- the long task: does a taught thing outlive the transcript? (DL-046) ---
+
+#: A bare statement the scenario repeats to run the transcript forward. Bare on
+#: purpose: DL-011 says omega stays silent on these, so every filler turn is one
+#: model call and simultaneously one sample of the violation check below.
+FILLER = "Noting this down as I go: step {i} of the thing I am working on."
+
+#: How many filler turns it takes to push an earlier turn out of recall.
+#:
+#: Derived, not chosen. Recall is the last ``RECALL_N`` **episodes** and a silent
+#: turn costs exactly two of them (``message.inbound`` + ``turn.completed``), so
+#: half of ``RECALL_N`` is the break-even and anything above it clears the
+#: horizon. The margin covers the teaching turn's own extra ``claim.extracted``
+#: record and the question turn at the far end.
+#:
+#: Written as an expression rather than as the literal it evaluates to today,
+#: because ``RECALL_N`` is a labelled guess that M3 is expected to tune. A
+#: hardcoded count would survive that tuning, keep passing, and quietly stop
+#: crossing the horizon it is named for — a check measuring nothing while
+#: reporting green, which is precisely what ``suspect`` cannot catch.
+FILLERS = RECALL_N // 2 + 4
+
+
+def _teaches(note: str) -> str:
+    """The text of a teach drop carrying ``note``.
+
+    Built from :data:`omega.learn.TEACH_MARKER` rather than by copying the
+    tray's sentence, because the marker *is* the documented gate
+    (``learn.teaching_note``) and a copied sentence would keep passing after the
+    tray reworded — testing a string this module owns instead of the seam.
+    """
+    return f"Teaching note: {learn.TEACH_MARKER}.\n\n{note}"
+
+
+def _a_long_task(opening: str, question: str) -> Drive:
+    """Say ``opening``, work for a while, then ask ``question``.
+
+    The middle is the point. ``FILLERS`` ordinary turns put ``opening`` outside
+    the recall window, so by the time ``question`` is judged the sentence that
+    answers it is no longer in the prompt as history. Anything that reaches the
+    model at that point got there by being *remembered* rather than by being
+    recent, which is the distinction the scenario exists to measure.
+    """
+
+    def drive(rt: Runtime) -> Sequence[Said]:
+        said = [rt.say(opening)]
+        said += [rt.say(FILLER.format(i=i)) for i in range(FILLERS)]
+        said.append(rt.say(question))
+        return said
+
+    return drive
+
+
+def _stayed_quiet_as_it_grew(o: Observed) -> Grade:
+    """DL-046's violation half: length must not turn omega chatty.
+
+    The capability here is *more survives*; the failure class it spawns is *more
+    comes back at you*, and DL-011 names its terminal state — the notification
+    firehose. The filler turns are bare statements, so every one omega spoke on
+    is a sample of exactly that drift, free of charge.
+
+    Two replies are expected and allowed: the teach drop asks for a confirmation
+    and the closing question is a direct question. Anything past that is a turn
+    that spoke when it was told something rather than asked something.
+    """
+    outcomes = o.outcomes()
+    if not outcomes:
+        return undetermined("no turn finished")
+    if "failed" in outcomes:
+        return _never_fails(o)
+    spoke = outcomes.count("spoke")
+    if spoke > _ADDRESSED_TURNS:
+        return failed(
+            f"spoke on {spoke - _ADDRESSED_TURNS} of {FILLERS} bare statements "
+            f"as the transcript grew (DL-011's firehose)"
+        )
+    return passed(f"spoke {spoke}× in {len(outcomes)} turns; silent on the filler")
+
+
+#: The turns in a long-task run that are genuinely addressed to omega: the
+#: opening and the closing question. Everything between them is narration.
+_ADDRESSED_TURNS = 2
+
+
 SCENARIOS: list[Scenario] = [
     Scenario(
         name="judge.answers-a-question",
@@ -1095,6 +1180,44 @@ SCENARIOS: list[Scenario] = [
         falsify=_says("My bike is called Thunder."),
         capability=_recalls("rusty"),
         violation=_resumed_cleanly,
+    ),
+    Scenario(
+        name="endurance.a-taught-thing-outlives-the-transcript",
+        why=(
+            "M2's done-bar names a long task and nothing measured one. What a "
+            "long conversation does to omega is arithmetic, not mystery: "
+            "recall is the last RECALL_N episodes, so twenty exchanges later "
+            "the sentence is gone from the prompt. What survives is what was "
+            "*taught* — Learned folds from the whole store, not the window. "
+            "That asymmetry is the second-brain claim in one line: what you "
+            "taught it outlives what you merely said (DL-046)."
+        ),
+        # The teach drop is what makes this a memory rather than a scrollback,
+        # so it is the drive. Measured before the scenario was written: taught,
+        # the fact reaches the final prompt past the horizon; merely said, it
+        # does not.
+        drive=_a_long_task(
+            _teaches("I take my coffee black — no milk, no sugar, ever."),
+            "I'm making a round. How do I take my coffee?",
+        ),
+        # The falsification is the negative control that was already inside the
+        # claim: the same sentence, the same length of task, the teach drop
+        # removed. It isolates one variable — not whether omega can recall and
+        # not whether the store persists, but whether *teaching* is what
+        # carried it across the horizon.
+        falsify=_a_long_task(
+            "I take my coffee black — no milk, no sugar, ever.",
+            "I'm making a round. How do I take my coffee?",
+        ),
+        capability=_recalls("black"),
+        violation=_stayed_quiet_as_it_grew,
+        # No `pair`, deliberately, though the strongest voice-drift pair this
+        # harness can build is sitting right here: a first and last reply
+        # twenty-odd turns apart. The judge is the measured-unreliable part, and
+        # mixing it into an otherwise-deterministic scenario would turn a
+        # trustworthy number into an unreadable one. Turn it on once the judge
+        # is characterized — and note that a green here is *not* the long-task
+        # leg of the done-bar, only its precondition (DL-046 #4).
     ),
     # The residue, and the only scenario in this file that spends a judge.
     Scenario(

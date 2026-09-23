@@ -15,9 +15,12 @@ those into this file is exactly the mixing the design forbids.
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
-from omega import evals, executor, provider
+from omega import evals, executor, learn, provider
+from omega.turn import RECALL_N
 from omega.evals import (
     FAIL,
     PASS,
@@ -845,3 +848,178 @@ def test_the_shipped_continuity_scenario_crosses_a_restart() -> None:
     assert scenario.name == "continuity.resumes-cold-after-a-restart"
     assert scenario.resume is not None, "continuity must cross a restart"
     assert scenario.violation is evals._resumed_cleanly
+
+
+# --- the long task: a taught thing outliving the transcript (DL-046) ---------
+
+
+def _observed(outcomes: list[str]) -> Observed:
+    """An `Observed` carrying just the turn outcomes.
+
+    Sibling of :func:`_obs`, which carries replies: the chattiness check reads
+    *how each turn ended* and never the text, so handing it replies would build
+    a fixture out of the one field it does not look at.
+    """
+    from pathlib import Path
+
+    from omega import episodes, projection
+
+    updates = [
+        projection.Update(
+            seq=i + 1,
+            state=projection.COMPLETE,
+            for_seq=i + 1,
+            at="2026-09-24T00:00:00+00:00",
+            kind=episodes.TURN_COMPLETED,
+            reply="something" if outcome == "spoke" else "",
+            outcome=outcome,
+            error="boom" if outcome == "failed" else None,
+        )
+        for i, outcome in enumerate(outcomes)
+    ]
+    return Observed(updates=updates, said=[], store=Path("."), seconds=0.0)
+
+
+def _prompt_watcher(reply: str = "noted"):
+    """A provider that records every ``act`` prompt and answers from the last.
+
+    The subject of these cases is the *instrument*: whether ``FILLERS`` turns
+    genuinely push the opening past the recall horizon. That is a claim about
+    what reaches the model, so the only honest way to check it is to look at
+    what reached the model. ``prompts`` is the evidence; the reply is incidental.
+    """
+    prompts: list[str] = []
+
+    def act(role, messages):
+        prompts.append("\n".join(str(m["content"]) for m in messages))
+        return reply
+
+    complete = provider.FakeProvider(
+        {
+            provider.JUDGE: lambda role, messages: "SPEAK",
+            provider.ACT: act,
+            provider.LEARN: lambda role, messages: json.dumps(
+                {
+                    "claims": [{"text": TAKES_IT_BLACK, "situation": "always"}],
+                    "schedules": [],
+                    "cancel": [],
+                }
+            ),
+        }
+    ).complete
+    return complete, prompts
+
+
+TAKES_IT_BLACK = "I take my coffee black."
+
+
+def _long_probe(opening: str) -> list[str]:
+    """Run one long task and return every ``act`` prompt it produced."""
+    complete, prompts = _prompt_watcher()
+    scenario = Scenario(
+        name="long-probe",
+        drive=evals._a_long_task(opening, "How do I take my coffee?"),
+        capability=evals._recalls("black"),
+        violation=evals._stayed_quiet_as_it_grew,
+    )
+    evals.run_once(scenario, complete=complete)
+    return prompts
+
+
+def test_the_filler_count_actually_clears_the_recall_horizon() -> None:
+    """The load-bearing property of the instrument, checked the only way it can
+    be: by reading what reached the model.
+
+    If ``FILLERS`` ever stops crossing the horizon the scenario keeps passing
+    while measuring nothing, because recall alone would carry the answer. That
+    is a check that cannot fail, and no score reveals it.
+    """
+    prompts = _long_probe(TAKES_IT_BLACK)
+
+    assert prompts, "the probe ran no act pass"
+    assert TAKES_IT_BLACK in prompts[0], "the opening was not in its own turn"
+    assert TAKES_IT_BLACK not in prompts[-1], (
+        "a merely-said sentence still reached the final prompt: "
+        f"FILLERS={evals.FILLERS} no longer clears RECALL_N={RECALL_N}"
+    )
+
+
+def test_a_taught_sentence_survives_the_same_horizon_that_drops_a_said_one() -> None:
+    """DL-046's asymmetry, both halves in one case, because either half alone
+    is consistent with a broken instrument: 'it survived' could be a horizon
+    that never closed, and 'it was dropped' could be a store that never wrote."""
+    said = _long_probe(TAKES_IT_BLACK)
+    taught = _long_probe(evals._teaches(TAKES_IT_BLACK))
+
+    assert TAKES_IT_BLACK not in said[-1], "the said sentence should have aged out"
+    assert TAKES_IT_BLACK in taught[-1], (
+        "the taught claim did not reach the final prompt — Learned is no "
+        "longer folded from the whole store"
+    )
+
+
+def test_the_teach_drop_is_one_production_recognises() -> None:
+    """Built from ``learn.TEACH_MARKER`` rather than copied from the tray, so
+    this asserts the seam and not a string this module owns."""
+    assert learn.teaching_note(evals._teaches("Some note.")) == "Some note."
+    assert learn.teaching_note("Some note.") is None
+
+
+def test_a_long_task_runs_the_turns_it_claims_to() -> None:
+    complete, _ = _prompt_watcher()
+    out = evals.run_once(
+        Scenario(
+            name="counts",
+            drive=evals._a_long_task("opening", "closing?"),
+            capability=evals._never_fails,
+            violation=evals._never_fails,
+        ),
+        complete=complete,
+    )
+
+    assert len(out.observed.outcomes()) == evals.FILLERS + 2
+    assert evals.FILLERS * 2 > RECALL_N, (
+        "FILLERS must out-run the horizon in episodes, not in turns"
+    )
+
+
+def test_speaking_on_the_filler_is_a_violation_not_a_miss() -> None:
+    """The paired failure class: the widening that makes a taught claim persist
+    also makes a longer transcript to react to (DL-011's firehose)."""
+    chatty = _observed(["spoke"] * (evals.FILLERS + 2))
+    quiet = _observed(["spoke"] + ["silent"] * evals.FILLERS + ["spoke"])
+
+    assert evals._stayed_quiet_as_it_grew(chatty).verdict == FAIL
+    assert evals._stayed_quiet_as_it_grew(quiet).verdict == PASS
+
+
+def test_the_chattiness_check_is_undetermined_on_an_empty_run() -> None:
+    assert evals._stayed_quiet_as_it_grew(_observed([])).verdict == UNDETERMINED
+
+
+def test_a_failed_turn_is_reported_as_the_failure_it_is() -> None:
+    """Not as chattiness. A run that broke has one finding, and naming it
+    'spoke too often' would send the reader to the wrong place."""
+    grade = evals._stayed_quiet_as_it_grew(_observed(["spoke", "failed"]))
+
+    assert grade.verdict == FAIL
+    assert "the turn failed" in grade.why
+
+
+def test_the_shipped_long_task_teaches_and_its_falsification_does_not() -> None:
+    """The one variable between the drive and its counter-input. If the teach
+    drop ever appears in both, the falsification stops isolating teaching and
+    starts asserting that omega cannot recall at all."""
+    (scenario,) = [
+        s for s in evals.SCENARIOS if s.name.startswith("endurance.")
+    ]
+    complete, prompts = _prompt_watcher()
+    evals.run_once(scenario, complete=complete)
+    drive_opening = prompts[0]
+
+    complete, prompts = _prompt_watcher()
+    evals.run_once(evals.replace(scenario, drive=scenario.falsify), complete=complete)
+
+    assert learn.TEACH_MARKER in drive_opening
+    assert learn.TEACH_MARKER not in prompts[0]
+    assert scenario.pair is None, "the long task must not spend an unreliable judge"
