@@ -23,20 +23,39 @@ question by implementation — the exact failure DL-006 records, where a stub's
 shape nearly became the contract by default. Errors surface as
 :class:`ProviderError`. The loop decides what to do about them, once we have
 decided what the loop should do.
+
+**The seam carries tool calls, and it was widened additively** (M1 step 7,
+DL-028). ``complete(role, messages)`` had no field in which a model could say
+*call this tool with these arguments*, so it grew an optional ``tools``
+parameter and :class:`Response` grew ``tool_calls``. Every caller that passes
+no tools produces exactly the request it produced before — the ``tools`` key is
+not even present — so the widening cannot regress the one property M1 exists to
+measure.
+
+*Why not parse tool calls out of the text.* ``judge`` already parses model text
+and survives only because its whole grammar is one word from a closed set of
+three. Tool arguments are structured and adversarial in the way a verdict is
+not: a path with a space, a command with a quote, a URL with a ``)``. §2.4
+forbids automatic retry, so every parse failure would be a *failed turn* rather
+than a retried one. Native tool calling moves that failure into the provider's
+typed channel, where it is the provider's problem and not a new class of lost
+turn.
 """
 
 from __future__ import annotations
 
+import json
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Optional, Protocol, Sequence
+from typing import Any, Callable, Optional, Protocol, Sequence
 
 __all__ = [
     "JUDGE",
     "ACT",
     "ROLES",
     "Message",
+    "ToolCall",
     "Response",
     "Provider",
     "ProviderError",
@@ -48,6 +67,8 @@ __all__ = [
     "system",
     "user",
     "assistant",
+    "assistant_tool_calls",
+    "tool_result",
 ]
 
 #: Decide what this event deserves — including deciding it deserves nothing.
@@ -103,6 +124,66 @@ def assistant(content: str) -> Message:
 
 
 @dataclass(frozen=True)
+class ToolCall:
+    """One request from the model to run one tool.
+
+    ``arguments`` is a **decoded** object, not the JSON string the wire
+    carries. Decoding it here is the point of native tool calling: the one
+    place that can be handed a malformed argument blob is the one place that
+    knows what the provider promised, and a decode failure is a
+    :class:`ProviderError` rather than a new parser in the loop (DL-028).
+
+    ``id`` matters as much as the name. A pass may request several tools, and
+    the result of each has to be handed back against the call it answers — a
+    result matched by position would silently pair the wrong output with the
+    wrong request the first time a model reordered them.
+    """
+
+    id: str
+    name: str
+    arguments: dict[str, Any] = field(default_factory=dict)
+
+
+def assistant_tool_calls(
+    tool_calls: Sequence[ToolCall], content: str = ""
+) -> Message:
+    """The assistant turn that *asked* for tools, ready to send back.
+
+    The next pass has to see the model's own request in its history or it is
+    being asked to interpret results to questions it cannot see — and the API
+    refuses a ``tool`` message that answers no call. ``content`` is carried
+    because a model may reason aloud *and* call a tool in one turn.
+    """
+    return {
+        "role": "assistant",
+        "content": content,
+        "tool_calls": [
+            {
+                "id": call.id,
+                "type": "function",
+                "function": {
+                    "name": call.name,
+                    "arguments": json.dumps(call.arguments, sort_keys=True),
+                },
+            }
+            for call in tool_calls
+        ],
+    }
+
+
+def tool_result(call_id: str, content: str) -> Message:
+    """What one tool returned, against the call id that asked for it.
+
+    This is **data, never instruction** (DL-014). A fetched page is the first
+    thing omega reads that someone else wrote, and it arrives in a role the
+    model is told nothing by: the approval gate that decides what may run is
+    static code in the execution layer (`omega.tools`), so nothing said inside
+    this content can widen what the next pass is allowed to do.
+    """
+    return {"role": "tool", "tool_call_id": call_id, "content": content}
+
+
+@dataclass(frozen=True)
 class Response:
     """What came back.
 
@@ -114,6 +195,9 @@ class Response:
     ``model`` is recorded rather than assumed: it is what the provider *says*
     it used, which is the only honest answer when a name can alias to a
     dated snapshot.
+
+    ``tool_calls`` is empty for every call that offered no tools, which is
+    every call `judge` and `reply` make.
     """
 
     text: str
@@ -121,6 +205,7 @@ class Response:
     finish_reason: Optional[str] = None
     prompt_tokens: Optional[int] = None
     completion_tokens: Optional[int] = None
+    tool_calls: tuple[ToolCall, ...] = ()
 
     @property
     def total_tokens(self) -> Optional[int]:
@@ -130,9 +215,18 @@ class Response:
 
 
 class Provider(Protocol):
-    """Anything that can answer a role with text. The whole contract."""
+    """Anything that can answer a role with text. The whole contract.
 
-    def complete(self, role: str, messages: Sequence[Message]) -> Response: ...
+    ``tools`` is optional and defaults to none, so a provider written against
+    the pre-DL-028 seam still satisfies every call `judge` and `reply` make.
+    """
+
+    def complete(
+        self,
+        role: str,
+        messages: Sequence[Message],
+        tools: Optional[Sequence[dict[str, Any]]] = None,
+    ) -> Response: ...
 
 
 # --- configuration ----------------------------------------------------------
@@ -275,35 +369,57 @@ class OpenAIProvider:
         _check_role(role)
         return self._models.get(role) or model_for(role)
 
-    def complete(self, role: str, messages: Sequence[Message]) -> Response:
+    def complete(
+        self,
+        role: str,
+        messages: Sequence[Message],
+        tools: Optional[Sequence[dict[str, Any]]] = None,
+    ) -> Response:
         _check_role(role)
         if not messages:
             raise ValueError("messages must not be empty")
 
         model = self.model_for(role)
+        request: dict[str, Any] = {"model": model, "messages": list(messages)}
+        if tools:
+            # Added only when there are tools to offer. A caller that passes
+            # none sends the request it sent before the seam was widened, key
+            # for key — which is what makes DL-028's "bit-for-bit unchanged"
+            # a fact about the wire rather than an intention.
+            request["tools"] = list(tools)
         try:
-            raw = self._client.chat.completions.create(
-                model=model, messages=list(messages)
-            )
+            raw = self._client.chat.completions.create(**request)
         except Exception as exc:  # noqa: BLE001 - every remote failure is one class
             raise ProviderError(f"{role} call to {model} failed: {exc}") from exc
 
         try:
             choice = raw.choices[0]
             text = choice.message.content
+            raw_calls = getattr(choice.message, "tool_calls", None) or ()
         except (AttributeError, IndexError, TypeError) as exc:
             raise ProviderError(
                 f"{role} call to {model} returned an unreadable response"
             ) from exc
 
+        tool_calls = tuple(_read_tool_call(role, model, c) for c in raw_calls)
+
         if text is None:
-            # Never let this become an empty string: `judge` reading "" would be
-            # indistinguishable from a model choosing to stay silent, and that
-            # distinction is the whole point of measuring silence.
-            raise ProviderError(
-                f"{role} call to {model} returned no content "
-                f"(finish_reason={getattr(choice, 'finish_reason', None)!r})"
-            )
+            if not tool_calls:
+                # Never let this become an empty string: `judge` reading "" would
+                # be indistinguishable from a model choosing to stay silent, and
+                # that distinction is the whole point of measuring silence.
+                raise ProviderError(
+                    f"{role} call to {model} returned no content "
+                    f"(finish_reason={getattr(choice, 'finish_reason', None)!r})"
+                )
+            # ...but the API returns `content: null` *exactly when* the model
+            # answered with tool calls instead of words, and that is not a model
+            # that said nothing — it is a model that said "run these". The
+            # reasoning above is untouched and the guard is narrowed, not
+            # removed: with no tool calls either, it still raises. Nothing that
+            # reaches `judge` can take this branch, because `judge` offers no
+            # tools and so can never come back with any.
+            text = ""
 
         usage = getattr(raw, "usage", None)
         return Response(
@@ -312,7 +428,53 @@ class OpenAIProvider:
             finish_reason=getattr(choice, "finish_reason", None),
             prompt_tokens=getattr(usage, "prompt_tokens", None),
             completion_tokens=getattr(usage, "completion_tokens", None),
+            tool_calls=tool_calls,
         )
+
+
+def _read_tool_call(role: str, model: str, raw: Any) -> ToolCall:
+    """One wire tool call as a :class:`ToolCall`, or a :class:`ProviderError`.
+
+    Strict on purpose. Arguments arrive as a JSON *string*, and the three ways
+    that can be wrong — unreadable object, invalid JSON, valid JSON that is not
+    an object — are each a failed call rather than a guess. Guessing here would
+    put a half-decoded argument in front of the approval classifier, which is
+    the one place in omega that must never be handed something it cannot read.
+    """
+    try:
+        call_id = raw.id
+        function = raw.function
+        name = function.name
+        arguments = function.arguments
+    except AttributeError as exc:
+        raise ProviderError(
+            f"{role} call to {model} returned an unreadable tool call"
+        ) from exc
+
+    if isinstance(arguments, dict):
+        decoded: Any = arguments
+    elif isinstance(arguments, str):
+        try:
+            decoded = json.loads(arguments) if arguments.strip() else {}
+        except json.JSONDecodeError as exc:
+            raise ProviderError(
+                f"{role} call to {model} asked for {name!r} with arguments that "
+                f"are not JSON: {exc}"
+            ) from exc
+    else:
+        raise ProviderError(
+            f"{role} call to {model} asked for {name!r} with arguments of type "
+            f"{type(arguments).__name__}"
+        )
+
+    if not isinstance(decoded, dict):
+        raise ProviderError(
+            f"{role} call to {model} asked for {name!r} with arguments that "
+            f"decoded to a {type(decoded).__name__}, not an object"
+        )
+    if not isinstance(name, str) or not name:
+        raise ProviderError(f"{role} call to {model} returned a nameless tool call")
+    return ToolCall(id=str(call_id), name=name, arguments=decoded)
 
 
 # --- the test provider ------------------------------------------------------
@@ -330,6 +492,12 @@ class FakeProvider:
     callable taking ``(role, messages)``. Running out of scripted answers is an
     error rather than a repeat of the last one: a test that silently reuses an
     answer passes for a reason it did not state.
+
+    **An answer may be a tool call**, so the `act` sub-loop is exercisable with
+    no network and no key: a scripted answer that is a :class:`ToolCall`, a
+    sequence of them, or a whole :class:`Response` becomes exactly that. A
+    string stays a string, so every case written before the seam widened means
+    what it meant.
     """
 
     def __init__(
@@ -347,37 +515,81 @@ class FakeProvider:
         }
         self._model = model
         self.calls: list[tuple[str, list[Message]]] = []
+        #: What was *offered* on each call, in lockstep with ``calls``. Kept
+        #: beside them rather than inside them so the tuple every existing case
+        #: unpacks keeps its two fields.
+        self.offers: list[Optional[list[dict[str, Any]]]] = []
 
     def calls_for(self, role: str) -> list[list[Message]]:
         return [m for r, m in self.calls if r == role]
 
-    def complete(self, role: str, messages: Sequence[Message]) -> Response:
+    def offers_for(self, role: str) -> list[Optional[list[dict[str, Any]]]]:
+        """What tools were offered to ``role``, call by call.
+
+        The assertion this exists for is the one DL-028 rests on: `judge` and
+        `reply` must offer **nothing**, and a widened seam that quietly started
+        offering them tools would change the property M1 measures without
+        changing a single test that reads only text.
+        """
+        return [o for (r, _), o in zip(self.calls, self.offers) if r == role]
+
+    def complete(
+        self,
+        role: str,
+        messages: Sequence[Message],
+        tools: Optional[Sequence[dict[str, Any]]] = None,
+    ) -> Response:
         _check_role(role)
         if not messages:
             raise ValueError("messages must not be empty")
         self.calls.append((role, list(messages)))
+        self.offers.append(None if tools is None else list(tools))
 
         scripted = self._answers.get(role)
         if scripted is None:
             raise ProviderError(f"FakeProvider has no answers scripted for {role!r}")
 
         if callable(scripted):
-            text = scripted(role, list(messages))
+            answer = scripted(role, list(messages))
         elif isinstance(scripted, list):
             if not scripted:
                 raise ProviderError(
                     f"FakeProvider ran out of scripted {role!r} answers "
                     f"after {len(self.calls_for(role)) - 1}"
                 )
-            text = scripted.pop(0)
+            answer = scripted.pop(0)
         else:
-            text = scripted
+            answer = scripted
 
-        if not isinstance(text, str):
-            raise ProviderError(
-                f"scripted {role!r} answer must be a string, got {type(text).__name__}"
+        return self._as_response(role, answer)
+
+    def _as_response(self, role: str, answer: object) -> Response:
+        if isinstance(answer, Response):
+            return answer
+        if isinstance(answer, str):
+            return Response(text=answer, model=self._model, finish_reason="stop")
+        if isinstance(answer, ToolCall):
+            answer = [answer]
+        if (
+            isinstance(answer, (list, tuple))
+            and answer
+            # Non-empty on purpose: an empty sequence would become a response
+            # with no tool calls *and* no text, which is a scripted answer that
+            # says nothing while looking deliberate.
+            and all(isinstance(c, ToolCall) for c in answer)
+        ):
+            return Response(
+                # Empty text beside tool calls, mirroring the live API's
+                # `content: null` — the shape the seam now has to survive.
+                text="",
+                model=self._model,
+                finish_reason="tool_calls",
+                tool_calls=tuple(answer),
             )
-        return Response(text=text, model=self._model, finish_reason="stop")
+        raise ProviderError(
+            f"scripted {role!r} answer must be a string, a ToolCall, a sequence "
+            f"of ToolCalls or a Response, got {type(answer).__name__}"
+        )
 
 
 # --- the module-level seam --------------------------------------------------
@@ -397,15 +609,24 @@ def set_provider(provider: Optional[Provider]) -> Optional[Provider]:
     return previous
 
 
-def complete(role: str, messages: Sequence[Message]) -> Response:
-    """The seam. Everything above this line speaks roles and messages only."""
+def complete(
+    role: str,
+    messages: Sequence[Message],
+    tools: Optional[Sequence[dict[str, Any]]] = None,
+) -> Response:
+    """The seam. Everything above this line speaks roles, messages and tools.
+
+    ``tools`` is passed straight through and defaults to none, so the two
+    callers that predate DL-028 — `judge` and `reply` — reach the provider with
+    the argument list they always had.
+    """
     if _provider is None:
         raise ProviderNotConfigured(
             "no provider installed; call set_provider(provider_from_env()) at startup"
         )
-    return _provider.complete(role, messages)
+    return _provider.complete(role, messages, tools)
 
 
-def completer() -> Callable[[str, Sequence[Message]], Response]:
+def completer() -> Callable[..., Response]:
     """The seam as a value, for injecting into a loop rather than importing it."""
     return complete

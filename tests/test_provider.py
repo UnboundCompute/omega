@@ -359,3 +359,159 @@ def test_recorded_messages_are_not_aliased_to_the_caller_s_list():
     fake.complete(pv.JUDGE, messages)
     messages.append(pv.user("added later"))
     assert len(fake.calls[0][1]) == 1
+
+
+# --- the widened seam: tool calls (M1 step 7, DL-028) ------------------------
+
+
+def _tool_call(name="read_file", args='{"path": "/tmp/x"}', call_id="call_1"):
+    """The wire shape of one tool call, reproduced from the API's spec rather
+    than imported — so this stays a test of *our* mapping."""
+    return SimpleNamespace(
+        id=call_id,
+        type="function",
+        function=SimpleNamespace(name=name, arguments=args),
+    )
+
+
+def _with_tool_calls(calls, content=None, model="m", finish="tool_calls"):
+    return SimpleNamespace(
+        model=model,
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(content=content, tool_calls=calls),
+                finish_reason=finish,
+            )
+        ],
+        usage=SimpleNamespace(prompt_tokens=3, completion_tokens=5),
+    )
+
+
+def test_a_caller_offering_no_tools_sends_the_request_it_always_sent():
+    """The property DL-028 rests on: the widening is additive, so `judge` and
+    `reply` cannot be regressed by it. Asserted on the *request keys*, because
+    an extra `tools: None` on the wire is a change even when it is ignored."""
+    client = _StubClient(_fake_openai_response("SILENT"))
+    pv.OpenAIProvider(client=client).complete(pv.JUDGE, [pv.user("x")])
+    assert set(client.seen[0]) == {"model", "messages"}
+    assert "tools" not in client.seen[0]
+
+
+def test_offered_tools_reach_the_request_untouched():
+    schema = {"type": "function", "function": {"name": "read_file"}}
+    client = _StubClient(_fake_openai_response("ok"))
+    pv.OpenAIProvider(client=client).complete(pv.ACT, [pv.user("x")], [schema])
+    assert client.seen[0]["tools"] == [schema]
+
+
+def test_tool_calls_come_back_decoded_with_their_ids():
+    client = _StubClient(
+        _with_tool_calls(
+            [
+                _tool_call("read_file", '{"path": "/tmp/a"}', "call_a"),
+                _tool_call("fetch", '{"url": "https://example.com/"}', "call_b"),
+            ]
+        )
+    )
+    response = pv.OpenAIProvider(client=client).complete(pv.ACT, [pv.user("x")])
+
+    assert [c.id for c in response.tool_calls] == ["call_a", "call_b"]
+    assert [c.name for c in response.tool_calls] == ["read_file", "fetch"]
+    assert response.tool_calls[0].arguments == {"path": "/tmp/a"}
+    assert response.tool_calls[1].arguments == {"url": "https://example.com/"}
+
+
+def test_null_content_beside_tool_calls_is_not_an_error():
+    """The collision DL-028 names. The API returns `content: null` *exactly
+    when* the model answered with tool calls, and a model that said "run these"
+    is not a model that said nothing."""
+    client = _StubClient(_with_tool_calls([_tool_call()], content=None))
+    response = pv.OpenAIProvider(client=client).complete(pv.ACT, [pv.user("x")])
+    assert response.text == ""
+    assert len(response.tool_calls) == 1
+
+
+def test_null_content_with_no_tool_calls_still_raises():
+    """The guard was narrowed, not removed. Without this the fix would have
+    quietly handed `judge` an empty string, which is the one thing DL-024 says
+    must never happen."""
+    client = _StubClient(_with_tool_calls([], content=None, finish="length"))
+    with pytest.raises(pv.ProviderError) as exc:
+        pv.OpenAIProvider(client=client).complete(pv.JUDGE, [pv.user("x")])
+    assert "length" in str(exc.value), "says why, not just that"
+
+
+def test_a_response_with_no_tools_offered_carries_no_tool_calls():
+    client = _StubClient(_fake_openai_response("SPEAK"))
+    response = pv.OpenAIProvider(client=client).complete(pv.JUDGE, [pv.user("x")])
+    assert response.tool_calls == ()
+
+
+def test_unparseable_tool_arguments_are_a_provider_error_not_a_guess():
+    """A half-read argument must never reach the approval classifier — the one
+    place in omega that has to be handed exactly what the model asked for."""
+    client = _StubClient(_with_tool_calls([_tool_call(args="{not json")]))
+    with pytest.raises(pv.ProviderError) as exc:
+        pv.OpenAIProvider(client=client).complete(pv.ACT, [pv.user("x")])
+    assert "read_file" in str(exc.value)
+
+
+def test_tool_arguments_that_are_not_an_object_are_refused():
+    client = _StubClient(_with_tool_calls([_tool_call(args="[1, 2]")]))
+    with pytest.raises(pv.ProviderError):
+        pv.OpenAIProvider(client=client).complete(pv.ACT, [pv.user("x")])
+
+
+def test_empty_tool_arguments_decode_to_an_empty_object():
+    """A tool that takes nothing is sent `""`, and that is not malformed."""
+    client = _StubClient(_with_tool_calls([_tool_call(args="")]))
+    response = pv.OpenAIProvider(client=client).complete(pv.ACT, [pv.user("x")])
+    assert response.tool_calls[0].arguments == {}
+
+
+def test_the_fake_can_script_a_tool_call():
+    """No network and no key, which is what makes the act sub-loop testable at
+    all."""
+    call = pv.ToolCall(id="c1", name="read_file", arguments={"path": "/tmp/a"})
+    fake = pv.FakeProvider({pv.ACT: [[call], "all done"]})
+
+    first = fake.complete(pv.ACT, [pv.user("x")], [{"name": "read_file"}])
+    assert first.tool_calls == (call,)
+    assert first.text == "", "mirrors the live API's content: null"
+
+    second = fake.complete(pv.ACT, [pv.user("x")])
+    assert second.tool_calls == () and second.text == "all done"
+
+
+def test_the_fake_records_what_was_offered_and_to_whom():
+    """DL-028's invariant, made assertable: judge is never offered a tool."""
+    fake = pv.FakeProvider({pv.JUDGE: ["SPEAK"], pv.ACT: ["done"]})
+    fake.complete(pv.JUDGE, [pv.user("x")])
+    fake.complete(pv.ACT, [pv.user("x")], [{"name": "read_file"}])
+
+    assert fake.offers_for(pv.JUDGE) == [None]
+    assert fake.offers_for(pv.ACT) == [[{"name": "read_file"}]]
+    assert [r for r, _ in fake.calls] == [pv.JUDGE, pv.ACT], "calls kept its shape"
+
+
+def test_a_scripted_answer_that_is_neither_text_nor_tool_calls_is_refused():
+    fake = pv.FakeProvider({pv.ACT: [42]})
+    with pytest.raises(pv.ProviderError):
+        fake.complete(pv.ACT, [pv.user("x")])
+
+
+def test_the_assistant_tool_call_message_carries_ids_and_json_arguments():
+    """The next pass must see the model's own request, and the API refuses a
+    tool result that answers no call."""
+    call = pv.ToolCall(id="c1", name="run_code", arguments={"argv": ["ls"]})
+    message = pv.assistant_tool_calls([call], "let me look")
+
+    assert message["role"] == "assistant" and message["content"] == "let me look"
+    assert message["tool_calls"][0]["id"] == "c1"
+    assert message["tool_calls"][0]["function"]["name"] == "run_code"
+    assert message["tool_calls"][0]["function"]["arguments"] == '{"argv": ["ls"]}'
+
+
+def test_a_tool_result_message_names_the_call_it_answers():
+    message = pv.tool_result("c1", "total 0")
+    assert message == {"role": "tool", "tool_call_id": "c1", "content": "total 0"}
