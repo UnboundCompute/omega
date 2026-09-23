@@ -17,6 +17,7 @@ from omega.projection import (
     BLOCKED,
     COMPLETE,
     FAILED,
+    NOT_PROJECTED,
     STATES,
     UNDERSTOOD,
     WORKING,
@@ -277,12 +278,39 @@ def test_every_m1_kind_is_accounted_for() -> None:
             for_seq=1, tool="t", ok=True, at=AT
         ),
         episodes.WORK_FINISHED: episodes.work_finished(for_seq=1, summary="s", at=AT),
+        episodes.SCHEDULE_CREATED: episodes.schedule_created(
+            id="s", instruction="i", cron="0 9 *", at=AT
+        ),
+        episodes.SCHEDULE_CANCELLED: episodes.schedule_cancelled(id="s", at=AT),
     }
     assert set(made) == set(episodes.KINDS)
     for kind, payload in made.items():
         update = project(payload, 1)
+        if kind in NOT_PROJECTED:
+            # Withheld on purpose. Asserting the *decision* rather than
+            # accepting a None keeps this guard able to tell a policy choice
+            # apart from a kind nobody wired up.
+            assert update is None, f"{kind} is listed as withheld but projected"
+            continue
         assert update is not None, f"{kind} projects to nothing"
         assert update.state in STATES
+
+
+def test_a_scheduled_fire_is_visible_to_the_tray() -> None:
+    """omega acting on its own must not happen invisibly. A fire is an
+    ordinary inbound, so it reaches the wire like any arriving message —
+    that is the user-facing half of DL-035's 'ordinary event' rule."""
+    fire = episodes.inbound(
+        "morning brief",
+        channel="schedule",
+        schedule_id="brief",
+        schedule_slot=AT,
+        at=AT,
+    )
+
+    update = project(fire, 7)
+
+    assert update is not None and update.state == "understood"
 
 
 # --- reading a stream out of the log ---------------------------------------

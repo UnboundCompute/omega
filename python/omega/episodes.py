@@ -36,6 +36,9 @@ __all__ = [
     "TOOL_CALLED",
     "TOOL_RETURNED",
     "WORK_FINISHED",
+    "SCHEDULE_CREATED",
+    "SCHEDULE_CANCELLED",
+    "MIN_EVERY_SECONDS",
     "BadPayload",
     "UnsupportedPayloadVersion",
     "encode",
@@ -48,6 +51,8 @@ __all__ = [
     "tool_called",
     "tool_returned",
     "work_finished",
+    "schedule_created",
+    "schedule_cancelled",
     "now",
 ]
 
@@ -62,6 +67,8 @@ TURN_COMPLETED = "turn.completed"
 TOOL_CALLED = "tool.called"
 TOOL_RETURNED = "tool.returned"
 WORK_FINISHED = "work.finished"
+SCHEDULE_CREATED = "schedule.created"
+SCHEDULE_CANCELLED = "schedule.cancelled"
 
 #: The complete M1 kind set (§2.1: "and that is all of them").
 #:
@@ -78,8 +85,21 @@ KINDS = frozenset(
         TOOL_CALLED,
         TOOL_RETURNED,
         WORK_FINISHED,
+        SCHEDULE_CREATED,
+        SCHEDULE_CANCELLED,
     }
 )
+
+# The two schedule kinds are deliberately *records*, not events (DL-035/036).
+# `queue.RECORD_KINDS` is the complement of `EVENT_KINDS`, so adding them here
+# alone makes the drain skip them — which is what we want, because writing down
+# "fire this every morning" must not itself run a turn.
+#
+# There is no `schedule.fired`. A fire is a `message.inbound` on the `schedule`
+# channel carrying `schedule_id`, so it enters the loop through the same door a
+# tray message does and the executor needs no knowledge of the clock at all.
+# That also makes "when did this last fire?" derivable from episodes that
+# already exist, which is what lets DL-036's table stay a droppable cache.
 
 #: The two kinds that end a claimed turn and let ``DONE`` advance (§1.2).
 #:
@@ -93,6 +113,12 @@ TERMINAL_KINDS = frozenset({TURN_COMPLETED, TURN_BLOCKED})
 #: How a turn ended. ``silent`` is a **success**, not a degraded ``spoke`` —
 #: DL-011 makes deciding to say nothing the load-bearing property of the loop.
 OUTCOMES = frozenset({"spoke", "silent", "failed"})
+
+#: The floor on how often a schedule may fire. Every fire is a real turn with a
+#: real model call, so this is a cost and side-effect limit, not a performance
+#: one — and DL-035 names "one slow turn stacking fires behind it" as a failure
+#: to design out rather than discover.
+MIN_EVERY_SECONDS = 60
 
 _CONTEXT_KINDS = frozenset({"file", "image", "text", "link", "screen"})
 _URGENCIES = frozenset({"normal", "timely"})
@@ -232,6 +258,8 @@ def inbound(
     context: Optional[list[dict[str, Any]]] = None,
     urgency: str = "normal",
     resumes_seq: Optional[int] = None,
+    schedule_id: Optional[str] = None,
+    schedule_slot: Optional[str] = None,
     at: Optional[str] = None,
 ) -> dict[str, Any]:
     """Something arrived that omega may need to respond to.
@@ -250,6 +278,21 @@ def inbound(
     ``resumes_seq`` is set when this message answers an earlier
     ``turn.blocked``. The answer is an ordinary turn, not a resumption of the
     blocked one — the blocked record simply lands in its recall.
+
+    ``schedule_id`` is set when the clock produced this rather than a person
+    (DL-035). It is the *only* thing distinguishing a fire from a typed message,
+    and deliberately so: the fire is an ordinary inbound, drained by the ordinary
+    queue into the ordinary loop. It is also what makes "when did this schedule
+    last run?" a question about episodes that already exist, which is what lets
+    the scheduler's table be a cache it is safe to throw away (DL-036).
+
+    ``schedule_slot`` is the scheduled minute this fire *serves*, which is not
+    the same as ``at`` — a fire running six hours late is appended now and owed
+    for this morning. Both are kept because they answer different questions and
+    the difference is the whole of lateness. Recording only ``at`` loses the
+    slot on restart, and a rebuilt scheduler then cannot tell an already-served
+    slot from a missed one; that is not hypothetical, it is the bug
+    ``test_a_restart_does_not_refire_what_already_fired`` caught.
     """
     payload: dict[str, Any] = {
         "v": VERSION,
@@ -262,6 +305,10 @@ def inbound(
     }
     if resumes_seq is not None:
         payload["resumes_seq"] = resumes_seq
+    if schedule_id is not None:
+        payload["schedule_id"] = schedule_id
+    if schedule_slot is not None:
+        payload["schedule_slot"] = schedule_slot
     _validate(payload)
     return payload
 
@@ -379,6 +426,53 @@ def work_finished(
     return payload
 
 
+def schedule_created(
+    *,
+    id: str,
+    instruction: str,
+    every: Optional[int] = None,
+    cron: Optional[str] = None,
+    at: Optional[str] = None,
+) -> dict[str, Any]:
+    """A standing intention to wake omega up (DL-035).
+
+    Exactly one of ``every`` (seconds) or ``cron`` (a ``minute hour dow``
+    subset, see :mod:`omega.schedule`). Two ways to say when is already one
+    more than necessary; a third would be a dialect.
+
+    ``instruction`` is what omega is asked to do when it fires, and it is
+    stored as the text the turn will receive. Storing a *prompt* rather than a
+    tool name is the part that keeps the clock from becoming a second engine:
+    a fire produces an ordinary event with ordinary text, and everything that
+    then happens is the ordinary loop.
+    """
+    payload = {
+        "v": VERSION,
+        "kind": SCHEDULE_CREATED,
+        "id": id,
+        "instruction": instruction,
+        "every": every,
+        "cron": cron,
+        "at": at or now(),
+    }
+    _validate(payload)
+    return payload
+
+
+def schedule_cancelled(*, id: str, at: Optional[str] = None) -> dict[str, Any]:
+    """Retire a schedule. Append-only: the definition stays in the log and the
+    projection simply stops including it, so "what was I running in March" is
+    still answerable and DL-017's rebuild-from-log keeps working."""
+    payload = {
+        "v": VERSION,
+        "kind": SCHEDULE_CANCELLED,
+        "id": id,
+        "at": at or now(),
+    }
+    _validate(payload)
+    return payload
+
+
 # --- validation -------------------------------------------------------------
 
 _REQUIRED: dict[str, tuple[str, ...]] = {
@@ -388,7 +482,14 @@ _REQUIRED: dict[str, tuple[str, ...]] = {
     TOOL_CALLED: ("for_seq", "tool", "args", "at"),
     TOOL_RETURNED: ("for_seq", "tool", "ok", "result", "error", "at"),
     WORK_FINISHED: ("for_seq", "summary", "ok", "at"),
+    SCHEDULE_CREATED: ("id", "instruction", "every", "cron", "at"),
+    SCHEDULE_CANCELLED: ("id", "at"),
 }
+
+#: The kinds that are *not* about one turn. Everything else names the inbound
+#: turn it belongs to; a schedule definition belongs to no turn, which is the
+#: whole reason it is a record the drain walks past.
+_UNATTACHED_KINDS = frozenset({MESSAGE_INBOUND, SCHEDULE_CREATED, SCHEDULE_CANCELLED})
 
 
 def _validate(payload: dict[str, Any]) -> None:
@@ -420,6 +521,19 @@ def _validate(payload: dict[str, Any]) -> None:
         _validate_context(payload["context"])
         if "resumes_seq" in payload:
             _require_seq(payload, "resumes_seq")
+        if "schedule_id" in payload:
+            # A fire. Optional, because an inbound from the tray has no
+            # schedule behind it — and additive, because an old payload
+            # without the field still decodes (see VERSION).
+            _require_str(payload, "schedule_id", non_empty=True)
+        if "schedule_slot" in payload:
+            _require_str(payload, "schedule_slot", non_empty=True)
+            if not payload.get("schedule_id"):
+                # A slot with no schedule is unattributable: it would claim a
+                # fire was owed without saying what owes it.
+                raise BadPayload("schedule_slot requires schedule_id")
+    elif kind in _UNATTACHED_KINDS:
+        _require_str(payload, "id", non_empty=True)
     else:
         # Every non-inbound kind names the inbound turn it belongs to. Without
         # it a record cannot be matched to its turn, and §1.2's "exactly one
@@ -460,6 +574,25 @@ def _validate(payload: dict[str, Any]) -> None:
         _require_str(payload, "summary", non_empty=True)
         if not isinstance(payload["ok"], bool):
             raise BadPayload("ok must be a bool")
+
+    if kind == SCHEDULE_CREATED:
+        _require_str(payload, "instruction", non_empty=True)
+        every, cron = payload["every"], payload["cron"]
+        if (every is None) == (cron is None):
+            raise BadPayload("schedule.created needs exactly one of every/cron")
+        if every is not None:
+            if not isinstance(every, int) or isinstance(every, bool):
+                raise BadPayload("every must be an int number of seconds")
+            if every < MIN_EVERY_SECONDS:
+                # A rate floor in the schema rather than in the scheduler, so
+                # that a one-second schedule cannot be *written down* and then
+                # become somebody else's problem at fire time. DL-035 wants the
+                # limit where it cannot be routed around.
+                raise BadPayload(
+                    f"every must be at least {MIN_EVERY_SECONDS}s, got {every}"
+                )
+        if cron is not None:
+            _require_str(payload, "cron", non_empty=True)
 
     _require_str(payload, "at", non_empty=True)
 

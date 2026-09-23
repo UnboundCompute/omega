@@ -54,6 +54,13 @@ def test_every_kind_round_trips():
         ep.work_finished(
             for_seq=41, summary="index rebuilt", at="2026-09-23T10:00:00+00:00"
         ),
+        ep.schedule_created(
+            id="brief",
+            instruction="write the morning brief",
+            cron="0 9 *",
+            at="2026-09-23T10:00:00+00:00",
+        ),
+        ep.schedule_cancelled(id="brief", at="2026-09-23T10:00:00+00:00"),
     ]
     assert {p["kind"] for p in built} == ep.KINDS, "a kind has no round-trip test"
     for payload in built:

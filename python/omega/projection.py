@@ -127,16 +127,34 @@ class Update:
         return out
 
 
+#: Kinds that deliberately do not reach the wire.
+#:
+#: Named rather than left to fall off the end of :func:`project`, because the
+#: difference between "we decided this is not a turn update" and "we forgot to
+#: handle it" is invisible at the call site — both are ``None`` — and the second
+#: one silently removes a kind from every UI.
+#:
+#: The schedule definitions are here because they are not about a turn: writing
+#: down "brief me every morning" changes no work state, and DL-035 keeps the
+#: *fire* visible instead. A fire is a `message.inbound`, so it projects as
+#: ``understood`` like any other arriving message — which is what makes omega
+#: acting on its own show up in the tray rather than happening invisibly.
+NOT_PROJECTED = frozenset({episodes.SCHEDULE_CREATED, episodes.SCHEDULE_CANCELLED})
+
+
 def project(payload: dict[str, Any], seq: int) -> Optional[Update]:
     """One episode to one wire update, or ``None`` if policy says it stays in.
 
     ``None`` is a real answer and not an error: the filter exists precisely so
-    that the outward stream is narrower than the log. Today every M1 kind
-    projects, but the caller must still handle ``None`` — a projection that
-    could never withhold anything would not be a filter.
+    that the outward stream is narrower than the log. What withholds today is
+    :data:`NOT_PROJECTED`, and the caller must handle ``None`` regardless — a
+    projection that could never withhold anything would not be a filter.
     """
     kind = payload.get("kind")
     at = str(payload.get("at", ""))
+
+    if kind in NOT_PROJECTED:
+        return None
 
     if kind == episodes.MESSAGE_INBOUND:
         return Update(
