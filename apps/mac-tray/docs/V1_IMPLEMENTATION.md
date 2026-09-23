@@ -39,6 +39,8 @@ become a second brain or an undeclared wire protocol.
 - One active in-memory conversation that survives close/reopen during the app process.
 - Proactive peek, unread collapse, no duplicate while open, and time-sensitive Notification
   Center fallback.
+- A non-focus-stealing response peek when a submitted turn finishes after the panel has been
+  closed.
 - Preview redaction by default, screen-lock redaction, and a manual Privacy Veil for presenting
   or screen sharing.
 - Launch-at-login support in the packaged app through `SMAppService`.
@@ -85,8 +87,8 @@ swift test
 The test suite covers framing, attachment and message wire codecs, interleaved request/update demultiplexing,
 unknown updates, spoken and silent turns, blocked-turn resume, cursor persistence, duplicate
 replay suppression, post-ack reconnect recovery, context identity, capture/turn state
-arbitration, attachment upload gating and retry, both shortcut preferences, and proactive
-presentation. A live opt-in test uploads a real file through the
+arbitration, attachment upload gating and retry, closed-panel response nudges, both shortcut
+preferences, and proactive presentation. A live opt-in test uploads a real file through the
 Python listener and validates the returned reference. Opt-in review renders cover
 resting, peek, empty, staged-context disclosure, delivery recovery, drop target, and privacy.
 

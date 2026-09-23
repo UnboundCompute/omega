@@ -36,6 +36,8 @@ The defining loop is:
 - The open panel stays above other windows and remains visible across app switches.
 - Clicking outside gives focus back to the underlying app but never closes omega.
 - Incoming content never steals keyboard focus.
+- If a response lands after the panel is closed, omega shows the same non-focus-stealing
+  top-center peek and unread treatment used for proactive messages.
 - The hotkey or an explicit close control closes the panel.
 - Closing and reopening preserves the active conversation, staged context, and scroll
   position.

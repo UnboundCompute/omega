@@ -108,6 +108,31 @@ final class TrayModelTests: XCTestCase {
     }
 
     @MainActor
+    func testResponseThatLandsAfterClosingShowsANudge() async {
+        let (model, transport) = connectedModel()
+        var nudged: String?
+        model.proactivePresentation = { message, _ in nudged = message }
+        model.draft = "Handle this"
+        model.send()
+        await settleTasks()
+        model.isExpanded = false
+
+        transport.emit(.update(.init(
+            seq: 2,
+            forSeq: 1,
+            state: "complete",
+            kind: "turn.completed",
+            outcome: "spoke",
+            reply: "Your response landed"
+        )))
+        await settleTasks()
+
+        XCTAssertEqual(nudged, "Your response landed")
+        XCTAssertFalse(model.messages.contains { $0.role == .omega })
+    }
+
+
+    @MainActor
     func testReplayBufferedUntilDuplicateAckMapsToLocalMessage() async {
         let (model, transport) = connectedModel()
         transport.bufferedUpdatesOnNextAck = [

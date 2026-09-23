@@ -345,7 +345,7 @@ final class TrayViewModel: ObservableObject {
             switch update.outcome {
             case "spoke":
                 if let reply = update.reply, !reply.isEmpty {
-                    if belongsToActiveTurn || isExpanded {
+                    if isExpanded {
                         messages.append(.init(role: .omega, text: reply))
                     } else if let proactivePresentation {
                         proactivePresentation(reply, urgency(for: update.forSeq))
