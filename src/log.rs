@@ -784,22 +784,22 @@ pub fn scan_frames(file: &File, file_len: u64) -> Result<Scan, Error> {
                 p.body_len = body_len;
                 p.len_crc = frame::len_crc32(body_len);
             } else {
-            // Otherwise the frame's extent is unknown and every byte to EOF is
-            // unexplained. Only something durable in there makes this damage.
-            // Non-zero bytes alone do not: a write that half landed leaves its
-            // own bytes behind, and they were never acknowledged.
-            if !tail_holds_no_durable_frame(file, offset, file_len, expected_seq)? {
-                return Err(Error::CorruptFrame {
-                    offset,
-                    detail: format!(
+                // Otherwise the frame's extent is unknown and every byte to EOF is
+                // unexplained. Only something durable in there makes this damage.
+                // Non-zero bytes alone do not: a write that half landed leaves its
+                // own bytes behind, and they were never acknowledged.
+                if !tail_holds_no_durable_frame(file, offset, file_len, expected_seq)? {
+                    return Err(Error::CorruptFrame {
+                        offset,
+                        detail: format!(
                         "body_len {} fails its own checksum (len_crc is {:#010x}, want {:#010x}), \
                          and a frame that verifies end to end follows it",
                         p.body_len,
                         p.len_crc,
                         frame::len_crc32(p.body_len),
                     ),
-                });
-            }
+                    });
+                }
 
                 break; // torn tail: a write that landed in part
             }
@@ -1613,7 +1613,11 @@ mod tests {
     fn a_self_validating_length_that_is_out_of_range_still_refuses() {
         let d = TempDir::new("ff_tail");
         let full = three_records(&d);
-        assert_eq!(frame::len_crc32(u32::MAX), u32::MAX, "the coincidence holds");
+        assert_eq!(
+            frame::len_crc32(u32::MAX),
+            u32::MAX,
+            "the coincidence holds"
+        );
         let mut bytes = full.clone();
         bytes.extend_from_slice(&[0xff; 64]);
         let err = assert_refuses_and_leaves_the_file_alone(&d, &bytes, "0xff tail");
@@ -1776,7 +1780,11 @@ mod tests {
         let log = open(&d);
         assert_eq!(log.head(), 3);
         assert_eq!(log.repaired_lengths(), 0, "already correct on disk");
-        assert_eq!(raw(&d), full, "the file is byte-identical to the healthy one");
+        assert_eq!(
+            raw(&d),
+            full,
+            "the file is byte-identical to the healthy one"
+        );
         drop(log);
 
         // (a2) but a damaged length on a *middle* frame is still corruption.
