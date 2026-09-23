@@ -1,0 +1,63 @@
+name: ci
+
+# M0's gate. The Rust half and the Python half are one artifact — the PyO3
+# extension — so both are built and tested in one job on one machine. Splitting
+# them would let a green Python run be testing a stale .so.
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: cargo + pytest (macOS)
+    runs-on: macos-14
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # `cargo test` links libpython, so the crate's `extension-module`
+      # feature stays off here. maturin turns it on for the wheel.
+      - name: cargo test
+        run: cargo test
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Install maturin and pytest
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "maturin>=1.7,<2.0" pytest
+
+      # --release so the 10,000-append and 10 MiB cases do not time out.
+      - name: maturin develop
+        run: maturin develop --release
+
+      - name: pytest
+        run: pytest -v
