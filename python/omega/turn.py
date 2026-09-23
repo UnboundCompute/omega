@@ -28,10 +28,11 @@ restart test depends on.
 
 from __future__ import annotations
 
+import base64
 from dataclasses import dataclass
 from typing import Any, Callable, Optional, Sequence
 
-from omega import episodes, provider
+from omega import blobs, episodes, provider
 from omega.queue import EVENT_KINDS, EventQueue, Pending
 
 __all__ = [
@@ -527,13 +528,33 @@ _REPLY_SYSTEM = (
 )
 
 
+def _event_turn(
+    ctx: TurnContext, *, images: bool, suffix: str = ""
+) -> provider.Message:
+    """The one user turn every role is given: recall, then the new event.
+
+    ``images`` is the whole of DL-031's cheap/capable split at the prompt
+    boundary. With it false the turn is a plain string and any attachment is
+    named but not shown; with it true the attachments on *this* event — never
+    the ones in recall — ride along as real bytes. `judge` passes false
+    because it fires on every event and only needs to know a picture is there
+    to route; `act` and `reply` pass true because they are the roles expected
+    to answer about it.
+    """
+    text = (
+        f"Recent history:\n{_transcript(ctx.recalled)}\n\n"
+        f"New event:\n{_render_event(ctx.event)}{suffix}"
+    )
+    parts = _image_parts(ctx) if images else []
+    if not parts:
+        return provider.user(text)
+    return provider.user([provider.text_part(text), *parts])
+
+
 def _judge_messages(ctx: TurnContext) -> list[provider.Message]:
     return [
         provider.system(_JUDGE_SYSTEM),
-        provider.user(
-            f"Recent history:\n{_transcript(ctx.recalled)}\n\n"
-            f"New event:\n{_render_event(ctx.event)}"
-        ),
+        _event_turn(ctx, images=False),
     ]
 
 
@@ -541,10 +562,7 @@ def _reply_messages(ctx: TurnContext, acted: ActResult) -> list[provider.Message
     work = f"\n\nWork done this turn: {', '.join(acted.tools)}" if acted.tools else ""
     return [
         provider.system(_REPLY_SYSTEM),
-        provider.user(
-            f"Recent history:\n{_transcript(ctx.recalled)}\n\n"
-            f"New event:\n{_render_event(ctx.event)}{work}"
-        ),
+        _event_turn(ctx, images=True, suffix=work),
     ]
 
 
@@ -564,6 +582,53 @@ def _transcript(recalled: Sequence[Pending]) -> str:
 
 
 def _render_event(payload: dict[str, Any]) -> str:
+    """One event as one line, plus a name for anything attached to it.
+
+    The attachment names are appended here rather than at the one call site
+    that can show pixels, because this function feeds *three* roles and the
+    whole of recall. An attachment that only the capable role learned about
+    would be invisible to the judge deciding whether to wake that role at all,
+    and invisible again the next turn when the same event comes back through
+    :func:`_transcript` — which is the shape of the bug DL-031 records.
+
+    Pure, and deliberately so: no disk, no blob store. It runs ``RECALL_N``
+    times per turn, and a renderer that reads files turns a text prompt into
+    forty stat calls.
+    """
+    line = _render_payload(payload)
+    notes = " ".join(_attachment_note(item) for item in _context_of(payload))
+    return f"{line} {notes}" if notes else line
+
+
+def _context_of(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    """Attachments on an event, tolerantly.
+
+    ``episodes.inbound`` validates this list strictly on the way in, so a
+    stored event has the shape below. This reads it defensively anyway: the
+    log outlives the code that wrote it, and a renderer is the wrong place to
+    discover that an old record is one field short.
+    """
+    context = payload.get("context")
+    if not isinstance(context, list):
+        return []
+    return [item for item in context if isinstance(item, dict)]
+
+
+def _attachment_note(item: dict[str, Any], reason: str = "") -> str:
+    """How an attachment reads when it is named rather than shown.
+
+    ``kind`` is the label, not the dispatch — what decides whether pixels get
+    sent is ``mime`` (DL-031). Here the label is the useful half: "image" and
+    "file" mean different things to a person, and the model is being told what
+    the person thinks they sent.
+    """
+    kind = str(item.get("kind") or "attachment")
+    title = str(item.get("title") or item.get("id") or "untitled")
+    tail = f" — {reason}" if reason else ""
+    return f"[{kind}: {title}{tail}]"
+
+
+def _render_payload(payload: dict[str, Any]) -> str:
     kind = payload.get("kind")
     if kind == episodes.MESSAGE_INBOUND:
         return f"you: {payload.get('text', '')}"
@@ -584,3 +649,96 @@ def _render_event(payload: dict[str, Any]) -> str:
         ok = "ok" if payload.get("ok") else f"failed: {payload.get('error')}"
         return f"tool {payload.get('tool')} {ok}"
     return str(kind)
+
+
+#: Caps on what travels as pixels (DL-031). A starting guess, not a
+#: measurement: a retina screenshot lands around 2–5 MiB, so one of them fits
+#: and a photo library does not. The per-turn total exists because ten images
+#: can each pass the per-image check and blow the budget together.
+MAX_IMAGE_BYTES = 5 * 1024 * 1024
+MAX_TURN_IMAGE_BYTES = 10 * 1024 * 1024
+
+
+def _is_image(item: dict[str, Any]) -> bool:
+    """Does this attachment have pixels omega could show?
+
+    Decided by ``mime`` and the presence of a blob, never by ``kind``. ``kind``
+    is the word a client chose for a tray row; ``mime`` is a fact about the
+    bytes, recorded for the same reason DL-027 keeps the media type in the
+    episode instead of in a filename anything on the box could rename. A
+    ``screen`` capture is an image; a ``file`` that happens to be a PNG is too.
+    """
+    mime = str(item.get("mime") or "").lower()
+    return mime.startswith("image/") and bool(item.get("blob"))
+
+
+def _image_parts(ctx: TurnContext) -> list[provider.Part]:
+    """Attachments on the new event, as content blocks for the model.
+
+    Every failure here degrades to a text part that *says* what could not be
+    shown, and none of them fails the turn. An oversized screenshot, a blob
+    missing from the store, an unreadable file — each is a thing omega should
+    tell the person it cannot show, not a turn that dies on the way to the
+    model. The degraded line is also visible in the log afterwards, which the
+    silent drop this replaces never was.
+
+    Only the new event's images. Recall renders them as names via
+    :func:`_render_event`, because ``RECALL_N`` is 40 and re-sending every
+    picture every turn makes the cost of a conversation grow with its length.
+    """
+    items = [item for item in _context_of(ctx.event) if _is_image(item)]
+    if not items:
+        return []
+
+    try:
+        store = blobs.BlobStore.open(ctx.queue.store.root)
+    except Exception as exc:  # noqa: BLE001
+        return [
+            provider.text_part(_attachment_note(item, f"not shown: {exc}"))
+            for item in items
+        ]
+
+    parts: list[provider.Part] = []
+    remaining = MAX_TURN_IMAGE_BYTES
+    for item in items:
+        part, spent = _one_image(store, item, remaining)
+        parts.append(part)
+        remaining -= spent
+    return parts
+
+
+def _one_image(
+    store: blobs.BlobStore, item: dict[str, Any], remaining: int
+) -> tuple[provider.Part, int]:
+    """One attachment as a part, and what it spent of the turn's budget.
+
+    The size that counts is the one on disk, not the ``bytes`` field the sender
+    declared. `CLAUDE.md` grades the world rather than the words, and here the
+    two really can differ: the field is a claim made by whatever built the
+    event, and the budget is being spent on the actual file.
+    """
+    digest = str(item.get("blob") or "")
+    mime = str(item.get("mime") or "application/octet-stream")
+    try:
+        path = store.path_for(digest)
+        size = path.stat().st_size
+    except Exception:  # noqa: BLE001
+        return provider.text_part(_attachment_note(item, "not shown: missing")), 0
+
+    if size > MAX_IMAGE_BYTES:
+        return provider.text_part(_attachment_note(item, "not shown: too large")), 0
+    if size > remaining:
+        return (
+            provider.text_part(
+                _attachment_note(item, "not shown: too many images this turn")
+            ),
+            0,
+        )
+
+    try:
+        raw = path.read_bytes()
+    except OSError as exc:
+        return provider.text_part(_attachment_note(item, f"not shown: {exc}")), 0
+
+    encoded = base64.b64encode(raw).decode("ascii")
+    return provider.image_part(f"data:{mime};base64,{encoded}"), size

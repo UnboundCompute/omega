@@ -77,6 +77,7 @@ __all__ = [
     "ACT",
     "ROLES",
     "Message",
+    "Part",
     "ToolCall",
     "Response",
     "Provider",
@@ -89,6 +90,8 @@ __all__ = [
     "system",
     "user",
     "assistant",
+    "text_part",
+    "image_part",
     "assistant_tool_calls",
     "tool_result",
 ]
@@ -148,15 +151,48 @@ class ProviderNotConfigured(ProviderError):
     """
 
 
-Message = dict  # {"role": "system"|"user"|"assistant", "content": str}
+Message = dict  # {"role": "system"|"user"|"assistant", "content": str | list}
+
+#: One piece of a multimodal user turn. Responses calls these content blocks
+#: and takes a list of them wherever a plain string would go.
+Part = dict
 
 
 def system(content: str) -> Message:
     return {"role": "system", "content": content}
 
 
-def user(content: str) -> Message:
+def user(content: "str | Sequence[Part]") -> Message:
+    """A user turn: either plain text, or a list of parts (DL-031).
+
+    The list form is how an image reaches the model. It stays a *list of
+    parts* rather than a dedicated ``images=`` argument because that is the
+    shape the wire already has — a caller that wants text, then a picture,
+    then more text about the picture writes exactly that, and the seam has no
+    opinion about the order.
+    """
     return {"role": "user", "content": content}
+
+
+def text_part(text: str) -> Part:
+    """Text inside a multimodal user turn.
+
+    Only valid on an *input* item. Assistant text comes back as
+    ``output_text``, which is why this is not the same thing as
+    :func:`assistant` and is not reusable there.
+    """
+    return {"type": "input_text", "text": text}
+
+
+def image_part(image_url: str) -> Part:
+    """An image inside a multimodal user turn.
+
+    ``image_url`` is either a URL the API can reach or a ``data:`` URI
+    carrying the bytes. omega sends the second: the blobs are on this machine
+    and DL-014 does not hand out a fetchable address for local bytes just to
+    save an upload.
+    """
+    return {"type": "input_image", "image_url": image_url}
 
 
 def assistant(content: str) -> Message:
@@ -387,7 +423,9 @@ def _as_input(messages: Sequence[Message]) -> list[dict[str, Any]]:
     """Canonical messages as Responses input items.
 
     Three shapes go in and three come out. A plain ``{role, content}`` passes
-    through untouched — Responses takes it verbatim. The other two are the ones
+    through untouched — Responses takes it verbatim, and that is true whether
+    ``content`` is a string or a list of parts (DL-031), which is the whole
+    reason images cost this function nothing. The other two are the ones
     chat completions expresses as *fields on a message* and Responses expresses
     as *items in a list*:
 

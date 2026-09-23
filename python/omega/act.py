@@ -53,7 +53,7 @@ from omega.tools import (
 # turn depend on the tools — which is the coupling that lets a tool change
 # quietly alter what a turn is.
 from omega.turn import MAX_ACT_PASSES, ActResult, TurnContext
-from omega.turn import _render_event, _transcript  # the turn's own rendering
+from omega.turn import _event_turn  # the turn's own rendering, images and all
 
 __all__ = [
     "act_loop",
@@ -113,10 +113,7 @@ def _act_messages(ctx: TurnContext, box: ToolBox) -> list[provider.Message]:
             f"a relative one is read against whatever directory omega happens "
             f"to be running in, which is not your store."
         ),
-        provider.user(
-            f"Recent history:\n{_transcript(ctx.recalled)}\n\n"
-            f"New event:\n{_render_event(ctx.event)}"
-        ),
+        _event_turn(ctx, images=True),
     ]
 
 
