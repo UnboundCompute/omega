@@ -34,11 +34,12 @@ All integers little-endian. One file, `episodes.log`.
 ```
 Header, 32 bytes, written once at creation:
   magic     8 bytes   b"OMEGALOG"
-  version   u32       = 1
+  version   u32       = 2
   reserved  20 bytes  zero
 
 Record frame, repeated:
   body_len  u32       byte length of body, 18..=MAX_BODY (18 = seq+ts+key_len, the real floor)
+  len_crc   u32       CRC-32/ISO-HDLC over the four bytes of body_len
   crc32     u32       CRC-32/ISO-HDLC over the body bytes
   body:
     seq        u64    starts at 1, strictly +1 per record, no gaps ever
@@ -51,14 +52,37 @@ Record frame, repeated:
 `MAX_BODY` = 64 MiB. `MAX_KEY` = 512 bytes. `seq` 0 is reserved and means "nothing consumed" —
 it is never a record's sequence number.
 
+**Why `body_len` carries its own checksum** (version 2; version 1 did not, and that was a
+data-loss bug found by audit and reproduced). `crc32` covers the body, so validating it requires
+already knowing how long the body is. That makes `body_len` the one field nothing can vouch for,
+and a single flipped bit in it that lands anywhere inside `18..=MAX_BODY` used to read as a frame
+claiming more bytes than the file holds — which recovery classified as a torn tail and **silently
+truncated**. Measured on a healthy three-episode log: one bit flipped in the first frame's length
+field destroyed all three acknowledged episodes and cut the file from 143 bytes to 32, with no
+error raised.
+
+The circularity is the whole problem, so `len_crc` breaks it: the length field is validated
+*before* it is trusted, without needing the body. A damaged length now fails its own checksum and
+is classified on the evidence, instead of being believed and acted on. Version 1 is not readable
+by this build and is not migrated — no log of it exists outside tests, and DL-017's
+rebuild-from-log replaces migration anyway.
+
 The payload is **opaque bytes** to Rust. What an episode *means* is the seam's business
 (DL-018: Rust owns structure, Python owns meaning). The log does not parse payloads.
 
 ## Durability rules
 
 - **`fsync` after every append**, before the append returns. Non-negotiable: the invariant is
-  that an append which returned survives `kill -9`. Cost is ~0.1–1ms against a turn dominated by
-  a 0.5–3s model call.
+  that an append which returned survives `kill -9`. **Measured cost on this machine is ~4ms per
+  append**, not the ~0.1–1ms this spec first claimed — `File::sync_all()` on macOS issues
+  `fcntl(F_FULLFSYNC)`, which is real durability and roughly 100× a plain `fsync(2)`. That is the
+  right trade against a turn dominated by a 0.5–3s model call, but anything sizing a write path
+  off the old figure would be out by an order of magnitude. It also caps append throughput at
+  ~250/s, which is far above the ~100–300 episodes per *day* this is built for.
+- **`kill -9` cannot test this.** The kernel completes an in-flight write and the page cache
+  survives the process, so every crash test passes whether or not `fsync` is called at all —
+  confirmed by deleting the `fsync` and watching all 115 tests stay green, 94× faster. The rule
+  must therefore be held by a test that observes the *call*, not the outcome.
 - **`fsync` the parent directory** once after creating the file, or the file itself can vanish
   on crash.
 - **Exclusive advisory lock** (`flock`) held for the lifetime of the open log. A second opener
@@ -89,25 +113,43 @@ Procedure:
 
 1. File missing → create, write header, `fsync` file, `fsync` dir. Empty log, `head` = 0.
 2. File is 0 bytes → treat as fresh; write the header. (Creation crashed before the header.)
-3. File is 1..31 bytes → torn header. No record can exist yet, so truncate to 0 and rewrite the
-   header.
+3. File is 1..31 bytes → **check the magic first, before touching anything.** If the bytes
+   present are not a prefix of `b"OMEGALOG"` → `NotAnOmegaLog`, refuse to open, change nothing.
+   Otherwise it is a torn header: no record can exist yet, so truncate to 0 and rewrite it.
+   *(Order matters and did not always: truncating first meant any short file at this path — a
+   note, a stray text file — was silently overwritten with a log header, because the magic check
+   sat behind the destructive step and never ran for files under 32 bytes.)*
 4. Bad magic → `NotAnOmegaLog`. Unknown version → `UnsupportedVersion`. Both refuse to open.
 5. Scan frames from offset 32, tracking `expected_seq` starting at 1:
-   - fewer than 8 bytes remain → **torn tail**, truncate here.
-   - `body_len` is **implausible** — 0, below the 18-byte minimum body, or above `MAX_BODY`:
+   - fewer than 12 bytes remain → **torn tail**, truncate here.
+   - `len_crc` does not match `body_len` → the length field itself is damaged, so nothing it
+     says may be acted on:
      - if every byte from this frame's start to EOF is **zero** → **zero-filled tail**, truncate
-       here. (A frame header we wrote is never all zeros, so this is a crash artifact.)
-     - otherwise → `CorruptFrame`. Non-zero garbage at a frame start is damage.
-     
+       here. (A frame prefix we wrote is never all zeros, so this is a crash artifact.)
+     - otherwise → `CorruptFrame`.
+   - `body_len` is **implausible** — 0, below the 18-byte minimum body, or above `MAX_BODY` —
+     while `len_crc` matches → `CorruptFrame`. A checksum-valid length we could never have
+     written means the file was built by something other than this code.
+
      Note the 18-byte minimum is the real floor: `seq` + `ts_micros` + `key_len` alone is 18
      bytes, so a body below that cannot be one we wrote.
-   - fewer than `body_len` bytes remain → **torn tail**, truncate to the frame start.
+   - fewer than `body_len` bytes remain, `len_crc` valid → **torn tail**, truncate to the frame
+     start. This is now safe to act on, and previously was not: the length is checksum-verified
+     before it is believed, so a frame that claims to run past EOF really is a write that was
+     interrupted, not a corrupted number pointing past the end of intact data.
    - CRC mismatch → **torn tail** if the frame ends exactly at EOF, else `CorruptFrame`.
    - `seq != expected_seq` → **torn tail** if the frame ends exactly at EOF, else `SequenceBreak`.
    - otherwise accept; record its offset; `expected_seq += 1`.
 6. If anything was truncated, `set_len` to the last good offset and `fsync`.
 7. Build the in-memory **offset index** (`seq → file offset`) and **dedup index**
-   (`key → seq`) from the scan.
+   (`key → seq`) from the scan. When two records share a dedup key, the **lowest** seq wins:
+   the first write of a key is the one it refers to.
+8. **Load checkpoints, then check them against `head`.** A checkpoint ahead of `head` cannot
+   legitimately happen and is *proof* that acknowledged episodes were lost — it is the one
+   moment that evidence exists, so it is consulted here rather than lazily on the next read.
+   Raise `CheckpointAhead` at open. Checking it only on the next `episodes_since` leaves the log
+   opening "cleanly" and the consumer wedged: unable to read, and unable to reset its own
+   position, because both paths raise.
 
 Recovery is **idempotent**: recovering an already-recovered file changes nothing. Both indexes
 are caches derived from the file, never authoritative (DL-016).
@@ -151,6 +193,26 @@ set_checkpoint(name, seq)     seq > head() is an error
 ```
 
 Checkpoints are **not** episodes. They are mutable derived state and must never enter the log.
+
+**A damaged sidecar must never stop the log from opening.** It loaded during `open` behind a `?`,
+so any problem with it — zero bytes, all zeros, a truncation, a flipped bit, bad magic — made
+every acknowledged episode unreachable. That is the violation metric, reached through state that
+is not the source of truth. Worse, the two most likely artifacts are the same ones the zero-fill
+clause exists for: a `rename` visible before its directory `fsync`, or a size extension persisted
+without its data pages, yields a zero-byte or all-zeros sidecar. The log's own recovery calls that
+survivable; the sidecar called it fatal.
+
+So: a sidecar that cannot be read is **renamed aside** to `<name>.damaged` and every checkpoint
+reads 0. The log opens. This is deliberately the same outcome as a *missing* sidecar, which was
+already the accepted, tested behaviour — so it adds no new failure mode, only a second road to a
+place we already went. The evidence is preserved rather than deleted, and the fact that it
+happened is reported through the seam, so it is loud without being fatal.
+
+The one thing that still refuses to open is a **well-formed** sidecar whose position is ahead of
+`head` (recovery step 8). That is not damage to derived state; it is proof that acknowledged
+episodes were lost, and it is the only moment that proof exists. The documented way out is to
+remove the sidecar by hand: a missing one reads as 0, consumers replay, and DL-007's write-key
+dedup makes replay idempotent by construction.
 
 ## The seam
 
@@ -218,7 +280,9 @@ in-flight turn" waits for M1. M0 proves the durability half: *an append that ret
 
 25. Torn tail mid-payload → recovers, truncates, `head()` is the last good seq.
 26. Torn tail at an exact frame boundary (length written, body not).
-27. Torn tail of 1 byte, and of 7 bytes (shorter than the frame header).
+27. Torn tail of 1 byte, and of 7 bytes, of **non-zero** bytes (shorter than the frame prefix).
+    The all-NUL versions of the same lengths are case 39; they take a different branch, so the
+    two must be spelled out separately rather than left to the reader.
 28. Torn header: file of 0 bytes, and of 1..31 bytes → recovers as an empty log, no error.
 29. **After a torn-tail recovery, the next append continues the sequence with no gap.**
 30. Recover, crash, recover again → identical state. Recovery is idempotent.
@@ -232,6 +296,9 @@ in-flight turn" waits for M1. M0 proves the durability half: *an append that ret
     25–28. Those paths are only reachable by mutating the file deliberately, which is what they
     do. A test that passes without exercising what it claims is an eval bug.
 33. Cases 31 and 32 run **20 times each**. Passing once is not passing.
+34. After any recovery, the rebuilt offset index matches a fresh full scan.
+35. Both indexes are caches: deleting them in memory and rescanning yields identical results.
+36. Concurrent readers in one process see a consistent view while appends happen.
 37. **Zero-filled tail** — append N episodes, append a run of NUL bytes (what real power loss
     leaves), reopen: the log opens, `head()` is N, all N episodes are readable, and the zeros are
     truncated. This case exists because the spec originally got it wrong and the log refused to
@@ -240,9 +307,51 @@ in-flight turn" waits for M1. M0 proves the durability half: *an append that ret
     bytes → `CorruptFrame`. Zeros only mean "crash artifact" when they run to EOF.
 39. A single NUL byte appended, and a run shorter than a frame header → both recover as a torn
     tail with no loss.
-34. After any recovery, the rebuilt offset index matches a fresh full scan.
-35. Both indexes are caches: deleting them in memory and rescanning yields identical results.
-36. Concurrent readers in one process see a consistent view while appends happen.
+
+### Added after the adversarial audit — each one is a bug that shipped
+
+Every case below corresponds to a defect that existed and that the first 39 cases missed. They
+are listed with what they caught, because a case whose origin is forgotten is a case someone
+later deletes as redundant.
+
+40. **A corrupted `body_len` never silently truncates.** Flip one bit in a frame's length field
+    so it stays inside `18..=MAX_BODY` but claims more bytes than the file holds → `CorruptFrame`,
+    the file is byte-identical afterwards, and every episode is still readable. Test the first
+    frame, a middle frame, and a value stretched to end exactly at EOF. *This is the audit's
+    finding 1: previously all three opened "cleanly" with `head()` reset and the file truncated
+    on disk — three acknowledged episodes destroyed with no error.* The old suite missed it
+    because both of its length-mutation tests used *implausible* values, which take a different
+    branch; the plausible-but-too-large case was never constructed.
+41. **`len_crc` is checked before `body_len` is used.** A length field that fails its own
+    checksum, with non-zero data present → `CorruptFrame`; with zeros to EOF → recovers as a
+    zero-filled tail. The zero-filled case must still work after the format change.
+42. **A damaged sidecar never blocks the log.** For each of: zero bytes, all zeros, truncated by
+    one byte, one flipped bit, bad magic, absurd count, absurd `name_len` — the log **opens**,
+    every episode is readable, checkpoints read 0, the damaged file is preserved as
+    `<name>.damaged`, and the seam reports that it happened. *Audit finding 2: all seven refused
+    to open, over state that is not the source of truth.*
+43. **A checkpoint ahead of `head` fails at open**, not lazily on the next read. *Audit finding
+    3: the log opened "cleanly" and the consumer was then wedged — unable to read and unable to
+    reset its position, since both raised.* Removing the sidecar by hand must recover it.
+44. **`fsync` is observed, not assumed.** A test must fail if the `fsync` in `append` is deleted.
+    *Audit finding 4: the entire suite — all 115 tests including 40 `kill -9` trials — passed
+    with durability removed, 94× faster. Every durability call in the crate could be deleted and
+    nothing noticed.* `kill -9` cannot catch this, so the test observes the call itself. The
+    same must hold for the directory `fsync` and both sidecar `fsync`s.
+45. **A small non-log file at the log path is refused, not overwritten.** A 26-byte text file
+    → `NotAnOmegaLog` and the file is byte-identical afterwards. *Audit finding 5: it was
+    silently replaced with a log header, because the magic check sat behind the truncation step
+    and never ran for files under 32 bytes.*
+46. **The seam's path rule is order-independent.** `MemoryStore.open(p)` puts the log in the same
+    place whether or not `p` already exists. *Audit finding 6: the same argument produced either
+    `p` as a file or `p/episodes.log` depending on what was on disk first, and the file form then
+    permanently blocked the directory form.*
+47. **The frame-boundary discontinuity is pinned.** Non-zero garbage at a frame start, in runs
+    from 1 byte up to and past the prefix length, is classified deliberately and the boundary is
+    tested on both sides. *Audit finding 7: the old suite tested 1, 2 and 7 bytes but never 8,
+    so the point where behaviour changes was untested.*
+48. **First key wins in the dedup index.** Two records sharing a dedup key resolve to the lower
+    seq, and a rebuild agrees. *Audit: unpinned — reversing it broke no test.*
 
 ### The violation metric
 
