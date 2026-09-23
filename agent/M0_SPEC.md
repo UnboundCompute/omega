@@ -126,16 +126,36 @@ Procedure:
      says may be acted on. Decide on the bytes' own evidence, in this order:
      - every byte from this frame's start to EOF is **zero** → **zero-filled tail**, truncate
        here. (A frame prefix we wrote is never all zeros, so this is a crash artifact.)
-     - the frame is **whole apart from this one field** — `body_len` is plausible, the body it
-       names fits in the file, that body matches the body CRC, and the `seq` inside it is the
-       one expected → the frame was fully durable and a later bit-flip hit its length checksum.
-       That is damage: `CorruptFrame`. A half-landed write cannot satisfy all four, because its
-       body is the part that did not arrive.
+     - the frame is **whole apart from this one field** — some candidate length is plausible,
+       the body it names fits in the file, that body matches the body CRC, and the `seq` inside
+       it is the one expected → the frame was fully durable and a later bit-flip hit its length
+       field or that field's checksum. Two candidates are tried, in order: the stored `body_len`,
+       then the length implied by EOF. A half-landed write cannot satisfy all four for either,
+       because its body is the part that did not arrive.
+
+       **This repairs; it does not refuse.** The four facts hold *independently* of the broken
+       field, so they identify the frame's true length, and a log whose damage is fully
+       identified has lost nothing. Recovery rewrites the four length bytes and their checksum
+       at the frame's offset and `fsync`s, before the truncation step. The repair must reach
+       the disk: the EOF-implied candidate only identifies the **last** frame, so an
+       in-memory-only fix would open today and refuse forever once the next append pushed that
+       frame into the middle. `Log::repaired_lengths()` reports how many were rewritten on this
+       open; a repaired file is byte-identical to one written healthy, so the count is the only
+       trace. *(This rule formerly returned `CorruptFrame` here. Refusing is permanent, so it
+       protected a provably intact episode by making every episode in the log unreachable.)*
      - otherwise the frame's extent is unknown, so every byte to EOF is **unexplained**. Scan
-       that region for any frame that **verifies end to end**. One found → `CorruptFrame`.
-       More unexplained bytes than a single maximum frame → `CorruptFrame`, since an append
-       writes one frame and `fsync`s before returning, so at most one is ever in flight.
-       Nothing found → **torn tail**, truncate here.
+       that region for any frame that **verifies end to end and chains, by sequence number, all
+       the way to EOF**. One found → `CorruptFrame`. More unexplained bytes than a single
+       maximum frame → `CorruptFrame`, since an append writes one frame and `fsync`s before
+       returning, so at most one is ever in flight. Nothing found → **torn tail**, truncate here.
+
+       **Why chaining, and not one frame that verifies.** A 4-byte CRC match is not proof here.
+       The one-in-four-billion reading of it assumes uniformly random bytes, and this region
+       holds neither: payloads are opaque by design, and recycled blocks are usually older
+       generations of this same log. A payload carrying frame-shaped bytes therefore made the
+       log refuse, permanently, on every subsequent open. A match now only earns the candidate a
+       look at whether the frames after it run unbroken to EOF, which a stray embedded frame
+       cannot do.
 
      **Why the rule is "a frame that verifies", not "a non-zero byte".** See case 49. The rule
      above says *data following a frame proves that frame was durable*; an earlier version read
@@ -347,8 +367,13 @@ later deletes as redundant.
     because both of its length-mutation tests used *implausible* values, which take a different
     branch; the plausible-but-too-large case was never constructed.
 41. **`len_crc` is checked before `body_len` is used.** A length field that fails its own
-    checksum, with non-zero data present → `CorruptFrame`; with zeros to EOF → recovers as a
-    zero-filled tail. The zero-filled case must still work after the format change.
+    checksum, with the body still intact → the frame is **repaired**: the log opens, `head()` is
+    unchanged, every episode reads back, `recovered_bytes` is 0, `repaired_lengths` is 1, and the
+    file is byte-identical to one written healthy — so a second open repairs nothing. Test the
+    first frame, a middle frame, and the last frame at EOF. With zeros to EOF → recovers as a
+    zero-filled tail. *Revised: this case previously asserted `CorruptFrame`. Four facts that
+    hold independently of the broken field identify the true length, and refusing a log whose
+    damage is fully identified loses every episode in it to protect one that was never at risk.*
 42. **A damaged sidecar never blocks the log.** For each of: zero bytes, all zeros, truncated by
     one byte, one flipped bit, bad magic, absurd count, absurd `name_len` — the log **opens**,
     every episode is readable, checkpoints read 0, the damaged file is preserved as
@@ -402,6 +427,13 @@ later deletes as redundant.
     works. `kill -9` cannot reach it either (case 32 says so explicitly): it is a page-writeback
     artifact, not a process-death artifact. A test that only ever tears at offset 0 of a frame is
     not testing tearing.
+
+    *Extended after the third audit.* A frame whose prefix page never landed while a later page
+    did is the same shape from the other side: the length field is gone, the body is on disk. The
+    log must **open and repair** it — not refuse — and it must not file a `.discarded-tail`,
+    because nothing is being discarded. Measured before the fix: 5 of 5 constructed variants
+    refused permanently, and the reverse writeback order alone produced 8 violations of this
+    case's own rule.
 
 50. **Truncation never destroys the bytes it discards.** A truncated tail that is not all zeros
     is copied to `<log>.discarded-tail` beside the log before `set_len`, uniquified so a second
