@@ -27,6 +27,12 @@ env/
 **/target/
 *.rs.bk
 
+# --- Swift ---
+.build/
+DerivedData/
+*.xcuserstate
+xcuserdata/
+
 # --- macOS ---
 .DS_Store
 
@@ -34,3 +40,6 @@ env/
 .idea/
 .vscode/
 *.swp
+
+# --- generated design review renders ---
+.impeccable/review/
