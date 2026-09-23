@@ -88,6 +88,24 @@ _DEFAULT_MODELS = {
     ACT: "gpt-4o",
 }
 
+#: Default sampling temperature per role, and ``None`` means *do not send the
+#: parameter at all*.
+#:
+#: ``judge`` is pinned to 0. It is a one-word classifier over a three-way
+#: choice, and at the API's default of 1.0 it was measured returning different
+#: verdicts for byte-identical input — the same request judged ``act`` three
+#: times in isolation and ``silent`` inside a turn. `CLAUDE.md` grades
+#: reliability as pass^k rather than pass@1, and a router that samples cannot
+#: clear that bar no matter how good the prompt is.
+#:
+#: ``act`` stays ``None``: composing a reply is not a classification, and the
+#: role's model is the one most likely to be a reasoning model that rejects the
+#: parameter outright. Omitting it keeps that request byte-for-byte what it was.
+_DEFAULT_TEMPERATURES: dict[str, Optional[float]] = {
+    JUDGE: 0.0,
+    ACT: None,
+}
+
 
 class ProviderError(RuntimeError):
     """The model call did not produce a usable answer.
@@ -296,6 +314,70 @@ def model_for(role: str) -> str:
     )
 
 
+def temperature_for(role: str) -> Optional[float]:
+    """The sampling temperature for ``role``, or ``None`` to omit it.
+
+    ``OMEGA_TEMPERATURE_JUDGE`` / ``OMEGA_TEMPERATURE_ACT`` override the
+    defaults, and the literal ``none`` means *send no temperature* — the escape
+    hatch that matters, because a reasoning model rejects the parameter with a
+    400 rather than ignoring it, and pinning the judge to 0 must never be the
+    reason a model cannot be used at all.
+
+    There is deliberately no bare ``OMEGA_TEMPERATURE``. The roles want
+    genuinely different values (see :data:`_DEFAULT_TEMPERATURES`), so one
+    variable for both would be a footgun of exactly the shape that put ``act``
+    on a model that cannot call tools.
+    """
+    _check_role(role)
+    raw = os.environ.get(f"OMEGA_TEMPERATURE_{role.upper()}")
+    if raw is None or not raw.strip():
+        return _DEFAULT_TEMPERATURES[role]
+    if raw.strip().lower() == "none":
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        raise ProviderNotConfigured(
+            f"OMEGA_TEMPERATURE_{role.upper()}={raw!r} is not a number or 'none'"
+        ) from None
+
+
+def _tool_hint(
+    role: str,
+    model: str,
+    tools: Optional[Sequence[dict[str, Any]]],
+    exc: BaseException,
+) -> str:
+    """A sentence naming the fix when a model cannot do function tools.
+
+    This exists because of a real, silent trap. ``act`` is the **only** role
+    offered tools, and a bare ``OMEGA_MODEL`` applies to both roles — so
+    pointing ``OMEGA_MODEL`` at a model that rejects function tools on
+    ``/v1/chat/completions`` disables every tool omega has, and the only symptom
+    is a raw 400 arriving one layer below anything that knows what a tool is.
+    Measured on a real store: every act pass failed and the turn was recorded
+    ``failed`` with the provider's own wording, which names neither the role nor
+    the variable that chose the model.
+
+    Kept to a hint on an existing error rather than a preflight check. omega
+    cannot know what a model supports without asking, and asking on startup
+    would spend a call on every boot to answer a question that only matters when
+    something has already gone wrong.
+    """
+    if not tools:
+        return ""
+    text = str(exc).lower()
+    if "tool" not in text and "function" not in text:
+        return ""
+    return (
+        f"\n\n{model} was offered {len(tools)} tools and rejected them. The "
+        f"{role} role is the one that calls tools, so it needs a model that "
+        f"supports function calling on chat completions. Set "
+        f"OMEGA_MODEL_{role.upper()} to one — a bare OMEGA_MODEL applies to "
+        f"every role, including this one."
+    )
+
+
 def provider_from_env(*, env_path: Optional[Path] = None) -> "OpenAIProvider":
     """Build the real provider from `.env` + the environment.
 
@@ -381,6 +463,9 @@ class OpenAIProvider:
 
         model = self.model_for(role)
         request: dict[str, Any] = {"model": model, "messages": list(messages)}
+        temperature = temperature_for(role)
+        if temperature is not None:
+            request["temperature"] = temperature
         if tools:
             # Added only when there are tools to offer. A caller that passes
             # none sends the request it sent before the seam was widened, key
@@ -390,7 +475,9 @@ class OpenAIProvider:
         try:
             raw = self._client.chat.completions.create(**request)
         except Exception as exc:  # noqa: BLE001 - every remote failure is one class
-            raise ProviderError(f"{role} call to {model} failed: {exc}") from exc
+            raise ProviderError(
+                f"{role} call to {model} failed: {exc}{_tool_hint(role, model, tools, exc)}"
+            ) from exc
 
         try:
             choice = raw.choices[0]

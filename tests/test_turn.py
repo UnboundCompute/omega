@@ -110,6 +110,55 @@ def test_act_then_speak_runs_the_act_step_and_records_its_tools(q: EventQueue) -
     assert last_payload(q)["tools"] == ["shell"]
 
 
+def test_the_answer_the_act_loop_composed_is_the_answer_the_person_gets(
+    q: EventQueue,
+) -> None:
+    """The sub-loop saw every tool result; nothing downstream did.
+
+    Measured against a real model before this existed: the loop wrote the file,
+    read it back and answered "the number 7 has been successfully written";
+    :func:`reply` threw that away, re-asked a model holding tool *names* and no
+    results, and omega told the person "I can't perform the action right now"
+    about work it had just finished. Composing again is not a second opinion,
+    it is a first guess by the only party that did not watch.
+    """
+    p = put(q, "write 7 into count.txt")
+    fp = fake(judge="ACT", act=["a blind recomposition that must not happen"])
+    answered = "The number 7 was written and read back."
+
+    def act(ctx: TurnContext) -> ActResult:
+        return ActResult(
+            tools=("write_file", "read_file"),
+            stop_reason="the model stopped asking for tools",
+            text=answered,
+        )
+
+    result = run_turn(q, p, complete=fp.complete, act=act, at=AT)
+
+    assert result.outcome == "spoke"
+    assert result.reply == answered
+    assert last_payload(q)["reply"] == answered
+    assert fp.calls_for(provider.ACT) == [], "the loop already answered; don't pay twice"
+
+
+def test_a_loop_that_ended_without_an_answer_still_gets_one_composed(
+    q: EventQueue,
+) -> None:
+    """The control. A stall, a block or a cap leaves ``text`` unset, and those
+    turns still owe the person a reply — so the early return has to key on an
+    answer actually being there, not on the act step having run."""
+    p = put(q, "check the build")
+    fp = fake(judge="ACT", act="I stopped after eight passes without finishing.")
+
+    def act(ctx: TurnContext) -> ActResult:
+        return ActResult(tools=("shell",), stop_reason="pass cap reached")
+
+    result = run_turn(q, p, complete=fp.complete, act=act, at=AT)
+
+    assert result.reply == "I stopped after eight passes without finishing."
+    assert len(fp.calls_for(provider.ACT)) == 1
+
+
 def test_a_blocked_turn_is_its_own_kind_not_a_failure(q: EventQueue) -> None:
     """§2.1 — stopping to ask is correct behaviour. Folding it into `failed`
     would make the tray show a stall as an error and lose the distinction the

@@ -91,9 +91,28 @@ _ACT_SYSTEM = (
 )
 
 
-def _act_messages(ctx: TurnContext) -> list[provider.Message]:
+def _act_messages(ctx: TurnContext, box: ToolBox) -> list[provider.Message]:
+    """The act prompt, with the store's **absolute path** in it.
+
+    Naming the path is not a convenience. ``tools.resolved`` expands a path
+    against the *working directory*, and the tier of a write is decided by
+    whether the result sits inside the store — so a model told only that there
+    is "omega's own store" writes ``note.txt``, that resolves somewhere else
+    entirely, and a write omega should have just done stops the turn to ask.
+    The gate was doing its job on an input nobody had given the model any way
+    to get right.
+
+    Every unit test passed an absolute in-store path by hand, so nothing could
+    have caught this until a real model chose the path itself.
+    """
     return [
-        provider.system(_ACT_SYSTEM),
+        provider.system(
+            f"{_ACT_SYSTEM}\n"
+            f"Your store is {box.store_root}. Files you write for yourself go "
+            f"there, as absolute paths under it. Use absolute paths everywhere: "
+            f"a relative one is read against whatever directory omega happens "
+            f"to be running in, which is not your store."
+        ),
         provider.user(
             f"Recent history:\n{_transcript(ctx.recalled)}\n\n"
             f"New event:\n{_render_event(ctx.event)}"
@@ -137,7 +156,7 @@ def act_loop(
         box = ToolBox(store_root=ctx.queue.store.root)
 
     offered = schemas()
-    messages = _act_messages(ctx)
+    messages = _act_messages(ctx, box)
     used: list[str] = []
     seen: set[tuple[str, str]] = set()
 
@@ -149,7 +168,16 @@ def act_loop(
             # Done. The model asking for nothing is the signal (§1.5) — and it
             # is the *only* signal, because no tool result can say "the job is
             # finished", only "this command came back".
-            return ActResult(tools=tuple(used), stop_reason=DONE_ASKING)
+            #
+            # The message it stopped on is carried out as ``text``. This model
+            # saw every tool result; nothing downstream will. Handing back only
+            # the tool *names* is what made omega finish a job and then deny
+            # having done it.
+            return ActResult(
+                tools=tuple(used),
+                stop_reason=DONE_ASKING,
+                text=response.text,
+            )
 
         repeats = [call for call in calls if _signature(call) in seen]
         if repeats:

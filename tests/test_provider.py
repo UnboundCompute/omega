@@ -387,14 +387,81 @@ def _with_tool_calls(calls, content=None, model="m", finish="tool_calls"):
     )
 
 
-def test_a_caller_offering_no_tools_sends_the_request_it_always_sent():
+def test_a_caller_offering_no_tools_sends_no_tools_key():
     """The property DL-028 rests on: the widening is additive, so `judge` and
     `reply` cannot be regressed by it. Asserted on the *request keys*, because
-    an extra `tools: None` on the wire is a change even when it is ignored."""
+    an extra `tools: None` on the wire is a change even when it is ignored.
+
+    ``temperature`` is here too and is **not** the widening: it is the separate,
+    deliberate pinning of the judge to 0 (see `_DEFAULT_TEMPERATURES`). It is
+    named explicitly rather than tolerated by a loose assertion, so that a third
+    key appearing on this request still fails this test.
+    """
     client = _StubClient(_fake_openai_response("SILENT"))
     pv.OpenAIProvider(client=client).complete(pv.JUDGE, [pv.user("x")])
-    assert set(client.seen[0]) == {"model", "messages"}
+    assert set(client.seen[0]) == {"model", "messages", "temperature"}
     assert "tools" not in client.seen[0]
+
+
+def test_the_judge_is_pinned_and_the_act_role_is_left_alone(monkeypatch):
+    """Sampling is the difference between a router and a coin flip.
+
+    Measured before this was pinned: byte-identical input judged `act` three
+    times in isolation and `silent` inside a turn. `act` deliberately sends no
+    temperature at all -- a reasoning model rejects the parameter outright, and
+    the role most likely to be one is the role that composes.
+    """
+    monkeypatch.delenv("OMEGA_TEMPERATURE_JUDGE", raising=False)
+    monkeypatch.delenv("OMEGA_TEMPERATURE_ACT", raising=False)
+
+    client = _StubClient(_fake_openai_response("SILENT"))
+    provider = pv.OpenAIProvider(client=client)
+    provider.complete(pv.JUDGE, [pv.user("x")])
+    provider.complete(pv.ACT, [pv.user("x")])
+
+    assert client.seen[0]["temperature"] == 0.0
+    assert "temperature" not in client.seen[1]
+
+
+def test_temperature_none_omits_the_parameter(monkeypatch):
+    """The escape hatch that has to exist: pinning the judge must never be the
+    reason a model cannot be used, and a reasoning model 400s on temperature
+    rather than ignoring it."""
+    monkeypatch.setenv("OMEGA_TEMPERATURE_JUDGE", "none")
+    client = _StubClient(_fake_openai_response("SILENT"))
+    pv.OpenAIProvider(client=client).complete(pv.JUDGE, [pv.user("x")])
+    assert "temperature" not in client.seen[0]
+
+
+def test_a_model_that_refuses_tools_says_which_variable_chose_it(monkeypatch):
+    """The real failure this hint exists for: a bare OMEGA_MODEL pointed `act`
+    at a model that cannot call tools on chat completions, so every tool omega
+    has was disabled by one line of config and the only symptom was a raw 400
+    from a layer that does not know what a tool is."""
+    monkeypatch.setenv("OMEGA_MODEL_ACT", "some-reasoning-model")
+    client = _StubClient(
+        error=RuntimeError("Function tools with reasoning_effort are not supported")
+    )
+    with pytest.raises(pv.ProviderError) as caught:
+        pv.OpenAIProvider(client=client).complete(
+            pv.ACT, [pv.user("x")], [{"type": "function"}]
+        )
+    message = str(caught.value)
+    assert "OMEGA_MODEL_ACT" in message
+    assert "some-reasoning-model" in message
+
+
+def test_no_hint_when_the_failure_had_nothing_to_do_with_tools(monkeypatch):
+    """The control. A network error during a tool-bearing call must not be
+    explained as a model that cannot call tools -- a hint that fires on every
+    failure sends people to edit config over a dropped connection."""
+
+    client = _StubClient(error=RuntimeError("connection reset by peer"))
+    with pytest.raises(pv.ProviderError) as caught:
+        pv.OpenAIProvider(client=client).complete(
+            pv.ACT, [pv.user("x")], [{"type": "function"}]
+        )
+    assert "OMEGA_MODEL_ACT" not in str(caught.value)
 
 
 def test_offered_tools_reach_the_request_untouched():

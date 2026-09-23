@@ -120,12 +120,25 @@ class ActResult:
     because stopping to ask is correct behaviour and not an error — and because
     a blocked turn that stayed claimed would freeze the single consumer for as
     long as the human took to answer.
+
+    ``text`` is the answer the sub-loop **already composed** — the message the
+    model stopped on when it stopped asking for tools. §1.5 makes that the
+    done-signal, and the same message is the reply: it is the only text in the
+    turn written by something that could see what the tools returned.
+
+    Throwing it away is not neutral. Measured on a real store: the loop wrote
+    the file, read it back, and answered "the number 7 has been successfully
+    written ... reading it back confirms it"; :func:`reply` then discarded that,
+    re-asked a model holding tool *names* and no results, and omega told the
+    person "I can't perform the action right now" about work it had just
+    finished. A second call cannot re-derive what the first one saw.
     """
 
     tools: tuple[str, ...] = ()
     blocked_on: Optional[str] = None
     error: Optional[str] = None
     stop_reason: str = ""
+    text: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -256,6 +269,13 @@ def reply(ctx: TurnContext, verdict: Verdict, acted: ActResult) -> Optional[str]
     """
     if not verdict.speaks:
         return None
+    if acted.text is not None and acted.text.strip():
+        # The sub-loop already answered, holding every tool result. Composing
+        # again here would ask a model that cannot see any of them to describe
+        # work it did not watch — which is exactly how omega came to write a
+        # file and then say it could not (see :class:`ActResult`). The cheapest
+        # correct reply is the one already written.
+        return acted.text
     response = ctx.complete(provider.ACT, _reply_messages(ctx, acted))
     if not response.text.strip():
         # DL-011, stated as sharply as it deserves: a model that **returns no
@@ -477,10 +497,16 @@ _JUDGE_SYSTEM = (
     "SPEAK - answer now, no work needed first\n"
     "ACT - do some work first, then answer\n"
     "SILENT - say nothing\n"
+    "You have a body: you can read and write files, run read-only shell "
+    "commands, and fetch a URL. ACT is the verdict that reaches them, and it "
+    "is the only one that does. Choose ACT whenever answering well means "
+    "looking something up on this machine, changing a file, or reading a "
+    "page - do not guess at an answer you could go and check.\n"
     "If the person wrote to you, they are talking to you: answer them. "
     "SPEAK or ACT is right there even for a greeting, a short question, or "
     "something you think is obvious. Do not stay silent on a message addressed "
-    "to you.\n"
+    "to you. A question about this machine, this project or a file on it is "
+    "still a question for you; SILENT is never the right answer to a question.\n"
     "SILENT is for events nobody asked you about - your own idle ticks, "
     "background noise, things already handled. Staying silent there is a "
     "correct and successful answer, not a failure.\n"
@@ -490,7 +516,14 @@ _JUDGE_SYSTEM = (
 
 _REPLY_SYSTEM = (
     "You are omega, a second brain. Answer the latest message directly and "
-    "briefly. Do not narrate what you are doing."
+    "briefly. Do not narrate what you are doing.\n"
+    "You have a body: you can read and write files, run read-only shell "
+    "commands, and fetch a URL. Never tell the person you cannot reach their "
+    "filesystem or the network - that is false - and never hand them a shell "
+    "command to run themselves in place of doing it.\n"
+    "You are not holding those tools in this particular message. If answering "
+    "properly would need one, say what you would need to check. Do not guess "
+    "an answer, and do not claim you are unable."
 )
 
 
