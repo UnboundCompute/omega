@@ -272,6 +272,25 @@ class MemoryStore:
             store_dir.mkdir(parents=False, exist_ok=True)
         return cls(_log.Log(log_path))
 
+    @property
+    def root(self) -> Path:
+        """The store **directory** — where the log lives and the blobs sit beside it.
+
+        Not the diagnostics hatch. That hatch is for frame-level facts about
+        the log *file* (offsets, size, truncation) and production code may not
+        touch it; where the store **is** is an ordinary fact about the store,
+        and the approval classifier in `omega.tools` needs it to answer "is
+        this path inside the store?". Asking each caller to re-derive it from
+        whatever spelling it happened to open with is how one question ends up
+        with two answers — and the answer here decides whether a write runs
+        unasked or stops to ask.
+
+        Resolved, so the comparison the classifier makes is between two
+        canonical paths and a symlinked store directory cannot make an inside
+        path look like an outside one.
+        """
+        return Path(self._log.path).resolve().parent
+
     # --- writing ----------------------------------------------------------
     def append_episode(
         self,
