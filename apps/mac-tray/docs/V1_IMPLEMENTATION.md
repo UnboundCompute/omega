@@ -13,6 +13,8 @@ become a second brain or an undeclared wire protocol.
 - Configurable global shortcut with registration-conflict recovery.
 - Focus enters the composer on open and returns to the prior app on explicit close.
 - Area, window, and active-display capture through the macOS capture tool.
+- The panel is removed before capture begins and restored after success, cancellation, or launch
+  failure, preventing omega from covering or appearing inside the selected content.
 - Screen Recording permission request, denied state, and direct System Settings recovery.
 - File, image, URL, selected-text, and clipboard staging through native pasteboard/drop APIs.
 - A resting drop target that expands before drop and states that the item will not be sent.

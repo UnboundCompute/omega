@@ -3,7 +3,7 @@ import Combine
 import SwiftUI
 
 @MainActor
-final class OmegaPanelController: NSWindowController {
+final class OmegaPanelController: NSWindowController, CapturePresentationControlling {
     enum Presentation {
         case resting
         case peek
@@ -16,6 +16,8 @@ final class OmegaPanelController: NSWindowController {
     private var contentObservation: AnyCancellable?
     private var dropObservation: AnyCancellable?
     private weak var previouslyActiveApplication: NSRunningApplication?
+    private var isCaptureSuspended = false
+    private var captureWasKey = false
     var timeSensitiveFallback: ((String) -> Void)?
 
     private let restingSize = NSSize(width: 190, height: 38)
@@ -40,6 +42,7 @@ final class OmegaPanelController: NSWindowController {
         panel.animationBehavior = .none
 
         super.init(window: panel)
+        viewModel.capturePresentation = self
         updateContent()
 
         contentObservation = Publishers.CombineLatest(viewModel.$messages, viewModel.$stagedContext)
@@ -117,6 +120,16 @@ final class OmegaPanelController: NSWindowController {
     }
 
     func showProactivePeek(_ message: String, urgency: ProactiveUrgency = .normal) {
+        if isCaptureSuspended {
+            if presentation == .expanded {
+                viewModel.receiveProactiveMessage(message)
+            } else {
+                viewModel.proactivePeek = message
+                viewModel.hasUnread = true
+            }
+            return
+        }
+
         guard presentation != .expanded else {
             viewModel.receiveProactiveMessage(message)
             return
@@ -144,12 +157,40 @@ final class OmegaPanelController: NSWindowController {
     }
 
     func toggle() {
+        guard !isCaptureSuspended else { return }
         switch presentation {
         case .expanded:
             showResting()
         case .resting, .peek:
             showExpanded()
         }
+    }
+
+    func hideForCapture(then start: @escaping @MainActor () -> Void) {
+        guard !isCaptureSuspended else { return }
+        isCaptureSuspended = true
+        captureWasKey = window?.isKeyWindow == true
+        window?.orderOut(nil)
+
+        // Give WindowServer one frame to remove omega before screencapture samples the display.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
+            start()
+        }
+    }
+
+    func restoreAfterCapture() {
+        guard isCaptureSuspended else { return }
+        isCaptureSuspended = false
+        resize(to: presentationSize(), animate: false)
+        updateContent()
+        window?.orderFrontRegardless()
+
+        if captureWasKey {
+            NSApp.activate(ignoringOtherApps: true)
+            window?.makeKey()
+            viewModel.composerFocusRequest += 1
+        }
+        captureWasKey = false
     }
 
     @objc private func screenParametersChanged() {
@@ -191,6 +232,14 @@ final class OmegaPanelController: NSWindowController {
         let messageHeight = min(CGFloat(viewModel.messages.count) * 54, 130)
         let contextHeight: CGFloat = viewModel.stagedContext.isEmpty ? 0 : 76
         return NSSize(width: 460, height: min(540, 380 + messageHeight + contextHeight))
+    }
+
+    private func presentationSize() -> NSSize {
+        switch presentation {
+        case .resting: restingSize
+        case .peek: peekSize
+        case .expanded: expandedSize()
+        }
     }
 
     private func frame(for size: NSSize) -> NSRect {

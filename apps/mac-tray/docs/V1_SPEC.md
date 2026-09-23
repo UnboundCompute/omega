@@ -43,6 +43,8 @@ The defining loop is:
 
 - The user can capture an area, window, or display through the native macOS selection
   experience.
+- omega temporarily leaves the screen while capture is active, then restores the exact prior
+  tray state after selection or cancellation, so content behind it remains selectable.
 - Files, images, screenshots, selected text, URLs, and clipboard content can be dragged or
   pasted into omega.
 - Dragging toward the camera widens omega into an obvious drop target before drop.

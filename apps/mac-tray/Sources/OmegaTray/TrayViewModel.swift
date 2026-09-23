@@ -4,6 +4,12 @@ import Foundation
 import UniformTypeIdentifiers
 
 @MainActor
+protocol CapturePresentationControlling: AnyObject {
+    func hideForCapture(then start: @escaping @MainActor () -> Void)
+    func restoreAfterCapture()
+}
+
+@MainActor
 final class TrayViewModel: ObservableObject {
     enum ScreenCaptureMode {
         case area
@@ -49,6 +55,7 @@ final class TrayViewModel: ObservableObject {
 
     private let transport: TrayTransport
     private var failedSend: FailedSend?
+    weak var capturePresentation: CapturePresentationControlling?
 
     private struct FailedSend {
         let messageID: UUID
@@ -237,6 +244,19 @@ final class TrayViewModel: ObservableObject {
     func captureScreen(_ mode: ScreenCaptureMode) {
         guard ensureScreenCapturePermission() else { return }
 
+        let start: @MainActor () -> Void = { [weak self] in
+            guard let self else { return }
+            self.startCapture(mode)
+        }
+
+        if let capturePresentation {
+            capturePresentation.hideForCapture(then: start)
+        } else {
+            start()
+        }
+    }
+
+    private func startCapture(_ mode: ScreenCaptureMode) {
         let destination = FileManager.default.temporaryDirectory
             .appendingPathComponent("omega-capture-\(UUID().uuidString).png")
         let process = Process()
@@ -246,6 +266,7 @@ final class TrayViewModel: ObservableObject {
 
         process.terminationHandler = { [weak self] process in
             Task { @MainActor in
+                defer { self?.capturePresentation?.restoreAfterCapture() }
                 guard process.terminationStatus == 0,
                       FileManager.default.fileExists(atPath: destination.path),
                       let image = NSImage(contentsOf: destination)
@@ -271,6 +292,7 @@ final class TrayViewModel: ObservableObject {
             try process.run()
         } catch {
             workState = .failed("Screen capture could not start.")
+            capturePresentation?.restoreAfterCapture()
         }
     }
 
