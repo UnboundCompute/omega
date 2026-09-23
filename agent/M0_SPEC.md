@@ -123,10 +123,29 @@ Procedure:
 5. Scan frames from offset 32, tracking `expected_seq` starting at 1:
    - fewer than 12 bytes remain → **torn tail**, truncate here.
    - `len_crc` does not match `body_len` → the length field itself is damaged, so nothing it
-     says may be acted on:
-     - if every byte from this frame's start to EOF is **zero** → **zero-filled tail**, truncate
+     says may be acted on. Decide on the bytes' own evidence, in this order:
+     - every byte from this frame's start to EOF is **zero** → **zero-filled tail**, truncate
        here. (A frame prefix we wrote is never all zeros, so this is a crash artifact.)
-     - otherwise → `CorruptFrame`.
+     - the frame is **whole apart from this one field** — `body_len` is plausible, the body it
+       names fits in the file, that body matches the body CRC, and the `seq` inside it is the
+       one expected → the frame was fully durable and a later bit-flip hit its length checksum.
+       That is damage: `CorruptFrame`. A half-landed write cannot satisfy all four, because its
+       body is the part that did not arrive.
+     - otherwise the frame's extent is unknown, so every byte to EOF is **unexplained**. Scan
+       that region for any frame that **verifies end to end**. One found → `CorruptFrame`.
+       More unexplained bytes than a single maximum frame → `CorruptFrame`, since an append
+       writes one frame and `fsync`s before returning, so at most one is ever in flight.
+       Nothing found → **torn tail**, truncate here.
+
+     **Why the rule is "a frame that verifies", not "a non-zero byte".** See case 49. The rule
+     above says *data following a frame proves that frame was durable*; an earlier version read
+     "data" as "any non-zero byte", which counts a write's own wreckage as proof of its own
+     durability. A crash during an append can persist a write's size extension and only some of
+     its pages — pages are independent units of writeback and nothing makes two of them land
+     together — so a frame straddling a page boundary lands **in part**, leaving real, non-zero
+     bytes that were never acknowledged. Reading those as durable data made the log refuse, and
+     refusal is permanent, so the log never opened again. The only honest form of "data" is a
+     frame that verifies end to end. Zeros are not one; a torn prefix is not one either.
    - `body_len` is **implausible** — 0, below the 18-byte minimum body, or above `MAX_BODY` —
      while `len_crc` matches → `CorruptFrame`. A checksum-valid length we could never have
      written means the file was built by something other than this code.
@@ -303,8 +322,10 @@ in-flight turn" waits for M1. M0 proves the durability half: *an append that ret
     leaves), reopen: the log opens, `head()` is N, all N episodes are readable, and the zeros are
     truncated. This case exists because the spec originally got it wrong and the log refused to
     open, losing everything.
-38. Zero-filled tail *inside* an otherwise valid frame region, i.e. zeros followed by real frame
-    bytes → `CorruptFrame`. Zeros only mean "crash artifact" when they run to EOF.
+38. Zero-filled tail *inside* an otherwise valid frame region, i.e. zeros followed by a **whole
+    frame that verifies** → `CorruptFrame`. Zeros only mean "crash artifact" when nothing durable
+    follows them. (Zeros followed by bytes that verify as no frame are covered by case 49: the
+    log opens and the tail is preserved.)
 39. A single NUL byte appended, and a run shorter than a frame header → both recover as a torn
     tail with no loss.
 
@@ -346,12 +367,49 @@ later deletes as redundant.
     place whether or not `p` already exists. *Audit finding 6: the same argument produced either
     `p` as a file or `p/episodes.log` depending on what was on disk first, and the file form then
     permanently blocked the directory form.*
-47. **The frame-boundary discontinuity is pinned.** Non-zero garbage at a frame start, in runs
-    from 1 byte up to and past the prefix length, is classified deliberately and the boundary is
-    tested on both sides. *Audit finding 7: the old suite tested 1, 2 and 7 bytes but never 8,
-    so the point where behaviour changes was untested.*
+47. **There is no frame-boundary discontinuity.** Non-zero garbage at a frame start, in runs from
+    1 byte up to and past the prefix length, is classified the *same way* throughout: it holds no
+    frame that verifies, so it was never acknowledged, so it is truncated and preserved. *Audit
+    finding 7 first caught that the old suite tested 1, 2 and 7 bytes but never 8, so the point
+    where behaviour changed was untested. Case 49 then removed the change itself — the step at
+    `PREFIX_LEN` was the bug, because that is exactly where a torn prefix falls. This case now
+    sweeps the same lengths asserting the opposite: that no step exists anywhere.*
 48. **First key wins in the dedup index.** Two records sharing a dedup key resolve to the lower
     seq, and a rebuild agrees. *Audit: unpinned — reversing it broke no test.*
+49. **A half-landed append never makes the log unopenable.** Build a log whose final frame
+    straddles a 4096-byte page boundary. For **both** writeback orders — only the earlier page
+    lands, only the later page lands — and for every split point across the frame, the log
+    reopens and every acknowledged episode is readable. Frames spanning three or more pages are
+    covered with an arbitrary subset of pages landed.
+
+    *This is the second time one clause produced the failure this spec's violation metric names,
+    and it is the most expensive defect found in M0.* A crash during an append can persist the
+    write's size extension while only some of its pages are written back. The recovery rule asked
+    "are the bytes from here to EOF all zero", the partially landed bytes are not zero, so the
+    tail was classified as corruption and the log **refused to open permanently, with every
+    acknowledged episode intact on disk and unreachable.** Measured before the fix on a healthy
+    27-episode log: landing only the earlier page destroyed 7 of 154 split points — every one a
+    tear falling inside the 12-byte prefix, where the length checksum lives; landing only the
+    later page, which no rule forbids, destroyed **152 of 154**.
+
+    *Why the first 48 cases all missed it, which is the part worth remembering:* both controls
+    pass. A wholly lost frame is the zero-fill case and recovers; a plain truncation recovers.
+    Only their **combination** fails, and every zero-fill test in the suite appends onto a clean
+    frame boundary, so the torn prefix each one constructs is entirely zeros — the one shape that
+    works. `kill -9` cannot reach it either (case 32 says so explicitly): it is a page-writeback
+    artifact, not a process-death artifact. A test that only ever tears at offset 0 of a frame is
+    not testing tearing.
+
+50. **Truncation never destroys the bytes it discards.** A truncated tail that is not all zeros
+    is copied to `<log>.discarded-tail` beside the log before `set_len`, uniquified so a second
+    recovery cannot clobber the first, and surfaced as `diagnostics.discarded_tail_path`. A
+    failure to write it never stops the log opening — filing the evidence must not recreate the
+    failure the evidence is about. Zeros are skipped, having nothing in them to read.
+
+    *Case 49 turned several refusals into truncations. Refusing had one real virtue: it surfaced
+    an anomaly instead of papering over it. This keeps that virtue without the cost, because the
+    judgement being made is about what the bytes* are *— no frame verifies here — and never about
+    what put them there. The bytes themselves remain, for whoever wants to look.*
 
 ### The violation metric
 
