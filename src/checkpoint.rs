@@ -25,7 +25,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crate::frame::{crc32, MAX_KEY};
-use crate::log::fsync_dir;
+use crate::sync::{sync_dir, sync_file};
 use crate::Error;
 
 const CKPT_MAGIC: [u8; 8] = *b"OMEGACKP";
@@ -39,6 +39,16 @@ pub fn sidecar_path(log_path: &Path) -> PathBuf {
     PathBuf::from(name)
 }
 
+/// What [`CheckpointStore::load_or_set_aside`] found.
+pub struct SidecarLoad {
+    pub store: CheckpointStore,
+    /// True when the sidecar could not be decoded, so every checkpoint reads 0.
+    pub was_damaged: bool,
+    /// Where the unreadable sidecar was moved, when it could be moved.
+    pub damaged_moved_to: Option<PathBuf>,
+}
+
+#[derive(Debug)]
 pub struct CheckpointStore {
     path: PathBuf,
     dir: PathBuf,
@@ -62,7 +72,11 @@ impl CheckpointStore {
         }
     }
 
-    /// Load the sidecar for `log_path`. A missing file is an empty store.
+    /// Load the sidecar for `log_path`. A missing file is an empty store; a
+    /// sidecar that cannot be decoded is an error.
+    ///
+    /// Callers opening a log want [`CheckpointStore::load_or_set_aside`]
+    /// instead: the log must not refuse to open over derived state.
     pub fn load(log_path: &Path) -> Result<CheckpointStore, Error> {
         let mut store = CheckpointStore::empty(log_path);
         let bytes = match fs::read(&store.path) {
@@ -72,6 +86,60 @@ impl CheckpointStore {
         };
         store.map = decode(&bytes)?;
         Ok(store)
+    }
+
+    /// Load the sidecar, or set it aside if it cannot be decoded.
+    ///
+    /// **A damaged sidecar must never stop the log from opening.** Checkpoints
+    /// are mutable derived state, not the source of truth; loading them behind
+    /// a `?` meant zero bytes, all zeros, a truncation or a flipped bit made
+    /// every acknowledged episode unreachable. Worse, the two likeliest
+    /// artifacts — a `rename` visible before its directory `fsync`, and a size
+    /// extension persisted without its data pages — are exactly the ones the
+    /// log's own zero-fill clause exists to survive.
+    ///
+    /// So an undecodable sidecar is renamed to `<name>.damaged` (uniquified, so
+    /// an earlier one is never clobbered) and every checkpoint reads 0. That is
+    /// deliberately the same outcome as a *missing* sidecar, which was already
+    /// the tested behaviour, so it adds no new failure mode. The file is kept
+    /// rather than deleted: it is the evidence.
+    ///
+    /// A genuine I/O failure reading the file is a different thing and still
+    /// propagates — "the disk would not answer" is not "the contents are
+    /// nonsense". A failure to *move* the damaged file does not propagate: the
+    /// log still opens, which is the entire point of the rule.
+    pub fn load_or_set_aside(log_path: &Path) -> Result<SidecarLoad, Error> {
+        let mut store = CheckpointStore::empty(log_path);
+        let bytes = match fs::read(&store.path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(SidecarLoad {
+                    store,
+                    was_damaged: false,
+                    damaged_moved_to: None,
+                })
+            }
+            Err(e) => return Err(Error::Io(e)),
+        };
+
+        match decode(&bytes) {
+            Ok(map) => {
+                store.map = map;
+                Ok(SidecarLoad {
+                    store,
+                    was_damaged: false,
+                    damaged_moved_to: None,
+                })
+            }
+            Err(_) => {
+                let moved = set_aside(&store.path);
+                Ok(SidecarLoad {
+                    store,
+                    was_damaged: true,
+                    damaged_moved_to: moved,
+                })
+            }
+        }
     }
 
     /// An unset checkpoint reads as 0, never null.
@@ -123,12 +191,38 @@ impl CheckpointStore {
                 .truncate(true)
                 .open(&tmp)?;
             f.write_all(&bytes)?;
-            f.sync_all()?;
+            sync_file(&f)?;
         }
         fs::rename(&tmp, &self.path)?;
-        fsync_dir(&self.dir)?;
+        sync_dir(&self.dir)?;
         Ok(())
     }
+}
+
+/// Move an undecodable sidecar out of the way, without ever clobbering one that
+/// is already there — a second damaged sidecar is a second piece of evidence,
+/// not a reason to destroy the first.
+///
+/// Best effort by design: if the move fails there is nothing useful to do about
+/// it here, and refusing to open the log would be the exact failure this whole
+/// path exists to prevent. The caller reports that it happened either way.
+fn set_aside(path: &Path) -> Option<PathBuf> {
+    for n in 0..1000u32 {
+        let mut name = path.as_os_str().to_os_string();
+        name.push(".damaged");
+        if n > 0 {
+            name.push(format!(".{n}"));
+        }
+        let candidate = PathBuf::from(name);
+        if candidate.exists() {
+            continue;
+        }
+        return match fs::rename(path, &candidate) {
+            Ok(()) => Some(candidate),
+            Err(_) => None,
+        };
+    }
+    None
 }
 
 fn encode(map: &BTreeMap<String, u64>) -> Vec<u8> {
@@ -160,7 +254,16 @@ fn decode(bytes: &[u8]) -> Result<BTreeMap<String, u64>, Error> {
     }
     let version = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
     if version != CKPT_VERSION {
-        return Err(Error::UnsupportedVersion(version));
+        // Not `Error::UnsupportedVersion`: that variant's message says
+        // "unsupported log version N, this build reads version M" with the
+        // *log's* format version in it, which is a different number about a
+        // different file. Reporting a sidecar mismatch through it named the
+        // wrong file and the wrong version, and pointed whoever read it at the
+        // log. From the log's side there is only one question about this file —
+        // can it be decoded — and the answer here is no.
+        return Err(bad(format!(
+            "checkpoint sidecar version {version}, this build reads version {CKPT_VERSION}"
+        )));
     }
     // `count` locates the CRC, rather than the CRC being wherever the file
     // happens to end. That is what lets a zero-filled tail be recognised and
@@ -345,6 +448,87 @@ mod tests {
             CheckpointStore::load(&p),
             Err(Error::CorruptFrame { .. })
         ));
+    }
+
+    /// Spec case 42 at this level: `load_or_set_aside` never fails over a
+    /// sidecar it cannot decode. It moves it, says so, and reads 0.
+    #[test]
+    fn an_undecodable_sidecar_is_set_aside_and_reported() {
+        let d = TempDir::new("ckpt_setaside");
+        let p = log_path(&d);
+        {
+            let mut store = CheckpointStore::load(&p).unwrap();
+            store.set("graph", 7).unwrap();
+        }
+        let mut broken = read_sidecar(&p).unwrap();
+        broken[0] = b'X';
+        fs::write(sidecar_path(&p), &broken).unwrap();
+
+        let loaded = CheckpointStore::load_or_set_aside(&p).unwrap();
+        assert!(loaded.was_damaged);
+        assert_eq!(loaded.store.get("graph"), 0);
+        assert_eq!(loaded.store.names(), Vec::<String>::new());
+        assert!(!sidecar_path(&p).exists());
+
+        // the evidence is kept, byte for byte
+        let moved = loaded.damaged_moved_to.unwrap();
+        assert_eq!(
+            moved.file_name().unwrap(),
+            "episodes.log.checkpoints.damaged"
+        );
+        assert_eq!(fs::read(&moved).unwrap(), broken);
+    }
+
+    /// A readable sidecar is loaded and nothing is set aside. The set-aside
+    /// path is destructive-ish (it renames), so "did not trigger" is worth an
+    /// assertion of its own rather than being assumed.
+    #[test]
+    fn a_readable_sidecar_is_left_exactly_where_it_is() {
+        let d = TempDir::new("ckpt_intact");
+        let p = log_path(&d);
+        {
+            let mut store = CheckpointStore::load(&p).unwrap();
+            store.set("graph", 7).unwrap();
+        }
+        let loaded = CheckpointStore::load_or_set_aside(&p).unwrap();
+        assert!(!loaded.was_damaged);
+        assert!(loaded.damaged_moved_to.is_none());
+        assert_eq!(loaded.store.get("graph"), 7);
+        assert!(sidecar_path(&p).exists());
+
+        // and so is a missing one: the same outcome, by the older road
+        let d = TempDir::new("ckpt_missing");
+        let loaded = CheckpointStore::load_or_set_aside(&log_path(&d)).unwrap();
+        assert!(!loaded.was_damaged);
+        assert_eq!(loaded.store.get("graph"), 0);
+    }
+
+    /// The sidecar's version mismatch used to be reported through
+    /// `Error::UnsupportedVersion`, whose message reads "unsupported log
+    /// version N, this build reads version M" — the wrong file and the wrong
+    /// version, pointing whoever read it at the log.
+    #[test]
+    fn a_sidecar_version_mismatch_does_not_blame_the_log() {
+        let d = TempDir::new("ckpt_version");
+        let p = log_path(&d);
+        {
+            let mut store = CheckpointStore::load(&p).unwrap();
+            store.set("graph", 1).unwrap();
+        }
+        let mut bytes = read_sidecar(&p).unwrap();
+        bytes[8..12].copy_from_slice(&99u32.to_le_bytes());
+        fs::write(sidecar_path(&p), &bytes).unwrap();
+
+        let err = CheckpointStore::load(&p).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("checkpoint sidecar version 99"),
+            "message must name the sidecar and its version: {msg}"
+        );
+        assert!(
+            !msg.contains("log version"),
+            "message must not blame the log: {msg}"
+        );
     }
 
     #[test]

@@ -5,11 +5,12 @@
 //! ```text
 //! Header, 32 bytes, written once at creation:
 //!   magic     8 bytes   b"OMEGALOG"
-//!   version   u32       = 1
+//!   version   u32       = 2
 //!   reserved  20 bytes  zero
 //!
 //! Record frame, repeated:
-//!   body_len  u32       byte length of body, 1..=MAX_BODY
+//!   body_len  u32       byte length of body, 18..=MAX_BODY
+//!   len_crc   u32       CRC-32/ISO-HDLC over the four bytes of body_len
 //!   crc32     u32       CRC-32/ISO-HDLC over the body bytes
 //!   body:
 //!     seq        u64    starts at 1, strictly +1 per record
@@ -18,11 +19,19 @@
 //!     key        key_len bytes, UTF-8
 //!     payload    body_len - (8+8+2+key_len) bytes, OPAQUE
 //! ```
+//!
+//! `len_crc` is version 2's whole reason for existing. `crc32` covers the body,
+//! so checking it requires already knowing how long the body is — which leaves
+//! `body_len` as the one field nothing can vouch for. A single flipped bit in
+//! it that lands inside `18..=MAX_BODY` reads as a frame claiming more bytes
+//! than the file holds, which recovery used to classify as a torn tail and
+//! silently truncate. `len_crc` breaks that circularity: the length is verified
+//! before anything acts on it. Version 1 is not readable and is not migrated.
 
 use crate::Error;
 
 pub const MAGIC: [u8; 8] = *b"OMEGALOG";
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 pub const HEADER_LEN: usize = 32;
 
 /// Maximum body length, 64 MiB.
@@ -30,8 +39,8 @@ pub const MAX_BODY: u32 = 64 * 1024 * 1024;
 /// Maximum dedup key length, 512 bytes.
 pub const MAX_KEY: usize = 512;
 
-/// `body_len` + `crc32` in front of every body.
-pub const PREFIX_LEN: usize = 8;
+/// `body_len` + `len_crc` + `crc32` in front of every body.
+pub const PREFIX_LEN: usize = 12;
 /// `seq` + `ts_micros` + `key_len`: the part of a body that is always present.
 pub const FIXED_BODY_LEN: usize = 8 + 8 + 2;
 
@@ -54,7 +63,8 @@ pub fn encode_header() -> [u8; HEADER_LEN] {
 }
 
 /// Validate a 32-byte header. `NotAnOmegaLog` on bad magic, `UnsupportedVersion`
-/// on anything but version 1. Both refuse to open (spec, Recovery step 4).
+/// on anything but version 2 — including version 1, which this build does not
+/// read and does not migrate. Both refuse to open (spec, Recovery step 4).
 pub fn validate_header(buf: &[u8]) -> Result<u32, Error> {
     if buf.len() < HEADER_LEN {
         return Err(Error::CorruptFrame {
@@ -76,6 +86,12 @@ pub fn crc32(body: &[u8]) -> u32 {
     let mut h = crc32fast::Hasher::new();
     h.update(body);
     h.finalize()
+}
+
+/// The checksum a given `body_len` must carry. Over the four encoded bytes, so
+/// it can be checked against the raw prefix without decoding anything else.
+pub fn len_crc32(body_len: u32) -> u32 {
+    crc32(&body_len.to_le_bytes())
 }
 
 /// Body length a record with this key and payload would need.
@@ -118,7 +134,8 @@ pub fn encode(seq: u64, ts_micros: i64, key: &str, payload: &[u8]) -> Result<Vec
 
     let mut frame = Vec::with_capacity(PREFIX_LEN + body_len as usize);
     frame.extend_from_slice(&body_len.to_le_bytes());
-    frame.extend_from_slice(&0u32.to_le_bytes()); // crc placeholder
+    frame.extend_from_slice(&len_crc32(body_len).to_le_bytes());
+    frame.extend_from_slice(&0u32.to_le_bytes()); // body crc placeholder
     frame.extend_from_slice(&seq.to_le_bytes());
     frame.extend_from_slice(&ts_micros.to_le_bytes());
     frame.extend_from_slice(&(key.len() as u16).to_le_bytes());
@@ -127,15 +144,37 @@ pub fn encode(seq: u64, ts_micros: i64, key: &str, payload: &[u8]) -> Result<Vec
 
     debug_assert_eq!(frame.len(), PREFIX_LEN + body_len as usize);
     let crc = crc32(&frame[PREFIX_LEN..]);
-    frame[4..8].copy_from_slice(&crc.to_le_bytes());
+    frame[8..12].copy_from_slice(&crc.to_le_bytes());
     Ok(frame)
 }
 
-/// Read `body_len` and `crc32` out of an 8-byte prefix.
-pub fn decode_prefix(prefix: &[u8; PREFIX_LEN]) -> (u32, u32) {
-    let body_len = u32::from_le_bytes([prefix[0], prefix[1], prefix[2], prefix[3]]);
-    let crc = u32::from_le_bytes([prefix[4], prefix[5], prefix[6], prefix[7]]);
-    (body_len, crc)
+/// The three fields in front of every body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Prefix {
+    pub body_len: u32,
+    pub len_crc: u32,
+    pub crc: u32,
+}
+
+impl Prefix {
+    /// Is `body_len` still the number we wrote?
+    ///
+    /// Nothing may act on `body_len` until this says yes (M0_SPEC.md, Recovery
+    /// step 5). A length that fails its own checksum is *evidence about the
+    /// length*, not a fact about the file's shape, and treating it as the
+    /// latter is what silently truncated acknowledged episodes under version 1.
+    pub fn len_is_intact(&self) -> bool {
+        len_crc32(self.body_len) == self.len_crc
+    }
+}
+
+/// Read `body_len`, `len_crc` and `crc32` out of a 12-byte prefix.
+pub fn decode_prefix(prefix: &[u8; PREFIX_LEN]) -> Prefix {
+    Prefix {
+        body_len: u32::from_le_bytes([prefix[0], prefix[1], prefix[2], prefix[3]]),
+        len_crc: u32::from_le_bytes([prefix[4], prefix[5], prefix[6], prefix[7]]),
+        crc: u32::from_le_bytes([prefix[8], prefix[9], prefix[10], prefix[11]]),
+    }
 }
 
 /// Is this `body_len` one we could ever have written?
@@ -224,9 +263,9 @@ mod tests {
         let h = encode_header();
         assert_eq!(h.len(), 32);
         assert_eq!(&h[0..8], b"OMEGALOG");
-        assert_eq!(&h[8..12], &1u32.to_le_bytes());
+        assert_eq!(&h[8..12], &2u32.to_le_bytes());
         assert!(h[12..32].iter().all(|b| *b == 0));
-        assert_eq!(validate_header(&h).unwrap(), 1);
+        assert_eq!(validate_header(&h).unwrap(), 2);
     }
 
     #[test]
@@ -243,14 +282,29 @@ mod tests {
         ));
     }
 
+    /// Version 1 is a readable *shape* — same magic, same header length — and
+    /// is deliberately not readable by this build. There is no migration path
+    /// and none is wanted: no version-1 log exists outside tests, and DL-017's
+    /// rebuild-from-log replaces migration.
+    #[test]
+    fn version_one_is_refused_not_migrated() {
+        let mut h = encode_header();
+        h[8..12].copy_from_slice(&1u32.to_le_bytes());
+        assert!(matches!(
+            validate_header(&h),
+            Err(Error::UnsupportedVersion(1))
+        ));
+    }
+
     #[test]
     fn frame_round_trip() {
         let frame = encode(1, -12345, "k", b"hello").unwrap();
-        let (body_len, crc) = decode_prefix(&frame[0..8].try_into().unwrap());
-        assert_eq!(body_len as usize, FIXED_BODY_LEN + 1 + 5);
-        assert_eq!(frame.len(), PREFIX_LEN + body_len as usize);
+        let p = decode_prefix(&frame[0..PREFIX_LEN].try_into().unwrap());
+        assert_eq!(p.body_len as usize, FIXED_BODY_LEN + 1 + 5);
+        assert_eq!(frame.len(), PREFIX_LEN + p.body_len as usize);
+        assert!(p.len_is_intact());
         let body = &frame[PREFIX_LEN..];
-        assert_eq!(crc, crc32(body));
+        assert_eq!(p.crc, crc32(body));
 
         let rec = decode_body(body, 32).unwrap();
         assert_eq!(rec.seq, 1);
@@ -310,8 +364,9 @@ mod tests {
     #[test]
     fn decode_body_rejects_key_len_past_end() {
         let mut f = encode(1, 0, "ab", b"cd").unwrap();
-        // key_len is at body offset 16 -> frame offset 24
-        f[24..26].copy_from_slice(&9000u16.to_le_bytes());
+        // key_len is at body offset 16 -> frame offset PREFIX_LEN + 16
+        let at = PREFIX_LEN + 16;
+        f[at..at + 2].copy_from_slice(&9000u16.to_le_bytes());
         assert!(matches!(
             decode_body(&f[PREFIX_LEN..], 0),
             Err(Error::CorruptFrame { .. })
@@ -321,7 +376,7 @@ mod tests {
     #[test]
     fn decode_body_rejects_non_utf8_key() {
         let mut f = encode(1, 0, "ab", b"cd").unwrap();
-        f[26] = 0xff; // first key byte
+        f[PREFIX_LEN + FIXED_BODY_LEN] = 0xff; // first key byte
         assert!(matches!(
             decode_body(&f[PREFIX_LEN..], 0),
             Err(Error::CorruptFrame { .. })
@@ -331,9 +386,36 @@ mod tests {
     #[test]
     fn crc_detects_a_flipped_payload_bit() {
         let mut f = encode(1, 0, "", b"payload").unwrap();
-        let (_, crc) = decode_prefix(&f[0..8].try_into().unwrap());
+        let p = decode_prefix(&f[0..PREFIX_LEN].try_into().unwrap());
         let last = f.len() - 1;
         f[last] ^= 0x01;
-        assert_ne!(crc, crc32(&f[PREFIX_LEN..]));
+        assert_ne!(p.crc, crc32(&f[PREFIX_LEN..]));
+    }
+
+    /// The point of version 2: every single-bit change to `body_len` is caught
+    /// by `len_crc`, so no damaged length is ever believed. 32 bits, all of
+    /// them, on a real frame.
+    #[test]
+    fn len_crc_catches_every_single_bit_flip_in_body_len() {
+        let f = encode(1, 0, "k", b"payload").unwrap();
+        let p = decode_prefix(&f[0..PREFIX_LEN].try_into().unwrap());
+        assert!(p.len_is_intact());
+        for bit in 0..32u32 {
+            let flipped = Prefix {
+                body_len: p.body_len ^ (1 << bit),
+                ..p
+            };
+            assert!(!flipped.len_is_intact(), "bit {bit} went undetected");
+        }
+    }
+
+    /// An all-zero prefix — what a persisted size extension without its data
+    /// pages reads back as — fails its own length checksum, so recovery reaches
+    /// the zero-to-EOF test instead of believing `body_len == 0`.
+    #[test]
+    fn an_all_zero_prefix_fails_its_length_checksum() {
+        let p = decode_prefix(&[0u8; PREFIX_LEN]);
+        assert_eq!(p.body_len, 0);
+        assert!(!p.len_is_intact());
     }
 }

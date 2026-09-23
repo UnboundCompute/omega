@@ -11,6 +11,58 @@ pub mod log;
 
 use std::fmt;
 
+/// Durability, made observable.
+///
+/// `kill -9` cannot test `fsync`: the kernel completes an in-flight write and
+/// the page cache outlives the process, so every crash test passes whether or
+/// not a single `fsync` is called — confirmed by deleting them all and watching
+/// the suite stay green, 94x faster (M0_SPEC.md case 44). A rule no test can
+/// fail is not a rule, so every durability call in this crate goes through one
+/// of these two functions and is counted.
+///
+/// The counters are **per-thread**. A process-wide counter would be unusable:
+/// `cargo test` runs tests in parallel, so an exact delta would race and a
+/// "went up by at least one" assertion would be satisfied by some *other*
+/// thread's append — which is precisely the mutant these tests exist to kill.
+/// Every operation here syncs on its caller's thread, so a thread-local count
+/// is both exact and race-free.
+pub mod sync {
+    use std::cell::Cell;
+    use std::fs::File;
+    use std::io;
+    use std::path::Path;
+
+    thread_local! {
+        static FILE_SYNCS: Cell<u64> = const { Cell::new(0) };
+        static DIR_SYNCS: Cell<u64> = const { Cell::new(0) };
+    }
+
+    /// `fsync` a file's data and metadata, and count it.
+    pub fn sync_file(f: &File) -> io::Result<()> {
+        f.sync_all()?;
+        FILE_SYNCS.with(|c| c.set(c.get() + 1));
+        Ok(())
+    }
+
+    /// `fsync` a directory, so a newly created or renamed entry in it is
+    /// durable, and count it.
+    pub fn sync_dir(dir: &Path) -> io::Result<()> {
+        File::open(dir)?.sync_all()?;
+        DIR_SYNCS.with(|c| c.set(c.get() + 1));
+        Ok(())
+    }
+
+    /// File `fsync`s completed on this thread since it started.
+    pub fn file_syncs() -> u64 {
+        FILE_SYNCS.with(|c| c.get())
+    }
+
+    /// Directory `fsync`s completed on this thread since it started.
+    pub fn dir_syncs() -> u64 {
+        DIR_SYNCS.with(|c| c.get())
+    }
+}
+
 /// Everything that can go wrong, as distinct variants. The Python layer maps
 /// each to its own exception type so callers can assert precisely rather than
 /// matching on a message.
@@ -285,6 +337,22 @@ mod py {
             with_log(&self.shared, |l| Ok(l.recovered_bytes())).map_err(to_py)
         }
 
+        /// True when the checkpoint sidecar could not be decoded on this open,
+        /// so it was set aside and every checkpoint now reads 0.
+        #[getter]
+        fn checkpoints_reset(&self) -> PyResult<bool> {
+            with_log(&self.shared, |l| Ok(l.checkpoints_reset())).map_err(to_py)
+        }
+
+        /// Where an unreadable sidecar was moved on this open, or None.
+        #[getter]
+        fn damaged_checkpoints_path(&self) -> PyResult<Option<PathBuf>> {
+            with_log(&self.shared, |l| {
+                Ok(l.damaged_checkpoints_path().map(|p| p.to_path_buf()))
+            })
+            .map_err(to_py)
+        }
+
         /// Seq of the last record, or 0 if the log is empty.
         fn head(&self) -> PyResult<u64> {
             with_log(&self.shared, |l| Ok(l.head())).map_err(to_py)
@@ -413,6 +481,27 @@ mod py {
         Ok(tuple.into_pyobject(py)?.into_any())
     }
 
+    /// File `fsync`s completed **on the calling thread** since it started.
+    ///
+    /// `kill -9` cannot test durability — the kernel finishes the write and the
+    /// page cache outlives the process — so the rule is held by observing the
+    /// call. Take this before an operation and after it; the difference is how
+    /// many times that operation actually reached the disk.
+    ///
+    /// Per-thread on purpose: a process-wide count would be satisfied by some
+    /// other thread's append, which is the exact mutant these counts exist to
+    /// catch.
+    #[pyfunction]
+    fn file_syncs() -> u64 {
+        crate::sync::file_syncs()
+    }
+
+    /// Directory `fsync`s completed on the calling thread since it started.
+    #[pyfunction]
+    fn dir_syncs() -> u64 {
+        crate::sync::dir_syncs()
+    }
+
     fn now_micros() -> i64 {
         use std::time::{SystemTime, UNIX_EPOCH};
         match SystemTime::now().duration_since(UNIX_EPOCH) {
@@ -426,6 +515,8 @@ mod py {
     fn init(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_class::<PyLog>()?;
         m.add_class::<PyRecordIter>()?;
+        m.add_function(wrap_pyfunction!(file_syncs, m)?)?;
+        m.add_function(wrap_pyfunction!(dir_syncs, m)?)?;
 
         // `create_exception!` takes the module as an identifier, so it records
         // `__module__ = "_log"`. Correct it to the real dotted name so
@@ -450,6 +541,9 @@ mod py {
         m.add("MAX_BODY", crate::frame::MAX_BODY)?;
         m.add("MAX_KEY", crate::frame::MAX_KEY)?;
         m.add("HEADER_LEN", crate::frame::HEADER_LEN)?;
+        // The frame prefix grew from 8 to 12 bytes in version 2 (body_len,
+        // len_crc, crc32). Exported so nothing outside has to hardcode it.
+        m.add("PREFIX_LEN", crate::frame::PREFIX_LEN)?;
         m.add("VERSION", crate::frame::VERSION)?;
         m.add("EPISODES_FILENAME", crate::log::EPISODES_FILENAME)?;
         Ok(())
