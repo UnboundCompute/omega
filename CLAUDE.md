@@ -32,8 +32,9 @@ together, in the ledger, before it gets code. What ended is the blanket freeze, 
 - Order of work: **talk → finalize docs → then code.** Both passes are done; code is now the
   work. A *new* question still goes talk → ledger → code, in that order.
 - **Still deferred, and not to be settled by whatever the first implementation happens to do:**
-  the store engine under the graph, the channel wire format, local vs API embeddings, tool
-  error/retry policy. Each gets a ledger entry when it is actually reached.
+  the **projection** store under the graph (the *log* is decided — DL-020), the channel wire
+  format, local vs API embeddings, tool error/retry policy. Each gets a ledger entry when it is
+  actually reached.
 
 ## Guiding principle: stay small and legible
 

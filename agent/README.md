@@ -27,6 +27,30 @@ the accumulated history on the hard features afterwards.
 Rust lands at **M0**, on the log — the simplest component to carry it, and it makes the seam a
 real cross-language boundary from the first commit. A seam that isn't crossed isn't tested.
 
+## M0: the log
+
+A **raw append-only file**, framed `[len | crc32 | seq | payload]`, `fsync` per append, with
+tail-truncation on recovery and a startup-built in-memory offset index.
+
+A file rather than a table because **append-only should be physical, not promised** — you cannot
+`UPDATE` a record in place even by accident. Regenerate-don't-patch is the foundation of the
+memory design, so the storage layer should make patching impossible rather than discouraged.
+
+Three properties that cannot be retrofitted once there is data:
+
+- **`fsync` per append** — a successful append must survive `kill -9`. ~0.1–1ms against a turn
+  dominated by a 0.5–3s model call is not a trade worth making.
+- **Idempotent append on a write-key** — dedup belongs in the log, not in the extractor that
+  calls it, or every future writer has to remember it.
+- **A stable monotonic sequence from record one** — every derived view resumes from a checkpoint,
+  and rebuild-from-log depends on it.
+
+At M0 the restart test is **half-assertable**: there's no loop yet, so M0 proves durability (a
+successful append survives, a torn tail truncates cleanly) and M1 completes the invariant.
+
+The **projection** store is a separate decision and is deliberately not made yet — derived state
+is droppable, so its engine can change any time. Nothing needs one before M3.
+
 ## The loop (M1)
 
 There is exactly **one** loop and everything goes through it. A single-consumer queue, one
