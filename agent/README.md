@@ -17,7 +17,7 @@ the accumulated history on the hard features afterwards.
 | | Milestone | Done-bar |
 |---|---|---|
 | **M0** | Store, log, the memory seam, restart test | `kill -9` mid-turn → lose only the in-flight turn, green in CI |
-| **M1** | One turn end to end: queue, executor, dumb recall | **Daily use starts**; every exchange lands in the log |
+| **M1** | **The core loop** — queue, executor, one full turn | **Daily use starts**; every exchange lands in the log |
 | **M2** | Identity, continuity, opinions | Reopen after 3 days and it resumes cold; voice holds under pressure |
 | **M3** | The derived graph + retrieval policy | Drop the graph, re-derive, identical projection |
 | **M4** | Knowing you | States something true about how you work that you were never told |
@@ -26,6 +26,26 @@ the accumulated history on the hard features afterwards.
 
 Rust lands at **M0**, on the log — the simplest component to carry it, and it makes the seam a
 real cross-language boundary from the first commit. A seam that isn't crossed isn't tested.
+
+## The loop (M1)
+
+There is exactly **one** loop and everything goes through it. A single-consumer queue, one
+executor draining it serially, one turn:
+
+```
+perceive → recall → judge → act → reply → write memory
+```
+
+- **`judge` is a real step.** Deciding to say nothing is a *successful* turn and must be logged
+  as one. If silence reads as failure anywhere — in the loop, in logs, in any later metric —
+  initiative degenerates into a notification firehose.
+- **The repetition lives inside `act`.** Tool → result → tool → result, re-asking each pass:
+  *are we done, verified?* and *is this moving?* A stall means stop, re-plan or come back and
+  ask — never flail silently. This is a sub-**loop**; a sub-agent would be a second context with
+  its own judgement, which fractures identity and puts its work outside the episodic log.
+- **Every wake enters at the same point.** M1 only has the you-wake, but the queue is already the
+  single entry, so the clock's time-wake later becomes just another producer rather than a second
+  path. Two engines would drift into two omegas.
 
 **M1 is where `apps/mac-tray` converges.** It is the point at which the real transport replaces
 `LocalDemoTransport`, under the three constraints below. Nothing before M1 should depend on the
