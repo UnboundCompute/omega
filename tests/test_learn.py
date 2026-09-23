@@ -23,45 +23,27 @@ import json
 import pytest
 
 from omega import derive, episodes, learn, provider, turn
-from omega.executor import Executor
 from omega.queue import EventQueue
+
+from tests.teaching import (
+    LEARNED_HEADING,
+    TRAY_INSTRUCTION,
+    _a_claim,
+    _answer,
+    _claim_obj,
+    _claims_in,
+    _drain,
+    _learned_section_of,
+    _log,
+    _replies,
+    _teach_text,
+    _Teaching,
+    _text_of,
+)
 
 # The literal instruction the tray builds — `TrayViewModel.swift:523-529`,
 # reproduced rather than imported, because the point of the case is that the
 # two halves agree while having no way to share a constant.
-TRAY_INSTRUCTION = (
-    "Teaching note from me. Treat this as something to remember and apply in "
-    "future conversations, not as a task to execute. Briefly confirm what you "
-    "learned."
-)
-
-
-def _teach_text(note: str) -> str:
-    return f"{TRAY_INSTRUCTION}\n\n{note}"
-
-
-def _claim_obj(seq: int, text: str, **over) -> derive.Claim:
-    fields = dict(
-        seq=seq,
-        text=text,
-        trigger=None,
-        situation="taught in the tray",
-        source_seq=seq - 1,
-        explicit=True,
-    )
-    fields.update(over)
-    return derive.Claim(**fields)
-
-
-def _answer(*claims: dict) -> str:
-    return json.dumps({"claims": list(claims)})
-
-
-def _a_claim(text="keep status updates short", **over) -> dict:
-    out = {"text": text, "situation": "asked in the tray", "trigger": None}
-    out.update(over)
-    return out
-
 
 # --- the gate ---------------------------------------------------------------
 
@@ -269,93 +251,6 @@ def test_the_receipt_reads_the_same_trigger_fields_the_matcher_does():
 
 # --- the whole path, through a real turn ------------------------------------
 
-
-class _Teaching:
-    """A provider scripted for all three roles, keeping what it was asked."""
-
-    def __init__(self, *, learn_answer, verdict: str = "SPEAK", reply: str = "ok"):
-        self.prompts: list[str] = []
-        self._fake = provider.FakeProvider(
-            {
-                provider.JUDGE: self._record(verdict),
-                provider.ACT: self._record(reply),
-                provider.LEARN: self._record(learn_answer),
-            }
-        )
-
-    def _record(self, answer):
-        def respond(role, messages):
-            self.prompts.append(
-                "\n".join(_text_of(m) for m in messages)
-            )
-            if callable(answer):
-                return answer(role, messages)
-            return answer
-
-        return respond
-
-    @property
-    def complete(self):
-        return self._fake.complete
-
-    @property
-    def calls(self):
-        return self._fake.calls
-
-    def last(self) -> str:
-        return self.prompts[-1]
-
-
-def _text_of(message: dict) -> str:
-    content = message["content"]
-    if isinstance(content, str):
-        return content
-    return "\n".join(
-        part.get("text", "") for part in content if isinstance(part, dict)
-    )
-
-
-LEARNED_HEADING = "What you have learned about working with this person"
-
-
-def _learned_section_of(prompt: str) -> str:
-    """Just the learned section, which is what "applies to this turn" means.
-
-    The rest of the prompt legitimately contains superseded claims — the
-    receipt that announced one is an ordinary reply and shows up in recall
-    forever. Reading the whole prompt would make a passing case out of the
-    wrong fact.
-    """
-    if LEARNED_HEADING not in prompt:
-        return ""
-    return prompt.split(LEARNED_HEADING, 1)[1].split("Recent history:", 1)[0]
-
-
-def _drain(q: EventQueue, teaching: _Teaching) -> None:
-    ex = Executor(q, complete=teaching.complete)
-    ex.recover()
-    ex.drain()
-
-
-def _log(q: EventQueue) -> list[tuple[int, dict]]:
-    """Every episode, decoded. Read back from the store rather than from any
-    object the turn built, because what the turn believed it wrote is the one
-    thing these cases are not allowed to trust."""
-    return [(e.seq, episodes.decode(e.payload)) for e in q.store.episodes_since(0)]
-
-
-def _claims_in(q: EventQueue) -> list[tuple[int, dict]]:
-    return [
-        (seq, p) for seq, p in _log(q) if p.get("kind") == episodes.CLAIM_EXTRACTED
-    ]
-
-
-def _replies(q: EventQueue) -> list[str]:
-    return [
-        p["reply"]
-        for _, p in _log(q)
-        if p.get("kind") == episodes.TURN_COMPLETED and p.get("reply")
-    ]
 
 
 def test_a_teach_drop_records_a_claim_that_later_fires(store):

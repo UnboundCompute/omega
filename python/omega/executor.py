@@ -32,6 +32,7 @@ from omega import episodes, provider
 from omega.derive import Learned, OpenWork
 from omega.memory import WriteKeyConflict
 from omega.queue import EVENT_KINDS, EventQueue, Pending
+from omega.schedule import Schedule, Scheduler
 from omega.turn import ActResult, TurnContext, TurnResult, no_act_loop_yet, run_turn
 
 __all__ = [
@@ -137,7 +138,15 @@ class StartupReport:
 class Executor:
     """The one consumer. Claims, runs, records, releases — in that order."""
 
-    __slots__ = ("_queue", "_complete", "_act", "_recovered", "_open", "_learned")
+    __slots__ = (
+        "_queue",
+        "_complete",
+        "_act",
+        "_recovered",
+        "_open",
+        "_learned",
+        "_standing",
+    )
 
     def __init__(
         self,
@@ -152,6 +161,14 @@ class Executor:
         self._recovered = False
         self._open = OpenWork()
         self._learned = Learned()
+        # Read-only: `due` and `fire` belong to the clock thread and are
+        # never called from here. A second fold of the same log rather than
+        # a shared object, because the clock mutates its copy on its own
+        # thread — and DL-036's whole claim is that this table is derived,
+        # so two folds of one log agree by construction rather than by
+        # locking. It exists so a teach drop can be told what is already
+        # scheduled and name one to stop (DL-044 #6).
+        self._standing = Scheduler(queue)
 
     @property
     def queue(self) -> EventQueue:
@@ -421,9 +438,20 @@ class Executor:
             # does a newly taught claim replace" (DL-043 #6), and a claim is
             # contradicted by one it was never going to fire alongside.
             known=self._learned.claims(),
+            # Folded to the head rather than to `pending.seq`, unlike the
+            # two views above. Those answer "what was true when this
+            # episode arrived"; this one answers "what is running now",
+            # and cancelling a schedule created while this turn sat in a
+            # backlog is correct — it is still firing.
+            running=self._standing_schedules(),
         )
         self._queue.finish(pending.seq)
         return result
+
+    def _standing_schedules(self) -> list[Schedule]:
+        self._standing.refresh()
+        return self._standing.schedules
+
 
     def __repr__(self) -> str:
         return f"<Executor {self._queue!r} recovered={self._recovered}>"

@@ -1,10 +1,19 @@
-"""Turning a teaching note into claims — DL-043, the third leg of DL-034.
+"""Turning a teaching note into claims and schedules — DL-043, DL-044.
 
 DL-042 settled what a learned claim *is*: a record with a trigger, filed in the
 log, folded into a view, rendered into the prompt when it fires. This is where
-one gets written.
+one gets written. DL-044 added the other thing a teaching note can be.
 
-Three things here are load-bearing.
+**A taught time is a schedule, not a claim with an hour on it.** A claim's
+``hours`` trigger is a filter on *rendering* — it decides whether the claim
+joins a prompt omega is already building. So *"every morning at nine, remind me
+to take my meds"* filed as a claim applies only when the person is already
+talking to omega at nine, which is the one circumstance in which they did not
+need reminding. The discriminator is therefore not whether a note mentions a
+time but **whether it asks omega to act unprompted**: *"in the mornings I prefer
+short answers"* is a real thing to teach and must stay a claim.
+
+Four things here are load-bearing.
 
 **The gate is a sentence, and that is on purpose.** A teach drop carries no
 marker. The tray wraps the note in an instruction and sends an ordinary inbound
@@ -26,26 +35,44 @@ recorded / I recorded nothing / I could not record it.
 fails to validate does not file two. Partial success is worse than either
 outcome: the receipt would list two claims and say nothing about the third, and
 the person would confirm a record that is quietly short. The whole extraction
-fails and the receipt says so.
+fails and the receipt says so. Schedules join the same window: a note that would
+file a claim and a broken schedule files neither.
+
+**Ids are omega's, never the model's.** A schedule id names something
+cancellable, and :meth:`omega.schedule.Scheduler._observe` redefines by id
+without complaint — so a model free to choose ids could silently overwrite one
+standing intention with another by reaching for the same obvious word twice.
+Ids are derived from the episode that taught them, and the model names an
+existing schedule only by quoting an id it was shown.
 """
 
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any, Callable, Optional, Sequence
 
-from omega import episodes, provider
+from omega import episodes, provider, schedule as scheduling
 from omega.derive import Claim
+from omega.schedule import Schedule
 
 __all__ = [
     "TEACH_MARKER",
     "MAX_CLAIMS_PER_NOTE",
     "MAX_CLAIM_CHARS",
+    "MAX_SCHEDULES_PER_NOTE",
+    "MAX_INSTRUCTION_CHARS",
+    "Extraction",
     "NotExtracted",
     "teaching_note",
     "extract",
+    "parse_answer",
     "parse_claims",
     "file_claims",
+    "file_schedules",
+    "cancel_schedules",
+    "schedule_id",
     "receipt",
     "when_phrase",
 ]
@@ -69,6 +96,36 @@ MAX_CLAIMS_PER_NOTE = 8
 #: is rendered on turns that have nothing to do with it, so a claim that is
 #: really a paragraph is a permanent tax on every prompt.
 MAX_CLAIM_CHARS = 300
+
+#: Schedules from one note. Lower than the claim cap and deliberately so: a
+#: claim that is wrong costs prompt budget, and a schedule that is wrong wakes
+#: omega up. DL-035 named unattended repetition as the price of proactivity, so
+#: the bound on how much of it one sentence can buy is tighter.
+MAX_SCHEDULES_PER_NOTE = 4
+
+#: A schedule's instruction is the whole text of a future turn, so it has room
+#: to be a sentence rather than a phrase — but not room to be a document that
+#: nobody will see again until it fires.
+MAX_INSTRUCTION_CHARS = 500
+
+
+@dataclass(frozen=True)
+class Extraction:
+    """What one teaching note turned into, before any of it is written.
+
+    Three lists rather than one because they are three different writes, and
+    keeping them apart until :func:`file_claims` / :func:`file_schedules` /
+    :func:`cancel_schedules` is what lets validation reject the whole note
+    without having appended part of it.
+    """
+
+    claims: list[dict[str, Any]] = field(default_factory=list)
+    schedules: list[dict[str, Any]] = field(default_factory=list)
+    #: Ids of standing schedules the note asks to retire.
+    cancel: list[str] = field(default_factory=list)
+
+    def __bool__(self) -> bool:
+        return bool(self.claims or self.schedules or self.cancel)
 
 
 class NotExtracted(RuntimeError):
@@ -113,8 +170,9 @@ def extract(
     *,
     note: str,
     known: Sequence[Claim] = (),
+    running: Sequence[Schedule] = (),
     context: str = "",
-) -> list[dict[str, Any]]:
+) -> Extraction:
     """Ask the ``learn`` role what to remember. Raises :class:`NotExtracted`.
 
     ``known`` is the whole learned set, not the subset that fires on this
@@ -124,13 +182,24 @@ def extract(
     second one is DL-042 #3 sited where DL-043 #6 puts it — at ingest, on a
     call that is already being made, O(claims) once per teach rather than per
     turn.
+
+    ``running`` is the standing schedules, shown for the same reason and used
+    the same way: it is what makes *"stop reminding me about the meds"* a thing
+    the extractor can express (DL-044 #6).
+
+    One call returns both kinds (DL-044 #2). Two calls would let each decide
+    independently that a sentence belonged to it, and a note that produced both
+    a claim and a schedule for the same sentence would fire *and* nag.
     """
-    response = complete(provider.LEARN, _messages(note, known, context))
-    return parse_claims(response.text, known=known)
+    response = complete(provider.LEARN, _messages(note, known, running, context))
+    return parse_answer(response.text, known=known, running=running)
 
 
 def _messages(
-    note: str, known: Sequence[Claim], context: str
+    note: str,
+    known: Sequence[Claim],
+    running: Sequence[Schedule],
+    context: str,
 ) -> list[provider.Message]:
     """The extraction prompt.
 
@@ -141,9 +210,17 @@ def _messages(
     was told null is the powerful option.
     """
     lines = [
-        "You turn a teaching note into claims to remember.",
+        "You turn a teaching note into things to remember and things to do.",
         "",
-        'Answer with JSON and nothing else: {"claims": [...]}.',
+        "Answer with JSON and nothing else:",
+        '  {"claims": [...], "schedules": [...], "cancel": [...]}',
+        "",
+        "A claim is something to bear in mind while answering.",
+        "A schedule wakes you up at a time and gives you something to do,",
+        "when nobody has said anything. Use a schedule only when the note",
+        "asks you to act on your own; a preference about mornings is a claim",
+        "with an hours trigger, not a schedule.",
+        "",
         "Each claim is an object:",
         '  "text"       what to remember, one sentence, written as an',
         "               instruction to yourself",
@@ -158,11 +235,23 @@ def _messages(
         '  {"hours": [9, 18]}        the local hour is at or after the first',
         "                            and before the second",
         "",
-        'Return {"claims": []} if the note asks you to remember nothing.',
+        "",
+        "Each schedule is an object:",
+        '  "instruction"  what to do when you wake, addressed to yourself',
+        '  "cron"         "minute hour day-of-week", where day-of-week is',
+        "                 0 for Sunday. Each field is *, a number, A-B, A,B",
+        "                 or */N. Local time.",
+        "",
+        '"cancel" is a list of ids of standing schedules to stop.',
+        "",
+        'Return empty lists if the note asks you for nothing.',
     ]
     if known:
         lines += ["", "Already remembered:"]
         lines += [f"  [{c.seq}] {c.text}" for c in known]
+    if running:
+        lines += ["", "Already scheduled:"]
+        lines += [f"  [{s.id}] {s.instruction}" for s in running]
     system = provider.system("\n".join(lines))
 
     body = f"Teaching note:\n{note}"
@@ -171,9 +260,12 @@ def _messages(
     return [system, provider.user(body)]
 
 
-def parse_claims(
-    text: str, *, known: Sequence[Claim] = ()
-) -> list[dict[str, Any]]:
+def parse_answer(
+    text: str,
+    *,
+    known: Sequence[Claim] = (),
+    running: Sequence[Schedule] = (),
+) -> Extraction:
     """Strict parse of the extraction answer. Raises :class:`NotExtracted`.
 
     The one leniency is a fenced code block, stripped before parsing, because a
@@ -181,11 +273,10 @@ def parse_claims(
     is refused: a parser that hunted for a JSON object inside prose would be
     reading a model that did not follow the format as though it had.
 
-    ``supersedes`` is checked against ``known``. An id naming no claim is
-    refused rather than dropped — :meth:`omega.derive.Learned.apply` removes
-    the superseded claim by key and silently succeeds when the key is absent,
-    so an invented id would file a claim that claims to replace something and
-    replaces nothing.
+    ``schedules`` and ``cancel`` may be absent — they are additive on an answer
+    shape that already exists — but ``claims`` may not, because the model is
+    always told to return it and an answer missing it is an answer in a
+    different format.
     """
     body = _unfence(text).strip()
     if not body:
@@ -196,7 +287,29 @@ def parse_claims(
         raise NotExtracted(f"the answer was not JSON: {exc}") from exc
     if not isinstance(parsed, dict) or "claims" not in parsed:
         raise NotExtracted('the answer had no "claims" field')
-    raw = parsed["claims"]
+    return Extraction(
+        claims=_parse_claim_list(parsed["claims"], known),
+        schedules=_parse_schedule_list(parsed.get("schedules")),
+        cancel=_parse_cancel_list(parsed.get("cancel"), running),
+    )
+
+
+def parse_claims(
+    text: str, *, known: Sequence[Claim] = ()
+) -> list[dict[str, Any]]:
+    """The claims of :func:`parse_answer`, for callers that want only those."""
+    return parse_answer(text, known=known).claims
+
+
+def _parse_claim_list(
+    raw: Any, known: Sequence[Claim]
+) -> list[dict[str, Any]]:
+    """``supersedes`` is checked against ``known``. An id naming no claim is
+    refused rather than dropped — :meth:`omega.derive.Learned.apply` removes
+    the superseded claim by key and silently succeeds when the key is absent,
+    so an invented id would file a claim that claims to replace something and
+    replaces nothing.
+    """
     if not isinstance(raw, list):
         raise NotExtracted('"claims" was not a list')
     if len(raw) > MAX_CLAIMS_PER_NOTE:
@@ -246,6 +359,82 @@ def parse_claims(
                 "supersedes": supersedes,
             }
         )
+    return out
+
+
+def _parse_schedule_list(raw: Any) -> list[dict[str, Any]]:
+    """Validate proposed schedules, including that the expression parses.
+
+    DL-044 #5: a cron expression is wrong in a way nothing downstream notices,
+    so it is checked here rather than quarantined at fold time. DL-035 accepted
+    fold-time quarantine because episodes can predate the parser; that is not a
+    licence to write one we already know is broken while the person is present
+    to be told.
+
+    Only ``cron`` is accepted, never ``every`` (DL-044 #7). Cron's resolution is
+    one minute and `Scheduler._slot_for` requires a strictly newer slot, so the
+    busiest expression this path can write fires once a minute — which is
+    exactly `episodes.MIN_EVERY_SECONDS`. The floor on the new path is the
+    grammar rather than a second check that could drift from the first.
+    """
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise NotExtracted('"schedules" was not a list')
+    if len(raw) > MAX_SCHEDULES_PER_NOTE:
+        raise NotExtracted(
+            f"{len(raw)} schedules from one note, over the limit of "
+            f"{MAX_SCHEDULES_PER_NOTE}"
+        )
+    out: list[dict[str, Any]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            raise NotExtracted("a schedule was not an object")
+        instruction = item.get("instruction")
+        if not isinstance(instruction, str) or not instruction.strip():
+            raise NotExtracted("a schedule had no instruction")
+        if len(instruction) > MAX_INSTRUCTION_CHARS:
+            raise NotExtracted(
+                f"a schedule instruction was {len(instruction)} characters, "
+                f"over the limit of {MAX_INSTRUCTION_CHARS}"
+            )
+        cron = item.get("cron")
+        if not isinstance(cron, str) or not cron.strip():
+            raise NotExtracted("a schedule had no cron expression")
+        try:
+            scheduling.validate_cron(cron)
+        except scheduling.CronError as exc:
+            raise NotExtracted(f"a schedule's timing was unusable: {exc}") from exc
+        out.append({"instruction": instruction.strip(), "cron": cron.strip()})
+    return out
+
+
+def _parse_cancel_list(raw: Any, running: Sequence[Schedule]) -> list[str]:
+    """An id naming nothing standing is refused, for DL-043 #6's reason.
+
+    :meth:`omega.schedule.Scheduler._observe` pops on cancel with a default, so
+    cancelling something that is not running succeeds silently — and the
+    receipt would then tell the person a reminder had stopped while it went on
+    firing. That is the one failure this whole path exists to avoid, arriving
+    from the other direction.
+    """
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise NotExtracted('"cancel" was not a list')
+    live = {s.id for s in running}
+    out: list[str] = []
+    for item in raw:
+        if not isinstance(item, str) or not item.strip():
+            raise NotExtracted("a cancel id was not a string")
+        sid = item.strip()
+        if sid not in live:
+            raise NotExtracted(
+                f"asked to stop {sid!r}, which is not something omega has "
+                f"scheduled"
+            )
+        if sid not in out:
+            out.append(sid)
     return out
 
 
@@ -314,6 +503,77 @@ def file_claims(
     return written
 
 
+def schedule_id(source_seq: int, index: int) -> str:
+    """The id for the ``index``-th schedule taught by episode ``source_seq``.
+
+    Derived rather than chosen, because ids are the handle by which a standing
+    intention is cancelled and :meth:`omega.schedule.Scheduler._observe`
+    redefines by id without complaint. A model free to name its own would reach
+    for the same obvious word twice across two notes and silently replace one
+    reminder with another; deriving from the teaching episode makes collision
+    impossible without anyone having to be careful.
+    """
+    return f"s{source_seq}-{index}"
+
+
+def file_schedules(
+    queue: Any,
+    schedules: Sequence[dict[str, Any]],
+    *,
+    source_seq: int,
+    at: Optional[str] = None,
+) -> list[Schedule]:
+    """Append each schedule definition and return what was written, in order.
+
+    No write key, for :func:`file_claims`' reason. Cron only, so the ``every``
+    field of the episode stays what it was — a programmatic spelling, not
+    something a sentence can reach.
+    """
+    written: list[Schedule] = []
+    for index, item in enumerate(schedules):
+        sid = schedule_id(source_seq, index)
+        payload = episodes.schedule_created(
+            id=sid,
+            instruction=item["instruction"],
+            cron=item["cron"],
+            at=at,
+        )
+        queue.append(payload)
+        written.append(
+            Schedule(
+                id=sid,
+                instruction=item["instruction"],
+                created_at=datetime.fromisoformat(payload["at"]),
+                cron=item["cron"],
+            )
+        )
+    return written
+
+
+def cancel_schedules(
+    queue: Any,
+    ids: Sequence[str],
+    *,
+    running: Sequence[Schedule] = (),
+    at: Optional[str] = None,
+) -> list[Schedule]:
+    """Retire each schedule and return the definitions that were stopped.
+
+    Returns the *definitions* rather than the ids so the receipt can say what
+    stopped in the person's words. Telling someone ``s41-0`` has been cancelled
+    is a confirmation they cannot check, which is the same defect as a
+    done-marker wearing different clothes.
+    """
+    by_id = {s.id: s for s in running}
+    stopped: list[Schedule] = []
+    for sid in ids:
+        queue.append(episodes.schedule_cancelled(id=sid, at=at))
+        existing = by_id.get(sid)
+        if existing is not None:
+            stopped.append(existing)
+    return stopped
+
+
 # --- the receipt ------------------------------------------------------------
 
 
@@ -321,6 +581,8 @@ def receipt(
     written: Sequence[Claim],
     *,
     known: Sequence[Claim] = (),
+    scheduled: Sequence[Schedule] = (),
+    stopped: Sequence[Schedule] = (),
     error: Optional[str] = None,
 ) -> str:
     """What to append to the reply so the person can check the record.
@@ -341,17 +603,52 @@ def receipt(
             f"I could not write that down — {error}. Nothing was recorded, so "
             f"tell me again if it matters."
         )
-    if not written:
+    if not (written or scheduled or stopped):
         return "I did not find anything to remember in that, so nothing was recorded."
 
     by_seq = {c.seq: c for c in known}
-    lines = ["I wrote this down:"]
-    for claim in written:
-        lines.append(f"- {claim.text} ({when_phrase(claim.trigger)})")
-        replaced = by_seq.get(claim.supersedes) if claim.supersedes else None
-        if replaced is not None:
-            lines.append(f"  replaces what you told me before: {replaced.text}")
+    lines: list[str] = []
+    if written:
+        lines.append("I wrote this down:")
+        for claim in written:
+            lines.append(f"- {claim.text} ({when_phrase(claim.trigger)})")
+            replaced = by_seq.get(claim.supersedes) if claim.supersedes else None
+            if replaced is not None:
+                lines.append(f"  replaces what you told me before: {replaced.text}")
+    if scheduled:
+        if lines:
+            lines.append("")
+        lines.append("I will wake up and do this:")
+        for item in scheduled:
+            # Rendered from the stored expression, not from the note (DL-044
+            # #5). `0 9 *` and `9 0 *` are both valid and only one of them is
+            # nine in the morning, so the phrasing has to come from the thing
+            # the clock will actually read.
+            lines.append(
+                f"- {item.instruction} ({_cron_phrase(item.cron)}) [{item.id}]"
+            )
+    if stopped:
+        if lines:
+            lines.append("")
+        lines.append("I stopped this:")
+        lines += [f"- {item.instruction}" for item in stopped]
     return "\n".join(lines)
+
+
+def _cron_phrase(cron: Optional[str]) -> str:
+    """The expression in words, degrading to the expression itself.
+
+    A schedule written by this module has already parsed, so the fallback is
+    unreachable from :func:`file_schedules` — it exists because the receipt must
+    never be the thing that raises. Losing the plain-English phrasing costs the
+    person some clarity; losing the reply costs them the whole turn.
+    """
+    if not cron:
+        return "on a timer"
+    try:
+        return scheduling.describe_cron(cron)
+    except scheduling.CronError:
+        return cron
 
 
 def when_phrase(trigger: Optional[dict[str, Any]]) -> str:

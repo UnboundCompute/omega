@@ -46,6 +46,8 @@ __all__ = [
     "CronError",
     "cron_matches",
     "previous_match",
+    "validate_cron",
+    "describe_cron",
     "LATE_AFTER_SECONDS",
     "CATCH_UP_HORIZON_MINUTES",
     "TICK_SECONDS",
@@ -165,6 +167,77 @@ def previous_match(
             return cursor
         cursor -= timedelta(minutes=1)
     return None
+
+
+def validate_cron(cron: str) -> None:
+    """Raise :class:`CronError` unless ``cron`` is an expression we can match.
+
+    The parser is private because nothing outside needs its *output*; this
+    exists because something outside does need its *verdict*. DL-044 writes
+    schedules from a model's proposal, and DL-035's fold-time quarantine was
+    accepted for episodes that predate the parser — not as a licence to write an
+    expression we already know is broken while the person is standing there to
+    be told.
+    """
+    _parse_cron(cron)
+
+
+#: Crontab's own numbering, which :func:`cron_matches` converts into.
+_DAY_NAMES = (
+    "Sunday",
+    "Monday",
+    "Tuesday",
+    "Wednesday",
+    "Thursday",
+    "Friday",
+    "Saturday",
+)
+
+#: Past this many distinct firing times in a day, :func:`describe_cron` counts
+#: instead of listing. A receipt is read, and a sentence naming eleven times is
+#: not read — it is skipped, which makes it a worse check than a count.
+_MAX_TIMES_LISTED = 4
+
+
+def describe_cron(cron: str) -> str:
+    """The expression in plain words, for the receipt (DL-044 #5).
+
+    Rendered from the expression that will be *stored*, so the person is
+    checking the thing the clock will run rather than a second description of
+    it. This matters more than the equivalent phrasing for a claim trigger:
+    ``0 9 *`` and ``9 0 *`` are both valid, only one of them is nine in the
+    morning, and nothing downstream will ever notice the difference.
+    """
+    minutes, hours, days = _parse_cron(cron)
+    times = _times_phrase(minutes, hours)
+    if len(hours) == 24 and len(days) == 7:
+        # "every minute every day" and "past every hour every day" both say the
+        # same thing twice. The day phrase earns its place only when it narrows
+        # something — "past every hour on weekdays" does.
+        return times
+    return f"{times} {_days_phrase(days)}"
+
+
+def _days_phrase(days: frozenset[int]) -> str:
+    if len(days) == 7:
+        return "every day"
+    if days == frozenset({1, 2, 3, 4, 5}):
+        return "on weekdays"
+    if days == frozenset({0, 6}):
+        return "at weekends"
+    return "on " + ", ".join(_DAY_NAMES[d] for d in sorted(days))
+
+
+def _times_phrase(minutes: frozenset[int], hours: frozenset[int]) -> str:
+    if len(hours) == 24:
+        if len(minutes) == 60:
+            return "every minute"
+        at = " and ".join(f":{m:02d}" for m in sorted(minutes))
+        return f"at {at} past every hour"
+    times = [f"{h}:{m:02d}" for h in sorted(hours) for m in sorted(minutes)]
+    if len(times) > _MAX_TIMES_LISTED:
+        return f"{len(times)} times"
+    return "at " + " and ".join(times)
 
 
 @dataclass(frozen=True)

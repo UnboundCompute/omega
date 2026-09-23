@@ -32,7 +32,7 @@ import base64
 from dataclasses import dataclass
 from typing import Any, Callable, Optional, Sequence
 
-from omega import blobs, derive, episodes, learn, provider
+from omega import blobs, derive, episodes, learn, provider, schedule
 from omega.queue import EVENT_KINDS, EventQueue, Pending
 
 __all__ = [
@@ -405,6 +405,7 @@ def _teach(
     pending: Pending,
     *,
     known: Sequence[derive.Claim],
+    running: Sequence[schedule.Schedule],
     at: Optional[str],
 ) -> Optional[str]:
     """Extract a teach drop and return its receipt, or ``None`` if it was not one.
@@ -432,19 +433,35 @@ def _teach(
     )
     try:
         extracted = learn.extract(
-            ctx.complete, note=note, known=known, context=context
+            ctx.complete,
+            note=note,
+            known=known,
+            running=running,
+            context=context,
+        )
+        # Cancels first: a note that retires one reminder and sets another in
+        # its place should not leave both standing for the width of this
+        # window, because a crash inside it would leave the old one firing
+        # forever beside the new one.
+        stopped = learn.cancel_schedules(
+            ctx.queue, extracted.cancel, running=running, at=at
         )
         written = learn.file_claims(
             ctx.queue,
-            extracted,
+            extracted.claims,
             for_seq=pending.seq,
             source_seq=pending.seq,
             at=at,
         )
+        scheduled = learn.file_schedules(
+            ctx.queue, extracted.schedules, source_seq=pending.seq, at=at
+        )
     except Exception as exc:  # noqa: BLE001 - see the docstring
         reason = str(exc) or type(exc).__name__
         return learn.receipt((), error=reason)
-    return learn.receipt(written, known=known)
+    return learn.receipt(
+        written, known=known, scheduled=scheduled, stopped=stopped
+    )
 
 
 def run_turn(
@@ -457,6 +474,7 @@ def run_turn(
     open_work: Sequence[derive.OpenBlock] = (),
     learned: Sequence[derive.Claim] = (),
     known: Sequence[derive.Claim] = (),
+    running: Sequence[schedule.Schedule] = (),
     at: Optional[str] = None,
 ) -> TurnResult:
     """Run one turn over an already-claimed episode and record how it ended.
@@ -556,7 +574,7 @@ def run_turn(
     # a receipt with; before `write_memory` because `claim.extracted` is not
     # projected (DL-042), so the receipt has nowhere to ride but the one reply
     # this turn is about to record.
-    receipt = _teach(ctx, pending, known=known, at=at)
+    receipt = _teach(ctx, pending, known=known, running=running, at=at)
 
     if text is None and receipt is None:
         # Silence. A success, recorded as one, with `reply` null rather than
