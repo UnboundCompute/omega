@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import pytest
 
-from omega import episodes, provider
+from omega import episodes, provider, turn
 from omega.memory import MemoryStore, WriteKeyConflict
 from omega.queue import EventQueue
 from omega.turn import (
@@ -511,3 +511,172 @@ def test_a_verdict_keeps_the_raw_answer_it_was_parsed_from() -> None:
     v = parse_verdict("SILENT - nothing worth saying")
     assert v == Verdict(choice=STAY_SILENT, raw="SILENT - nothing worth saying")
     assert v.speaks is False
+
+
+# --- context budgets: a count is not a budget (DL-039) -----------------------
+
+
+def _prompt(q: EventQueue, pending) -> str:
+    """The judge's user message, as text. The judge rather than act or reply
+    because it fires on *every* event including every clock tick, so it is
+    where an unbounded transcript costs the most."""
+    ctx = TurnContext(
+        seq=pending.seq,
+        event=pending.payload,
+        recalled=recall(q, before=pending.seq),
+        queue=q,
+        complete=lambda *a, **k: None,
+    )
+    message = turn._judge_messages(ctx)[-1]
+    content = message["content"]
+    return content if isinstance(content, str) else content[0]["text"]
+
+
+def test_an_ordinary_conversation_is_not_elided_at_all(q):
+    """The cap must be invisible in normal use. A budget that fires on a
+    two-sentence message would teach the model that every line is truncated,
+    which is worse than the problem it was added to solve."""
+    for i in range(5):
+        seq = q.append(episodes.inbound(f"message {i}", channel="tray", at=AT))
+        q.claim(seq)
+        q.append(episodes.completed(for_seq=seq, outcome="spoke", reply=f"reply {i}", at=AT))
+        q.finish(seq)
+    text = _prompt(q, put(q))
+    assert "not shown here" not in text
+    assert "message 0" in text and "reply 4" in text
+
+
+def test_one_pasted_document_does_not_ride_along_on_every_later_turn(q):
+    """The measured defect. A 100 KB paste rendered in full into every later
+    prompt — ~27k tokens, re-sent up to forty times, including into every
+    unattended clock tick."""
+    paste = "lorem ipsum dolor sit amet " * 4000
+    seq = q.append(episodes.inbound(paste, channel="tray", at=AT))
+    q.claim(seq)
+    q.append(episodes.completed(for_seq=seq, outcome="spoke", reply="noted", at=AT))
+    q.finish(seq)
+
+    text = _prompt(q, put(q))
+    assert len(text) < 10_000, f"transcript is {len(text):,} chars"
+    assert "not shown here" in text
+
+
+def test_an_elision_says_how_much_is_missing_and_where_to_find_it(q):
+    """An elision that reads like the end of the sentence teaches the model the
+    person stopped mid-thought. Naming the seq keeps this a bounded *view* of a
+    complete record — something omega can be asked to go and fetch."""
+    seq = q.append(episodes.inbound("x" * 50_000, channel="tray", at=AT))
+    q.claim(seq)
+    q.append(episodes.completed(for_seq=seq, outcome="spoke", reply="ok", at=AT))
+    q.finish(seq)
+
+    text = _prompt(q, put(q))
+    assert f"at seq {seq} in the log" in text
+    assert "more characters not shown here" in text
+
+
+def test_the_full_text_is_still_in_the_log_after_it_is_elided(q):
+    """*Grade the world.* The budget bounds a derived view; it must not touch
+    the record. If this ever fails, elision has become deletion."""
+    paste = "y" * 50_000
+    seq = q.append(episodes.inbound(paste, channel="tray", at=AT))
+    q.claim(seq)
+    q.append(episodes.completed(for_seq=seq, outcome="spoke", reply="ok", at=AT))
+    q.finish(seq)
+
+    _prompt(q, put(q))
+    assert q.at(seq).payload["text"] == paste
+
+
+def test_the_new_event_keeps_a_far_looser_budget_than_recall(q):
+    """Cutting the new event is cutting the question. A 10 KB message is
+    history-sized when recalled and subject-sized when it is what was just
+    asked, and one budget for both would have to be wrong for one of them."""
+    message = "z" * 10_000
+    pending = q.at(q.append(episodes.inbound(message, channel="tray", at=AT)))
+    q.claim(pending.seq)
+    text = _prompt(q, q.at(pending.seq))
+    new_event = text.split("New event:\n", 1)[1]
+    assert message in new_event
+
+    # The same message, now history: cut.
+    q.append(
+        episodes.completed(
+            for_seq=pending.seq, outcome="spoke", reply="ok", at=AT
+        )
+    )
+    q.finish(pending.seq)
+    history = _prompt(q, put(q)).split("New event:", 1)[0]
+    assert message not in history
+    assert "not shown here" in history
+
+
+def test_a_message_too_large_even_for_the_new_event_budget_is_cut(q):
+    """The looser budget is still a budget. One pasted book should cost a
+    degraded turn, not a failed request."""
+    pending = q.at(q.append(episodes.inbound("q" * 200_000, channel="tray", at=AT)))
+    q.claim(pending.seq)
+    text = _prompt(q, q.at(pending.seq))
+    assert len(text) < turn.MAX_NEW_EVENT_CHARS + 5_000
+    assert "not shown here" in text
+
+
+def test_many_medium_lines_are_bounded_by_the_transcript_budget(q):
+    """The shape a per-line cap alone misses: forty lines each just under it.
+    Without the transcript budget this is ~40 x 2,000 chars of context that no
+    single line is responsible for."""
+    for i in range(turn.RECALL_N):
+        seq = q.append(
+            episodes.inbound(f"{i} " + "w" * 1_900, channel="tray", at=AT)
+        )
+        q.claim(seq)
+        q.append(episodes.completed(for_seq=seq, outcome="spoke", reply="ok", at=AT))
+        q.finish(seq)
+
+    history = _prompt(q, put(q)).split("New event:", 1)[0]
+    assert len(history) < turn.MAX_RECALL_CHARS + 2_000, f"{len(history):,} chars"
+
+
+def test_dropping_oldest_lines_is_announced_and_never_silent(q):
+    """A window that silently got shorter is a model answering "you never
+    mentioned that" — right about its context and wrong about the conversation."""
+    for i in range(turn.RECALL_N):
+        seq = q.append(
+            episodes.inbound(f"{i} " + "v" * 1_900, channel="tray", at=AT)
+        )
+        q.claim(seq)
+        q.append(episodes.completed(for_seq=seq, outcome="spoke", reply="ok", at=AT))
+        q.finish(seq)
+
+    history = _prompt(q, put(q)).split("New event:", 1)[0]
+    assert "earlier event(s) not shown here" in history
+
+
+def test_the_newest_lines_survive_when_the_budget_bites(q):
+    """When something has to go it is the least recent thing, because that is
+    the one whose absence is least likely to be the answer."""
+    for i in range(turn.RECALL_N):
+        seq = q.append(
+            episodes.inbound(f"marker{i} " + "u" * 1_900, channel="tray", at=AT)
+        )
+        q.claim(seq)
+        q.append(episodes.completed(for_seq=seq, outcome="spoke", reply="ok", at=AT))
+        q.finish(seq)
+
+    history = _prompt(q, put(q)).split("New event:", 1)[0]
+    assert f"marker{turn.RECALL_N - 1}" in history
+    assert "marker0" not in history
+
+
+def test_elide_leaves_a_line_at_its_budget_plus_only_the_note():
+    """Fail closed on the cap itself: a cap that can be exceeded by the note it
+    adds is not a cap."""
+    line = "a" * 10_000
+    out = turn._elide(line, 100, at=7)
+    assert out.startswith("a" * 100)
+    assert len(out) < 100 + 120
+    assert "at seq 7 in the log" in out
+
+
+def test_elide_does_not_touch_a_line_already_within_budget():
+    assert turn._elide("short", 100, at=1) == "short"

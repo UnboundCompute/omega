@@ -41,6 +41,9 @@ __all__ = [
     "STAY_SILENT",
     "VERDICTS",
     "RECALL_N",
+    "MAX_EVENT_CHARS",
+    "MAX_NEW_EVENT_CHARS",
+    "MAX_RECALL_CHARS",
     "MAX_ACT_PASSES",
     "JudgeUndecided",
     "NotAnEvent",
@@ -69,6 +72,30 @@ VERDICTS = frozenset({SPEAK, ACT_THEN_SPEAK, STAY_SILENT})
 #: recovered for a quality that can. **N is a labelled guess**, tuned in M3
 #: against the corpus M1 is here to start.
 RECALL_N = 40
+
+#: **A count is not a budget** (DL-039). ``RECALL_N`` bounds how many episodes
+#: come back, which was mistaken for bounding how much *context* they cost.
+#: One pasted document renders in full, on every later turn, into every role's
+#: prompt — including the judge, which now fires on every clock tick with
+#: nobody watching. Measured: a single 100 KB paste is ~27k tokens re-sent
+#: forty times.
+#:
+#: Two budgets, because history and the live message answer different
+#: questions. A recalled line is *context* — enough to know the thing was said
+#: and roughly what it was. The new event is the *subject*, and cutting it is
+#: cutting the thing omega was asked about, so its budget is far looser and it
+#: exists only to stop one paste taking the whole turn down.
+#:
+#: Guesses, labelled as such, and cheap to change: nothing is lost by cutting
+#: too hard, because the log keeps the original and the elision note says where.
+MAX_EVENT_CHARS = 2_000
+MAX_NEW_EVENT_CHARS = 32_000
+
+#: The whole recalled transcript, after per-line elision. Backstop for the
+#: shape per-line caps miss: forty lines each just under the line cap. Reached
+#: oldest-first, because when something has to go the least recent thing is the
+#: one whose absence is least likely to be the answer.
+MAX_RECALL_CHARS = 24_000
 
 #: §2.3 — a fixed cap on `act` passes. Not an answer to "where does the stop
 #: threshold sit"; a floor that makes the question answerable with real stalls
@@ -541,9 +568,14 @@ def _event_turn(
     to route; `act` and `reply` pass true because they are the roles expected
     to answer about it.
     """
+    # The new event gets its own, far looser budget (DL-039): it is the thing
+    # omega was asked about, so cutting it is cutting the question. It is
+    # bounded at all only because one pasted document should cost a degraded
+    # turn rather than a failed request.
+    event = _elide(_render_event(ctx.event), MAX_NEW_EVENT_CHARS)
     text = (
         f"Recent history:\n{_transcript(ctx.recalled)}\n\n"
-        f"New event:\n{_render_event(ctx.event)}{suffix}"
+        f"New event:\n{event}{suffix}"
     )
     parts = _image_parts(ctx) if images else []
     if not parts:
@@ -576,9 +608,60 @@ def _transcript(recalled: Sequence[Pending]) -> str:
     something the person typed — asked "which number did I talk about", it
     answered with the range of its own recall window. The new event is rendered
     unlabelled too, so history and the live line look alike.
+
+    Both budgets live here rather than in the renderer's callers because this
+    is the only place that sees the *whole* window; a per-line cap alone misses
+    forty lines each just under it (DL-039).
     """
-    lines = [_render_event(p.payload) for p in recalled]
+    lines = [
+        _elide(_render_event(p.payload), MAX_EVENT_CHARS, at=p.seq)
+        for p in recalled
+    ]
+    lines = _within(lines, MAX_RECALL_CHARS)
     return "\n".join(lines) if lines else "(nothing yet)"
+
+
+def _within(lines: list[str], budget: int) -> list[str]:
+    """Drop whole lines, oldest first, until the transcript fits.
+
+    Dropping *whole* lines rather than shaving every line proportionally: a
+    transcript of forty half-sentences is worse than one of twenty sentences,
+    and the second at least leaves what survives intelligible.
+
+    The drop is **announced**. A window that silently got shorter is the shape
+    of a model confidently answering "you never mentioned that" — and it would
+    be right about its context and wrong about the conversation, which is the
+    worst combination available.
+    """
+    total = sum(len(line) + 1 for line in lines)
+    if total <= budget:
+        return lines
+    dropped = 0
+    while lines and total > budget:
+        total -= len(lines[0]) + 1
+        lines.pop(0)
+        dropped += 1
+    return [
+        f"[{dropped} earlier event(s) not shown here — they are in the log]",
+        *lines,
+    ]
+
+
+def _elide(line: str, budget: int, *, at: Optional[int] = None) -> str:
+    """Cut a rendered line to ``budget``, saying so and saying where.
+
+    The note is the whole point. An elision that reads like the end of the
+    sentence teaches the model the person stopped talking mid-thought; one that
+    names the log position is a thing omega can be asked to go and fetch, which
+    keeps this a *bounded view* of a complete record rather than a lossy one.
+    """
+    if len(line) <= budget:
+        return line
+    where = f", at seq {at} in the log" if at is not None else ", in the log"
+    return (
+        f"{line[:budget]}… "
+        f"[{len(line) - budget:,} more characters not shown here{where}]"
+    )
 
 
 def _render_event(payload: dict[str, Any]) -> str:
