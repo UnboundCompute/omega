@@ -372,6 +372,50 @@ mod tests {
         assert!(!PathBuf::from(tmp).exists());
     }
 
+    /// `clear_stale_temp` is hygiene rather than correctness — nothing reads
+    /// the `.tmp` sidecar — and that is exactly why nothing exercised it: it
+    /// was the one surviving mutant of sixteen in a mutation sweep. A function
+    /// no test can fail is not a rule, so this opens a log with a stale temp
+    /// beside it and asserts the file is gone afterwards.
+    ///
+    /// Driven through `Log::open` on purpose, so both the body and its one
+    /// call site are covered: emptying the body and deleting the call are the
+    /// same defect from a caller's point of view.
+    #[test]
+    fn a_stale_temp_sidecar_is_cleared_when_the_log_opens() {
+        use crate::log::Log;
+
+        let d = TempDir::new("ckpt_stale_tmp");
+        let p = log_path(&d);
+        {
+            let mut log = Log::open(&p).unwrap();
+            log.append(b"episode", "", 1).unwrap();
+            log.set_checkpoint("graph", 1).unwrap();
+        }
+
+        // What a crash between write-temp and rename leaves behind.
+        let mut tmp = sidecar_path(&p).into_os_string();
+        tmp.push(".tmp");
+        let tmp = PathBuf::from(tmp);
+        fs::write(&tmp, b"half-written checkpoint").unwrap();
+        assert!(tmp.exists(), "the stale temp must exist before the open");
+
+        let log = Log::open(&p).unwrap();
+        assert!(!tmp.exists(), "opening the log must clear the stale temp");
+        // Clearing it must not disturb the sidecar it was a draft of, nor the
+        // log: this is the difference between hygiene and data loss.
+        assert_eq!(log.checkpoint("graph"), 1);
+        assert_eq!(log.head(), 1);
+        drop(log);
+
+        // And it is idempotent: removing a file that is not there is an error
+        // this deliberately ignores, so a second open is a no-op.
+        clear_stale_temp(&p);
+        let log = Log::open(&p).unwrap();
+        assert!(!tmp.exists());
+        assert_eq!(log.checkpoint("graph"), 1);
+    }
+
     #[test]
     fn corrupt_sidecar_is_rejected() {
         let d = TempDir::new("ckpt_corrupt");
