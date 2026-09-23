@@ -518,30 +518,36 @@ def _reply_messages(ctx: TurnContext, acted: ActResult) -> list[provider.Message
 def _transcript(recalled: Sequence[Pending]) -> str:
     """Recall rendered newest-last. Records the loop wrote are included: a turn
     that stayed silent is part of the history, and hiding it would make the
-    model re-decide the same event without knowing it already answered."""
-    lines = [_render_event(p.payload, seq=p.seq) for p in recalled]
+    model re-decide the same event without knowing it already answered.
+
+    Nothing labels the lines. Ordering is what line order already says, and a
+    seq number in the margin is scaffolding the model cannot tell apart from
+    something the person typed — asked "which number did I talk about", it
+    answered with the range of its own recall window. The new event is rendered
+    unlabelled too, so history and the live line look alike.
+    """
+    lines = [_render_event(p.payload) for p in recalled]
     return "\n".join(lines) if lines else "(nothing yet)"
 
 
-def _render_event(payload: dict[str, Any], *, seq: Optional[int] = None) -> str:
-    prefix = f"[{seq}] " if seq is not None else ""
+def _render_event(payload: dict[str, Any]) -> str:
     kind = payload.get("kind")
     if kind == episodes.MESSAGE_INBOUND:
-        return f"{prefix}you: {payload.get('text', '')}"
+        return f"you: {payload.get('text', '')}"
     if kind == episodes.TURN_COMPLETED:
         outcome = payload.get("outcome")
         if outcome == "silent":
-            return f"{prefix}omega: (stayed silent)"
+            return "omega: (stayed silent)"
         if outcome == "failed":
-            return f"{prefix}omega: (turn failed: {payload.get('error')})"
-        return f"{prefix}omega: {payload.get('reply', '')}"
+            return f"omega: (turn failed: {payload.get('error')})"
+        return f"omega: {payload.get('reply', '')}"
     if kind == episodes.TURN_BLOCKED:
-        return f"{prefix}omega asked: {payload.get('needs', '')}"
+        return f"omega asked: {payload.get('needs', '')}"
     if kind == episodes.WORK_FINISHED:
-        return f"{prefix}work finished: {payload.get('summary', '')}"
+        return f"work finished: {payload.get('summary', '')}"
     if kind == episodes.TOOL_CALLED:
-        return f"{prefix}tool {payload.get('tool')} called"
+        return f"tool {payload.get('tool')} called"
     if kind == episodes.TOOL_RETURNED:
         ok = "ok" if payload.get("ok") else f"failed: {payload.get('error')}"
-        return f"{prefix}tool {payload.get('tool')} {ok}"
-    return f"{prefix}{kind}"
+        return f"tool {payload.get('tool')} {ok}"
+    return str(kind)
