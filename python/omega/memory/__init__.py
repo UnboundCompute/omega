@@ -213,10 +213,25 @@ class MemoryStore:
         rather than a guess, and the **file** form creates nothing at all,
         because there the caller named a file and not the directory holding it
         (case 23).
+
+        A **broken symlink** in the directory position raises ``ValueError``
+        naming the path and its target, and creates nothing. ``exists()``
+        follows symlinks, so a dangling link reads as "not there" while the
+        name is in fact taken — the create behind it used to fail with a bare
+        ``FileExistsError`` that named neither the link nor the reason.
+        Resolving the link instead would put the store somewhere the caller
+        never named, and silently repairing it would destroy someone's
+        intent, so this fails closed and says what is wrong.
         """
         log_path = cls.log_path_for(path)
         store_dir = Path(os.fspath(path))
         if log_path != store_dir and not store_dir.exists():
+            if store_dir.is_symlink():
+                raise ValueError(
+                    f"store path {str(store_dir)!r} is a symlink to "
+                    f"{os.readlink(store_dir)!r}, which does not exist; "
+                    "point it at a directory or remove it"
+                )
             store_dir.mkdir(parents=False, exist_ok=True)
         return cls(_log.Log(log_path))
 

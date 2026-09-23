@@ -300,3 +300,49 @@ def test_case_23_missing_parent_directory(tmp_path: Path) -> None:
     assert str(exc.value)
     assert not missing.exists()
     assert not missing.parent.exists()
+
+
+def test_case_23_broken_symlink_in_the_directory_position(tmp_path: Path) -> None:
+    """Case 23 — a dangling symlink where the store goes is refused by name.
+
+    ``Path.exists()`` follows symlinks, so a broken link reads as "nothing is
+    there" while the name is in fact taken. The create behind it then failed
+    with a bare ``FileExistsError`` naming neither the link nor the reason.
+    The rule is ValueError — the declared type for an argument that cannot
+    mean anything — and nothing on disk is touched either way.
+    """
+    store = tmp_path / "store"
+    target = tmp_path / "nowhere"
+    os.symlink(target, store)
+    assert store.is_symlink() and not store.exists()
+
+    with pytest.raises(ValueError) as exc:
+        MemoryStore.open(store)
+    message = str(exc.value)
+    assert str(store) in message, message
+    assert "nowhere" in message, message
+    assert not isinstance(exc.value, OSError), "a bare OS error is what we replaced"
+
+    # Nothing was created, resolved or repaired: the link is still a link to
+    # the same missing target, and no store was built at either end of it.
+    assert store.is_symlink()
+    assert os.readlink(store) == str(target)
+    assert not target.exists()
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["store"]
+
+
+def test_case_23_a_symlink_to_a_real_directory_still_opens(tmp_path: Path) -> None:
+    """Case 23 — and the rule is about *broken* links, not about links.
+
+    A symlink pointing at a directory that exists is an ordinary store path.
+    Refusing it would be a new prohibition the spec never asked for, so this
+    is the control that keeps the fix above narrow.
+    """
+    real = tmp_path / "real"
+    real.mkdir()
+    store = tmp_path / "store"
+    os.symlink(real, store)
+
+    with MemoryStore.open(store) as opened:
+        assert opened.append_episode(b"through the link", "", 1) == 1
+    assert (real / "episodes.log").exists()
