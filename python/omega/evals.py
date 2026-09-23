@@ -163,6 +163,14 @@ class Observed:
     #: Why :attr:`same_speaker` is what it is — including the reason it is
     #: ``None``, which is the case worth being able to read.
     judge_why: str = ""
+    #: The two texts the judge was actually shown, when it was shown any.
+    #:
+    #: Kept because a verdict without its evidence cannot be error-analysed, and
+    #: a judged sweep costs money and network to produce (DL-047). Recorded on
+    #: the *undetermined* paths as well as the failing one: order-disagreement
+    #: is the case most worth reading, and it is the first thing a record of
+    #: pass/fail alone throws away.
+    judged_pair: Optional[tuple[str, str]] = None
 
     def terminal(self) -> Optional[projection.Update]:
         """The last turn's terminal record, or ``None`` if no turn finished."""
@@ -562,6 +570,10 @@ def judged(
                 f"any verdict would be read out of evidence that has none"
             ),
         )
+    # From here on the pair is recorded whatever happens, because every
+    # remaining path produces a verdict *about these two texts* and a verdict
+    # without its evidence cannot be error-analysed (DL-047).
+    observed = replace(observed, judged_pair=(texts[0], texts[1]))
     fit = calibration(complete)
     if not fit.ok:
         return replace(observed, judge_why=f"judge not calibrated: {fit.why}")
@@ -737,6 +749,33 @@ def select(scenarios: Sequence[Scenario], patterns: Sequence[str]) -> list[Scena
     ]
 
 
+#: How much of each judged reply the report prints before pointing at the log.
+#: Generous: the whole reason these lines exist is to be *read*, and a voice
+#: judgement cut off at one line is the evidence the sweep was supposed to
+#: return. The full text is in the store either way.
+MAX_EVIDENCE_CHARS = 600
+
+
+def _evidence(o: Outcome) -> list[str]:
+    """What a failed repetition leaves you to work with (DL-047).
+
+    A sweep that spends money and network must hand back something to read, not
+    only a verdict. The store path goes first because it is the complete record
+    and costs one line; the judged pair follows because a voice verdict is
+    unreadable without the two texts it was a verdict *about*.
+    """
+    pad = f"{'':<34}  "
+    lines = [f"{pad}log: {o.observed.store}"]
+    pair = o.observed.judged_pair
+    if pair is not None:
+        for label, text in zip(("A", "B"), pair):
+            body = " ".join(text.split())
+            if len(body) > MAX_EVIDENCE_CHARS:
+                body = f"{body[:MAX_EVIDENCE_CHARS]}… (+{len(body) - MAX_EVIDENCE_CHARS})"
+            lines.append(f"{pad}judged {label}: {body}")
+    return lines
+
+
 def report(results: Sequence[Result]) -> str:
     """The scoreboard, written so a bad number cannot read as a good one."""
     lines = ["", f"{'scenario':<34} {'pass^k':>8}  {'viol':>4}  {'undet':>5}  {'avg s':>6}"]
@@ -755,6 +794,7 @@ def report(results: Sequence[Result]) -> str:
                     lines.append(f"{'':<34}  run {i}: {o.capability.why}")
                 if o.violation.verdict != PASS:
                     lines.append(f"{'':<34}  run {i}: VIOLATION {o.violation.why}")
+                lines += _evidence(o)
 
     reliable = sum(1 for r in results if r.reliable)
     violations = sum(r.violations for r in results)

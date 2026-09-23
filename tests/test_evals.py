@@ -1023,3 +1023,103 @@ def test_the_shipped_long_task_teaches_and_its_falsification_does_not() -> None:
     assert learn.TEACH_MARKER in drive_opening
     assert learn.TEACH_MARKER not in prompts[0]
     assert scenario.pair is None, "the long task must not spend an unreliable judge"
+
+
+# --- a failing sweep must return evidence, not a number (DL-047) -------------
+
+
+def _judged(answer_a: str, answer_b: str, a: str = VOICE_A, b: str = VOICE_B) -> Outcome:
+    """One judged repetition, graded, with the judge scripted after calibration."""
+    observed = evals.judged(
+        _obs(a, b),
+        evals._first_and_last_reply,
+        judging(*CAL, answer_a, answer_b),
+    )
+    return Outcome(
+        capability=evals._one_voice(observed),
+        violation=passed("not the subject here"),
+        observed=observed,
+    )
+
+
+def test_the_judged_pair_is_recorded_so_a_verdict_can_be_read() -> None:
+    """The verdict is 'the two replies read as different speakers'. Without the
+    two replies that is not a finding, it is an assertion — and the sweep that
+    produced it cost money and network."""
+    out = _judged("DIFFERENT", "DIFFERENT")
+
+    assert out.capability.verdict == FAIL
+    assert out.observed.judged_pair == (VOICE_A, VOICE_B), "the evidence was discarded"
+
+
+def test_the_pair_is_kept_when_the_judge_contradicts_itself() -> None:
+    """Order-disagreement is undetermined, and it is the case most worth
+    reading — so it is the first thing a pass/fail-only record loses."""
+    out = _judged("SAME", "DIFFERENT")
+
+    assert out.capability.verdict == UNDETERMINED
+    assert "order-dependent" in out.observed.judge_why
+    assert out.observed.judged_pair == (VOICE_A, VOICE_B)
+
+
+def test_the_pair_is_kept_when_the_judge_is_not_calibrated() -> None:
+    """A judge having a bad day still judged *something*, and which two texts
+    it was shown is exactly what tells you whether to believe the next run."""
+    observed = evals.judged(
+        _obs(VOICE_A, VOICE_B),
+        evals._first_and_last_reply,
+        judging("SAME", "SAME"),  # calls the known-different pair SAME
+    )
+
+    assert observed.same_speaker is None
+    assert "not calibrated" in observed.judge_why
+    assert observed.judged_pair == (VOICE_A, VOICE_B)
+
+
+def test_the_report_prints_the_pair_and_the_log_for_a_failed_run() -> None:
+    """DL-047's point: a sweep hands back something to read."""
+    out = _judged("DIFFERENT", "DIFFERENT")
+    text = evals.report([Result(scenario="judged-probe", outcomes=[out])])
+
+    assert "judged A:" in text and "judged B:" in text
+    assert VOICE_A in text
+    assert "log:" in text
+
+
+def test_a_clean_run_prints_no_evidence_block() -> None:
+    """Evidence is for failures. Printing it always would bury the one line
+    that matters under the runs that were fine."""
+    out = _judged("SAME", "SAME")
+    text = evals.report([Result(scenario="judged-probe", outcomes=[out])])
+
+    assert out.capability.verdict == PASS, out.capability.why
+    assert "judged A:" not in text
+    assert "log:" not in text
+
+
+def test_a_long_reply_is_elided_with_its_true_length() -> None:
+    """Elided, not silently truncated — the note says how much was cut, and the
+    store path on the line above says where the rest is."""
+    out = _judged("DIFFERENT", "DIFFERENT", a="Well, as I was saying. " * 200)
+    text = evals.report([Result(scenario="judged-probe", outcomes=[out])])
+
+    assert "\u2026 (+" in text, "a cut with no note reads like the end of the reply"
+    assert len(text) < 8_000, "the report turned into a transcript dump"
+
+
+def test_an_unjudged_failure_still_points_at_its_log() -> None:
+    """Most scenarios never call a judge. They still fail, and the log is still
+    the only complete record of why."""
+    out = evals.run_once(
+        Scenario(
+            name="structural",
+            drive=evals._says("hello"),
+            capability=lambda o: failed("nope"),
+            violation=evals._never_fails,
+        ),
+        complete=speaking(),
+    )
+    text = evals.report([Result(scenario="structural", outcomes=[out])])
+
+    assert "log:" in text and str(out.observed.store) in text
+    assert "judged A:" not in text
