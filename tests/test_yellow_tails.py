@@ -71,12 +71,21 @@ def test_case_26_torn_tail_one_byte_into_the_body(
     _assert_recovers_to(store_dir, payloads[:3])
 
 
-@pytest.mark.parametrize("n_bytes", [1, 2, 7])
-def test_case_27_torn_tail_shorter_than_a_frame_header(
+@pytest.mark.parametrize("n_bytes", [1, 2, 7, rawlog.PREFIX_LEN - 1])
+def test_case_27_torn_tail_shorter_than_a_frame_prefix(
     store_dir: Path, log_path: Path, n_bytes: int
 ) -> None:
-    """Case 27 — a partial tail of 1..7 bytes, shorter than the 8-byte frame
-    header, is a torn tail. Non-zero bytes, so this is not the zero-fill path."""
+    """Case 27 — a partial tail shorter than the frame prefix is a torn tail.
+
+    The prefix became 12 bytes in version 2 (``body_len``, ``len_crc``,
+    ``crc32``), and this case kept testing 1, 2 and 7 while its prose still
+    said 8. It therefore stopped at the *old* boundary and never reached the
+    last length that is short — ``PREFIX_LEN - 1``, the one byte away from a
+    readable length field. It is named here rather than written as a literal
+    so the parametrization cannot go stale behind the format again.
+
+    Non-zero bytes, so this is not the zero-fill path (case 39 is).
+    """
     payloads = seed(store_dir, 3)
     clean_size = rawlog.size(log_path)
     rawlog.append_bytes(log_path, bytes([0xAB]) * n_bytes)
@@ -175,9 +184,14 @@ def test_case_30_recovery_is_idempotent(store_dir: Path, log_path: Path) -> None
 # --- 37-39: zero-filled tails ---------------------------------------------
 
 
-@pytest.mark.parametrize("zeros", [8, 18, 64, 4096, 65536])
+@pytest.mark.parametrize("zeros", [rawlog.PREFIX_LEN, 18, 64, 4096, 65536])
 def test_case_37_zero_filled_tail(store_dir: Path, log_path: Path, zeros: int) -> None:
     """Case 37 — a run of NULs to EOF is a crash artifact, not damage.
+
+    The shortest run here is ``PREFIX_LEN``: the first length at which the
+    zeros are a readable (and implausible) ``body_len`` rather than a run too
+    short to hold one, which is case 39's path. It used to be the literal 8,
+    which was that boundary in version 1 and is on case 39's side now.
 
     Real power loss or a kernel panic can persist a write's *size extension*
     without its data pages, so the tail reads back as zeros. The log must open,
@@ -247,24 +261,32 @@ def test_case_38_zeros_with_real_frames_after_them_is_corruption(
     assert rawlog.size(log_path) == size_before, "a failed open must not truncate"
 
 
+@pytest.mark.parametrize("zeros", [8, rawlog.PREFIX_LEN])
 def test_case_38_a_single_zero_word_followed_by_data(
-    store_dir: Path, log_path: Path
+    store_dir: Path, log_path: Path, zeros: int
 ) -> None:
-    """Case 38 — even 8 zero bytes followed by real data is corruption."""
+    """Case 38 — even a short run of zeros followed by real data is corruption.
+
+    Both sides of the prefix boundary: a run too short to be a ``body_len`` at
+    all, and a whole prefix of zeros. Neither is a crash artifact, because
+    something durable follows them.
+    """
     seed(store_dir, 3)
-    rawlog.append_bytes(log_path, b"\x00" * 8)
+    rawlog.append_bytes(log_path, b"\x00" * zeros)
     rawlog.append_bytes(log_path, rawlog.encode_frame(4, 4_000, "", b"tail"))
 
     with pytest.raises(CorruptFrame):
         MemoryStore.open(store_dir)
 
 
-@pytest.mark.parametrize("zeros", [1, 2, 7])
+@pytest.mark.parametrize("zeros", [1, 2, 7, rawlog.PREFIX_LEN - 1])
 def test_case_39_short_zero_run_is_a_torn_tail(
     store_dir: Path, log_path: Path, zeros: int
 ) -> None:
-    """Case 39 — a single NUL, or a run shorter than a frame header, recovers as
-    a torn tail with no loss."""
+    """Case 39 — a single NUL, or a run shorter than a frame prefix, recovers
+    as a torn tail with no loss. ``PREFIX_LEN - 1`` is the last such length and
+    is named, not spelled 7, so it follows the format rather than trailing it.
+    """
     payloads = seed(store_dir, 4)
     clean_size = rawlog.size(log_path)
     rawlog.append_bytes(log_path, b"\x00" * zeros)

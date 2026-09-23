@@ -460,14 +460,53 @@ fn frame_is_whole_but_for_its_length_crc(
     p: &frame::Prefix,
     expected_seq: u64,
 ) -> std::io::Result<bool> {
-    if !frame::body_len_is_plausible(p.body_len) {
+    let body_at = offset + PREFIX_LEN as u64;
+
+    // The length the prefix claims. This catches a `body_len` that was
+    // rewritten on disk while the rest of the frame stayed whole.
+    if body_of_len_verifies(file, file_len, offset, p.body_len, p, expected_seq)? {
+        return Ok(true);
+    }
+
+    // The length implied by the end of the file. This catches bit rot in the
+    // length field itself -- the case `len_crc` exists to detect, and the one
+    // that must never truncate (spec case 40). If the frame really does run
+    // from here to EOF, and that body still checksums against the `crc` the
+    // writer stored, and still carries the sequence number recovery expects,
+    // then every byte of it landed and only the four length bytes rotted.
+    //
+    // A half-landed append cannot pass this test, because its body is
+    // precisely the part that did not arrive: the bytes between `body_at` and
+    // EOF are a prefix of the body, or stale blocks, and either way they do
+    // not checksum to a `crc` computed over the whole of it.
+    let implied = u32::try_from(file_len.saturating_sub(body_at)).unwrap_or(u32::MAX);
+    if implied != p.body_len
+        && body_of_len_verifies(file, file_len, offset, implied, p, expected_seq)?
+    {
+        return Ok(true);
+    }
+
+    Ok(false)
+}
+
+/// Does a body of exactly `body_len` bytes at `body_at` verify end to end --
+/// right size, right checksum, right sequence number?
+fn body_of_len_verifies(
+    file: &File,
+    file_len: u64,
+    offset: u64,
+    body_len: u32,
+    p: &frame::Prefix,
+    expected_seq: u64,
+) -> std::io::Result<bool> {
+    if !frame::body_len_is_plausible(body_len) {
         return Ok(false);
     }
     let body_at = offset + PREFIX_LEN as u64;
-    if file_len.saturating_sub(body_at) < p.body_len as u64 {
+    if file_len.saturating_sub(body_at) < body_len as u64 {
         return Ok(false);
     }
-    let mut body = vec![0u8; p.body_len as usize];
+    let mut body = vec![0u8; body_len as usize];
     file.read_exact_at(&mut body, body_at)?;
     if frame::crc32(&body) != p.crc {
         return Ok(false);
@@ -1161,7 +1200,7 @@ mod tests {
     fn torn_tail_at_an_exact_frame_boundary() {
         let d = TempDir::new("torn_boundary");
         let full = three_records(&d);
-        // keep two whole frames plus the 8-byte prefix of the third
+        // keep two whole frames plus the frame prefix of the third
         let mut end = HEADER_LEN;
         for _ in 0..2 {
             let bl = u32::from_le_bytes(full[end..end + 4].try_into().unwrap()) as usize;
@@ -1174,8 +1213,10 @@ mod tests {
     }
 
     #[test]
-    fn torn_tail_of_one_and_seven_bytes() {
-        for extra in [1usize, 7] {
+    // Spec case 27. Every length shorter than a frame prefix, up to the last
+    // one: below PREFIX_LEN there is no length field to read at all.
+    fn torn_tail_shorter_than_a_frame_prefix() {
+        for extra in [1usize, 7, PREFIX_LEN - 1] {
             let d = TempDir::new(&format!("torn_{extra}"));
             let full = three_records(&d);
             let mut end = HEADER_LEN;
@@ -1301,10 +1342,11 @@ mod tests {
     // zeros. That is a crash artifact, not damage: the log must open.
     #[test]
     fn zero_filled_tail_recovers_with_no_loss() {
-        // 1 and 7 bytes take the "fewer than 8 bytes remain" path; 8, 18 and 64
-        // take the new implausible-body_len-but-all-zeros path. Both must end
-        // in the same place.
-        for zeros in [1usize, 7, 8, 18, 64, 4096] {
+        // Runs shorter than PREFIX_LEN take the "fewer than a prefix remains"
+        // path; PREFIX_LEN and above take the implausible-body_len-but-all-zeros
+        // path. Both must end in the same place, so the loop straddles the
+        // boundary rather than stopping at version 1's 8.
+        for zeros in [1usize, 7, PREFIX_LEN - 1, PREFIX_LEN, 18, 64, 4096] {
             let d = TempDir::new(&format!("zerotail_{zeros}"));
             let full = three_records(&d);
             let mut bytes = full.clone();

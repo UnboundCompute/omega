@@ -299,7 +299,10 @@ in-flight turn" waits for M1. M0 proves the durability half: *an append that ret
 
 25. Torn tail mid-payload → recovers, truncates, `head()` is the last good seq.
 26. Torn tail at an exact frame boundary (length written, body not).
-27. Torn tail of 1 byte, and of 7 bytes, of **non-zero** bytes (shorter than the frame prefix).
+27. Torn tail of 1, 7 and `PREFIX_LEN - 1` bytes, of **non-zero** bytes — every length
+    shorter than the frame prefix, up to the last one. The prefix is **12** bytes in version 2
+    (`body_len`, `len_crc`, `crc32`), so a parametrization that stops at 7 stops at version 1's
+    boundary and never reaches the byte before a length becomes readable.
     The all-NUL versions of the same lengths are case 39; they take a different branch, so the
     two must be spelled out separately rather than left to the reader.
 28. Torn header: file of 0 bytes, and of 1..31 bytes → recovers as an empty log, no error.
@@ -326,8 +329,8 @@ in-flight turn" waits for M1. M0 proves the durability half: *an append that ret
     frame that verifies** → `CorruptFrame`. Zeros only mean "crash artifact" when nothing durable
     follows them. (Zeros followed by bytes that verify as no frame are covered by case 49: the
     log opens and the tail is preserved.)
-39. A single NUL byte appended, and a run shorter than a frame header → both recover as a torn
-    tail with no loss.
+39. A single NUL byte appended, and a run shorter than the 12-byte frame prefix → both recover
+    as a torn tail with no loss.
 
 ### Added after the adversarial audit — each one is a bug that shipped
 
