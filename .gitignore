@@ -4,6 +4,9 @@ AGENT.md
 # --- secrets / local env ---
 .env
 .env.*
+# ...except the checked-in template, which holds no key. Without this the
+# pattern above would hide the one file that tells a reader where the key goes.
+!.env.example
 *.local
 secrets/
 
