@@ -42,7 +42,21 @@
 | 15 | Snapshot/diff as the only notion of "did it work" | opencode | **AVOID** | DL-011 (verify-on-resume) |
 | 16 | Cross-session memory of any kind | opencode | **N/A** | — (the gap) |
 | 17 | Verification that an action achieved its goal | opencode | **N/A** | — (the gap) |
-| — | *Hermes rows pending — readers in flight* | Hermes | — | — |
+| 18 | "Footprint ladder": a new core tool is the **last** resort, after five cheaper seams | Hermes | **TAKE** | DL-014 (the fence) |
+| 19 | Approval floor is deterministic code (static classifier), not model judgement | Hermes | **TAKE** | DL-014 (approval) |
+| 20 | Bypass flag **frozen at process start** so no running tool can flip it mid-session | Hermes | **TAKE** | DL-014 (injection) |
+| 21 | Progressive disclosure: long-tail tools replaced by 3 bridge tools, query-capped | Hermes | **TAKE** | DL-014 (ring 2) |
+| 22 | Skill bodies injected as a **user** message, not the system prompt (cache validity) | Hermes | **TAKE** | DL-008 |
+| 23 | Agent-created skills + a background curator that pins/archives/consolidates them | Hermes | **ADAPT** | DL-014 (ring 3) |
+| 24 | Growth redirected out-of-tree to a reviewed, pinned manifest catalog | Hermes | **ADAPT** | DL-014 (ring 2) |
+| 25 | Cron as a real proactive wake path, independent of the user | Hermes | **TAKE** | DL-011 (time-wake) |
+| 26 | Tool failure returned to the model as a result; model decides whether to retry | Hermes | **ADAPT** | DL-011 |
+| 27 | ~58 tools sent on **every** call, endpoint-shaped (browser = 10 verbs) | Hermes | **AVOID** | DL-014 (ring 1) |
+| 28 | Verification opt-in and **defaulting off**; guard is "policy-only, never checks" | Hermes | **AVOID** | DL-011 |
+| 29 | Plugins importing internal symbols → 1,148 re-exports of compat scaffolding | Hermes | **AVOID** | DL-014 (the seam) |
+| 30 | Splitting god-files mechanically (one concern now spans 5 sibling modules) | Hermes | **AVOID** | *stay small and legible* |
+| 31 | Three different "the default is X" values for one setting in one codebase | Hermes | **AVOID** | — (scale smell) |
+| — | *Hermes memory & context rows pending — reader in flight* | Hermes | — | — |
 
 ---
 
@@ -198,13 +212,145 @@ matches — one approval clears a batch, without weakening the per-call gate.
 "grew too big and bloated, which made adding and customizing things hard" — so the useful
 output here is a **diagnosis**, not just an inventory.*
 
-> **Pending.** Two readers are in flight — one on memory and context, one on the loop, tools
-> and skills. This section and the register's Hermes rows fill in when they land.
+**Scale.** ~809,000 lines of Python excluding tests. `agent/` alone is 240 files and ~107,000
+lines. The repository root holds roughly thirty `hermes_state_*.py` modules side by side —
+schema, compression, fts, search, sessions, timeline, rewind, maintenance, wal, guard,
+repair. The state layer is not knowable from one file.
 
-One observation available without reading any code: the repository root contains roughly
-thirty `hermes_state_*.py` modules side by side — schema, compression, fts, search,
-sessions, timeline, rewind, maintenance, wal, guard, repair, and more. Whatever else is
-true, the state layer is not knowable from one file.
+### Loop
+
+Three nested loops. An outer driver (CLI repl, gateway event dispatch, or cron) calls one
+`run_conversation`; inside it a turn loop bounded by an iteration budget; inside *that* a
+per-API-call retry loop. Each turn iteration runs a fixed phase sequence — begin, prepare,
+assemble request, preflight gate, announce, retry loop, normalize response, then either a
+tool round or a final text response. Normal termination is the model returning no tool
+calls; forced termination is budget exhaustion falling through to a finalizer.
+
+That confirms DL-011's shape from a third angle: one cycle, with the inner tool-call
+repetition as a given rather than a second architecture.
+
+**Cron is a genuine proactive wake path** — a supervised ticker thread on a schedule
+(durations, "every" phrases, 5-field cron, one-shots), building a job prompt and running it
+through the same turn machinery, with an inactivity watchdog and catch-up windows. A second
+autonomous path auto-claims tasks from a shared board and spawns unattended workers. So the
+time-wake in DL-011 is well-trodden, not exotic.
+
+**Tool errors** are caught broadly and returned to the model as an error result; the model,
+not the framework, decides whether to retry, and there is no automatic re-execution of a
+logically-failed call. Truncated tool-call JSON has its own separate retry path, and
+API-transport recovery is heavy machinery (~1,800 lines classifying 401s, rate limits,
+format errors, overflow). Note the asymmetry: enormous effort on *transport* failure,
+almost none on *semantic* failure.
+
+**Verification barely exists and defaults off.** The turn-end guard is explicitly
+policy-only and states it never runs checks itself; the evidence ledger explicitly never
+blocks completion; the whole mechanism is opt-in behind an environment flag. The one real
+check found anywhere in the tree is re-reading a file's sha256 after writing it and hard-
+erroring on mismatch. Everything else — terminal, browser, delegation, home automation —
+trusts the handler's own return value.
+
+### Tools
+
+Declaration is one call into a registry at import time, auto-discovered. Adding a core tool
+is genuinely two touchpoints (the tool file, plus naming it in a toolset); a fully custom
+tool needs no core files at all. That part is good.
+
+The problem is what's exposed. The shared core bundle is **about 58 tools sent on every API
+call**, on every platform, and they are **endpoint-shaped**: the browser registers ten
+separate one-verb tools, the task board about fourteen. Their own docs concede the
+consequence — "every model tool is sent on every API call... the bar for a new core tool is
+high." A handful of umbrella tools (delegate, execute code, skill management) are the
+counterexample and are visibly the better design.
+
+Two mitigations are worth taking. **Availability gating** evaluates a per-tool check before
+the model ever sees it, TTL-cached. And a real **progressive-disclosure bridge** replaces the
+long tail (MCP servers, plugin tools) in the model-visible array with three bridge tools —
+search, describe, call — capped at a few queries per call. Core tools never defer; only the
+tail does.
+
+**Approval** is the strongest part of the codebase. The never-allow floor is deterministic
+code: a ~1,500-line static classifier of dangerous shell patterns, then a gate with pluggable
+human-decision transports (CLI prompt, gateway round-trip, protocol elicitation), with an
+optional second-opinion model only for borderline cases. And the bypass flag is **frozen at
+process start**, explicitly so that no running tool or skill can flip it mid-session — a
+deliberate prompt-injection defence, and exactly the hole DL-014 warns about.
+
+### Skills and plugins
+
+A skill is a directory with a `SKILL.md` (frontmatter plus markdown), optionally scripts,
+references and templates. 62 built-in across 14 categories, 150 more shipped-but-inactive
+and installed on demand. Adding one is one or two files, filesystem-scanned, no registry
+edit — close to zero ceremony, and the best seam in the system.
+
+Two details worth stealing. Invoking a skill injects its body as a **user message rather than
+into the system prompt**, deliberately, to keep the prompt cache valid. And skills are *also*
+exposed as ordinary tools, so **the model can read and rewrite its own skills** — with a
+background curator that forks a model pass to pin, archive and consolidate the skills the
+agent wrote for itself.
+
+That last mechanism is the closest prior art anywhere to DL-014's ring 3. It is built as
+files rather than as memory, which makes it the second independent implementation to choose
+files — see the assessment below.
+
+**Plugins** are Python implementing a hook contract across five kinds, each with its own
+discovery. And there is a **policy freeze**: no new in-tree memory providers since May 2026,
+no new third-party plugins since June 2026, with new work redirected to an out-of-tree
+catalog of ~196 reviewed, SHA-pinned manifests holding no code in the tree. That freeze is a
+documented admission that the in-tree plugin surface became unmanageable.
+
+### The bloat diagnosis
+
+Size is the symptom. The mechanism is that **there was never a narrow, stable extension
+surface**, so plugins imported whatever internal symbol happened to be reachable. When the
+internals were finally refactored, that refactor could not proceed without months of
+load-bearing compatibility scaffolding: a 290KB compat manifest plus 160KB of documentation
+enumerating 1,148 lazy re-exports, 592 restored imports, 290 restored deletions and 34 names
+that could not be restored at all, with 332 files carrying a compat block, CI-enforced and
+sunset-dated.
+
+Two second-order lessons:
+
+- **Mechanical file-splitting redistributes bloat rather than removing it.** Their stated rule
+  is that a file over ~2,000 lines should be split into topic siblings. It isn't holding —
+  an 8,138-line client, a 7,343-line adapter, a 4,835-line CLI that already has fourteen
+  mixin siblings. And where splitting *did* happen, the turn loop became thirty sibling files
+  totalling ~12,000 lines in which one concern ("how are errors retried") now spans five of
+  them. The boundary needed redrawing, not the file.
+- **Conflicting defaults are a reliable smell of scale.** One iteration setting has three
+  different documented defaults in one codebase — unlimited in the constructor, 500 in a
+  docstring, 250 in the shipped config.
+
+### Good — worth taking
+
+- The **footprint ladder**: their own docs rank adding a core tool last, after extending an
+  existing one, a skill, a gated tool, a plugin, or a catalog entry. This is DL-014's "the
+  tool surface never grows; skills do," reached independently by people who earned it.
+- The **approval floor in deterministic code**, and especially freezing the bypass flag at
+  process start.
+- The **progressive-disclosure bridge** for the long tail, and pre-model availability gating.
+- **Skills as a near-zero-ceremony filesystem convention**, injected as a user message to
+  preserve cache validity.
+- **Agent-authored skills with a curator** — the real prior art for learned skills.
+- **Cron as a first-class wake path.**
+- Redirecting growth **out of tree** to a reviewed, pinned catalog once in-tree growth stops
+  being manageable. Better still would be not needing the freeze.
+
+### Bad — avoid
+
+- **~58 endpoint-shaped tools on every call.** Four times opencode's surface, well past where
+  selection degrades, and the reason a disclosure bridge had to be bolted on later.
+- **Verification opt-in and defaulting off**, with a guard that by its own docstring never
+  checks anything.
+- **No stable extension ABI** — the single root cause of the compat tax, and the thing omega
+  must get right on day one rather than retrofit.
+- **Splitting files without redrawing boundaries.**
+- Enormous investment in transport-failure recovery beside almost none in semantic-failure
+  recovery.
+
+### Memory and context
+
+> **Pending** — reader still in flight. Given ~30 state modules and an explicit compression
+> layer, this is the section most likely to contain something we actually want.
 
 ---
 
@@ -214,9 +360,34 @@ true, the state layer is not knowable from one file.
 omega's design, because a gap common to all of them is unlikely to be an accident of one
 codebase.*
 
-1. **Nobody verifies that an action achieved its goal.** Both systems trust the tool's
-   return. The literature says this is the dominant source of false success. omega's "done =
-   a verified state change" is therefore not a truism restated — it is the differentiator,
-   and there is no prior art to copy.
-2. **Durable cross-session memory is the unbuilt part.** (Pending confirmation from the
-   Hermes read, where the answer may well differ — it has a large state layer.)
+1. **Nobody verifies that an action achieved its goal.** opencode's snapshot-diff serves undo,
+   not success. Hermes ships a verification mechanism that is opt-in, defaults off, and whose
+   guard states in its own docstring that it never runs checks. Between them the only real
+   postcondition check found anywhere is re-reading a file hash after a write. The literature
+   calls unverified completion the dominant source of false success, and two mature systems
+   confirm nobody has built the check. **"Done = a verified state change" is therefore not a
+   principle we restated — it is the differentiator, and there is no prior art to copy.**
+
+2. **Both invest heavily in transport failure and barely at all in semantic failure.**
+   Retries, backoff, `Retry-After` honouring, error classification — thousands of lines. A
+   tool that ran, returned cleanly, and did the wrong thing gets nothing. That asymmetry is
+   the same blind spot as (1), seen from the error-handling side.
+
+3. **Both chose skills as files on disk, and one added a curator.** opencode pins names and
+   descriptions and loads bodies on demand; Hermes scans a directory, injects bodies as user
+   messages, and lets the model rewrite its own skills under a background consolidator. Two
+   independent implementations converging is evidence, and it suggests **authored** skills
+   (files, versioned, editable by hand) and **learned** skills (derived, in memory, written by
+   omega about you) are two different things rather than one — DL-014 chose the second, and
+   should probably carry both, distinguished by who wrote it.
+
+4. **Both keep the model's live tool surface deliberately small, and the one that didn't had
+   to retrofit a bridge.** opencode ships ~14 built-ins filtered per turn. Hermes ships ~58 on
+   every call and subsequently built a three-tool search/describe/call bridge to hide the long
+   tail. Nobody who has run one of these at scale believes a big flat catalog works.
+
+5. **Growth pressure eventually gets pushed out of the tree.** Hermes froze in-tree plugins
+   and redirected to a reviewed pinned catalog; opencode's equivalent is a file-drop seam and
+   plugin functions that need no core edits. The difference is that opencode had the seam from
+   the start and Hermes had to declare a freeze — which is the whole argument for fixing the
+   extension contract before the first external consumer exists.
