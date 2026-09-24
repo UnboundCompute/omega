@@ -12,7 +12,9 @@ stream instead of a single `await`.
 > changed underneath since this was written is **learning** — omega now files what it is
 > taught, turns a taught time into a schedule, and infers from conversation on its own. That
 > added six episode kinds, **none of which reach the wire**, which makes the stream properly
-> gappy for the first time. §4's ordering rule and the new §5 are the two parts to re-read.
+> gappy for the first time. Image understanding has landed too: bounded image attachments on
+> the new event now reach the capable model as multimodal input. §4's ordering rule and the new
+> §5 are the two parts to re-read.
 
 **The boundary rule, which this work must not erode.** The tray is a *channel*, not the
 agent. It may render conversation, collect context, and display durable work state. It must
@@ -131,18 +133,17 @@ digest returned by `attach` so `say` can cite it; the response echoed back on an
 still contains only `{id, kind}` (§6), which is unchanged and deliberate — the tray already
 has the previews, and a digest is not something the UI needs back.
 
-> ### ⚠ Still true: omega cannot look at an image
+> ### Current understanding boundary
 >
-> This lands **storage and transport only**. The provider seam is text
-> (`complete(role, messages)`, DL-024) — there is no multimodal path, so a model omega calls
-> never receives the pixels. What omega knows about an attachment is its kind, its size and
-> its digest: enough to say *an image of 184 KB was attached and is still exactly the one
-> that was attached*, and nothing about what is in it.
+> Image understanding now exists (DL-031). Image attachments on the new event—including screen
+> captures and image files—reach the capable role as bounded multimodal input. The limits are
+> 5 MiB per image and 10 MiB across one turn; a missing, unreadable, or oversized image degrades
+> to an explicit text note instead of failing the turn.
 >
-> So **screen capture must not be presented as a working feature** until multimodal exists.
-> Round-tripping a digest correctly is not seeing. Do not let the UI imply otherwise; the
-> bytes are safe and re-readable, which is the part that had to be decided permanently, and
-> the rest waits for the provider seam to grow.
+> Non-image file contents, links, and selected text remain reference-only at the model boundary.
+> Storage and transport still make those items durable, but durability is not document
+> understanding. The tray may present screen capture and image inspection as working while
+> continuing to label non-image context honestly.
 
 `context[].kind` must be one of **`file` `image` `text` `link` `screen`** — lowercase.
 `StagedContext.Kind`'s raw values are capitalised (`"File"`, `"Image"`, …), so **map the case,

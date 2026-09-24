@@ -52,9 +52,13 @@ become a second brain or an undeclared wire protocol.
 - Render agent replies as native structured Markdown while preserving selection and links.
 - Start a non-interactive omega runtime when the packaged tray launches, reuse an already-running
   resident process, stop the owned process on app quit, and surface startup failures in the tray.
-- Add a lossless New Chat surface reset and a one-shot Teach Omega composer mode. Teaching notes
-  are durable episodes and current-recall instructions; they are not described as extracted
-  long-term facts before that memory layer exists.
+- Add a lossless New Chat surface reset and a one-shot Teach Omega composer mode. Teach Omega is
+  only a writing affordance: it sends the person's exact note through the ordinary `say` path,
+  and omega's normal reply provides the durable claim or schedule receipt.
+- Preserve indented continuation lines in learning receipts so replacement details stay attached
+  to the claim they qualify, while rendering the complete receipt without truncation.
+- Accept monotonic projection sequence gaps as normal; withheld learning and scheduling episodes
+  never cause a reconnect or false data-loss state.
 
 ## Deliberately waiting at the model-understanding boundary
 

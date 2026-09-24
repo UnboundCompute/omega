@@ -426,7 +426,7 @@ private struct ExpandedTrayView: View {
                     Image(systemName: "graduationcap")
                     Text("Teach omega")
                         .fontWeight(.semibold)
-                    Text("Saved in history · available to current recall")
+                    Text("Write one clear fact, preference, or routine")
                         .foregroundStyle(TrayTheme.secondaryText)
                     Spacer(minLength: 0)
                     Button(action: viewModel.cancelTeaching) {

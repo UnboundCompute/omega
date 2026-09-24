@@ -22,7 +22,7 @@ final class MarkdownMessageTests: XCTestCase {
         XCTAssertEqual(blocks, [
             .heading(level: 1, text: "Result"),
             .paragraph("This is **important** and `literal`."),
-            .unordered("First"),
+            .unordered(text: "First"),
             .ordered(marker: "2.", text: "Second"),
             .quote("A note"),
             .code("let answer = 42"),
@@ -40,6 +40,27 @@ final class MarkdownMessageTests: XCTestCase {
         XCTAssertEqual(
             TrayMarkdownParser.parse("```\nunfinished"),
             [.code("unfinished")]
+        )
+    }
+
+    func testLearningReceiptKeepsIndentedReplacementWithItsClaim() {
+        XCTAssertEqual(
+            TrayMarkdownParser.parse(
+                """
+                I wrote this down:
+                - I take my medication at 6:40 on weekdays (when you mention medication)
+                  replaces what you told me before: I take my medication in the mornings
+                """
+            ),
+            [
+                .paragraph("I wrote this down:"),
+                .unordered(
+                    text: "I take my medication at 6:40 on weekdays (when you mention medication)",
+                    continuation: [
+                        "replaces what you told me before: I take my medication in the mornings"
+                    ]
+                ),
+            ]
         )
     }
 }

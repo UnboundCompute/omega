@@ -16,7 +16,7 @@ final class TrayModelTests: XCTestCase {
     }
 
     @MainActor
-    func testTeachModeSendsLearningInstructionButShowsOnlyTheNote() async throws {
+    func testTeachModeSendsTheUsersExactTextAsAnOrdinaryMessage() async throws {
         let (model, transport) = connectedModel()
         model.beginTeaching()
         model.draft = "Prefer concise status updates."
@@ -25,8 +25,7 @@ final class TrayModelTests: XCTestCase {
         await settleTasks()
 
         let submission = try XCTUnwrap(transport.submissions.first)
-        XCTAssertTrue(submission.text.contains("remember and apply in future conversations"))
-        XCTAssertTrue(submission.text.contains("Prefer concise status updates."))
+        XCTAssertEqual(submission.text, "Prefer concise status updates.")
         XCTAssertEqual(model.messages.first?.text, "Prefer concise status updates.")
         XCTAssertEqual(model.composerMode, .ask)
     }
@@ -367,6 +366,33 @@ final class TrayModelTests: XCTestCase {
 
         XCTAssertTrue(model.messages.isEmpty)
         XCTAssertEqual(cursor, 9)
+    }
+
+    @MainActor
+    func testProjectionSequenceGapsAreAcceptedAsNormal() async {
+        var persisted: [Int] = []
+        let transport = ScriptedTransport()
+        let model = TrayViewModel(
+            transport: transport,
+            loadCursor: { 2 },
+            persistCursor: { persisted.append($0) }
+        )
+        model.start()
+        model.isExpanded = true
+
+        transport.emit(.update(.init(
+            seq: 9,
+            forSeq: 8,
+            state: "complete",
+            kind: "turn.completed",
+            outcome: "spoke",
+            reply: "The withheld episodes do not create a stream error."
+        )))
+        await settleTasks()
+
+        XCTAssertEqual(model.messages.last?.text, "The withheld episodes do not create a stream error.")
+        XCTAssertEqual(persisted, [9])
+        XCTAssertEqual(transport.resumeCursors, [9])
     }
 
     @MainActor

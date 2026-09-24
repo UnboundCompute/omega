@@ -3,8 +3,8 @@ import SwiftUI
 enum TrayMarkdownBlock: Equatable {
     case paragraph(String)
     case heading(level: Int, text: String)
-    case unordered(String)
-    case ordered(marker: String, text: String)
+    case unordered(text: String, continuation: [String] = [])
+    case ordered(marker: String, text: String, continuation: [String] = [])
     case quote(String)
     case code(String)
     case divider
@@ -46,6 +46,12 @@ enum TrayMarkdownParser {
                 continue
             }
 
+            if paragraph.isEmpty,
+               isIndented(line),
+               appendListContinuation(trimmed, to: &blocks) {
+                continue
+            }
+
             if ["---", "***", "___"].contains(trimmed) {
                 flushParagraph()
                 blocks.append(.divider)
@@ -54,7 +60,7 @@ enum TrayMarkdownParser {
                 blocks.append(heading)
             } else if let item = unorderedItem(from: trimmed) {
                 flushParagraph()
-                blocks.append(.unordered(item))
+                blocks.append(.unordered(text: item))
             } else if let item = orderedItem(from: trimmed) {
                 flushParagraph()
                 blocks.append(.ordered(marker: item.marker, text: item.text))
@@ -97,6 +103,34 @@ enum TrayMarkdownParser {
         else { return nil }
         return ("\(number).", String(line[line.index(after: afterDot)...]))
     }
+
+    private static func isIndented(_ line: String) -> Bool {
+        line.first == "\t" || line.prefix { $0 == " " }.count >= 2
+    }
+
+    private static func appendListContinuation(
+        _ text: String,
+        to blocks: inout [TrayMarkdownBlock]
+    ) -> Bool {
+        guard let last = blocks.last else { return false }
+        switch last {
+        case .unordered(let item, let continuation):
+            blocks[blocks.count - 1] = .unordered(
+                text: item,
+                continuation: continuation + [text]
+            )
+            return true
+        case .ordered(let marker, let item, let continuation):
+            blocks[blocks.count - 1] = .ordered(
+                marker: marker,
+                text: item,
+                continuation: continuation + [text]
+            )
+            return true
+        default:
+            return false
+        }
+    }
 }
 
 struct MarkdownMessageView: View {
@@ -126,10 +160,10 @@ struct MarkdownMessageView: View {
             inlineText(text)
                 .font(.system(size: headingSize(level), weight: .semibold))
                 .padding(.top, level == 1 ? 3 : 1)
-        case .unordered(let text):
-            listRow(marker: "•", text: text)
-        case .ordered(let marker, let text):
-            listRow(marker: marker, text: text)
+        case .unordered(let text, let continuation):
+            listRow(marker: "•", text: text, continuation: continuation)
+        case .ordered(let marker, let text, let continuation):
+            listRow(marker: marker, text: text, continuation: continuation)
         case .quote(let text):
             HStack(alignment: .top, spacing: 9) {
                 Rectangle()
@@ -153,14 +187,21 @@ struct MarkdownMessageView: View {
         }
     }
 
-    private func listRow(marker: String, text: String) -> some View {
+    private func listRow(marker: String, text: String, continuation: [String]) -> some View {
         HStack(alignment: .firstTextBaseline, spacing: 7) {
             Text(marker)
                 .font(.system(size: 12, weight: .semibold))
                 .foregroundStyle(TrayTheme.signal)
                 .frame(minWidth: 14, alignment: .trailing)
-            inlineText(text)
-                .font(.system(size: 13))
+            VStack(alignment: .leading, spacing: 3) {
+                inlineText(text)
+                    .font(.system(size: 13))
+                ForEach(Array(continuation.enumerated()), id: \.offset) { _, line in
+                    inlineText(line)
+                        .font(.system(size: 12))
+                        .foregroundStyle(TrayTheme.secondaryText)
+                }
+            }
         }
         .accessibilityElement(children: .combine)
     }

@@ -47,8 +47,9 @@ final class TraySnapshotTests: XCTestCase {
 
                 The **capture path works**, including [native links](https://example.com).
 
-                - Images reach the model
-                - Replies keep their structure
+                I wrote this down:
+                - Prefer concise status updates (when we discuss communication)
+                  replaces what you told me before: Give detailed status updates
 
                 ```swift
                 let status = "ready"

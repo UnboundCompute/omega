@@ -226,7 +226,7 @@ final class TrayViewModel: ObservableObject {
         let sentContext = stagedContext
         let sentMode = composerMode
         let submission = TraySubmission(
-            text: sentMode == .teach ? teachingInstruction(for: text) : text,
+            text: text,
             context: sentContext.map {
                 TrayContextReference(
                     id: $0.id,
@@ -518,14 +518,6 @@ final class TrayViewModel: ObservableObject {
             composerMode: originalComposerMode
         )
         turnState = .failed(detail)
-    }
-
-    private func teachingInstruction(for note: String) -> String {
-        """
-        Teaching note from me. Treat this as something to remember and apply in future conversations, not as a task to execute. Briefly confirm what you learned.
-
-        \(note)
-        """
     }
 
     func removeContext(id: UUID) {
