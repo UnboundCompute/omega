@@ -748,10 +748,46 @@ def _event_turn(
     return provider.user([provider.text_part(text), *parts])
 
 
+#: Repeated at the very end of the judge's user turn, after the transcript.
+#:
+#: Measured, not guessed. On the live store, `hello` failed roughly every other
+#: time with ``JudgeUndecided: judge answered 'Hello! How can I help?'`` — and
+#: that string is exactly the reply the *previous* turn had given. Rendering the
+#: prompt for the failing seq showed why: it ends
+#:
+#:     you: hello
+#:     omega: Hello! How can I help?
+#:
+#:     New event:
+#:     you: hello
+#:
+#: which is a few-shot demonstration of answering the greeting, with the only
+#: instruction not to do that sitting four thousand characters earlier in the
+#: system message. At temperature 0 the likeliest continuation of that text is
+#: the greeting, so the model completed the conversation instead of classifying
+#: it. The alternation was the tell: after a *failed* turn the transcript ends
+#: ``omega: (turn failed: …)``, which is no pattern to copy, and the judge
+#: answered correctly.
+#:
+#: So the format demand is repeated where the model actually generates, and the
+#: first sentence names the specific error rather than the general rule —
+#: "answer with one word" was already said and lost; "do not answer that
+#: message" is the thing the transcript is arguing for.
+#:
+#: **The parser is deliberately not loosened to accept this.** Scanning a
+#: sentence for a verdict word would read "not silent" as silence, and a router
+#: that guesses is worse than one that says it could not decide.
+_JUDGE_SUFFIX = (
+    "\n\n---\n"
+    "Do not answer that message. You are routing it, not replying to it.\n"
+    "Your entire reply is one word - SPEAK, ACT, or SILENT."
+)
+
+
 def _judge_messages(ctx: TurnContext) -> list[provider.Message]:
     return [
         provider.system(_JUDGE_SYSTEM),
-        _event_turn(ctx, images=False),
+        _event_turn(ctx, images=False, suffix=_JUDGE_SUFFIX),
     ]
 
 
