@@ -19,7 +19,7 @@ import json
 
 import pytest
 
-from omega import evals, executor, learn, provider
+from omega import episodes, evals, executor, learn, provider
 from omega.turn import RECALL_N
 from omega.evals import (
     FAIL,
@@ -1123,3 +1123,197 @@ def test_an_unjudged_failure_still_points_at_its_log() -> None:
 
     assert "log:" in text and str(out.observed.store) in text
     assert "judged A:" not in text
+
+
+# --- the learning checks, graded on a real store (DL-044, DL-054) -----------
+#
+# These read a store rather than an `Observed` built by hand, because what they
+# are for is the distinction between three ways of ending up with an empty
+# learned set — the pass never ran, the pass broke, the pass ran and kept
+# nothing — and only one of those is visible in the log. A fixture that handed
+# them a list of claims would erase exactly the thing under test.
+
+
+def _appends(*payloads: dict) -> evals.Drive:
+    def drive(rt) -> list:
+        for payload in payloads:
+            rt.append(payload)
+        return []
+
+    return drive
+
+
+def _graded(check, *payloads: dict) -> Grade:
+    """``check`` applied to a run whose store holds ``payloads``."""
+    out = evals.run_once(
+        Scenario(
+            name="probe",
+            drive=_appends(*payloads),
+            capability=check,
+            violation=lambda o: passed("not under test here"),
+        ),
+        complete=speaking(),
+    )
+    return out.capability
+
+
+def _claim(text: str, *, explicit: bool, seq: int = 1) -> dict:
+    return episodes.claim_extracted(
+        for_seq=seq,
+        text=text,
+        source_seq=seq,
+        situation="probe",
+        explicit=explicit,
+        trigger=None,
+        supersedes=None,
+    )
+
+
+def _reflected(*, filed: int = 0, reason=None) -> dict:
+    return episodes.reflection_done(through=1, filed=filed, reason=reason)
+
+
+def test_a_noticed_pattern_is_read_off_the_store() -> None:
+    grade = _graded(
+        evals._noticed("kalimba"),
+        _reflected(filed=1),
+        _claim("they take kalimba breaks between tasks", explicit=False),
+    )
+    assert grade.verdict == PASS
+
+
+def test_a_taught_claim_does_not_count_as_something_noticed() -> None:
+    """The scenario is defined against the teach path. A claim that arrived by
+    being typed into a composer proves the opposite of what it is asked."""
+    grade = _graded(
+        evals._noticed("kalimba"),
+        _reflected(filed=0),
+        _claim("they take kalimba breaks between tasks", explicit=True),
+    )
+    assert grade.verdict == FAIL
+
+
+def test_keeping_nothing_is_undetermined_when_no_pass_ran() -> None:
+    """*Fail closed on empty.* An empty learned set is what a working pass over
+    dull narration leaves behind — and also what a pass that never ran leaves
+    behind. Reading the second as the first is a green check for a feature that
+    is switched off."""
+    grade = _graded(evals._kept_nothing)
+    assert grade.verdict == UNDETERMINED
+    assert "no reflection pass ran" in grade.why
+
+
+def test_keeping_nothing_is_undetermined_when_the_pass_broke() -> None:
+    """DL-052 in miniature: a `learn` role returning 400 on every call files
+    nothing, which is byte-for-byte what correct restraint looks like in the
+    learned set. The record is the only thing that tells them apart."""
+    grade = _graded(
+        evals._kept_nothing,
+        _reflected(reason="400: temperature is not supported"),
+    )
+    assert grade.verdict == UNDETERMINED
+    assert "temperature" in grade.why
+
+
+def test_keeping_nothing_passes_only_when_a_pass_really_ran() -> None:
+    grade = _graded(evals._kept_nothing, _reflected(filed=0))
+    assert grade.verdict == PASS
+
+
+def test_a_belief_filed_from_dull_narration_is_the_firehose() -> None:
+    grade = _graded(
+        evals._kept_nothing,
+        _reflected(filed=1),
+        _claim("they are working on a reconciliation", explicit=False),
+    )
+    assert grade.verdict == FAIL
+    assert "unremarkable" in grade.why
+
+
+def test_an_inferred_claim_is_not_a_taught_one() -> None:
+    """Why `_claims_mentioning` grew an `explicit` filter.
+
+    The endurance scenario's falsification keeps the sentence and removes the
+    teach drop. Since DL-054 a reflection over that same conversation may reach
+    the belief on its own — correct behaviour that would make the
+    falsification pass and quietly retire a working scenario.
+    """
+    out = evals.run_once(
+        Scenario(
+            name="probe",
+            drive=_appends(_claim("they take their coffee with cardamom", explicit=False)),
+            capability=lambda o: passed("not under test here"),
+            violation=lambda o: passed("not under test here"),
+        ),
+        complete=speaking(),
+    )
+    observed = out.observed
+    assert evals._claims_mentioning(observed, "cardamom") == [
+        "they take their coffee with cardamom"
+    ]
+    assert evals._claims_mentioning(observed, "cardamom", explicit=True) == []
+
+
+def test_a_taught_time_filed_as_a_claim_is_reported_as_its_own_failure() -> None:
+    """DL-044's near-miss, and the reason it is not a bare absence.
+
+    A claim with an hour on it renders into prompts omega is already building
+    and never wakes anything up. It reads as a plausible memory to anyone
+    inspecting `--learned`, so the check has to say which of the two happened.
+    """
+    grade = _graded(
+        evals._scheduled_at("medication", 6),
+        _claim("take medication at 6:40 on weekdays", explicit=True),
+    )
+    assert grade.verdict == FAIL
+    assert "instead of a schedule" in grade.why
+
+
+def test_a_taught_time_that_became_a_schedule_passes_on_the_hour() -> None:
+    grade = _graded(
+        evals._scheduled_at("medication", 6),
+        episodes.schedule_created(
+            id="s1-0",
+            instruction="Remind me to take my medication.",
+            cron="40 6 1-5",
+        ),
+    )
+    assert grade.verdict == PASS
+
+
+def test_a_schedule_at_the_wrong_hour_does_not_pass() -> None:
+    """The guess channel the scenario closes. A model defaulting to nine
+    o'clock would satisfy a check that only asked whether *a* schedule
+    exists."""
+    grade = _graded(
+        evals._scheduled_at("medication", 6),
+        episodes.schedule_created(
+            id="s1-0",
+            instruction="Remind me to take my medication.",
+            cron="0 9 *",
+        ),
+    )
+    assert grade.verdict == FAIL
+
+
+def test_one_sentence_may_not_become_several_standing_obligations() -> None:
+    grade = _graded(
+        evals._scheduled_at_most_once,
+        episodes.schedule_created(id="a", instruction="take medication", cron="40 6 1"),
+        episodes.schedule_created(id="b", instruction="take medication", cron="40 6 2"),
+    )
+    assert grade.verdict == FAIL
+    assert "2 schedules" in grade.why
+
+
+def test_a_stretch_nobody_taught_may_not_end_with_a_schedule() -> None:
+    """DL-054's asymmetry as a violation check: a wrong inferred claim is a bad
+    sentence in a prompt, a wrong inferred schedule is a notification every
+    morning forever."""
+    grade = _graded(
+        evals._inferred_nothing_standing,
+        _reflected(filed=0),
+        episodes.schedule_created(id="x", instruction="brief me", cron="0 9 *"),
+    )
+    assert grade.verdict == FAIL
+    assert "nobody taught" in grade.why

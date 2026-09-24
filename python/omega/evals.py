@@ -46,7 +46,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Iterable, Optional, Sequence
 
-from omega import derive, episodes, learn, memory, projection, provider
+from omega import derive, episodes, executor, learn, memory, projection, provider
 from omega.runtime import Runtime, Said
 from omega.turn import RECALL_N
 
@@ -953,12 +953,41 @@ def _recalls(needle: str) -> Check:
     return check
 
 
-def _claims_mentioning(o: Observed, needle: str) -> Optional[list[str]]:
-    """The taught claims in this run's store that mention ``needle``.
+@dataclass(frozen=True)
+class _Facts:
+    """What one run's store holds about learning, read once after it closed.
 
-    ``None`` when the store could not be read at all, which is an
+    One reader for three questions — what is believed, what was reflected on,
+    what standing obligations exist — because they are asked together by
+    almost every learning check and opening the store three times to answer
+    them separately is three chances to get a different answer.
+    """
+
+    #: ``(text, explicit)`` for every claim still active in the derived view.
+    claims: list[tuple[str, bool]]
+    reflections: list[dict[str, Any]]
+    schedules: list[dict[str, Any]]
+
+    def inferred(self) -> list[str]:
+        return [text for text, explicit in self.claims if not explicit]
+
+    def reflection_error(self) -> Optional[str]:
+        """The first failed pass's reason, if any pass failed.
+
+        The distinction this exists for is the one that hid DL-052: *ran and
+        kept nothing* and *never ran* and *broke* all leave an empty learned
+        set, and only the first of them is the behaviour worth a green check.
+        """
+        for record in self.reflections:
+            if record.get("reason"):
+                return str(record["reason"])
+        return None
+
+
+def _facts(o: Observed) -> Optional[_Facts]:
+    """``None`` when the store could not be read at all, which is an
     ``undetermined`` and not a zero — *"fail closed on empty"* cuts both ways,
-    and a store that would not open is not a store that taught nothing.
+    and a store that would not open is not a store that learned nothing.
 
     Read after the runtime has closed, which is the only time it *can* be read:
     the log holds an exclusive lock for the lifetime of the open handle, so
@@ -971,9 +1000,48 @@ def _claims_mentioning(o: Observed, needle: str) -> Optional[list[str]]:
     try:
         with store:
             learned = derive.Learned.rebuild(store)
-            return [c.text for c in learned.claims() if needle.lower() in c.text.lower()]
+            claims = [(c.text, c.explicit) for c in learned.claims()]
+            payloads = [
+                episodes.decode(record.payload)
+                for record in store.episodes_since(0)
+            ]
     except Exception:  # noqa: BLE001
         return None
+    return _Facts(
+        claims=claims,
+        reflections=[
+            p for p in payloads if p.get("kind") == episodes.REFLECTION_DONE
+        ],
+        schedules=[
+            p for p in payloads if p.get("kind") == episodes.SCHEDULE_CREATED
+        ],
+    )
+
+
+def _claims_mentioning(
+    o: Observed, needle: str, *, explicit: Optional[bool] = None
+) -> Optional[list[str]]:
+    """Claims in this run's store that mention ``needle``.
+
+    ``explicit`` narrows to one kind of claim and the default of ``None`` means
+    either. It is not a convenience: since DL-054 a claim can arrive two ways,
+    and a check named for one of them that accepts the other measures
+    something it does not say. The endurance scenario is the live case — its
+    falsification removes the *teach drop* and keeps the sentence, and a
+    reflection pass over that same conversation may well conclude the
+    preference on its own. That conclusion is correct behaviour and would
+    silently make the falsification pass, retiring a scenario that is still
+    working.
+    """
+    facts = _facts(o)
+    if facts is None:
+        return None
+    return [
+        text
+        for text, was_explicit in facts.claims
+        if needle.lower() in text.lower()
+        and (explicit is None or was_explicit is explicit)
+    ]
 
 
 def _recalls_a_taught_thing(needle: str) -> Check:
@@ -994,7 +1062,12 @@ def _recalls_a_taught_thing(needle: str) -> Check:
     """
 
     def check(o: Observed) -> Grade:
-        filed = _claims_mentioning(o, needle)
+        # `explicit=True`: this asks whether *teaching* carried the fact across
+        # the horizon, and since DL-054 a reflection pass over the same
+        # conversation can reach the same belief without being taught. Counting
+        # that here would score the falsification — which is this drive with
+        # the teach drop removed — as a pass.
+        filed = _claims_mentioning(o, needle, explicit=True)
         if filed is None:
             return undetermined("could not read the store to see what was filed")
         if not filed:
@@ -1101,6 +1174,250 @@ def _stayed_quiet_as_it_grew(o: Observed) -> Grade:
 #: The turns in a long-task run that are genuinely addressed to omega: the
 #: opening and the closing question. Everything between them is narration.
 _ADDRESSED_TURNS = 2
+
+
+# --- inferred learning, DL-054 ----------------------------------------------
+
+_NARRATION = "Working through step {i} of the reconciliation now."
+
+#: A bare statement that ends the stretch, and the reason it is here rather
+#: than the drive simply stopping.
+#:
+#: The pass runs when a sweep of the queue finds nothing, so the reflection
+#: triggered after the last narration turn is still in flight when that turn's
+#: ``say`` returns. One more turn makes the wait structural: the executor is a
+#: single writer, so this turn cannot be handled until the pass before it has
+#: finished, and a drive that ended without it would race the runtime's close
+#: and score an empty store as *learned nothing*.
+_STRETCH_CLOSING = "That's the reconciliation finished for today."
+
+
+def _a_watched_stretch(*marked: str) -> Drive:
+    """``REFLECT_EVERY`` ordinary turns, with ``marked`` spread through them.
+
+    Every line is a bare statement, which is both cheap and the point: a
+    reflection pass is triggered by how much conversation has happened, not by
+    anything about it, and the stretch it reads is the person narrating their
+    day rather than addressing omega. Nothing here is a teach drop, so
+    anything that ends up in the learned set got there by being *noticed*.
+
+    ``marked`` lines are spaced out rather than bunched, because three mentions
+    in a row is one episode being narrated at length. What makes something a
+    pattern is that it recurs across the window, and a drive that cannot tell
+    those apart would score a scenario that cannot either.
+    """
+
+    pool = list(marked)
+    step = executor.REFLECT_EVERY // (len(pool) + 1)
+    lines: list[str] = []
+    for i in range(executor.REFLECT_EVERY):
+        if pool and i and i % step == 0:
+            lines.append(pool.pop(0))
+        else:
+            lines.append(_NARRATION.format(i=i))
+    lines.extend(pool)
+
+    def drive(rt: Runtime) -> Sequence[Said]:
+        said = [rt.say(line) for line in lines]
+        said.append(rt.say(_STRETCH_CLOSING))
+        return said
+
+    return drive
+
+
+def _pass_ran(facts: _Facts) -> Optional[Grade]:
+    """The precondition both inference checks share, or ``None`` if it holds.
+
+    Every way of *not learning* leaves the same empty learned set — the pass
+    never ran, the pass broke, the pass ran and kept nothing — and only the
+    last is a behaviour. Two of the three are undetermined rather than either
+    pass or fail, because a check that reads "broke" as "correctly kept
+    nothing" is how a dead role scores green (DL-052), and one that reads it as
+    "failed to notice" sends you looking at a prompt when the fault is a 400.
+    """
+    if not facts.reflections:
+        return undetermined(
+            "no reflection pass ran, so nothing was either noticed or refused"
+        )
+    broke = facts.reflection_error()
+    if broke:
+        return undetermined(f"the reflection pass failed: {broke[:120]}")
+    return None
+
+
+def _noticed(needle: str) -> Check:
+    """Is there an *inferred* claim about ``needle``?
+
+    ``explicit=False`` is load-bearing and not bookkeeping: an explicit claim
+    mentioning the same thing would mean the teach path fired, which is the
+    behaviour this scenario is defined against.
+    """
+
+    def check(o: Observed) -> Grade:
+        facts = _facts(o)
+        if facts is None:
+            return undetermined("could not read the store to see what was noticed")
+        blocked = _pass_ran(facts)
+        if blocked is not None:
+            return blocked
+        hits = [
+            text
+            for text, explicit in facts.claims
+            if not explicit and needle.lower() in text.lower()
+        ]
+        if hits:
+            return passed(f"noticed it unprompted: {hits[0][:70]!r}")
+        return failed(
+            f"nothing inferred mentions {needle!r}; the pass kept "
+            f"{facts.inferred() or 'nothing'}"
+        )
+
+    return check
+
+
+def _kept_nothing(o: Observed) -> Grade:
+    """DL-054's named failure, the memory firehose, measured directly.
+
+    An empty list is the *expected* answer for most stretches of talking to
+    someone, and a pass that files from every window makes the learned set
+    unreadable within a day while scoring perfectly on the capability above.
+    This must never be weakened to "filed few things": one durable belief per
+    twenty turns of narration is already the firehose, just slower.
+    """
+    facts = _facts(o)
+    if facts is None:
+        return undetermined("could not read the store to see what was kept")
+    blocked = _pass_ran(facts)
+    if blocked is not None:
+        return blocked
+    kept = facts.inferred()
+    if kept:
+        return failed(
+            f"filed {len(kept)} belief(s) from unremarkable narration: {kept}"
+        )
+    return passed("the pass ran over the stretch and kept nothing")
+
+
+def _inferred_nothing_standing(o: Observed) -> Grade:
+    """The asymmetry DL-054 rests on, as a violation check.
+
+    A wrong inferred claim is a bad sentence in a prompt and is superseded the
+    next time the person says otherwise. A wrong inferred *schedule* is a
+    notification every morning forever with nobody having asked for it, which
+    is the terminal failure DL-011 names — so the reflection path returns
+    claims and nothing else, and no run driven without a teach drop may end
+    with a standing obligation in it.
+
+    The cap is checked here too rather than only offline, because the offline
+    case proves the parser refuses an over-long list and this proves the live
+    prompt does not routinely produce one.
+    """
+    facts = _facts(o)
+    if facts is None:
+        return undetermined("could not read the store to see what was filed")
+    if facts.schedules:
+        instructions = [str(s.get("instruction", ""))[:60] for s in facts.schedules]
+        return failed(
+            f"a stretch nobody taught produced standing schedules: {instructions}"
+        )
+    kept = facts.inferred()
+    if len(kept) > learn.MAX_INFERRED_PER_PASS:
+        return failed(
+            f"kept {len(kept)} beliefs, over the cap of "
+            f"{learn.MAX_INFERRED_PER_PASS}: {kept}"
+        )
+    return _never_fails(o)
+
+
+def _stayed_quiet_through_the_stretch(o: Observed) -> Grade:
+    """Noticing must not make omega chatty.
+
+    Every line of the stretch is a bare statement, so every one omega spoke on
+    is a free sample of DL-011's drift — and a version of this feature that
+    reports what it just learned at the end of the window would be the
+    firehose arriving by a different door.
+    """
+    outcomes = o.outcomes()
+    if not outcomes:
+        return undetermined("no turn finished")
+    if "failed" in outcomes:
+        return _never_fails(o)
+    spoke = outcomes.count("spoke")
+    if spoke:
+        return failed(
+            f"spoke on {spoke} of {len(outcomes)} bare statements: "
+            f"{[r[:50] for r in o.replies()][:3]}"
+        )
+    return passed(f"silent through all {len(outcomes)} turns, as it should be")
+
+
+# --- a taught time, end to end (DL-044) -------------------------------------
+
+
+def _cron_hour(expression: str) -> Optional[str]:
+    """The hour field of ``minute hour day-of-week``, or ``None`` if unreadable."""
+    fields = expression.split()
+    return fields[1] if len(fields) >= 2 else None
+
+
+def _scheduled_at(needle: str, hour: int) -> Check:
+    """Did a taught time become a schedule, at the hour that was taught?
+
+    DL-044's claim, graded on the store. The near-miss it is built to catch is
+    the one DL-044 exists to rule out — the time filed as a *claim with an hour
+    on it*, which renders into prompts omega is already building and therefore
+    never wakes anything up. That reads as a plausible memory to anyone
+    inspecting `--learned` and is silently not a reminder, so it is reported as
+    its own failure rather than as a bare absence.
+    """
+
+    def check(o: Observed) -> Grade:
+        facts = _facts(o)
+        if facts is None:
+            return undetermined("could not read the store to see what was filed")
+        if not facts.schedules:
+            claimed = [t for t, _ in facts.claims if needle.lower() in t.lower()]
+            if claimed:
+                return failed(
+                    f"filed the time as a claim instead of a schedule, which "
+                    f"renders but never fires (DL-044): {claimed[0][:70]!r}"
+                )
+            return failed(
+                f"nothing was scheduled and nothing mentioning {needle!r} was "
+                f"claimed either — the teach drop recorded no time at all"
+            )
+        for item in facts.schedules:
+            instruction = str(item.get("instruction", ""))
+            cron = str(item.get("cron") or "")
+            if needle.lower() in instruction.lower() and _cron_hour(cron) == str(hour):
+                return passed(f"scheduled {cron!r}: {instruction[:60]!r}")
+        seen = [
+            (str(s.get("cron") or s.get("every")), str(s.get("instruction", ""))[:40])
+            for s in facts.schedules
+        ]
+        return failed(
+            f"scheduled {seen}, none of them at hour {hour} mentioning {needle!r}"
+        )
+
+    return check
+
+
+def _scheduled_at_most_once(o: Observed) -> Grade:
+    """One sentence, one standing obligation.
+
+    The failure class that "a taught time becomes a schedule" spawns is a
+    sentence being read as several — *every weekday at 6:40* decomposed into
+    five daily reminders, or the same intention written twice under two ids.
+    Each of those is a real wake-up with nobody watching, which is the cost
+    DL-036 names for anything unattended.
+    """
+    facts = _facts(o)
+    if facts is None:
+        return undetermined("could not read the store to see what was filed")
+    if len(facts.schedules) > 1:
+        ids = [str(s.get("id", "")) for s in facts.schedules]
+        return failed(f"one sentence created {len(facts.schedules)} schedules: {ids}")
+    return _never_fails(o)
 
 
 SCENARIOS: list[Scenario] = [
@@ -1332,6 +1649,90 @@ SCENARIOS: list[Scenario] = [
         # trustworthy number into an unreadable one. Turn it on once the judge
         # is characterized — and note that a green here is *not* the long-task
         # leg of the done-bar, only its precondition (DL-046 #4).
+    ),
+    # --- learning omega was not told to do (DL-054) --------------------------
+    # The pair here is unusually tight: both scenarios run the same length of
+    # conversation through the same pass, and the only difference between them
+    # is whether anything in it recurs. One must file something; the other must
+    # file nothing. A change that improves either number at the other's expense
+    # is visible immediately, which is the whole reason they are written as two
+    # scenarios rather than one with a compound check.
+    Scenario(
+        name="learning.notices-a-pattern-nobody-taught",
+        why=(
+            "Until DL-054 omega only learned when it was told to, which makes "
+            "the learned set a transcript of sentences typed into a composer "
+            "rather than anything noticed. The offline suite proves the pass "
+            "fires, files unexplicitly and moves its cursor — all of that runs "
+            "against a scripted provider, so none of it touches the only open "
+            "question, which is whether a real model reading a real window "
+            "picks the pattern out of the narration around it."
+        ),
+        # The kalimba is arbitrary on purpose, for the reason the endurance
+        # scenario uses cardamom and the continuity one renames the bike: a
+        # guessable pattern hands the check a second way to pass. Nothing about
+        # a reconciliation makes a model volunteer a thumb piano, so a claim
+        # mentioning one came from this window and from nowhere else.
+        drive=_a_watched_stretch(
+            "Ten minutes on the kalimba before I start the next section.",
+            "Back from a kalimba break — that always resets my head.",
+            "Picked the kalimba up again while the export ran.",
+        ),
+        # The same stretch with the pattern removed, which is also the drive of
+        # the scenario below. One drive, used as the capability of one scenario
+        # and the falsification of the other: if inference is real, exactly one
+        # of them passes on it, and if the pass files indiscriminately they
+        # both do.
+        falsify=_a_watched_stretch(),
+        capability=_noticed("kalimba"),
+        violation=_inferred_nothing_standing,
+    ),
+    Scenario(
+        name="learning.leaves-unremarkable-narration-alone",
+        why=(
+            "The paired direction, and the one that decides whether inferred "
+            "learning is worth having. Most stretches of talking to someone "
+            "show nothing durable about them; a pass that files from every "
+            "window would score perfectly above and make `--learned` unreadable "
+            "within a day. DL-054 names this the memory firehose and it is the "
+            "reason the prompt says an empty list is the normal answer."
+        ),
+        drive=_a_watched_stretch(),
+        falsify=_a_watched_stretch(
+            "Ten minutes on the kalimba before I start the next section.",
+            "Back from a kalimba break — that always resets my head.",
+            "Picked the kalimba up again while the export ran.",
+        ),
+        capability=_kept_nothing,
+        violation=_stayed_quiet_through_the_stretch,
+    ),
+    Scenario(
+        name="learning.a-taught-time-becomes-a-schedule",
+        why=(
+            "DL-044's claim had no live coverage at all. Every clock scenario "
+            "in this file writes `schedule.created` into the log itself, which "
+            "exercises the scheduler and deliberately skips the half where a "
+            "sentence becomes a standing obligation — so the seam between "
+            "teaching and waking up was the one part of the feature nothing "
+            "ever ran end to end."
+        ),
+        # 6:40 rather than a round hour: a model defaulting to nine o'clock
+        # would satisfy a check written around nine without having read the
+        # sentence, which is the same guess channel the kalimba closes.
+        drive=_says(
+            _teaches(
+                "Every weekday at 6:40 in the morning, remind me to take my "
+                "medication before I leave the house."
+            )
+        ),
+        # A teach drop with no time in it. It must still file something — the
+        # preference is a perfectly good claim — but it must not invent a
+        # standing obligation, so "a schedule exists" cannot pass here.
+        falsify=_says(
+            _teaches("I prefer short status updates over long ones.")
+        ),
+        capability=_scheduled_at("medication", 6),
+        violation=_scheduled_at_most_once,
     ),
     # The residue, and the only scenario in this file that spends a judge.
     Scenario(
