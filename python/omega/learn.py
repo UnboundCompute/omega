@@ -66,6 +66,9 @@ __all__ = [
     "MAX_INSTRUCTION_CHARS",
     "Extraction",
     "NotExtracted",
+    "Lens",
+    "CONVERSATION",
+    "WORK",
     "teaching_note",
     "extract",
     "reflect",
@@ -115,6 +118,50 @@ MAX_SCHEDULES_PER_NOTE = 4
 #: of forty turns, it has to rank, and ranking is most of what makes the
 #: difference between a memory and a transcript.
 MAX_INFERRED_PER_PASS = 3
+
+
+@dataclass(frozen=True)
+class Lens:
+    """What a reflection pass is looking at, in the two words the prompt needs.
+
+    Reflection reads two different objects now: a stretch of omega's own
+    conversation (DL-054) and a digest of work the person did somewhere else
+    (DL-057). Everything about the pass is the same — the same refusals, the
+    same cap, the same claim shape, the same fold — except the sentence naming
+    what is being read, and the label above it.
+
+    Two fields rather than two prompts, because the parts that matter are the
+    parts both share: *most stretches show nothing*, and *patterns, not events*.
+    A second prompt would be a second place for those to drift.
+    """
+
+    #: How the system prompt opens, naming what is about to be read.
+    opening: tuple[str, ...]
+    #: What the material is called when it is handed over.
+    label: str
+
+
+#: Reflecting over omega's own recent conversation (DL-054).
+CONVERSATION = Lens(
+    opening=(
+        "You are reviewing a stretch of your own recent conversation to see",
+        "whether it shows anything worth remembering about this person.",
+    ),
+    label="The conversation",
+)
+
+#: Reflecting over a digest of work the person did in another agent (DL-057).
+#: It says *watched*, not *took part in*, because omega did not: reading a
+#: record of somebody working is weaker evidence than talking to them, and the
+#: prompt should not imply a memory omega does not have.
+WORK = Lens(
+    opening=(
+        "You are reviewing a record of work this person did in a coding tool,",
+        "which you watched but did not take part in. Look for what it shows",
+        "about how they work — not for what the work was about.",
+    ),
+    label="The session",
+)
 
 #: A schedule's instruction is the whole text of a future turn, so it has room
 #: to be a sentence rather than a phrase — but not room to be a document that
@@ -286,6 +333,7 @@ def reflect(
     *,
     transcript: str,
     known: Sequence[Claim] = (),
+    observing: Lens = CONVERSATION,
 ) -> list[dict[str, Any]]:
     """What this stretch of conversation showed. Raises :class:`NotExtracted`.
 
@@ -318,7 +366,9 @@ def reflect(
     in a prompt. A wrong inferred schedule is a notification at nine every
     morning forever, which is the failure DL-011 names as terminal.
     """
-    response = complete(provider.LEARN, _reflection_messages(transcript, known))
+    response = complete(
+        provider.LEARN, _reflection_messages(transcript, known, observing)
+    )
     raw = _unfence(response.text)
     try:
         answer = json.loads(raw)
@@ -332,7 +382,7 @@ def reflect(
 
 
 def _reflection_messages(
-    transcript: str, known: Sequence[Claim]
+    transcript: str, known: Sequence[Claim], observing: Lens = CONVERSATION
 ) -> list[provider.Message]:
     """The reflection prompt.
 
@@ -356,8 +406,7 @@ def _reflection_messages(
     distinction is drawn explicitly and with both examples.
     """
     lines = [
-        "You are reviewing a stretch of your own recent conversation to see",
-        "whether it shows anything worth remembering about this person.",
+        *observing.opening,
         "",
         "Most stretches show nothing. Returning an empty list is the normal",
         "and expected answer. Only write something down if the conversation",
@@ -398,7 +447,7 @@ def _reflection_messages(
         ]
         lines += [f"  [{c.seq}] {c.text}" for c in known]
     system = provider.system("\n".join(lines))
-    return [system, provider.user(f"The conversation:\n{transcript}")]
+    return [system, provider.user(f"{observing.label}:\n{transcript}")]
 
 
 def parse_answer(

@@ -319,6 +319,7 @@ class Learned:
         "_last_failure",
         "_reflected_through",
         "_since_reflection",
+        "_ingested",
     )
 
     def __init__(self) -> None:
@@ -328,6 +329,7 @@ class Learned:
         self._last_failure = ""
         self._reflected_through = 0
         self._since_reflection = 0
+        self._ingested: set[str] = set()
 
     @property
     def through(self) -> int:
@@ -394,6 +396,19 @@ class Learned:
                 # stretches hold, and so what a dead pass successfully imitates.
                 self._failed += 1
                 self._last_failure = str(reason)
+        elif payload.get("kind") == episodes.TRANSCRIPT_INGESTED:
+            # The set of sessions already read (DL-057). A receipt exists whether
+            # the session taught anything or not, which is the point: most teach
+            # nothing, so "did I read this?" cannot be asked of the claims.
+            self._ingested.add(str(payload["session"]))
+            reason = payload.get("reason")
+            if reason:
+                # Counted with the other learning failures for the reason the
+                # reflection branch gives: this runs with nobody watching, and a
+                # reader whose `learn` role has died looks exactly like a run of
+                # sessions that genuinely held nothing.
+                self._failed += 1
+                self._last_failure = str(reason)
         elif payload.get("kind") == episodes.MESSAGE_INBOUND:
             # What paces reflection: arriving messages, not raw log growth. A
             # turn that ran six tools writes six episodes and is still one thing
@@ -457,6 +472,18 @@ class Learned:
         tool records a turn happens to write are not.
         """
         return self._since_reflection
+
+    @property
+    def ingested(self) -> frozenset[str]:
+        """Ids of the transcript sessions already read (DL-057).
+
+        Derived from receipts in the log rather than kept in a file beside the
+        transcripts, for DL-036's reason: a cursor that lives outside the log is
+        a second source of truth that can disagree with it, and the way this one
+        would disagree is by losing itself on a restart and re-reading — and
+        so re-filing — a week of sessions it had already concluded on.
+        """
+        return frozenset(self._ingested)
 
     @property
     def last_failure(self) -> str:

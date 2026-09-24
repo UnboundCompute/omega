@@ -294,6 +294,9 @@ def test_every_m1_kind_is_accounted_for() -> None:
         episodes.REFLECTION_DONE: episodes.reflection_done(
             through=1, filed=0, at=AT
         ),
+        episodes.TRANSCRIPT_INGESTED: episodes.transcript_ingested(
+            session="s", source="claude-code", project="p", filed=0, at=AT
+        ),
     }
     assert set(made) == set(episodes.KINDS)
     for kind, payload in made.items():

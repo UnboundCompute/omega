@@ -35,7 +35,15 @@ import threading
 from pathlib import Path
 from typing import Callable, Optional
 
-from omega import derive, learn, memory, provider, runtime, schedule as scheduling
+from omega import (
+    derive,
+    learn,
+    memory,
+    provider,
+    runtime,
+    schedule as scheduling,
+    transcripts,
+)
 from omega.channel import DEFAULT_HOST, DEFAULT_PORT
 from omega.queue import EventQueue
 
@@ -370,7 +378,14 @@ def main(argv: Optional[list[str]] = None) -> int:
         return 2
 
     rt = runtime.Runtime(
-        store_dir, listen=args.listen, host=args.host, port=args.port
+        store_dir,
+        listen=args.listen,
+        host=args.host,
+        port=args.port,
+        # The one place the transcript sense is granted (DL-057). This is the
+        # assembled process, so it is where an authority to read outside the
+        # store belongs; a `Runtime` built anywhere else has no such sense.
+        transcripts_root=transcripts.default_root(),
     )
     try:
         rt.start()

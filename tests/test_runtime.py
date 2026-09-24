@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import threading
 import time
 from datetime import datetime, timedelta
@@ -830,3 +831,91 @@ def _every_episode(path: Path):
     with MemoryStore.open(path) as store:
         q = EventQueue(store)
         return list(q.recent(q.head()))
+
+
+# --- the idle work (DL-054, DL-057) -------------------------------------------
+
+
+def _with_a_session(tmp_path: Path) -> Path:
+    """A finished transcript from some other agent, on disk, old enough to read."""
+    root = tmp_path / "projects"
+    (root / "-Users-me-work").mkdir(parents=True)
+    path = root / "-Users-me-work" / "sess-1.jsonl"
+    path.write_text(
+        "".join(
+            json.dumps({"message": {"role": "user", "content": text}}) + "\n"
+            for text in (
+                "rewrite the parser so it streams",
+                "no, keep the error path",
+                "run the tests before you commit",
+                "push it",
+            )
+        )
+    )
+    old = time.time() - 3 * 60 * 60
+    os.utime(path, (old, old))
+    return root
+
+
+def _reads_transcripts(reply: str = "ok") -> provider.FakeProvider:
+    fake = speaking(reply)
+    fake._answers[provider.LEARN] = lambda role, messages: json.dumps({"claims": []})
+    return fake
+
+
+def test_the_drain_reaches_the_idle_work_when_the_queue_goes_dry(
+    store_dir: Path, tmp_path: Path
+) -> None:
+    """The regression that matters most in this file, because the bug it guards
+    against produced no symptom at all.
+
+    ``_drain_pending`` steps rather than calling ``Executor.drain``, which is
+    right — it buys a stop point between episodes. What it silently cost was the
+    thing ``drain`` does when a sweep finds nothing: reflection (DL-054) and
+    ingestion (DL-057) both hang off that moment, so for as long as the loop
+    only ever called ``step``, neither had ever run in this process. Nothing
+    failed. There was simply never a ``reflection.done`` in any log.
+
+    Asserted through ingestion because it is the pass that needs no threshold —
+    it is the same call site reflection sits on.
+    """
+    root = _with_a_session(tmp_path)
+    with runtime_at(
+        store_dir, _reads_transcripts(), transcripts_root=root, sense=0.0
+    ) as rt:
+        rt.say("morning")
+
+        assert until(
+            lambda: any(
+                p.payload["kind"] == episodes.TRANSCRIPT_INGESTED
+                for p in _every_episode_of(rt)
+            )
+        ), "the drain never reached the idle work"
+
+    receipts = [
+        p.payload
+        for p in _every_episode(store_dir)
+        if p.payload["kind"] == episodes.TRANSCRIPT_INGESTED
+    ]
+    assert [r["session"] for r in receipts] == ["sess-1"]
+    assert graded(store_dir), str(graded(store_dir))
+
+
+def test_a_runtime_given_no_transcript_root_has_no_such_sense(
+    store_dir: Path, tmp_path: Path
+) -> None:
+    """Reading files omega did not write, outside its own store, is an authority
+    granted at the one place that assembles the real process — not the default
+    behaviour of every ``Runtime`` a test happens to build. The failure this
+    prevents is a test suite that reads the person's home directory."""
+    _with_a_session(tmp_path)
+    with runtime_at(store_dir, _reads_transcripts(), sense=0.0) as rt:
+        rt.say("morning")
+        rt.say("again")
+
+    kinds = {p.payload["kind"] for p in _every_episode(store_dir)}
+    assert episodes.TRANSCRIPT_INGESTED not in kinds
+
+
+def _every_episode_of(rt: Runtime):
+    return list(rt.queue.recent(rt.queue.head()))

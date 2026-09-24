@@ -28,7 +28,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
-from omega import episodes, learn, provider
+from omega import episodes, learn, provider, transcripts
 from omega.derive import Learned, OpenWork
 from omega.memory import WriteKeyConflict
 from omega.queue import EVENT_KINDS, EventQueue, Pending
@@ -488,6 +488,105 @@ class Executor:
             return True
         self._queue.append(episodes.reflection_done(through=head, filed=len(filed)))
         return True
+
+    def ingest(self, *, root: Optional[Any] = None, now: Optional[Any] = None) -> int:
+        """Read finished transcripts from other agents and keep what they showed.
+
+        DL-057. Returns how many sessions were read. Called from the same idle
+        moment as :meth:`reflect` and for the same two reasons: the queue being
+        empty is the one point omega is provably not mid-turn, and a sense that
+        cost reply latency would be a sense worth turning off.
+
+        **One model call per session, and a hard cap on sessions per pass.**
+        The digest is mechanical (:mod:`omega.transcripts`); the only model call
+        is the same reflection pass DL-054 already runs, pointed at a different
+        object through :data:`omega.learn.WORK`. That is the whole design: this
+        path adds a *source*, not an engine, so everything already true of
+        reflection — the refusal to invent, the cap of three, ``explicit=False``,
+        the claim shape, the fold — is true here without being re-derived.
+
+        **A receipt per session, filed or not.** Most sessions teach nothing,
+        so "have I read this?" cannot be answered from the claims; it is
+        answered from :attr:`Learned.ingested`, which is why the receipt is
+        written even when the digest was empty or the pass filed none.
+
+        **Never raises**, for :meth:`reflect`'s reason. A transcript is the
+        first input to reach omega's learning path that omega did not produce
+        and the person did not type, and the drain thread must not be something
+        a malformed file on disk can stop.
+        """
+        if not self._recovered:
+            return 0
+        if self._complete is None:
+            return 0
+        if self._queue.head() == 0:
+            # An omega with an empty log has never been spoken to, and the first
+            # thing in it should not be a belief about a person it has not met,
+            # inferred from a file it found on disk. Also the honest answer to a
+            # mechanical problem: every claim names the episode it came from,
+            # and on an empty log there is no episode to name.
+            return 0
+        self._learned.advance(self._queue.store)
+        try:
+            sessions = transcripts.discover(
+                root, now=now, seen=self._learned.ingested
+            )
+        except Exception:  # noqa: BLE001 - see the docstring
+            # No receipt: nothing was read, so there is no session to name one
+            # after, and a failure to *look* is not a failure to learn from any
+            # particular thing.
+            return 0
+
+        read = 0
+        for session in sessions[: transcripts.MAX_SESSIONS_PER_PASS]:
+            self._ingest_one(session)
+            read += 1
+        return read
+
+    def _ingest_one(self, session: transcripts.Session) -> None:
+        # Advanced per session, not once per pass: the second session of a pass
+        # must see what the first one filed, or a habit visible in both gets
+        # written twice instead of once and superseded.
+        self._learned.advance(self._queue.store)
+        head = self._queue.head()
+        receipt = {
+            "session": session.id,
+            "source": session.source,
+            "project": session.project,
+        }
+        try:
+            digest = transcripts.digest(session)
+        except Exception as exc:  # noqa: BLE001
+            reason = str(exc) or type(exc).__name__
+            self._queue.append(episodes.transcript_ingested(**receipt, reason=reason))
+            return
+        if digest is None:
+            # Not a failure. A session too short to show a pattern is the
+            # ordinary case, and calling it one would bury a real fault in the
+            # count that exists to surface it.
+            self._queue.append(episodes.transcript_ingested(**receipt, filed=0))
+            return
+        try:
+            claims = learn.reflect(
+                self._complete,
+                transcript=digest,
+                known=self._learned.claims(),
+                observing=learn.WORK,
+            )
+            filed = learn.file_claims(
+                self._queue,
+                claims,
+                # As in `reflect`: there is no turn, so the head at the moment
+                # the session was read is the honest cause to point at.
+                for_seq=head,
+                source_seq=head,
+                explicit=False,
+            )
+        except Exception as exc:  # noqa: BLE001
+            reason = str(exc) or type(exc).__name__
+            self._queue.append(episodes.transcript_ingested(**receipt, reason=reason))
+            return
+        self._queue.append(episodes.transcript_ingested(**receipt, filed=len(filed)))
 
     def _handle(self, pending: Pending) -> Optional[TurnResult]:
         if not pending.is_event:

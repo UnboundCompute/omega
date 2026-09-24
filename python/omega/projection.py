@@ -162,6 +162,15 @@ class Update:
 #: pass files are reachable the way every other claim is, by asking. Pushing it
 #: would be omega announcing that it had been thinking about you, unprompted,
 #: roughly once a session, which is the notification firehose starting small.
+#:
+#: `transcript.ingested` is withheld for all of `reflection.done`'s reasons and
+#: one of its own, which is the point of DL-057 rather than an aside. This is
+#: the first thing omega notices that nobody asked it to look at — DL-056's
+#: *noticed* category, the one with no consent story — and it ships with no
+#: outward surface at all precisely so the firehose cannot exist before the rule
+#: governing it does. "I read what you did in another tool today" is also the
+#: single creepiest sentence this path could produce, and it would produce one
+#: per session, silently, as the *default*.
 NOT_PROJECTED = frozenset(
     {
         episodes.SCHEDULE_CREATED,
@@ -170,6 +179,7 @@ NOT_PROJECTED = frozenset(
         episodes.CLAIM_RETRACTED,
         episodes.CLAIM_EXTRACTION_FAILED,
         episodes.REFLECTION_DONE,
+        episodes.TRANSCRIPT_INGESTED,
     }
 )
 

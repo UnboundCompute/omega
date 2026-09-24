@@ -40,6 +40,7 @@ __all__ = [
     "SCHEDULE_CANCELLED",
     "CLAIM_EXTRACTED",
     "CLAIM_RETRACTED",
+    "TRANSCRIPT_INGESTED",
     "MIN_EVERY_SECONDS",
     "TRIGGER_FIELDS",
     "BadPayload",
@@ -60,6 +61,7 @@ __all__ = [
     "claim_retracted",
     "claim_extraction_failed",
     "reflection_done",
+    "transcript_ingested",
     "now",
 ]
 
@@ -80,6 +82,7 @@ CLAIM_EXTRACTED = "claim.extracted"
 CLAIM_RETRACTED = "claim.retracted"
 CLAIM_EXTRACTION_FAILED = "claim.extraction_failed"
 REFLECTION_DONE = "reflection.done"
+TRANSCRIPT_INGESTED = "transcript.ingested"
 
 #: The complete M1 kind set (§2.1: "and that is all of them").
 #:
@@ -102,6 +105,7 @@ KINDS = frozenset(
         CLAIM_RETRACTED,
         CLAIM_EXTRACTION_FAILED,
         REFLECTION_DONE,
+        TRANSCRIPT_INGESTED,
     }
 )
 
@@ -703,6 +707,53 @@ def reflection_done(
     return payload
 
 
+def transcript_ingested(
+    *,
+    session: str,
+    source: str,
+    project: str,
+    filed: int = 0,
+    reason: Optional[str] = None,
+    at: Optional[str] = None,
+) -> dict[str, Any]:
+    """One session of somebody else's agent transcript was read (DL-057).
+
+    **This is the cursor, and that is why the kind exists.** Like a reflection
+    pass, the common and desired outcome is that a session shows nothing worth
+    remembering — so "have I read this one?" cannot be answered from the claims
+    it produced, because usually there are none. Without a receipt per session
+    omega would re-read and re-reflect over the same transcripts forever, paying
+    for a model call each time to conclude nothing again.
+
+    **Kept in the log rather than in a cursor file**, for DL-036's reason: a
+    reader that persists its own private position either goes quiet forever when
+    it is wrong or re-reads everything when it is lost, and both fail silently.
+    The log already survives restart and already gets rebuilt from nothing.
+
+    ``session`` identifies the transcript, ``source`` which agent wrote it, and
+    ``project`` where the work was happening — the last is not needed to avoid
+    re-reading, and is here because a receipt a person cannot place is a receipt
+    they cannot check.
+
+    Deliberately **not** the transcript's contents. What omega experienced is
+    that it read a session; what it learned is a claim. Copying somebody else's
+    conversation into this log would make memory stop deriving from what omega
+    did (DL-017) and would put untrusted text permanently in recall.
+    """
+    payload = {
+        "v": VERSION,
+        "kind": TRANSCRIPT_INGESTED,
+        "session": session,
+        "source": source,
+        "project": project,
+        "filed": filed,
+        "reason": reason,
+        "at": at or now(),
+    }
+    _validate(payload)
+    return payload
+
+
 def _copy_trigger(trigger: dict[str, Any]) -> dict[str, Any]:
     copied = dict(trigger)
     if isinstance(copied.get("any"), list):
@@ -735,6 +786,7 @@ _REQUIRED: dict[str, tuple[str, ...]] = {
     CLAIM_RETRACTED: ("for_seq", "claim_seq", "at"),
     CLAIM_EXTRACTION_FAILED: ("for_seq", "reason", "at"),
     REFLECTION_DONE: ("through", "filed", "reason", "at"),
+    TRANSCRIPT_INGESTED: ("session", "source", "project", "filed", "reason", "at"),
 }
 
 #: The kinds that are *not* about one turn. Everything else names the inbound
@@ -783,6 +835,24 @@ def _validate(payload: dict[str, Any]) -> None:
                 # A slot with no schedule is unattributable: it would claim a
                 # fire was owed without saying what owes it.
                 raise BadPayload("schedule_slot requires schedule_id")
+    elif kind == TRANSCRIPT_INGESTED:
+        # Identified by the session it read, not by a turn and not by a cursor
+        # into omega's own log: the thing being tracked lives outside, so the
+        # identity has to come from outside too.
+        _require_str(payload, "session", non_empty=True)
+        _require_str(payload, "source", non_empty=True)
+        _require_str(payload, "project", non_empty=True)
+        filed = payload["filed"]
+        if isinstance(filed, bool) or not isinstance(filed, int) or filed < 0:
+            raise BadPayload("filed must be a non-negative count")
+        reason = payload["reason"]
+        if reason is not None and not (isinstance(reason, str) and reason.strip()):
+            raise BadPayload("reason must be null or a non-empty string")
+        if reason is not None and filed:
+            # Same all-or-nothing rule as the reflection record, for the same
+            # reason: a receipt claiming both a failure and a write would be
+            # the only evidence of a partial one.
+            raise BadPayload("a failed ingestion cannot also have filed claims")
     elif kind == REFLECTION_DONE:
         # No `for_seq` and no `id`: a reflection belongs to no turn and names no
         # standing thing. It is identified by the stretch of log it covered.

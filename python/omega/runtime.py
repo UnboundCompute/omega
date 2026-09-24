@@ -68,6 +68,7 @@ from omega.turn import ActResult, TurnContext
 
 __all__ = [
     "DEFAULT_POLL",
+    "SENSE_SECONDS",
     "DEFAULT_TURN_TIMEOUT",
     "DEFAULT_STOP_TIMEOUT",
     "NotRunning",
@@ -85,6 +86,13 @@ __all__ = [
 #: other producer against the same queue. Small enough that such an event is not
 #: visibly late, large enough that an idle omega is not a spinning CPU.
 DEFAULT_POLL = 0.05
+
+#: Shortest gap between two goes at the idle work — reflection (DL-054) and
+#: transcript ingestion (DL-057). Nothing is waiting on either, so this is set
+#: from cost rather than from latency: a minute is often enough that a session
+#: finished while omega was busy is learned from the same hour, and rare enough
+#: that an idle process is not folding its log twelve hundred times a minute.
+SENSE_SECONDS = 60.0
 
 #: How long :meth:`Runtime.say` waits for a turn's terminal record. Generous,
 #: because a turn is two model calls and M1 has no streaming: a caller that gave
@@ -238,6 +246,15 @@ class Runtime:
         # a turn engine that should do nothing it was not handed.
         act: Callable[[TurnContext], ActResult] = act_loop,
         listen: bool = True,
+        # Where other agents' transcripts live (DL-057). ``None`` means omega
+        # has no such sense, and that is the default on purpose — the opposite
+        # of the clock below, for a reason the clock does not have: this one
+        # reads files omega did not write, outside its own store. An authority
+        # like that is granted at the one place that assembles the real process
+        # (`__main__`), never assumed by every `Runtime` a test happens to
+        # build, which would make reading the person's home directory the
+        # default behaviour of the test suite.
+        transcripts_root: Optional[PathLike] = None,
         # On by default because DL-035's whole point is that omega acts on time
         # without being asked, and a proactivity that has to be switched on is
         # one that is off in every deployment nobody remembered to configure.
@@ -247,6 +264,7 @@ class Runtime:
         port: int = DEFAULT_PORT,
         poll: float = DEFAULT_POLL,
         tick: float = TICK_SECONDS,
+        sense: float = SENSE_SECONDS,
         turn_timeout: float = DEFAULT_TURN_TIMEOUT,
     ) -> None:
         if poll <= 0:
@@ -257,11 +275,15 @@ class Runtime:
         self._complete = complete
         self._act = act
         self._listen = listen
+        self._transcripts = (
+            None if transcripts_root is None else Path(os.fspath(transcripts_root))
+        )
         self._clock = clock
         self._host = host
         self._port = port
         self._poll = poll
         self._tick = tick
+        self._sense_every = sense
         self._turn_timeout = turn_timeout
 
         self._store: Optional[MemoryStore] = None
@@ -270,6 +292,11 @@ class Runtime:
         self._executor: Optional[Executor] = None
         self._channel: Optional[Channel] = None
         self._scheduler: Optional[Scheduler] = None
+        # 0.0 rather than "now", so the first idle moment after a start senses
+        # immediately: a process that was down over a lunch break has a backlog
+        # of finished sessions, and making it wait out a full interval first is
+        # a delay with nothing on the other side of it.
+        self._sensed_at = 0.0
         self._thread: Optional[threading.Thread] = None
         self._clock_thread: Optional[threading.Thread] = None
         self._report: Optional[StartupReport] = None
@@ -552,6 +579,44 @@ class Runtime:
         while not self._stopping.is_set() and queue.claimed() < queue.head():
             if executor.step() is not None:
                 self._turns += 1
+        if not self._stopping.is_set() and queue.claimed() >= queue.head():
+            self._sense()
+
+    def _sense(self) -> None:
+        """The work that only happens when there is nothing to answer.
+
+        Stepping instead of calling ``Executor.drain`` bought a stop point
+        between episodes and cost the thing ``drain`` does at the end of a
+        sweep: reflection (DL-054) and transcript ingestion (DL-057) both hang
+        off the moment the queue goes dry, and a loop that only ever calls
+        ``step`` never reaches either. That was not a tuning problem — it is why
+        reflection had never once run in this process.
+
+        **Rate-limited by wall clock, not by the poll.** The drain wakes twenty
+        times a second; folding the learned view and scanning a transcript
+        directory at that rate would make idle omega the most expensive thing on
+        the machine. Both passes are self-gating underneath (reflection on
+        messages since the last one, ingestion on unread sessions), so this
+        interval only decides how often they are *asked*.
+
+        Never raises for the same reason the passes themselves don't: a sense
+        that can kill the drain thread is a sense that can stop every future
+        turn, which is a worse outcome than not learning.
+        """
+        executor = self._executor
+        if executor is None:  # pragma: no cover - stopped mid-flight
+            return
+        now = time.monotonic()
+        if now - self._sensed_at < self._sense_every:
+            return
+        self._sensed_at = now
+        # One pass reads at most `transcripts.MAX_SESSIONS_PER_PASS` sessions,
+        # so a stop requested mid-sense waits about as long as it would for a
+        # long turn. Both are bounded by a model call, which is the shortest
+        # unit this loop has ever been interruptible at.
+        executor.reflect()
+        if self._transcripts is not None:
+            executor.ingest(root=self._transcripts)
 
     # --- the heartbeat thread ---------------------------------------------
 

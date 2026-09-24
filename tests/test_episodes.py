@@ -81,6 +81,13 @@ def test_every_kind_round_trips():
         ep.claim_retracted(
             for_seq=41, claim_seq=12, at="2026-09-23T10:00:00+00:00"
         ),
+        ep.transcript_ingested(
+            session="63815d72-59e0-4cf4-a771-e7e561b4bef8",
+            source="claude-code",
+            project="-Users-me-project",
+            filed=2,
+            at="2026-09-23T10:00:00+00:00",
+        ),
     ]
     assert {p["kind"] for p in built} == ep.KINDS, "a kind has no round-trip test"
     for payload in built:
