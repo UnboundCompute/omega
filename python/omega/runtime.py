@@ -255,6 +255,12 @@ class Runtime:
         # build, which would make reading the person's home directory the
         # default behaviour of the test suite.
         transcripts_root: Optional[PathLike] = None,
+        # Where macOS keeps its own app-usage record (DL-059). ``None`` for
+        # every reason above and a stronger one: this path is readable only
+        # under Full Disk Access, so a default that pointed at it would make a
+        # broad system permission look like something the code assumed it had.
+        # Granted in `__main__` or not at all.
+        usage_path: Optional[PathLike] = None,
         # On by default because DL-035's whole point is that omega acts on time
         # without being asked, and a proactivity that has to be switched on is
         # one that is off in every deployment nobody remembered to configure.
@@ -278,6 +284,7 @@ class Runtime:
         self._transcripts = (
             None if transcripts_root is None else Path(os.fspath(transcripts_root))
         )
+        self._usage = None if usage_path is None else Path(os.fspath(usage_path))
         self._clock = clock
         self._host = host
         self._port = port
@@ -587,10 +594,16 @@ class Runtime:
 
         Stepping instead of calling ``Executor.drain`` bought a stop point
         between episodes and cost the thing ``drain`` does at the end of a
-        sweep: reflection (DL-054) and transcript ingestion (DL-057) both hang
-        off the moment the queue goes dry, and a loop that only ever calls
-        ``step`` never reaches either. That was not a tuning problem — it is why
-        reflection had never once run in this process.
+        sweep: reflection (DL-054), transcript ingestion (DL-057) and the usage
+        digest (DL-059) all hang off the moment the queue goes dry, and a loop
+        that only ever calls ``step`` never reaches any of them. That was not a
+        tuning problem — it is why reflection had never once run in this
+        process.
+
+        Every sense that gets added lands here, in this order, and the order is
+        cheapest-first rather than arbitrary: each pass is self-gating, so the
+        ones with nothing to do cost a set lookup, and the one with work to do
+        is the last thing between here and the next poll.
 
         **Rate-limited by wall clock, not by the poll.** The drain wakes twenty
         times a second; folding the learned view and scanning a transcript
@@ -617,6 +630,8 @@ class Runtime:
         executor.reflect()
         if self._transcripts is not None:
             executor.ingest(root=self._transcripts)
+        if self._usage is not None:
+            executor.digest_usage(path=self._usage)
 
     # --- the heartbeat thread ---------------------------------------------
 

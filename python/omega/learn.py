@@ -69,6 +69,7 @@ __all__ = [
     "Lens",
     "CONVERSATION",
     "WORK",
+    "DAY",
     "teaching_note",
     "extract",
     "reflect",
@@ -161,6 +162,23 @@ WORK = Lens(
         "about how they work — not for what the work was about.",
     ),
     label="The session",
+)
+
+#: Reflecting over one day of the Mac's own usage record (DL-059). The weakest
+#: evidence of the three and the opening says so twice — *did not see*, and
+#: *rhythm, not content* — because this is the lens most likely to produce a
+#: confident sentence about a person from a table of numbers. It knows when
+#: they were at the machine and which app was in front; it knows nothing
+#: whatever about what they were doing in it, and a claim that implies
+#: otherwise is the invention this whole path is bounded against.
+DAY = Lens(
+    opening=(
+        "You are reviewing a record of which applications this person had open",
+        "during one day, which you did not see and were not part of. Look for",
+        "the rhythm of their day — when they start, when they stop, when they",
+        "are deep in one thing. You do not know what they were working on.",
+    ),
+    label="The day",
 )
 
 #: A schedule's instruction is the whole text of a future turn, so it has room

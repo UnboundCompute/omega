@@ -37,6 +37,7 @@ from typing import Callable, Optional
 
 from omega import (
     derive,
+    habits,
     learn,
     memory,
     provider,
@@ -386,6 +387,13 @@ def main(argv: Optional[list[str]] = None) -> int:
         # assembled process, so it is where an authority to read outside the
         # store belongs; a `Runtime` built anywhere else has no such sense.
         transcripts_root=transcripts.default_root(),
+        # And the one place the usage sense is granted (DL-059), for the same
+        # reason and with a sharper edge: reading this file needs Full Disk
+        # Access, which is a system-wide permission the person granted to the
+        # *app*. Naming the path here, once, beside the other one, is what keeps
+        # the breadth of that grant visible in the code rather than implied by a
+        # default nobody reads.
+        usage_path=habits.default_path(),
     )
     try:
         rt.start()

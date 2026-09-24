@@ -28,7 +28,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
-from omega import episodes, learn, provider, transcripts
+from omega import episodes, habits, learn, provider, transcripts
 from omega.derive import Learned, OpenWork
 from omega.memory import WriteKeyConflict
 from omega.queue import EVENT_KINDS, EventQueue, Pending
@@ -599,6 +599,92 @@ class Executor:
             self._queue.append(episodes.transcript_ingested(**receipt, reason=reason))
             return
         self._queue.append(episodes.transcript_ingested(**receipt, filed=len(filed)))
+
+    def digest_usage(
+        self, *, path: Optional[Any] = None, now: Optional[Any] = None
+    ) -> int:
+        """Read finished days from the Mac's own usage record (DL-059).
+
+        Returns how many days were digested. Structurally :meth:`ingest` with a
+        different source, and deliberately so: the sense being added is a
+        *source*, not an engine, so the cap, the ``explicit=False``, the refusal
+        to invent, the receipt-as-cursor and the fold all come from the
+        reflection path unchanged rather than being re-derived here.
+
+        **The one thing that differs is where the bound lives.** A session is
+        finished when its file stops changing, which :mod:`omega.transcripts`
+        can see. A day is finished when it is over, which is a fact about the
+        clock — so the eligibility rule is in :func:`omega.habits.discover` and
+        this method holds no date logic at all.
+
+        **Never raises**, for :meth:`ingest`'s reason and one more: this reads a
+        database in an undocumented format belonging to the operating system,
+        which an update is free to change under us. The drain thread must not be
+        something a macOS release can stop.
+        """
+        if not self._recovered:
+            return 0
+        if self._queue.head() == 0:
+            # As in `ingest`: the first thing in an empty log must not be a
+            # belief about a person omega has not met, and there is no episode
+            # for such a claim to name as its cause.
+            return 0
+        self._learned.advance(self._queue.store)
+        try:
+            days = habits.discover(path, now=now, seen=self._learned.digested)
+        except Exception:  # noqa: BLE001 - see the docstring
+            # No receipt, for the reason `discover` itself returns empty when
+            # the database cannot be opened: a failure to *look* is not a
+            # failure to learn from any particular day, and writing receipts for
+            # days that were never read would mark them read forever.
+            return 0
+
+        read = 0
+        for day in days[: habits.MAX_DAYS_PER_PASS]:
+            self._digest_one_day(day)
+            read += 1
+        return read
+
+    def _digest_one_day(self, day: habits.Day) -> None:
+        # Per day, not once per pass: the second day of a pass must see what the
+        # first one filed, or a rhythm visible in both gets written twice
+        # instead of once and superseded.
+        self._learned.advance(self._queue.store)
+        head = self._queue.head()
+        receipt = {"day": day.id, "source": day.source}
+        try:
+            digest = habits.digest(day)
+        except Exception as exc:  # noqa: BLE001
+            reason = str(exc) or type(exc).__name__
+            self._queue.append(episodes.usage_digested(**receipt, reason=reason))
+            return
+        if digest is None:
+            # Not a failure, and the expected outcome for a weekend or a day
+            # away from the machine. Calling it one would bury a real schema
+            # break in the count that exists to surface it.
+            self._queue.append(episodes.usage_digested(**receipt, filed=0))
+            return
+        try:
+            claims = learn.reflect(
+                self._completer(),
+                transcript=digest,
+                known=self._learned.claims(),
+                observing=learn.DAY,
+            )
+            filed = learn.file_claims(
+                self._queue,
+                claims,
+                # As everywhere on this path: there is no turn, so the head at
+                # the moment the day was read is the honest cause to point at.
+                for_seq=head,
+                source_seq=head,
+                explicit=False,
+            )
+        except Exception as exc:  # noqa: BLE001
+            reason = str(exc) or type(exc).__name__
+            self._queue.append(episodes.usage_digested(**receipt, reason=reason))
+            return
+        self._queue.append(episodes.usage_digested(**receipt, filed=len(filed)))
 
     def _handle(self, pending: Pending) -> Optional[TurnResult]:
         if not pending.is_event:

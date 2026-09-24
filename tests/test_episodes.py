@@ -88,6 +88,12 @@ def test_every_kind_round_trips():
             filed=2,
             at="2026-09-23T10:00:00+00:00",
         ),
+        ep.usage_digested(
+            day="2026-09-23",
+            source="knowledgec",
+            filed=1,
+            at="2026-09-23T10:00:00+00:00",
+        ),
     ]
     assert {p["kind"] for p in built} == ep.KINDS, "a kind has no round-trip test"
     for payload in built:

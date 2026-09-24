@@ -19,7 +19,7 @@ hierarchy would buy nothing the closed ``KINDS`` set does not already give.
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Any, Optional
 
 from omega.blobs import is_digest
@@ -41,6 +41,7 @@ __all__ = [
     "CLAIM_EXTRACTED",
     "CLAIM_RETRACTED",
     "TRANSCRIPT_INGESTED",
+    "USAGE_DIGESTED",
     "MIN_EVERY_SECONDS",
     "TRIGGER_FIELDS",
     "BadPayload",
@@ -62,6 +63,7 @@ __all__ = [
     "claim_extraction_failed",
     "reflection_done",
     "transcript_ingested",
+    "usage_digested",
     "now",
 ]
 
@@ -83,6 +85,7 @@ CLAIM_RETRACTED = "claim.retracted"
 CLAIM_EXTRACTION_FAILED = "claim.extraction_failed"
 REFLECTION_DONE = "reflection.done"
 TRANSCRIPT_INGESTED = "transcript.ingested"
+USAGE_DIGESTED = "usage.digested"
 
 #: The complete M1 kind set (§2.1: "and that is all of them").
 #:
@@ -106,6 +109,7 @@ KINDS = frozenset(
         CLAIM_EXTRACTION_FAILED,
         REFLECTION_DONE,
         TRANSCRIPT_INGESTED,
+        USAGE_DIGESTED,
     }
 )
 
@@ -754,6 +758,48 @@ def transcript_ingested(
     return payload
 
 
+def usage_digested(
+    *,
+    day: str,
+    source: str,
+    filed: int = 0,
+    reason: Optional[str] = None,
+    at: Optional[str] = None,
+) -> dict[str, Any]:
+    """One finished day of the Mac's own usage record was read (DL-059).
+
+    The same object as :func:`transcript_ingested` over a different source, and
+    written as a separate kind rather than as a ``source`` variant of that one
+    because the two carry different identities — a session id is a file, a day
+    is a local calendar date — and a shared kind would have to make each field
+    optional, which is how a cursor stops being checkable.
+
+    **This is the cursor.** A quiet day is the *common* outcome and files
+    nothing, so "have I read this day?" cannot be answered from the claims. In
+    the log rather than in a file beside the database, for DL-036's reason.
+
+    ``day`` is an ISO local date, ``source`` which record it came from. There is
+    no third field naming the material: a transcript receipt carries ``project``
+    so the person can place it, and a date needs no placing.
+
+    Deliberately **not** what was on screen. What omega experienced is that it
+    read a day; what it learned is a claim. Copying app names and times into
+    this log would put a permanent surveillance record in recall and make memory
+    stop deriving from what omega did (DL-017).
+    """
+    payload = {
+        "v": VERSION,
+        "kind": USAGE_DIGESTED,
+        "day": day,
+        "source": source,
+        "filed": filed,
+        "reason": reason,
+        "at": at or now(),
+    }
+    _validate(payload)
+    return payload
+
+
 def _copy_trigger(trigger: dict[str, Any]) -> dict[str, Any]:
     copied = dict(trigger)
     if isinstance(copied.get("any"), list):
@@ -787,6 +833,7 @@ _REQUIRED: dict[str, tuple[str, ...]] = {
     CLAIM_EXTRACTION_FAILED: ("for_seq", "reason", "at"),
     REFLECTION_DONE: ("through", "filed", "reason", "at"),
     TRANSCRIPT_INGESTED: ("session", "source", "project", "filed", "reason", "at"),
+    USAGE_DIGESTED: ("day", "source", "filed", "reason", "at"),
 }
 
 #: The kinds that are *not* about one turn. Everything else names the inbound
@@ -853,6 +900,30 @@ def _validate(payload: dict[str, Any]) -> None:
             # reason: a receipt claiming both a failure and a write would be
             # the only evidence of a partial one.
             raise BadPayload("a failed ingestion cannot also have filed claims")
+    elif kind == USAGE_DIGESTED:
+        # Identified by a local calendar date, for the reason the session
+        # receipt is identified by a filename: the thing being tracked lives
+        # outside omega's log, so its identity has to come from outside too.
+        # Checked as a date rather than as any non-empty string, because a
+        # cursor whose keys are not comparable to the keys the reader generates
+        # is a cursor that silently re-reads forever.
+        _require_str(payload, "day", non_empty=True)
+        try:
+            date.fromisoformat(payload["day"])
+        except ValueError as exc:
+            raise BadPayload(f"day must be an ISO date: {exc}") from exc
+        _require_str(payload, "source", non_empty=True)
+        filed = payload["filed"]
+        if isinstance(filed, bool) or not isinstance(filed, int) or filed < 0:
+            raise BadPayload("filed must be a non-negative count")
+        reason = payload["reason"]
+        if reason is not None and not (isinstance(reason, str) and reason.strip()):
+            raise BadPayload("reason must be null or a non-empty string")
+        if reason is not None and filed:
+            # The same all-or-nothing rule the other two learning receipts
+            # carry: a record claiming both a failure and a write would be the
+            # only evidence of a partial one.
+            raise BadPayload("a failed digest cannot also have filed claims")
     elif kind == REFLECTION_DONE:
         # No `for_seq` and no `id`: a reflection belongs to no turn and names no
         # standing thing. It is identified by the stretch of log it covered.

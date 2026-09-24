@@ -320,6 +320,7 @@ class Learned:
         "_reflected_through",
         "_since_reflection",
         "_ingested",
+        "_digested",
     )
 
     def __init__(self) -> None:
@@ -330,6 +331,7 @@ class Learned:
         self._reflected_through = 0
         self._since_reflection = 0
         self._ingested: set[str] = set()
+        self._digested: set[str] = set()
 
     @property
     def through(self) -> int:
@@ -409,6 +411,15 @@ class Learned:
                 # sessions that genuinely held nothing.
                 self._failed += 1
                 self._last_failure = str(reason)
+        elif payload.get("kind") == episodes.USAGE_DIGESTED:
+            # The set of days already read (DL-059), and the same argument once
+            # more: a quiet day is the ordinary outcome and files nothing, so
+            # the claims cannot say which days have been looked at.
+            self._digested.add(str(payload["day"]))
+            reason = payload.get("reason")
+            if reason:
+                self._failed += 1
+                self._last_failure = str(reason)
         elif payload.get("kind") == episodes.MESSAGE_INBOUND:
             # What paces reflection: arriving messages, not raw log growth. A
             # turn that ran six tools writes six episodes and is still one thing
@@ -484,6 +495,18 @@ class Learned:
         so re-filing — a week of sessions it had already concluded on.
         """
         return frozenset(self._ingested)
+
+    @property
+    def digested(self) -> frozenset[str]:
+        """ISO dates of the days already read from the Mac's usage record
+        (DL-059).
+
+        Separate from :attr:`ingested` rather than one set of opaque ids,
+        because the two name different things and a collision between a session
+        id and a date would be undetectable — it would present as a day that
+        was silently never read.
+        """
+        return frozenset(self._digested)
 
     @property
     def last_failure(self) -> str:

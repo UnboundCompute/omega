@@ -171,6 +171,12 @@ class Update:
 #: governing it does. "I read what you did in another tool today" is also the
 #: single creepiest sentence this path could produce, and it would produce one
 #: per session, silently, as the *default*.
+#:
+#: `usage.digested` is withheld for every one of those reasons and is the
+#: sharper case (DL-059). It is the same *noticed* category, from a source the
+#: person did not hand over but the operating system already had, and the
+#: sentence it would produce — "I see you were in Slack all afternoon" — is the
+#: one that would end the project. There is no version of this that is pushed.
 NOT_PROJECTED = frozenset(
     {
         episodes.SCHEDULE_CREATED,
@@ -180,6 +186,7 @@ NOT_PROJECTED = frozenset(
         episodes.CLAIM_EXTRACTION_FAILED,
         episodes.REFLECTION_DONE,
         episodes.TRANSCRIPT_INGESTED,
+        episodes.USAGE_DIGESTED,
     }
 )
 
