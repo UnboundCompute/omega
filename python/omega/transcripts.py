@@ -94,13 +94,24 @@ MIN_MESSAGES = 4
 
 #: Wrappers the harness injects into the user role. None of them are the person
 #: talking, and a digest that carried them would teach omega about its own
-#: tooling.
+#: tooling. Measured against 40 real sessions rather than guessed at: the first
+#: version of this list caught the reminders and missed the four below, which
+#: between them were most of what survived into the digests.
+#:
+#: The compaction summary is the one worth naming. It arrives in the user role,
+#: it is long, and it is *already a summary* — reflecting over it would be
+#: re-summarising a summary, which compounds drift and raises stated confidence
+#: every time. The original messages it summarises are in the same file.
 _NOT_THE_PERSON = (
     "<system-reminder>",
     "<command-name>",
     "<local-command-stdout>",
     "<command-message>",
+    "<task-notification>",
     "Caveat: The messages below",
+    "This session is being continued from a previous conversation",
+    # Both spellings: "…by user]" and "…by user for tool use]".
+    "[Request interrupted by user",
 )
 
 

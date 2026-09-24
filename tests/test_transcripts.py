@@ -176,10 +176,35 @@ def test_a_message_mixing_a_tool_result_with_text_is_dropped_whole() -> None:
 
 def test_the_harness_talking_is_not_the_person_talking() -> None:
     """Injected reminders arrive in the user role. A digest that carried them
-    would teach omega about its own tooling and call it a habit."""
-    assert transcripts._person_said("<system-reminder>do a thing</system-reminder>") is None
+    would teach omega about its own tooling and call it a habit.
+
+    The list these check is measured, not guessed: its first version caught the
+    reminders and missed the rest, which were most of what survived into the
+    digests of forty real sessions.
+    """
+    for injected in (
+        "<system-reminder>do a thing</system-reminder>",
+        "<task-notification> <task-id>abc</task-id> done",
+        "[Request interrupted by user]",
+        "[Request interrupted by user for tool use]",
+        "Caveat: The messages below were generated while running a command.",
+    ):
+        assert transcripts._person_said(injected) is None, injected
     assert transcripts._person_said("  ") is None
     assert transcripts._person_said("write the parser") == "write the parser"
+
+
+def test_a_compaction_summary_is_not_something_to_reflect_over() -> None:
+    """*Never re-summarise a summary.* It arrives in the user role and reads
+    like the person, but it is already a derived view — and the messages it was
+    derived from are in the same file, which is what the digest should read."""
+    assert (
+        transcripts._person_said(
+            "This session is being continued from a previous conversation that "
+            "ran out of context. Summary: they wanted the parser rewritten."
+        )
+        is None
+    )
 
 
 def test_tool_arguments_are_not_in_the_digest(tmp_path: Path) -> None:
