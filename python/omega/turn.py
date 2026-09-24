@@ -219,6 +219,13 @@ class TurnContext:
     #: case and renders as nothing at all.
     learned: Sequence[derive.Claim] = ()
 
+    #: The *whole* learned set, which ``learned`` is a subset of. It reaches no
+    #: prompt — rendering ninety-one claims on every turn is the memory
+    #: firehose pointed inward (DL-060) — and exists so the `recall` tool can
+    #: answer from what the turn already holds rather than reopening a store
+    #: this process has locked.
+    known: Sequence[derive.Claim] = ()
+
 
 @dataclass(frozen=True)
 class TurnResult:
@@ -527,11 +534,13 @@ def run_turn(
     and would put the decision about what applies inside the thing that renders
     it — the same separation recall has kept since M1.
 
-    ``known`` is the *whole* learned set and is used for one thing: deciding
-    what a newly taught claim replaces (DL-043 #6). It is separate from
-    ``learned`` because the two ask opposite questions — ``learned`` is what
-    fires on this event, and a claim can only be contradicted by one that was
-    never going to fire alongside it.
+    ``known`` is the *whole* learned set and is used for two things that do not
+    touch each other: deciding what a newly taught claim replaces (DL-043 #6),
+    and answering the `recall` tool (DL-060). It is separate from ``learned``
+    because those and ``learned`` ask opposite questions — ``learned`` is what
+    fires on this event, a claim can only be contradicted by one that was never
+    going to fire alongside it, and *what do you remember about me* is a
+    question about the set rather than about the turn.
     """
     complete = complete or provider.complete
     event = perceive(pending)
@@ -544,6 +553,7 @@ def run_turn(
         complete=complete,
         open_work=tuple(open_work),
         learned=tuple(learned),
+        known=tuple(known),
     )
 
     verdict: Optional[Verdict] = None
@@ -689,10 +699,15 @@ _JUDGE_SYSTEM = (
     "ACT - do some work first, then answer\n"
     "SILENT - say nothing\n"
     "You have a body: you can read and write files, run read-only shell "
-    "commands, and fetch a URL. ACT is the verdict that reaches them, and it "
-    "is the only one that does. Choose ACT whenever answering well means "
-    "looking something up on this machine, changing a file, or reading a "
-    "page - do not guess at an answer you could go and check.\n"
+    "commands, fetch a URL, and look at the notes you have written about this "
+    "person. ACT is the verdict that reaches them, and it is the only one that "
+    "does. Choose ACT whenever answering well means looking something up on "
+    "this machine, changing a file, or reading a page - do not guess at an "
+    "answer you could go and check.\n"
+    "Asked what you know or remember about them, choose ACT. Your notes are "
+    "not in front of you when you decide this, and only a small part of them "
+    "is ever in front of you at all, so answering from what you can see means "
+    "reporting an empty memory while holding a full one.\n"
     "If the person wrote to you, they are talking to you: answer them. "
     "SPEAK or ACT is right there even for a greeting, a short question, or "
     "something you think is obvious. Do not stay silent on a message addressed "
@@ -727,9 +742,14 @@ _REPLY_SYSTEM = (
     "somewhere; that is false. If you were told something and it is not in "
     "front of you now, say you don't have it - not that you cannot keep it.\n"
     "You have a body: you can read and write files, run read-only shell "
-    "commands, and fetch a URL. Never tell the person you cannot reach their "
-    "filesystem or the network - that is false - and never hand them a shell "
-    "command to run themselves in place of doing it.\n"
+    "commands, fetch a URL, and look at the notes you have written about this "
+    "person. Never tell the person you cannot reach their filesystem or the "
+    "network - that is false - and never hand them a shell command to run "
+    "themselves in place of doing it.\n"
+    "Only a few of your notes are ever in front of you: the ones that matched "
+    "this message. There are many more. So 'I don't have any details about "
+    "you' is wrong - what is true is that none are in front of you right now, "
+    "and that you can go and look.\n"
     "You are not holding those tools in this particular message. If answering "
     "properly would need one, say what you would need to check. Do not guess "
     "an answer, and do not claim you are unable.\n"

@@ -153,7 +153,10 @@ def act_loop(
     directory the log lives in and nothing has to be configured twice.
     """
     if box is None:
-        box = ToolBox(store_root=ctx.queue.store.root)
+        # The claims come from the turn, not from the store (DL-060): this
+        # process holds the log's lock, so a box that opened it to answer
+        # `recall` would wait on itself.
+        box = ToolBox(store_root=ctx.queue.store.root, remembered=tuple(ctx.known))
 
     offered = schemas()
     messages = _act_messages(ctx, box)

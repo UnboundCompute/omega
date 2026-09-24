@@ -113,6 +113,7 @@ def test_tools_are_offered_to_act_and_to_nobody_else(q: EventQueue, box: ToolBox
         "write_file",
         "run_code",
         "fetch",
+        "recall",
     }
 
 
@@ -460,3 +461,58 @@ def test_only_a_write_clears_the_set_not_any_other_call(
     result = act_loop(ctx_for(q, fp), box=box)
 
     assert result.stop_reason.startswith(STALLED), result.stop_reason
+
+
+# --- recall reaches the act loop without a store (DL-060) -------------------
+
+
+def _known() -> list:
+    from omega.derive import Claim
+
+    return [
+        Claim(
+            seq=61,
+            text="The user's dog is named Shiro and is a Shih Tzu.",
+            trigger={"any": ["dog", "Shiro"]},
+            situation="noticed while working",
+            source_seq=1,
+            explicit=False,
+        )
+    ]
+
+
+def test_the_box_the_act_loop_builds_carries_what_omega_knows(q: EventQueue) -> None:
+    """The DL-058 lesson applied to DL-060: build the subject the way the
+    process builds it.
+
+    Every other recall test hands the box its claims directly, and all of them
+    would stay green if `act_loop` built a box with none — which is exactly the
+    live failure, a tool that works in a test and answers "I have nothing" in
+    the tray. So this one passes **no box at all** and lets the loop construct
+    it from the turn, which is the only path production ever takes.
+    """
+    fp = acting(call("recall", about="dog"), "")
+    seq = q.append(episodes.inbound("what do u remember about me?", channel="tray", at=AT))
+    q.claim(seq)
+    ctx = TurnContext(
+        seq=seq,
+        event=q.at(seq).payload,
+        recalled=[],
+        queue=q,
+        complete=fp.complete,
+        # Not in `learned`: no trigger fires on this question. That is the bug
+        # DL-060 exists for, and putting the claim in `learned` here would test
+        # a turn that never happens.
+        learned=(),
+        known=_known(),
+    )
+
+    result = act_loop(ctx)
+
+    assert result.tools == ("recall",)
+    returned = [p for p in tool_episodes(q, seq) if p["kind"] == episodes.TOOL_RETURNED]
+    assert returned and returned[0]["ok"] is True
+    # The model saw the claim. Without the wiring it would have seen "you have
+    # not written anything down" and said so, with every test above still green.
+    second = fp.calls_for(provider.ACT)[1]
+    assert any(m.get("role") == "tool" and "Shiro" in m["content"] for m in second)

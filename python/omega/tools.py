@@ -3,11 +3,21 @@ DL-028.
 
 DL-014 fixed the body and said it never grows: **read/write files, run code,
 fetch the web, speak on a channel, read/write its own memory.** *Speak* is the
-channel and *read/write memory* is the log; both already exist. So this file is
-the other three, and **the set does not grow.** A new behaviour is a learned
-skill composed out of these (ring 3, a memory), never a new function here —
-that is the whole answer to why omega's tool catalog stays under the
-degradation threshold by construction rather than by discipline.
+channel, *writing* memory is the log, and this file is the rest — so **the set
+does not grow.** A new behaviour is a learned skill composed out of these
+(ring 3, a memory), never a new function here — that is the whole answer to why
+omega's tool catalog stays under the degradation threshold by construction
+rather than by discipline.
+
+**`recall` is the sixth member of that body, not a sixth member of the list**
+(DL-060). This docstring used to say memory was "already" both halves, and that
+sentence was wrong for years' worth of the design: *reading* memory existed
+only as `turn.recall` — the last N episodes, plus whichever learned claims had
+their trigger words said aloud in the message. Neither is omega looking at what
+it believes, so asked *what do you remember about me* it answered, accurately,
+that it had nothing in front of it while holding ninety-one claims. The other
+four tools all point outward, at the world; nothing pointed in. That is the
+slot DL-014 declared and this fills.
 
 **Approval is code, never model judgement.** A chain of reasoning, or an
 instruction injected through a tool result, can talk a model out of asking. So
@@ -22,6 +32,7 @@ reversibility x blast radius with `CLAUDE.md`'s own three tiers:
                    small read-only allowlist,
                    external otherwise             . asks
     fetch       -> external, always               . asks
+    recall      -> exploration, always            . runs
 
 **Why `fetch` is external even though reading is exploration.** `CLAUDE.md`
 tiers a network call as external, and here that abstraction has a concrete
@@ -76,7 +87,9 @@ __all__ = [
     "WRITE_FILE",
     "RUN_CODE",
     "FETCH",
+    "RECALL",
     "TOOL_NAMES",
+    "MAX_RECALLED",
     "READ_ONLY_ARGV0",
     "MAX_RESULT_CHARS",
     "MAX_READ_BYTES",
@@ -98,6 +111,7 @@ __all__ = [
     "write_file",
     "run_code",
     "fetch",
+    "recall",
 ]
 
 # --- the three tiers --------------------------------------------------------
@@ -119,11 +133,30 @@ READ_FILE = "read_file"
 WRITE_FILE = "write_file"
 RUN_CODE = "run_code"
 FETCH = "fetch"
+RECALL = "recall"
 
 #: Ring 1's remainder, and it is closed (DL-014). Spelled as a frozenset so
 #: that "the set does not grow" is a fact about an object and not a promise in
 #: a comment.
-TOOL_NAMES = frozenset({READ_FILE, WRITE_FILE, RUN_CODE, FETCH})
+#:
+#: ``recall`` joining it is not the set growing, and the distinction is the
+#: whole of DL-060. DL-014's body names six things and this file's own
+#: docstring lists them; *read/write its own memory* is one of the six, and it
+#: was dismissed as already existing. Writing memory does exist. Reading it
+#: existed only as recall — the last N episodes plus whichever claims happened
+#: to have their trigger words said out loud — which is not omega being able to
+#: look at what it believes. So this fills a declared slot that was assumed
+#: complete and never was.
+TOOL_NAMES = frozenset({READ_FILE, WRITE_FILE, RUN_CODE, FETCH, RECALL})
+
+#: How many claims one ``recall`` answers with.
+#:
+#: There are 91 in the live log and the number only goes up, so an uncapped
+#: answer is a slow way to turn the act loop's context into a roster. The cap
+#: is on the *answer*, never on the search: a phrase is matched against every
+#: claim omega holds and only the rendering stops, so a capped result is
+#: omega's best matches rather than an arbitrary prefix of its memory.
+MAX_RECALLED = 25
 
 #: Programs whose **every** invocation is read-only, whatever flags follow.
 #:
@@ -295,6 +328,24 @@ def _classify_read_file(box: "ToolBox", args: dict[str, Any]) -> Decision:
         tier=EXPLORATION,
         why=f"read {path}",
         args={"path": str(path)},
+    )
+
+
+def _classify_recall(box: "ToolBox", args: dict[str, Any]) -> Decision:
+    about = args.get("about")
+    if about is not None and not isinstance(about, str):
+        raise ToolRejected(f"{RECALL}'s 'about' must be a string or absent")
+    phrase = (about or "").strip()
+    # Exploration, and there is no path by which it could be anything else.
+    # It reads no file, runs no program and reaches no network: the claims it
+    # answers from were handed to the box by the turn that built it. That is
+    # also why it needs no store-root check the way `write_file` does — there
+    # is no store access to be inside or outside of.
+    return Decision(
+        tool=RECALL,
+        tier=EXPLORATION,
+        why=f"recall what is known about {phrase!r}" if phrase else "recall everything known",
+        args={"about": phrase},
     )
 
 
@@ -830,6 +881,65 @@ def fetch(
     return _cap(f"{head}\n\n{text}")
 
 
+def recall(claims: Sequence[Any], about: str = "") -> str:
+    """What omega has written down, optionally narrowed to a phrase (DL-060).
+
+    ``claims`` is passed in and never fetched. The running process holds an
+    exclusive lock on the log, so a tool that opened the store to answer this
+    would deadlock against the agent that called it — and beyond the lock, the
+    turn was *already handed* the whole set (``run_turn``'s ``known``), so
+    reading it again would be a second retrieval path that could disagree with
+    the one the prompt rendered from.
+
+    **Matching is looser here than a trigger, deliberately.** ``fires_on`` is
+    substring over the phrases a claim names about itself, and it is kept dumb
+    because it decides whether omega *acts* on something unasked. This decides
+    what omega *shows* when asked, where the cost of a near-miss is a line the
+    person skims and the cost of a strict miss is the answer that started
+    DL-060. So a search matches against the claim's own text as well as its
+    trigger words, and an empty search returns everything.
+
+    The answer is deliberately flat text, not JSON: the model reads it, the
+    person never sees it, and a structured shape would invite parsing it back
+    into something that decides. This only ever describes.
+    """
+    from omega.learn import when_phrase  # local: Ring 1 must not import policy
+
+    needle = about.strip().lower()
+    matched = []
+    for claim in claims:
+        if not needle:
+            matched.append(claim)
+            continue
+        trigger = getattr(claim, "trigger", None) or {}
+        words = [str(p) for p in (trigger.get("any") or [])]
+        haystack = " ".join([str(getattr(claim, "text", "")), *words]).lower()
+        if needle in haystack:
+            matched.append(claim)
+
+    if not matched:
+        if not claims:
+            # Distinct from "nothing matched", and it has to be: an empty
+            # memory and a failed search read identically to a model that is
+            # about to tell the person one or the other.
+            return "You have not written anything down about this person yet."
+        return (
+            f"Nothing you have written down mentions {about.strip()!r}. "
+            f"You hold {len(claims)} claims in total."
+        )
+
+    shown = matched[:MAX_RECALLED]
+    lines = [f"- {getattr(c, 'text', '')} ({when_phrase(getattr(c, 'trigger', None))})" for c in shown]
+    header = (
+        f"You have written down {len(claims)} things about this person."
+        if not needle
+        else f"{len(matched)} of {len(claims)} mention {about.strip()!r}."
+    )
+    if len(matched) > len(shown):
+        lines.append(f"... and {len(matched) - len(shown)} more; search for something narrower.")
+    return _cap("\n".join([header, *lines]))
+
+
 def _cap(text: str) -> str:
     if len(text) <= MAX_RESULT_CHARS:
         return text
@@ -913,6 +1023,23 @@ _TOOLS: dict[str, _Tool] = {
             ["url"],
         ),
     ),
+    RECALL: _Tool(
+        classify=_classify_recall,
+        dispatch=lambda box, args: recall(box.remembered, args.get("about") or ""),
+        schema=_schema(
+            RECALL,
+            "Look at what you have written down about this person. Use it "
+            "when you are asked what you know or remember about them, or "
+            "before answering something your notes might already cover.",
+            {
+                "about": {
+                    "type": "string",
+                    "description": "Narrow to claims mentioning this. Omit for all of them.",
+                }
+            },
+            [],
+        ),
+    ),
 }
 
 assert set(_TOOLS) == TOOL_NAMES, "the tool set and its registry disagree"
@@ -920,7 +1047,7 @@ assert set(_TOOLS) == TOOL_NAMES, "the tool set and its registry disagree"
 
 def schemas() -> list[dict[str, Any]]:
     """What is offered to the model, in the order the tools are declared."""
-    return [_TOOLS[name].schema for name in (READ_FILE, WRITE_FILE, RUN_CODE, FETCH)]
+    return [_TOOLS[name].schema for name in (READ_FILE, WRITE_FILE, RUN_CODE, FETCH, RECALL)]
 
 
 @dataclass(frozen=True)
@@ -936,8 +1063,20 @@ class ToolBox:
 
     store_root: Path
 
+    #: Every claim omega holds, handed over by the turn (DL-060). A tuple and
+    #: not a store handle: the process that builds this box is the one holding
+    #: the log's exclusive lock, so a box that opened the store to answer
+    #: `recall` would deadlock against its own caller.
+    #:
+    #: Defaulted to empty so every existing construction keeps working, and an
+    #: empty box answers "you have not written anything down" — which is true
+    #: of a box nobody gave any claims to, and is the only honest thing a tool
+    #: that was handed nothing can say.
+    remembered: tuple[Any, ...] = ()
+
     def __post_init__(self) -> None:
         object.__setattr__(self, "store_root", Path(self.store_root).resolve())
+        object.__setattr__(self, "remembered", tuple(self.remembered))
 
     def classify(self, name: str, arguments: dict[str, Any]) -> Decision:
         """The gate. Static, code-only, and it runs **before** dispatch.

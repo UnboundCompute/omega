@@ -680,3 +680,43 @@ def test_elide_leaves_a_line_at_its_budget_plus_only_the_note():
 
 def test_elide_does_not_touch_a_line_already_within_budget():
     assert turn._elide("short", 100, at=1) == "short"
+
+
+def test_a_turn_hands_the_act_step_everything_omega_knows(q: EventQueue) -> None:
+    """DL-060's wiring, at the layer that does the wiring.
+
+    `run_turn` receives the whole learned set as ``known`` and has to put it on
+    the context, or the `recall` tool answers "you have not written anything
+    down" while holding ninety-one claims — which is the live failure, and
+    every test below the turn stays green through it because they build a
+    ``TurnContext`` by hand. Only this layer can catch ``known`` being dropped
+    on the way in, so this is the one that asserts it arrives.
+
+    It also asserts what must *not* happen: ``known`` is not ``learned``. A
+    claim that no trigger fired must be reachable by the tool and absent from
+    the prompt, because rendering the whole set every turn is the thing DL-060
+    rejected.
+    """
+    from omega.derive import Claim
+
+    shiro = Claim(
+        seq=61,
+        text="The user's dog is named Shiro and is a Shih Tzu.",
+        trigger={"any": ["dog", "Shiro"]},
+        situation="noticed while working",
+        source_seq=1,
+        explicit=False,
+    )
+    p = put(q, "what do u remember about me?")
+    fp = fake(judge="ACT", act="You have a Shih Tzu named Shiro.")
+    seen: dict[str, object] = {}
+
+    def act(ctx: TurnContext) -> ActResult:
+        seen["known"] = tuple(ctx.known)
+        seen["learned"] = tuple(ctx.learned)
+        return ActResult(tools=("recall",), stop_reason="done, verified")
+
+    run_turn(q, p, complete=fp.complete, act=act, known=[shiro], learned=(), at=AT)
+
+    assert seen["known"] == (shiro,), "the act step could not reach what omega knows"
+    assert seen["learned"] == (), "no trigger fires on this question; the prompt stays clean"

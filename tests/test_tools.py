@@ -20,6 +20,7 @@ from pathlib import Path
 import pytest
 
 from omega import tools
+from omega.derive import Claim
 from omega.tools import (
     EXPLORATION,
     EXTERNAL,
@@ -41,10 +42,18 @@ def box(tmp_path: Path) -> ToolBox:
 # --- the set does not grow --------------------------------------------------
 
 
-def test_ring_one_is_four_tools_and_the_registry_agrees() -> None:
-    """DL-014: the tool set is closed. A fifth entry is a design decision, not
-    an import."""
-    assert tools.TOOL_NAMES == {"read_file", "write_file", "run_code", "fetch"}
+def test_ring_one_is_five_tools_and_the_registry_agrees() -> None:
+    """DL-014: the tool set is closed. A sixth entry is a design decision, not
+    an import.
+
+    It was four until DL-060, and the fifth arrived the way this test demands —
+    as a ledger entry first. The argument there is that it is not growth:
+    DL-014's body names *read/write its own memory* among the six things omega
+    can do, and only the writing half had ever been built, so `recall` fills a
+    declared slot rather than adding one. That reading is exactly what this
+    assertion exists to force someone to write down, so the count moving is the
+    guard working, not the guard being wrong."""
+    assert tools.TOOL_NAMES == {"read_file", "write_file", "run_code", "fetch", "recall"}
     assert {s["function"]["name"] for s in tools.schemas()} == tools.TOOL_NAMES
 
 
@@ -730,3 +739,119 @@ def test_a_decision_is_frozen() -> None:
     decision = Decision(tool="fetch", tier=EXTERNAL, why="x")
     with pytest.raises(Exception):
         decision.tier = EXPLORATION  # type: ignore[misc]
+
+
+# --- recall: omega looking at what it believes (DL-060) ---------------------
+#
+# The case that produced DL-060 is the first one here and is written as the
+# screenshot was: ninety-one claims on file, a question about memory, and every
+# trigger missing. A tool that passed on a one-claim fixture and failed on that
+# shape would be tested against a situation omega has never been in.
+
+
+def _claim(seq: int, text: str, trigger: object = None) -> Claim:
+    return Claim(
+        seq=seq,
+        text=text,
+        trigger=trigger,
+        situation="noticed while working",
+        source_seq=1,
+        explicit=False,
+    )
+
+
+#: One real fact, buried in the project procedures that made up 73% of the live
+#: set, each triggered on a noun the person did not happen to say.
+def _like_the_live_log() -> list[Claim]:
+    claims = [
+        _claim(61, "The user's dog is named Shiro and is a Shih Tzu.", {"any": ["dog", "Shiro"]})
+    ]
+    claims += [
+        _claim(
+            100 + i,
+            f"When handling release {i}, coordinate version updates across components.",
+            {"any": [f"release{i}", "deploy"]},
+        )
+        for i in range(90)
+    ]
+    return claims
+
+
+def test_the_question_that_returned_nothing_now_returns_the_thing_omega_knows() -> None:
+    """The DL-060 case, end to end through the gate.
+
+    Asked *what do you remember about me*, omega had ninety-one claims and said
+    it had none, because not one trigger matched the words of the question.
+    ``recall`` is the answer to that exact shape, so it is tested on it: the
+    same ninety-one, searched for the thing the person actually wants.
+    """
+    claims = _like_the_live_log()
+    assert not any(
+        c.fires_on(text="what do u remember about me?", channel="tray", hour=9)
+        for c in claims
+    ), "the fixture must reproduce the failure: no trigger may fire on the question"
+
+    answer = tools.recall(claims, "dog")
+    assert "Shiro" in answer
+    assert "Shih Tzu" in answer
+
+
+def test_recall_runs_without_asking_because_it_reaches_nothing() -> None:
+    """Exploration, like ``read_file``. It opens no file, starts no process and
+    makes no request — the claims were handed to the box — so there is nothing
+    for a person to approve and nothing that could be undone."""
+    box = ToolBox(store_root=Path("/tmp"), remembered=_like_the_live_log())
+    decision = box.classify("recall", {"about": "dog"})
+    assert decision.tier == EXPLORATION
+    assert "dog" in decision.why
+
+
+def test_an_empty_memory_and_a_failed_search_do_not_read_alike() -> None:
+    """Both are "no claims came back" and they mean opposite things. A model
+    about to tell the person *I don't know anything about you* must be able to
+    tell "you have taught me nothing" from "nothing I hold mentions cats"."""
+    nothing = tools.recall([])
+    missed = tools.recall(_like_the_live_log(), "kayaking")
+    assert nothing != missed
+    assert "not written anything down" in nothing
+    assert "91" in missed
+
+
+def test_a_search_matches_the_claim_itself_and_not_only_its_trigger() -> None:
+    """Looser than ``fires_on`` on purpose (DL-060). The trigger decides whether
+    omega acts unasked and is kept dumb; this decides what it shows when asked,
+    where a strict miss is the bug that started all this. "Shih Tzu" appears in
+    the claim's text and in no trigger."""
+    found = tools.recall(_like_the_live_log(), "Shih Tzu")
+    assert "Shiro" in found
+
+
+def test_a_hundred_claims_do_not_all_come_back() -> None:
+    """The cap is on the answer, not the search: the count is honest about the
+    whole set and the rendering stops. An uncapped recall over a memory that
+    only grows is the firehose pointed inward."""
+    answer = tools.recall(_like_the_live_log())
+    assert answer.count("\n-") <= tools.MAX_RECALLED
+    assert "91" in answer
+    assert "more" in answer
+
+
+def test_recall_never_opens_the_store(tmp_path: Path) -> None:
+    """The process that builds the box holds the log's exclusive lock, so a
+    `recall` that read the store would wait on its own caller. This box names a
+    store root that does not exist at all: if anything in the path touched it,
+    this raises instead of answering."""
+    box = ToolBox(store_root=tmp_path / "nope", remembered=_like_the_live_log())
+    decision = box.classify("recall", {"about": "Shiro"})
+    assert "Shiro" in box.dispatch(decision)
+
+
+def test_a_box_given_no_claims_says_so_rather_than_inventing_a_number() -> None:
+    """Every construction that predates DL-060 builds a box with no claims.
+    Such a box must not answer as though the person's memory were empty when it
+    is only this box that was handed nothing — the wording is the same because
+    it is the only thing the tool can honestly report, and the guard is that it
+    never claims a count it does not have."""
+    answer = tools.recall(ToolBox(store_root=Path("/tmp")).remembered)
+    assert "not written anything down" in answer
+    assert "0" not in answer
