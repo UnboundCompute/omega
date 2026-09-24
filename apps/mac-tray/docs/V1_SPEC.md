@@ -71,6 +71,8 @@ The defining loop is:
   only** — it helps the person phrase a durable fact well, and then sends a plain message like
   any other. Omega decides what was a teach drop; the tray does not label it and there is no
   separate submission type (`TRAY_INTEGRATION.md` §5).
+- Teach Omega is entered directly from the composer in one click; it is not buried in the
+  top-row overflow menu. Its visible mode strip provides the explicit way back to ordinary asking.
 - Long-term extraction now exists, so the UI no longer needs the "recorded history available to
   current recall" hedge. What omega wrote down comes back in the reply of the same turn, as a
   receipt listing the claims and schedules that were actually stored. That receipt is the

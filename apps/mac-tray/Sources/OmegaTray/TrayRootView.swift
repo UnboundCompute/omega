@@ -253,13 +253,6 @@ private struct ExpandedTrayView: View {
                     viewModel.startNewChat()
                 }
                 .disabled(!viewModel.canStartNewChat)
-
-                Divider()
-
-                Button("Teach omega…", systemImage: "graduationcap") {
-                    viewModel.beginTeaching()
-                }
-                .disabled(!viewModel.canBeginTeaching)
             } label: {
                 Image(systemName: "ellipsis")
                     .font(.system(size: 11, weight: .semibold))
@@ -441,14 +434,34 @@ private struct ExpandedTrayView: View {
             }
 
             HStack(alignment: .bottom, spacing: 10) {
-                Button(action: viewModel.pasteFromClipboard) {
-                    Image(systemName: "paperclip")
-                        .frame(width: 28, height: 28)
+                if viewModel.composerMode == .ask {
+                    Button(action: viewModel.pasteFromClipboard) {
+                        Image(systemName: "paperclip")
+                            .frame(width: 28, height: 28)
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(TrayTheme.secondaryText)
+                    .accessibilityLabel("Add from clipboard")
+                    .help("Add from clipboard")
+
+                    Button(action: viewModel.beginTeaching) {
+                        Label("Teach", systemImage: "graduationcap")
+                            .font(.system(size: 11, weight: .medium))
+                            .padding(.horizontal, 7)
+                            .frame(height: 28)
+                            .background(
+                                TrayTheme.raised,
+                                in: RoundedRectangle(cornerRadius: 8, style: .continuous)
+                            )
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(
+                        viewModel.canBeginTeaching ? TrayTheme.secondaryText : TrayTheme.tertiaryText
+                    )
+                    .disabled(!viewModel.canBeginTeaching)
+                    .accessibilityLabel("Teach omega")
+                    .help("Teach omega")
                 }
-                .buttonStyle(.plain)
-                .foregroundStyle(TrayTheme.secondaryText)
-                .disabled(viewModel.composerMode == .teach)
-                .accessibilityLabel("Add from clipboard")
 
                 TextField(viewModel.composerPlaceholder, text: $viewModel.draft, axis: .vertical)
                     .textFieldStyle(.plain)
