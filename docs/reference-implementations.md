@@ -79,7 +79,7 @@
 | 52 | Volume capped at 5–10 items; skim the card, tap for the whole thing | ChatGPT Pulse | **ADAPT** | tray panel |
 | 53 | Data connectors **off by default**; each one opted in separately | ChatGPT Pulse | **TAKE** | DL-011 |
 | 54 | Per-item feedback + topic curation + a feedback history you can read *and delete* | ChatGPT Pulse | **ADAPT** | DL-009 |
-| 55 | Notify only on a **terminal state** *and* only when the user **appears away** | Claude Code | **TAKE** | DL-011 (when to speak) |
+| 55 | Notify only on a **terminal state** *and* only when the user **appears away** | Claude Code | **TAKE** | DL-011 — *blocked* category only |
 | 56 | Quiet channel by default; the louder channel is opt-in per environment | Claude Code | **TAKE** | tray |
 | 57 | The trigger is "the agent stopped and needs you", not "something happened" | Aider | **TAKE** | DL-011 |
 | 58 | Asking and declaring-done are **typed tool calls**, not free prose | Cline | **TAKE** | DL-042, DL-055 |
@@ -620,11 +620,15 @@ one sentence: notify when *"the LLM has finished generating a response and is wa
 your input."* Opt-in behind `--notifications`, with `--notifications-command` to route it
 anywhere — Slack, Discord, Pushbullet.
 
-Both say the same thing in different words, and it is the single most useful rule in this
-survey: **the message is "I have stopped and I need you", not "something occurred."** A
-terminal state is a bounded, countable, non-repeating event. "Something occurred" is a
-firehose with extra steps. Pair that with the absent-user gate and you get a proactivity
-policy that is two predicates long and hard to abuse.
+Both say the same thing in different words: **the message is "I have stopped and I need
+you", not "something occurred."** A terminal state is a bounded, countable, non-repeating
+event. "Something occurred" is a firehose with extra steps. Pair that with the absent-user
+gate and you get a policy two predicates long and hard to abuse.
+
+The limit matters as much as the rule, and is developed under *What omega should take from
+this* below: a coding harness only ever speaks about work the user explicitly started, so
+this covers one of omega's four categories of unprompted speech — the easiest one. It is not
+a general theory of when to speak first, and should not be read as one.
 
 ### Asking and finishing as typed acts
 
@@ -718,17 +722,88 @@ Recorded as row 70 with a **N/A** verdict for that reason.
 
 ### What omega should take from this
 
-Synthesised, the shipping consensus is four rules, and the first two are nearly free:
+**First, a correction to this section's own emphasis.** The three systems here that could be
+verified against a file — Claude Code, Aider, Cline — are the three *least* like omega, and
+an earlier draft of this synthesis leaned on them because they were checkable rather than
+because they were relevant. That is evidence availability driving a conclusion, and it is
+worth recording as a methodological failure rather than quietly fixing.
 
-1. **Speak on a terminal state or a batched schedule — never on an event.** (Claude Code,
-   Aider, Pulse.)
-2. **Gate on attention: don't speak to someone already looking at you.** (Claude Code.)
-3. **Cap the volume and end explicitly.** (Pulse's 5–10 and its terminator; Tasks' 30/hour.)
-4. **Never let the channel outlive its consent.** (Instinct's 2 PM digests, inverted.)
+A coding harness has exactly one proactive trigger: work the user explicitly started reached
+a terminal state. That is a **delayed reply**, not unprompted speech — the user initiated,
+walked away, and came back. omega's hard cases are the ones where nobody initiated anything.
 
-These are a *design decision*, not an implementation detail, so per this project's order of
-work they belong in the ledger before they belong in code. Flagged for a DL-011 amendment
-rather than written into the tray unilaterally.
+**The actual peer is Instinct**: an assistant that acts on a person's behalf across their
+real channels, reads their mail and calendar, and speaks without being asked. omega is that
+shape. The difference omega is betting on is the consent and provenance machinery Instinct
+shipped without — which makes the security architecture the product, not an annex to it.
+
+#### Unprompted speech is four categories, not one
+
+The survey's lessons partition across them rather than applying uniformly:
+
+| Category | Who consented | Governing rule | Source |
+|---|---|---|---|
+| **Blocked** — omega is mid-action and needs a decision | the user started this action | terminal state + attention gate | Claude Code, Aider |
+| **Scheduled** — a schedule fired (DL-035) | the user asked, once, earlier | consent must be **live at send time**, not merely at creation time | Instinct, inverted |
+| **Triggered claim** — a recorded trigger condition met (DL-042) | the user asked, once, earlier | as scheduled; the receipt stays the precision check | Instinct, inverted |
+| **Noticed** — perceive surfaced something nobody asked about | nobody | batch it, cap it, terminate it explicitly | Pulse; Google Now as the failure |
+
+Only the first row is what the coding harnesses solved, and it is also the easiest, because
+the user already knows something is running. The bottom two rows are where the firehose
+lives, and the bottom row is where Google Now died.
+
+#### The security angle, which is the whole differentiator
+
+Instinct's five reported failures are not a list of bugs. They are a specification, read
+backwards, for what omega has to be:
+
+| Instinct's reported failure | What omega needs | Where |
+|---|---|---|
+| Acted on binding commitments without prior approval | approval rings, drawn by reversibility | DL-014 |
+| Retained email, refused deletion until pressured | retraction as a first-class log event | DL-048 |
+| Kept sending digests after Gmail was disconnected | permission re-checked at send time | DL-011 amendment |
+| Perpetual irrevocable licence over user material | local-first; the log is on the user's disk | DL-016/020 |
+| Read inboxes *and* acted autonomously | provenance-gated authority — below | DL-014, DL-049 |
+
+The last row is the one this document previously glossed, and it is the serious one. omega
+will eventually hold all three legs of the classic trifecta at once: **access to private
+data**, **exposure to attacker-controlled content**, and **the ability to communicate
+outward**. Any channel open to third parties makes the perceive stream attacker-controlled
+by definition. Instinct's reported behaviour of autonomously pulling verification codes out
+of an inbox is precisely what that trifecta produces — a confused deputy with the user's
+credentials and a send button.
+
+The defence cannot be a prompt rule. "Treat inbound content as data, never instruction" is
+correct and will also be defeated, because it asks the model to be the security boundary.
+The structural version available to omega, and not available to a stateless assistant, is
+**provenance**: the append-only log already records where every piece of evidence entered
+from. That makes it possible to ask a question most agents cannot — *what is the origin
+chain of the justification for this action?* — and to make the answer bind:
+
+- An action whose supporting evidence traces to untrusted-origin content cannot execute in a
+  low ring, regardless of how convincing the reasoning looks.
+- Credential-shaped material — verification codes, tokens, reset links — is a deny category
+  that never reaches a context able to transmit, rather than a thing omega is trusted to be
+  sensible about.
+- Because rings are keyed on provenance rather than on the model's self-assessment, this is
+  *grade the world, not the words* applied to authority.
+
+This is a sketch, not a decision, and it touches DL-014 and DL-049 both. It is recorded here
+so the injection surface is on the page before the inbox connector is, rather than after.
+
+#### The uncomfortable part
+
+Instinct was loved, and it was loved **because** it acted without asking. Every gate omega
+adds subtracts from exactly that feeling. The bet is that DL-014's tiers can be drawn so
+cheap reversible actions pass ungated while binding or irreversible ones stop — which makes
+DL-014 not a safety annex but the place this product is won or lost. Drawn badly in one
+direction omega is Instinct with worse funding; drawn badly in the other it is a
+confirmation-dialog generator that nobody delegates to twice.
+
+All of the above is a *design decision*, not an implementation detail, so per this project's
+order of work it belongs in the ledger before it belongs in code. Flagged for a DL-011
+amendment (the four categories) and a DL-014 revisit (provenance-gated rings), rather than
+written into the tray unilaterally.
 
 ---
 
