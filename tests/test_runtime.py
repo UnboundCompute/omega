@@ -917,5 +917,98 @@ def test_a_runtime_given_no_transcript_root_has_no_such_sense(
     assert episodes.TRANSCRIPT_INGESTED not in kinds
 
 
+def _with_a_usage_database(tmp_path: Path) -> Path:
+    """A knowledgeC-shaped database holding a month of working days.
+
+    A month rather than yesterday because a pass digests the *oldest*
+    undigested days, so a fixture holding only yesterday would exercise nothing.
+    """
+    import sqlite3
+
+    from omega import habits
+
+    path = tmp_path / "knowledgeC.db"
+    conn = sqlite3.connect(path)
+    conn.execute(
+        "CREATE TABLE ZOBJECT (Z_PK INTEGER PRIMARY KEY, ZSTREAMNAME TEXT, "
+        "ZVALUESTRING TEXT, ZSTARTDATE REAL, ZENDDATE REAL)"
+    )
+    today = datetime.now().date()
+    index = 0
+    for back in range(1, habits.LOOKBACK_DAYS + 1):
+        day = today - timedelta(days=back)
+        midnight = datetime(day.year, day.month, day.day).timestamp()
+        for bundle, start, end in (
+            ("com.microsoft.VSCode", 9.0, 13.0),
+            ("com.googlecode.iterm2", 9.5, 12.0),
+            ("com.apple.Safari", 13.0, 17.0),
+        ):
+            index += 1
+            conn.execute(
+                "INSERT INTO ZOBJECT VALUES (?,?,?,?,?)",
+                (
+                    index,
+                    habits.STREAM,
+                    bundle,
+                    midnight + start * 3600 - habits.APPLE_EPOCH,
+                    midnight + end * 3600 - habits.APPLE_EPOCH,
+                ),
+            )
+    conn.commit()
+    conn.close()
+    return path
+
+
+def test_the_drain_reaches_the_usage_sense_too(
+    store_dir: Path, tmp_path: Path
+) -> None:
+    """DL-059 at the layer that actually ships it.
+
+    The executor cases prove `digest_usage` works when it is called. This
+    proves it is *called* — which is the half that was missing when reflection
+    and ingestion both shipped unreachable, and the half no amount of testing
+    the pass in isolation would have caught. Every sense added from here gets
+    this case, or it is a pass nobody has shown the drain reaches.
+    """
+    path = _with_a_usage_database(tmp_path)
+    with runtime_at(
+        store_dir, _reads_transcripts(), usage_path=path, sense=0.0
+    ) as rt:
+        rt.say("morning")
+
+        assert until(
+            lambda: any(
+                p.payload["kind"] == episodes.USAGE_DIGESTED
+                for p in _every_episode_of(rt)
+            )
+        ), "the drain never reached the usage sense"
+
+    receipts = [
+        p.payload
+        for p in _every_episode(store_dir)
+        if p.payload["kind"] == episodes.USAGE_DIGESTED
+    ]
+    assert receipts, "no day was digested"
+    assert all(r["source"] == "knowledgec" for r in receipts)
+    assert all(r["reason"] is None for r in receipts), [r["reason"] for r in receipts]
+    assert graded(store_dir), str(graded(store_dir))
+
+
+def test_a_runtime_given_no_usage_path_has_no_such_sense(
+    store_dir: Path, tmp_path: Path
+) -> None:
+    """The same authority argument as the transcript root, one notch sharper:
+    this path is readable only under Full Disk Access, so a `Runtime` that went
+    looking for it by default would make a broad system permission look like
+    something the code assumed it had."""
+    _with_a_usage_database(tmp_path)
+    with runtime_at(store_dir, _reads_transcripts(), sense=0.0) as rt:
+        rt.say("morning")
+        rt.say("again")
+
+    kinds = {p.payload["kind"] for p in _every_episode(store_dir)}
+    assert episodes.USAGE_DIGESTED not in kinds
+
+
 def _every_episode_of(rt: Runtime):
     return list(rt.queue.recent(rt.queue.head()))

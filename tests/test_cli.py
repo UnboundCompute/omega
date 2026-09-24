@@ -397,3 +397,46 @@ def test_the_store_path_expands_a_tilde(
     monkeypatch.setattr(cli, "_REPO_ROOT", tmp_path / "no-such-repo")
     _found, where = cli.resolve_env(None, Path(cli.DEFAULT_STORE).expanduser())
     assert where == tmp_path / ".omega" / ".env"
+
+
+# --- the authorities the assembled process grants ----------------------------
+
+
+def test_the_real_process_grants_both_senses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The one place that assembles omega is the one place that hands it an
+    authority to read outside its own store — and until now nothing checked
+    that it still does.
+
+    This is DL-058's lesson at the layer above it. Both senses default to
+    ``None`` on ``Runtime`` deliberately, so that no test and no embedder reads
+    the person's home directory by accident; the cost of that default is that
+    deleting the grant in `main` breaks nothing any other test can see. The
+    sense would simply be off in production, silently, which is exactly how
+    reflection and ingestion each shipped unreachable.
+
+    Asserted as *the real paths*, not merely as "not None": a grant pointing
+    somewhere plausible but wrong is the same silent failure with more steps.
+    """
+    from omega import habits, transcripts
+
+    seen: dict[str, object] = {}
+
+    class Recorded:
+        def __init__(self, store_dir, **kwargs):
+            seen.update(kwargs)
+            seen["store_dir"] = store_dir
+
+        def start(self):
+            raise SystemExit(0)
+
+    fake = speaking()
+    monkeypatch.setattr(provider, "provider_from_env", lambda *, env_path=None: fake)
+    monkeypatch.setattr(runtime, "Runtime", Recorded)
+
+    with pytest.raises(SystemExit):
+        cli.main(["--store", str(tmp_path / "store"), "--no-listen"])
+
+    assert seen["transcripts_root"] == transcripts.default_root()
+    assert seen["usage_path"] == habits.default_path()
