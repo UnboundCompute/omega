@@ -431,6 +431,22 @@ class Executor:
                 self.reflect()
                 return results
 
+    def _completer(self) -> Callable[..., provider.Response]:
+        """The model seam, resolved the way a turn resolves it.
+
+        ``run_turn`` has always fallen back to the process-wide provider when
+        nothing was injected (``turn.py``: ``complete = complete or
+        provider.complete``), and nothing in production injects one — the
+        provider is installed globally at startup and the ``Executor`` is built
+        with ``complete=None``. The two idle passes below read ``self._complete``
+        directly and returned early when it was ``None``, so on the assembled
+        process they were both unreachable: reflection and ingestion ran in
+        tests, which inject a fake, and never once outside them. Resolving here
+        means there is one answer to "which model does omega think with" and the
+        idle passes get the same one the replies do.
+        """
+        return self._complete or provider.complete
+
     def reflect(self) -> bool:
         """Look back over recent conversation and keep what it showed (DL-054).
 
@@ -459,15 +475,13 @@ class Executor:
         self._learned.advance(self._queue.store)
         if self._learned.since_reflection < REFLECT_EVERY:
             return False
-        if self._complete is None:
-            return False
 
         head = self._queue.head()
         window = self._queue.recent(REFLECT_WINDOW)
         known = self._learned.claims()
         try:
             claims = learn.reflect(
-                self._complete,
+                self._completer(),
                 transcript=_transcript(window),
                 known=known,
             )
@@ -516,8 +530,6 @@ class Executor:
         a malformed file on disk can stop.
         """
         if not self._recovered:
-            return 0
-        if self._complete is None:
             return 0
         if self._queue.head() == 0:
             # An omega with an empty log has never been spoken to, and the first
@@ -568,7 +580,7 @@ class Executor:
             return
         try:
             claims = learn.reflect(
-                self._complete,
+                self._completer(),
                 transcript=digest,
                 known=self._learned.claims(),
                 observing=learn.WORK,

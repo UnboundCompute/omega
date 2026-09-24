@@ -434,6 +434,60 @@ def test_nothing_is_read_before_recovery(store, tmp_path: Path) -> None:
     assert ex.ingest(root=tmp_path, now=NOW) == 0
 
 
+def test_the_idle_passes_run_on_an_executor_built_the_way_production_builds_one(
+    store, tmp_path: Path
+) -> None:
+    """The shape every other case here skips, and the one that actually ships.
+
+    Nothing injects a completer into the assembled process: ``__main__``
+    installs the provider globally and ``Runtime`` builds the ``Executor`` with
+    ``complete=None``. Turns survived that because ``run_turn`` falls back to
+    ``provider.complete``; reflection and ingestion did not, so both were dead
+    code in production while passing every test in this file — the tests all
+    inject a fake. Building the executor the way production builds it is the
+    only thing that tells the two apart.
+    """
+    _session(tmp_path, records=_five_messages())
+    q = EventQueue(store)
+    q.append(episodes.inbound("morning", channel="tray"))
+    fp = _reader(lambda role, messages: _claims("They test before they commit."))
+    ex = Executor(q)  # no `complete=`: exactly what `Runtime` passes
+    ex.recover()
+
+    previous = provider.set_provider(fp)
+    try:
+        assert ex.ingest(root=tmp_path, now=NOW) == 1
+    finally:
+        provider.set_provider(previous)
+
+    assert [c["text"] for c in _written(store, episodes.CLAIM_EXTRACTED)] == [
+        "They test before they commit."
+    ]
+    assert _written(store, episodes.TRANSCRIPT_INGESTED)[0]["filed"] == 1
+
+
+def test_an_unconfigured_provider_is_a_recorded_reason_not_a_silent_skip(
+    store, tmp_path: Path
+) -> None:
+    """Failing closed, visibly. An omega that cannot reach a model must not
+    quietly look like an omega with nothing to learn — the receipt carries the
+    reason, and the cursor still moves so a broken seam costs one attempt per
+    session rather than one per idle tick."""
+    _session(tmp_path, records=_five_messages())
+    q, ex, _ = _ready(store)
+    ex._complete = None
+
+    previous = provider.set_provider(None)
+    try:
+        assert ex.ingest(root=tmp_path, now=NOW) == 1
+    finally:
+        provider.set_provider(previous)
+
+    receipt = _written(store, episodes.TRANSCRIPT_INGESTED)[0]
+    assert receipt["filed"] == 0
+    assert "no provider installed" in receipt["reason"]
+
+
 def _written(store, kind: str) -> list[dict]:
     """Every episode of ``kind`` in the log, read back from the bytes.
 
