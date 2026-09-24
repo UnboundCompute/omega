@@ -67,8 +67,14 @@ The defining loop is:
   deleting episodes, or isolating omega from its durable history. It is unavailable while a
   draft, staged context, or turn is active so nothing is silently discarded.
 - A one-shot Teach Omega composer mode accepts an explicit fact, preference, or working rule and
-  submits it as a durable learning instruction rather than a task. Until long-term extraction is
-  built, the UI describes this honestly as recorded history available to current recall.
+  submits it as a durable learning instruction rather than a task. **It is a framing affordance
+  only** — it helps the person phrase a durable fact well, and then sends a plain message like
+  any other. Omega decides what was a teach drop; the tray does not label it and there is no
+  separate submission type (`TRAY_INTEGRATION.md` §5).
+- Long-term extraction now exists, so the UI no longer needs the "recorded history available to
+  current recall" hedge. What omega wrote down comes back in the reply of the same turn, as a
+  receipt listing the claims and schedules that were actually stored. That receipt is the
+  person's only check on what omega believes, so it renders in full and is never truncated.
 - User instructions are compact; omega responses are text-led rather than a wall of chat
   bubbles.
 - Omega responses render native Markdown structure—paragraphs, emphasis, links, lists, quotes,

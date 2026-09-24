@@ -7,6 +7,13 @@ tested; nothing in `python/` needs to change for this work.
 streaming connection to omega's localhost channel, and re-prove `TrayViewModel` against a
 stream instead of a single `await`.
 
+> **Status, 2026-09-24: the tray is running against live omega**, so §§1–4 are now a
+> description of something that works rather than a brief for something to build. What
+> changed underneath since this was written is **learning** — omega now files what it is
+> taught, turns a taught time into a schedule, and infers from conversation on its own. That
+> added six episode kinds, **none of which reach the wire**, which makes the stream properly
+> gappy for the first time. §4's ordering rule and the new §5 are the two parts to re-read.
+
 **The boundary rule, which this work must not erode.** The tray is a *channel*, not the
 agent. It may render conversation, collect context, and display durable work state. It must
 not own memory, personality, initiative judgement, or agent orchestration. If a change starts
@@ -121,7 +128,7 @@ connection lives and the draft is untouched.
 
 **Update the tray's staged-context model to carry the reference.** `StagedContext` needs the
 digest returned by `attach` so `say` can cite it; the response echoed back on an `update`
-still contains only `{id, kind}` (§5), which is unchanged and deliberate — the tray already
+still contains only `{id, kind}` (§6), which is unchanged and deliberate — the tray already
 has the previews, and a digest is not something the UI needs back.
 
 > ### ⚠ Still true: omega cannot look at an image
@@ -245,10 +252,15 @@ advances the cursor past it on purpose — the comment there says why: otherwise
 would be re-read on every tick forever. A client that reconnects on a gap would ask for the
 same range, receive the same gap, and reconnect again, forever.
 
-Today the stream happens to be contiguous — all six M1 episode kinds project, and the
-`CLAIMED`/`DONE` checkpoints are named checkpoints rather than episodes, so they consume no
-`seq`. That is a coincidence of the current kind set, not a contract, and the projection is
-explicitly built as a filter. Treat gaps as normal from the first line of code.
+**This is no longer theoretical, and the earlier draft of this document was wrong about it.**
+It used to say the stream "happens to be contiguous — all six M1 episode kinds project". That
+was true when there were six kinds. There are now **twelve, and six of them are withheld** —
+the whole learning and scheduling half of the log (§5). A busy teaching session produces long
+runs of `seq` the tray will never be handed. If any code was written against the contiguous
+reading, that is the first thing to go looking for.
+
+The `CLAIMED`/`DONE` checkpoints remain named checkpoints rather than episodes, so they still
+consume no `seq`. Treat gaps as normal — and now expect them.
 
 **The server outlives the tray.** Disconnecting is ordinary; omega keeps running and keeps
 turning. Reconnect with backoff and resume from the cursor. Never let a broken pipe surface as
@@ -275,7 +287,134 @@ onto rather than treating as a formality.
 
 ---
 
-## 5. Swift changes, file by file
+## 5. The learning path — mostly a story about what the tray does *not* get
+
+Omega learns now, on two paths, and the interesting thing from the Swift side is how little
+of it reaches the wire. That is deliberate, and it is the part most likely to be mistaken for
+a missing feature and "fixed".
+
+Six of the twelve episode kinds are withheld by `projection.NOT_PROJECTED`:
+
+| withheld kind | what it records |
+|---|---|
+| `claim.extracted` | omega wrote down something it was taught |
+| `claim.retracted` | omega dropped something it had been told |
+| `claim.extraction_failed` | omega tried to write something down and could not |
+| `schedule.created` | a taught time became a standing schedule |
+| `schedule.cancelled` | a standing schedule was stopped |
+| `reflection.done` | a background pass read a window of conversation |
+
+**The one rule behind all six: one turn, one outward voice.** A turn that learns four things
+says so once, in its reply. Giving claims their own wire update would be a second way for one
+turn to reach the person — which `act.py` §1.6 already refuses for the agent's own output, and
+which is no better arriving through the projection. If the tray ever grows a "learning" feed,
+that decision gets made in the ledger first, not in Swift.
+
+### Teaching is not a mode, and there is no teach op
+
+DL-034: a teach drop is deliberately indistinguishable **in kind** from an ordinary inbound
+message. *"Remember that I take my medication at 6:40"* is a `say` like any other — same op,
+same fields, same `understood → … → complete`. Omega decides it was a teach drop; the tray
+does not, and must not send a flag saying so.
+
+This settles the **Teach Omega composer mode** in `V1_SPEC.md`. It is legitimate as a *framing
+affordance* — a composer that prompts the person to phrase a durable fact well — but it must
+compile to a plain `say`. It is not a different submission type and it does not get a different
+endpoint. The tray shaping how the person writes is fine; the tray telling omega how to file it
+is the boundary this document opens by drawing.
+
+### The receipt rides the reply, and a teach drop is never `silent`
+
+What omega learned comes back inside the ordinary `turn.completed` reply, appended after any
+conversational text with a blank line between them:
+
+```
+I wrote this down:
+- I take my medication at 6:40 on weekdays (when you mention medication)
+  replaces what you told me before: I take my medication in the mornings
+
+I will wake up and do this:
+- remind me to take my medication before I leave the house (at 6:40 on weekdays) [s42-0]
+```
+
+That block is the real output of `learn.receipt`, not a sketch of it. Note the two different
+parentheticals, because they are easy to conflate: a **claim**'s is its *conversational*
+trigger — when omega will bring it up — while a **schedule**'s is a clock time. *"when you
+mention medication"* and *"at 6:40 on weekdays"* are answers to different questions, and the
+receipt deliberately shows both so the person can disagree with either. The bracketed `s42-0`
+is the schedule id; it is the only id the receipt shows, and it is there because stopping a
+schedule needs a handle.
+
+Three consequences for rendering:
+
+1. **It is already Markdown-shaped** — lists, and a two-space-indented continuation line under
+   a superseded claim. The spec's native-Markdown rendering handles it; nothing special is
+   needed, but do not strip leading `-` or collapse the indent, because the indent is what
+   makes "replaces what you told me before" belong to its claim rather than float free.
+2. **The receipt is built from what was actually appended**, never from what the model claimed
+   it wrote. A line in that block is a durable fact about the log. This is the person's
+   precision check on omega's memory and the only place a *wrong* thing omega learned becomes
+   visible — so it must render in full, never truncated behind a "show more".
+3. **A teach drop always completes as `spoke`, even when the judge chose silence.** When
+   there is no conversational reply, the receipt *becomes* the reply, because a teach omega
+   says nothing about is indistinguishable from one it dropped. So §3's silent path is real
+   for ordinary turns and unreachable for teaching ones. Do not special-case it; just know
+   that a teach drop with no visible bubble is a bug, not a quiet success.
+
+A failed extraction is the same shape: *"I could not write that down — …. Nothing was
+recorded, so tell me again if it matters."* arrives as an ordinary `spoke` reply, **not** as
+`failed`. The turn genuinely succeeded; the learning inside it did not. Rendering that as a
+broken turn would be wrong, and adding a retry affordance to it would be worse — the person
+re-teaching in their own words is the retry.
+
+### Omega now learns from conversation nobody meant as teaching
+
+DL-054: when the queue goes idle and enough has been said since the last pass, omega reflects
+over a window of recent conversation and may file claims the person never typed. Those are
+filed as **not explicit** — the distinction is what makes a contradiction worth interrupting
+for or not.
+
+**The tray sees none of this.** No update, no indicator, no "omega is thinking". That is the
+`reflection.done` row in the table above and it is the strongest of the six: pushing it would
+be omega announcing it had been thinking about you, unprompted, roughly once a session, which
+is the notification firehose starting small — the named terminal failure in DL-011. A tray
+that surfaces reflection activity is a tray that has reintroduced the thing this whole design
+exists to avoid.
+
+It does mean something slightly odd is true and worth knowing before it is filed as a bug:
+**omega can turn out to believe something the person never sees it learn.** It will say so
+when it becomes relevant, or on request. That is the intended shape.
+
+### A schedule firing is the live proactivity path
+
+DL-035: when a schedule fires, omega appends an ordinary `message.inbound` and runs an
+ordinary turn. On the wire it is `understood` with a `for_seq` the tray never sent, followed
+by the usual states.
+
+§6's last bullet on `TrayViewModel` already says updates can arrive for a `for_seq` this
+client never sent and the message list must tolerate an omega bubble with no user bubble
+before it. **That is no longer a future concern — it is how every reminder arrives**, and with
+the tray live it is exercisable today: teach omega a time a couple of minutes out and watch
+the turn appear unprompted. It is also the cheapest end-to-end proof that the clock, the
+schedule store and the projection agree.
+
+### The honest gap: the tray cannot read what omega has learned
+
+There is no op for it. `say`, `attach`, `subscribe`, `ping` — that is the whole vocabulary,
+and none of them answers *what do you currently believe about me*. The standing set is
+reachable only offline, through `python -m omega --learned` against a store omega is not
+running on (DL-016: the log holds an exclusive lock for the lifetime of the open handle, so
+that command cannot be run against the live process).
+
+So a "what omega knows" panel is **not buildable today**, and the missing piece is a read op
+on the channel, not anything in Swift. It is a real gap rather than an oversight — DL-049's
+ring-1 read-only tools are where it gets decided — and it is named here so the tray side does
+not spend a day looking for an endpoint that does not exist. The available answer in the
+meantime is the conversational one: ask omega.
+
+---
+
+## 6. Swift changes, file by file
 
 ### `TrayTransport.swift` — rewrite
 Replace the protocol with a connection abstraction. Shape it however suits the codebase, but
@@ -354,7 +493,7 @@ duplicate bubbles; an unknown `kind` being ignored rather than crashing.
 
 ---
 
-## 6. Running omega to develop against
+## 7. Running omega to develop against
 
 ```sh
 python3.11 -m venv .venv
