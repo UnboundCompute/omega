@@ -156,6 +156,12 @@ class Update:
 #: question the receipt cannot answer, *has this been happening*, which is asked
 #: later and deliberately by someone running `--learned`, not pushed. Projecting
 #: it would make a failed teach arrive twice and put a second voice on the turn.
+#:
+#: `reflection.done` is withheld because it is about no turn at all (DL-054). It
+#: is omega's own bookkeeping — where the last pass got to — and the claims a
+#: pass files are reachable the way every other claim is, by asking. Pushing it
+#: would be omega announcing that it had been thinking about you, unprompted,
+#: roughly once a session, which is the notification firehose starting small.
 NOT_PROJECTED = frozenset(
     {
         episodes.SCHEDULE_CREATED,
@@ -163,6 +169,7 @@ NOT_PROJECTED = frozenset(
         episodes.CLAIM_EXTRACTED,
         episodes.CLAIM_RETRACTED,
         episodes.CLAIM_EXTRACTION_FAILED,
+        episodes.REFLECTION_DONE,
     }
 )
 

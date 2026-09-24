@@ -312,13 +312,22 @@ class Learned:
     delete.
     """
 
-    __slots__ = ("_claims", "_through", "_failed", "_last_failure")
+    __slots__ = (
+        "_claims",
+        "_through",
+        "_failed",
+        "_last_failure",
+        "_reflected_through",
+        "_since_reflection",
+    )
 
     def __init__(self) -> None:
         self._claims: dict[int, Claim] = {}
         self._through = 0
         self._failed = 0
         self._last_failure = ""
+        self._reflected_through = 0
+        self._since_reflection = 0
 
     @property
     def through(self) -> int:
@@ -371,6 +380,28 @@ class Learned:
         elif payload.get("kind") == episodes.CLAIM_EXTRACTION_FAILED:
             self._failed += 1
             self._last_failure = str(payload["reason"])
+        elif payload.get("kind") == episodes.REFLECTION_DONE:
+            self._reflected_through = int(payload["through"])
+            self._since_reflection = 0
+            reason = payload.get("reason")
+            if reason:
+                # A reflection that failed is a failed extraction and counts as
+                # one. It matters more here than on the teach path: that one
+                # tells the person in a receipt, this one runs with nobody
+                # watching, so the count is the only thing between a `learn`
+                # role that has died and a stretch of conversation that
+                # genuinely held nothing worth keeping — which is what most
+                # stretches hold, and so what a dead pass successfully imitates.
+                self._failed += 1
+                self._last_failure = str(reason)
+        elif payload.get("kind") == episodes.MESSAGE_INBOUND:
+            # What paces reflection: arriving messages, not raw log growth. A
+            # turn that ran six tools writes six episodes and is still one thing
+            # that happened, so counting the log would make a tool-heavy stretch
+            # reflect several times over and a long conversation not at all —
+            # exactly backwards, since the conversation is what there is to
+            # reflect *on*.
+            self._since_reflection += 1
         elif payload.get("kind") == episodes.CLAIM_RETRACTED:
             # ``pop`` with a default for the same reason supersession uses one:
             # naming a claim that is no longer active is an ordinary race in an
@@ -404,6 +435,28 @@ class Learned:
         lingers a teach too long is cheaper than one that goes quiet early.
         """
         return self._failed
+
+    @property
+    def reflected_through(self) -> int:
+        """The seq the last reflection pass covered up to (DL-054). 0 if none.
+
+        Read from the log rather than kept in the executor, for DL-017's reason:
+        a cursor that lives in memory is a cursor that resets on restart, and a
+        reflection that re-examines a window it has already concluded on will
+        re-file what it concluded — which is how this path would fill the
+        learned set with duplicates of one true sentence after every crash.
+        """
+        return self._reflected_through
+
+    @property
+    def since_reflection(self) -> int:
+        """Messages that have arrived since the last reflection pass.
+
+        Deliberately not *turns*: a schedule fire and a typed sentence are both
+        one ``message.inbound`` and both are something to reflect on, while the
+        tool records a turn happens to write are not.
+        """
+        return self._since_reflection
 
     @property
     def last_failure(self) -> str:

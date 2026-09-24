@@ -60,6 +60,7 @@ from omega.schedule import Schedule
 __all__ = [
     "TEACH_MARKER",
     "MAX_CLAIMS_PER_NOTE",
+    "MAX_INFERRED_PER_PASS",
     "MAX_CLAIM_CHARS",
     "MAX_SCHEDULES_PER_NOTE",
     "MAX_INSTRUCTION_CHARS",
@@ -67,6 +68,7 @@ __all__ = [
     "NotExtracted",
     "teaching_note",
     "extract",
+    "reflect",
     "parse_answer",
     "parse_claims",
     "file_claims",
@@ -104,6 +106,15 @@ MAX_CLAIM_CHARS = 300
 #: omega up. DL-035 named unattended repetition as the price of proactivity, so
 #: the bound on how much of it one sentence can buy is tighter.
 MAX_SCHEDULES_PER_NOTE = 4
+
+#: Claims one reflection pass may file (DL-054). Lower than a teach's cap, and
+#: the gap is the point: a teach is a sentence the person deliberately typed, a
+#: reflection is omega's own reading of a stretch of conversation, and the
+#: lower-confidence source gets the tighter budget. Three is also small enough
+#: that the model must choose — asked for at most three things worth keeping out
+#: of forty turns, it has to rank, and ranking is most of what makes the
+#: difference between a memory and a transcript.
+MAX_INFERRED_PER_PASS = 3
 
 #: A schedule's instruction is the whole text of a future turn, so it has room
 #: to be a sentence rather than a phrase — but not room to be a document that
@@ -270,6 +281,126 @@ def _messages(
     return [system, provider.user(body)]
 
 
+def reflect(
+    complete: Callable[..., provider.Response],
+    *,
+    transcript: str,
+    known: Sequence[Claim] = (),
+) -> list[dict[str, Any]]:
+    """What this stretch of conversation showed. Raises :class:`NotExtracted`.
+
+    DL-054, and the half of learning DL-043 #2 deferred. Everything
+    :func:`extract` files came from a sentence the person deliberately typed
+    into a composer; this is omega reading what it has already been through and
+    keeping what it noticed. The output is the same claim shape and goes through
+    the same :func:`file_claims`, differing only in ``explicit``.
+
+    **A window rather than a message, and that is the whole design.** The things
+    worth inferring about a person — how they work, what they keep coming back
+    to, what to raise when they are doing a particular thing — are patterns, and
+    a pattern is not visible in one sentence. An extractor handed a single
+    message and asked what is worth remembering must either invent something or
+    file nothing, and a model asked that question will invent: omega has been
+    observed answering *"Black, no sugar"* for a coffee preference it was never
+    told. Showing it the stretch instead is what makes *not enough evidence* an
+    available answer.
+
+    ``known`` is shown for :func:`extract`'s reason and one more. There it stops
+    a new claim contradicting an old one silently; here it also stops the pass
+    re-filing what it already concluded last time, which is the way this path
+    would otherwise fill the learned set with near-duplicates of one true fact.
+
+    ``schedules``, ``cancel`` and ``retract`` are deliberately *not* reachable
+    from here — this returns claims and nothing else. Every one of those is
+    omega doing something on the person's behalf that they did not ask for in
+    that moment: inferring its way into waking them at nine, or into dropping a
+    belief they taught it on purpose. A wrong inferred claim is a bad sentence
+    in a prompt. A wrong inferred schedule is a notification at nine every
+    morning forever, which is the failure DL-011 names as terminal.
+    """
+    response = complete(provider.LEARN, _reflection_messages(transcript, known))
+    raw = _unfence(response.text)
+    try:
+        answer = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise NotExtracted(f"the answer was not JSON: {exc}") from exc
+    if not isinstance(answer, dict):
+        raise NotExtracted("the answer was not a JSON object")
+    return _parse_claim_list(
+        answer.get("claims", []), known, limit=MAX_INFERRED_PER_PASS
+    )
+
+
+def _reflection_messages(
+    transcript: str, known: Sequence[Claim]
+) -> list[provider.Message]:
+    """The reflection prompt.
+
+    Two things in here are load-bearing and both are about *refusing*.
+
+    **It says the expected answer is none.** A model asked to find what is worth
+    remembering in forty turns will find something, because that is what it was
+    asked to do, and the result is a learned set that grows without bound while
+    every individual claim looks locally plausible. DL-011 names the
+    notification firehose as the loop's terminal failure; the memory firehose is
+    the same failure with a longer fuse, and worse, because the person never
+    sees the moment a claim is filed — only a slow fog of things omega
+    half-believes about them. Saying *most stretches contain nothing* up front
+    is the cheapest guard available, and the eval carries the check that it
+    works.
+
+    **It asks for a pattern, not an event.** *"He mentioned the Tuesday standup"*
+    is a fact already in the log and recall will find it; *"he prepares for the
+    Tuesday standup on Monday evenings"* is a thing to bear in mind that recall
+    cannot reconstruct. The first is what a model reaches for by default, so the
+    distinction is drawn explicitly and with both examples.
+    """
+    lines = [
+        "You are reviewing a stretch of your own recent conversation to see",
+        "whether it shows anything worth remembering about this person.",
+        "",
+        "Most stretches show nothing. Returning an empty list is the normal",
+        "and expected answer. Only write something down if the conversation",
+        "shows it more than once, or states it as a standing fact.",
+        "",
+        "Remember patterns, not events. What happened is already recorded and",
+        "you can look it up. Write down only what would change how you answer",
+        "a future question:",
+        '  bad   "He asked about the Tuesday standup."',
+        '  good  "He prepares for the Tuesday standup on Monday evenings —',
+        '         raise anything standup-related before then."',
+        "",
+        "Never write down anything you are guessing at. If the conversation",
+        "hints at a preference without stating it, that is not evidence.",
+        "",
+        "Answer with JSON and nothing else:",
+        '  {"claims": [...]}',
+        "",
+        f"At most {MAX_INFERRED_PER_PASS} claims. Each is an object:",
+        '  "text"       what to remember, one sentence, written as an',
+        "               instruction to yourself",
+        '  "situation"  what was going on when you noticed this',
+        '  "trigger"    when the claim applies, or null',
+        '  "supersedes" the id of a claim this one replaces, or null',
+        "",
+        "A trigger is an object with any of these fields, combined with AND.",
+        "No other field is allowed.",
+        '  {"any": ["phrase", ...]}  the message mentions one of these',
+        '  {"channel": "tray"}       the message arrived on this channel',
+        '  {"hours": [9, 18]}        the local hour is at or after the first',
+        "                            and before the second",
+    ]
+    if known:
+        lines += [
+            "",
+            "You already believe these. Do not write any of them down again;",
+            "if this conversation refines one, use its id in supersedes.",
+        ]
+        lines += [f"  [{c.seq}] {c.text}" for c in known]
+    system = provider.system("\n".join(lines))
+    return [system, provider.user(f"The conversation:\n{transcript}")]
+
+
 def parse_answer(
     text: str,
     *,
@@ -313,7 +444,7 @@ def parse_claims(
 
 
 def _parse_claim_list(
-    raw: Any, known: Sequence[Claim]
+    raw: Any, known: Sequence[Claim], limit: int = MAX_CLAIMS_PER_NOTE
 ) -> list[dict[str, Any]]:
     """``supersedes`` is checked against ``known``. An id naming no claim is
     refused rather than dropped — :meth:`omega.derive.Learned.apply` removes
@@ -323,10 +454,9 @@ def _parse_claim_list(
     """
     if not isinstance(raw, list):
         raise NotExtracted('"claims" was not a list')
-    if len(raw) > MAX_CLAIMS_PER_NOTE:
+    if len(raw) > limit:
         raise NotExtracted(
-            f"{len(raw)} claims from one note, over the limit of "
-            f"{MAX_CLAIMS_PER_NOTE}"
+            f"{len(raw)} claims from one note, over the limit of {limit}"
         )
 
     seqs = {c.seq for c in known}
@@ -505,13 +635,23 @@ def file_claims(
     for_seq: int,
     source_seq: int,
     at: Optional[str] = None,
+    explicit: bool = True,
 ) -> list[Claim]:
     """Append each claim and return what was written, in order.
 
-    ``explicit=True`` for all of them: everything this module files came from a
-    note the person deliberately typed into a composer whose placeholder asks
-    *What should omega learn?*. Inferred claims are DL-043 #2's deferred half
-    and there is no path here that produces one.
+    ``explicit`` defaults to true because the teach path is the one that must
+    not get this wrong by omission: a note the person deliberately typed into a
+    composer whose placeholder asks *What should omega learn?* is explicit by
+    definition, and a default of false would silently downgrade every taught
+    claim if a caller forgot the argument. :func:`reflect`'s caller passes false
+    and is the only thing that does (DL-054).
+
+    The flag is not a confidence score and nothing treats it as one. DL-042 gave
+    it one job — deciding whether a contradiction is worth interrupting the
+    person about — and the reason it can stay that cheap is that neither kind of
+    claim can destroy anything: both leave the active set by supersession or
+    retraction, both stay in the log, and re-derivation reaches the earlier
+    state either way.
 
     **No write key**, unlike the turn's terminal record. A key would make a
     replay of this window raise ``WriteKeyConflict`` — the payloads differ by
@@ -527,7 +667,7 @@ def file_claims(
             text=item["text"],
             source_seq=source_seq,
             situation=item["situation"],
-            explicit=True,
+            explicit=explicit,
             trigger=item["trigger"],
             supersedes=item["supersedes"],
             at=at,
@@ -540,7 +680,7 @@ def file_claims(
                 trigger=item["trigger"],
                 situation=item["situation"],
                 source_seq=source_seq,
-                explicit=True,
+                explicit=explicit,
                 supersedes=item["supersedes"],
             )
         )

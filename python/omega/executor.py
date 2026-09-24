@@ -28,12 +28,36 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
-from omega import episodes, provider
+from omega import episodes, learn, provider
 from omega.derive import Learned, OpenWork
 from omega.memory import WriteKeyConflict
 from omega.queue import EVENT_KINDS, EventQueue, Pending
 from omega.schedule import Schedule, Scheduler
-from omega.turn import ActResult, TurnContext, TurnResult, no_act_loop_yet, run_turn
+from omega.turn import (
+    ActResult,
+    TurnContext,
+    TurnResult,
+    _transcript,
+    no_act_loop_yet,
+    run_turn,
+)
+
+#: Messages that must arrive before another reflection pass runs (DL-054).
+#:
+#: A rate limit on a model call that nobody asked for, so it is set from cost
+#: and from what a pass needs to see rather than from responsiveness: a pattern
+#: is not visible in three messages, and there is no one waiting on the answer.
+#: Twenty is roughly a session's worth of back-and-forth. It is a number that
+#: wants measuring and has not been — the ledger says so rather than the comment
+#: implying otherwise.
+REFLECT_EVERY = 20
+
+#: How much conversation one pass reads. Larger than ``REFLECT_EVERY`` on
+#: purpose: the windows overlap, so a habit that shows up either side of a
+#: boundary is still one pattern to one pass rather than two halves neither pass
+#: can see. `_transcript` applies the same character budget recall uses, so this
+#: is an upper bound on episodes and not on prompt size.
+REFLECT_WINDOW = 40
 
 __all__ = [
     "INTERRUPTED_ERROR",
@@ -397,9 +421,73 @@ class Executor:
                 if result is not None:
                     results.append(result)
                     if max_turns is not None and len(results) >= max_turns:
+                        # Returned *without* reflecting, on purpose. A caller
+                        # that asked for a bounded number of turns has not been
+                        # told the queue is empty, and reflecting over a window
+                        # whose tail is still waiting would move the cursor past
+                        # episodes no pass has read.
                         return results
             if not progressed:
+                self.reflect()
                 return results
+
+    def reflect(self) -> bool:
+        """Look back over recent conversation and keep what it showed (DL-054).
+
+        Returns whether a pass ran. Called by :meth:`drain` at the moment a
+        sweep of the queue finds nothing — the one moment omega is provably not
+        mid-turn — so reflection costs no reply latency and adds no failure mode
+        to the path that produces an answer. Public because the live evals drive
+        it directly; nothing else should need to.
+
+        **Never raises**, for :func:`omega.turn._teach`'s reason carried one step
+        further. That one must not lose a composed reply to a second call going
+        wrong; this one must not take down the drain thread, which would stop
+        every future turn in the process to improve a memory. A failure becomes
+        a ``reflection.done`` carrying the reason, which is the only place it can
+        be seen later — there is no reply here to put a receipt in.
+
+        **The cursor moves whether or not anything is filed**, including on
+        failure. A pass that failed and then re-read the same window on the next
+        idle tick would call the model again every few seconds for as long as
+        the fault lasted, which turns a broken `learn` role into a bill. The
+        window is bounded and conversation keeps arriving, so nothing is lost
+        that the next pass will not see.
+        """
+        if not self._recovered:
+            return False
+        self._learned.advance(self._queue.store)
+        if self._learned.since_reflection < REFLECT_EVERY:
+            return False
+        if self._complete is None:
+            return False
+
+        head = self._queue.head()
+        window = self._queue.recent(REFLECT_WINDOW)
+        known = self._learned.claims()
+        try:
+            claims = learn.reflect(
+                self._complete,
+                transcript=_transcript(window),
+                known=known,
+            )
+            filed = learn.file_claims(
+                self._queue,
+                claims,
+                # There is no turn, so `for_seq` names the episode the pass read
+                # up to. The field is required of every attached kind and this
+                # is the honest value for it: the claim is *about* that stretch,
+                # and pointing it at some earlier turn would invent a cause.
+                for_seq=head,
+                source_seq=head,
+                explicit=False,
+            )
+        except Exception as exc:  # noqa: BLE001 - see the docstring
+            reason = str(exc) or type(exc).__name__
+            self._queue.append(episodes.reflection_done(through=head, reason=reason))
+            return True
+        self._queue.append(episodes.reflection_done(through=head, filed=len(filed)))
+        return True
 
     def _handle(self, pending: Pending) -> Optional[TurnResult]:
         if not pending.is_event:

@@ -59,6 +59,7 @@ __all__ = [
     "claim_extracted",
     "claim_retracted",
     "claim_extraction_failed",
+    "reflection_done",
     "now",
 ]
 
@@ -78,6 +79,7 @@ SCHEDULE_CANCELLED = "schedule.cancelled"
 CLAIM_EXTRACTED = "claim.extracted"
 CLAIM_RETRACTED = "claim.retracted"
 CLAIM_EXTRACTION_FAILED = "claim.extraction_failed"
+REFLECTION_DONE = "reflection.done"
 
 #: The complete M1 kind set (§2.1: "and that is all of them").
 #:
@@ -99,6 +101,7 @@ KINDS = frozenset(
         CLAIM_EXTRACTED,
         CLAIM_RETRACTED,
         CLAIM_EXTRACTION_FAILED,
+        REFLECTION_DONE,
     }
 )
 
@@ -659,6 +662,47 @@ def claim_extraction_failed(
     return payload
 
 
+def reflection_done(
+    *,
+    through: int,
+    filed: int = 0,
+    reason: Optional[str] = None,
+    at: Optional[str] = None,
+) -> dict[str, Any]:
+    """One reflection pass happened and covered the log up to ``through`` (DL-054).
+
+    Carries the cursor, which is the part that makes this kind necessary rather
+    than convenient. A reflection that files nothing is the *common* and the
+    *desired* outcome — most stretches of conversation contain no habit worth
+    remembering — so "where did the last pass get to" cannot be read off the
+    claims it wrote, because usually there are none and the pass would
+    re-examine the same window forever.
+
+    ``filed`` is how many claims it wrote, ``reason`` why it failed, and a pass
+    is one or the other. Both are here for DL-053's reason, which binds harder
+    on this path than on the teach it was written for: a teach drop that fails
+    tells the person in a receipt, but a reflection has no reply to put a
+    receipt in and nobody is watching when it runs. Without this record a
+    reflection pass that started failing on every call would be indistinguishable
+    from one finding nothing worth keeping — which is exactly the state it is
+    supposed to be in most of the time.
+
+    Not about a turn, so no ``for_seq``: a reflection is something omega does
+    between turns, in the moment the queue is empty, and attaching it to
+    whichever turn happened to be last would invent a relationship.
+    """
+    payload = {
+        "v": VERSION,
+        "kind": REFLECTION_DONE,
+        "through": through,
+        "filed": filed,
+        "reason": reason,
+        "at": at or now(),
+    }
+    _validate(payload)
+    return payload
+
+
 def _copy_trigger(trigger: dict[str, Any]) -> dict[str, Any]:
     copied = dict(trigger)
     if isinstance(copied.get("any"), list):
@@ -690,6 +734,7 @@ _REQUIRED: dict[str, tuple[str, ...]] = {
     ),
     CLAIM_RETRACTED: ("for_seq", "claim_seq", "at"),
     CLAIM_EXTRACTION_FAILED: ("for_seq", "reason", "at"),
+    REFLECTION_DONE: ("through", "filed", "reason", "at"),
 }
 
 #: The kinds that are *not* about one turn. Everything else names the inbound
@@ -738,6 +783,22 @@ def _validate(payload: dict[str, Any]) -> None:
                 # A slot with no schedule is unattributable: it would claim a
                 # fire was owed without saying what owes it.
                 raise BadPayload("schedule_slot requires schedule_id")
+    elif kind == REFLECTION_DONE:
+        # No `for_seq` and no `id`: a reflection belongs to no turn and names no
+        # standing thing. It is identified by the stretch of log it covered.
+        _require_seq(payload, "through")
+        filed = payload["filed"]
+        if isinstance(filed, bool) or not isinstance(filed, int) or filed < 0:
+            raise BadPayload("filed must be a non-negative count")
+        reason = payload["reason"]
+        if reason is not None and not (isinstance(reason, str) and reason.strip()):
+            raise BadPayload("reason must be null or a non-empty string")
+        if reason is not None and filed:
+            # A pass that failed cannot also have filed, because extraction is
+            # all-or-nothing (DL-043) and this path keeps that rule. A record
+            # saying both would be the only evidence of a partial write and
+            # would make "did learning work" unanswerable from the log.
+            raise BadPayload("a failed reflection cannot have filed claims")
     elif kind in _UNATTACHED_KINDS:
         _require_str(payload, "id", non_empty=True)
     else:
