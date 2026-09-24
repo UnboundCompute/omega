@@ -46,7 +46,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Iterable, Optional, Sequence
 
-from omega import episodes, learn, projection, provider
+from omega import derive, episodes, learn, memory, projection, provider
 from omega.runtime import Runtime, Said
 from omega.turn import RECALL_N
 
@@ -953,6 +953,67 @@ def _recalls(needle: str) -> Check:
     return check
 
 
+def _claims_mentioning(o: Observed, needle: str) -> Optional[list[str]]:
+    """The taught claims in this run's store that mention ``needle``.
+
+    ``None`` when the store could not be read at all, which is an
+    ``undetermined`` and not a zero — *"fail closed on empty"* cuts both ways,
+    and a store that would not open is not a store that taught nothing.
+
+    Read after the runtime has closed, which is the only time it *can* be read:
+    the log holds an exclusive lock for the lifetime of the open handle, so
+    this is the same offline fold ``--learned`` does (DL-049).
+    """
+    try:
+        store = memory.MemoryStore.open(o.store)
+    except Exception:  # noqa: BLE001 - any failure to read is the same answer
+        return None
+    try:
+        with store:
+            learned = derive.Learned.rebuild(store)
+            return [c.text for c in learned.claims() if needle.lower() in c.text.lower()]
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _recalls_a_taught_thing(needle: str) -> Check:
+    """Graded on the store first and the reply second.
+
+    ``_recalls`` alone reads only what omega *said*, and that is how a whole
+    role can be down without a single check going red: extraction is allowed to
+    fail into a receipt rather than a failed turn (DL-043 #5), so a broken
+    ``learn`` model files nothing, says so once in a receipt nobody grades, and
+    leaves the closing question to be answered from the model's own general
+    knowledge. Measured, not hypothesised — that is exactly what a bare
+    ``OMEGA_MODEL`` pointed at a reasoning model did here (DL-052).
+
+    So this asks the two questions in order and keeps them apart, because they
+    have different repairs: *was it filed* is about teaching, *was it used* is
+    about recall across the horizon. Collapsing them into one boolean is what
+    made a dead learn role look like a working memory.
+    """
+
+    def check(o: Observed) -> Grade:
+        filed = _claims_mentioning(o, needle)
+        if filed is None:
+            return undetermined("could not read the store to see what was filed")
+        if not filed:
+            return failed(
+                f"nothing was taught: the store holds no claim mentioning "
+                f"{needle!r}, so there was no memory for the reply to carry"
+            )
+        reply = _last_reply(o)
+        if reply is None:
+            return undetermined("nothing was said")
+        if needle.lower() in reply.lower():
+            return passed(f"filed {needle!r} as a claim and used it past the horizon")
+        return failed(
+            f"the claim was filed but the reply did not use {needle!r}: {reply[:80]!r}"
+        )
+
+    return check
+
+
 def _first_and_last_reply(o: Observed) -> Optional[tuple[str, str]]:
     replies = o.replies()
     return (replies[0], replies[-1]) if len(replies) >= 2 else None
@@ -1262,7 +1323,7 @@ SCENARIOS: list[Scenario] = [
             "I take my coffee with cardamom — no milk, no sugar, ever.",
             "I'm making a round. How do I take my coffee?",
         ),
-        capability=_recalls("cardamom"),
+        capability=_recalls_a_taught_thing("cardamom"),
         violation=_stayed_quiet_as_it_grew,
         # No `pair`, deliberately, though the strongest voice-drift pair this
         # harness can build is sitting right here: a first and last reply
