@@ -74,6 +74,27 @@
 | 47 | Instruction files merged **down the whole directory chain**, with per-directory provenance | Hermes | **ADAPT** | DL-008 (associative pull) |
 | 48 | Thresholds, caps and cooldowns scattered as constants across ≥4 files; no tunables module | Hermes | **AVOID** | *stay small and legible* |
 | 49 | Automatic associative recall — anything pulled in because it *became* relevant | both | **N/A** | — (the gap) |
+| 50 | Proactive output **batched into one daily delivery**, never streamed as events fire | ChatGPT Pulse | **TAKE** | DL-011 (firehose) |
+| 51 | The delivery is **deliberately finite** and closes with an explicit terminator | ChatGPT Pulse | **TAKE** | DL-011 |
+| 52 | Volume capped at 5–10 items; skim the card, tap for the whole thing | ChatGPT Pulse | **ADAPT** | tray panel |
+| 53 | Data connectors **off by default**; each one opted in separately | ChatGPT Pulse | **TAKE** | DL-011 |
+| 54 | Per-item feedback + topic curation + a feedback history you can read *and delete* | ChatGPT Pulse | **ADAPT** | DL-009 |
+| 55 | Notify only on a **terminal state** *and* only when the user **appears away** | Claude Code | **TAKE** | DL-011 (when to speak) |
+| 56 | Quiet channel by default; the louder channel is opt-in per environment | Claude Code | **TAKE** | tray |
+| 57 | The trigger is "the agent stopped and needs you", not "something happened" | Aider | **TAKE** | DL-011 |
+| 58 | Asking and declaring-done are **typed tool calls**, not free prose | Cline | **TAKE** | DL-042, DL-055 |
+| 59 | "Do not indicate that you will perform an action without actually doing it" | Cline | **TAKE** | DL-055 (corroboration) |
+| 60 | Recurring scheduled research that reports back on a fixed cadence | Tasks, Perplexity | **ADAPT** | DL-035 |
+| 61 | Hard per-tier ceilings on event-triggered runs (30/hour, 720/day) | ChatGPT Tasks | **TAKE** | DL-036 (unattended cost) |
+| 62 | An agent that can't reliably tell the time, scheduling its own reminders | ChatGPT Tasks | **AVOID** | DL-035 |
+| 63 | Proactive cards inferred from passive behaviour logging; wound down to a feed | Google Now | **AVOID** | DL-011 |
+| 64 | Acting irreversibly for the user **without asking first** | Instinct | **AVOID** | DL-014 (approval) |
+| 65 | A proactive channel that **outlives its own consent** | Instinct | **AVOID** | DL-011, DL-048 |
+| 66 | Retaining user data with **no deletion path** until publicly embarrassed | Instinct | **AVOID** | DL-048 (retraction) |
+| 67 | Perpetual irrevocable licence over the user's material, for training | Instinct | **AVOID** | *local-first* |
+| 68 | Inbox-reading plus autonomous action = a standing injection target | Instinct | **AVOID** | DL-014 (rings) |
+| 69 | Local-first, model-agnostic, reaching the user through chat apps they already run | OpenClaw | **ADAPT** | DL-004 (channels) |
+| 70 | Reactive-only assistants died of latency and reliability — proactivity was never the issue | Humane, Rabbit | **N/A** | — (honest negative) |
 
 ---
 
@@ -515,6 +536,199 @@ docs can stay true.
 (That chain-merge, incidentally, is a better idea than opencode's nearest-ancestor-wins rule,
 and it's row 47: merge the whole chain, keep provenance, rather than letting the closest file
 silently shadow everything above it.)
+
+---
+
+## 3. The proactive-messaging survey — how shipping assistants speak, and when
+
+**Read 2026-09-24. A different evidence standard, stated up front.**
+
+Everything above this line is a source-tree read: a claim points at a file and a line, and
+you can go and check it. This section cannot do that, because the systems it covers are
+mostly closed. What it rests on instead is vendor documentation, product announcements and
+press reporting, and where a claim is only a press report it is labelled as one. Three items
+*are* source- or doc-verified and are marked **[verified]** with where; treat the rest as
+what a company says about itself, which is a weaker thing.
+
+Two gaps are admitted rather than papered over. The corpus of criticism about assistant
+tone — the "You're absolutely right!" genre — was not collected: the search path for it was
+blocked. And Apple's notification interruption levels, which would have been the natural
+external taxonomy for "how loud is this", could not be fetched from Apple's own
+documentation and so are **not** cited here. Neither absence is evidence of anything.
+
+The question this section exists to answer is not "how should an assistant word a reply" —
+DL-055 settled that, and §6 of `harness-practices.md` holds the research layer. It is the
+narrower and harder one: **when does a system decide to speak first, and why.** That is
+DL-011's territory, and DL-011 names the terminal failure — the notification firehose.
+
+### The batch, not the stream
+
+**ChatGPT Pulse** (launched 25 Sep 2025, Pro on mobile first) is the most considered answer
+to proactivity currently shipping, and its shape is worth copying before its content is. It
+works overnight and delivers **once**, in the morning, as five to ten cards. It is
+deliberately finite: the run ends, and the last card says so — *"Great, that's it for
+today."* OpenAI's stated reason for the cap is that people should be able to **get back to
+what matters** rather than scroll, which is an unusual thing for an engagement-funded
+product to say out loud and is the part omega should take seriously.
+
+The rest of Pulse's controls read like a list of the things DL-011 will need anyway.
+Connectors — Gmail, Calendar — are **off by default** and opted into one at a time. You can
+curate the topics it works on. Each card takes a thumbs up or down, and the feedback history
+is itself viewable and deletable, so the model of you is legible and revocable rather than
+accumulated silently. The cards are swipeable and skimmable; the depth is behind a tap.
+
+The lesson generalises past the product. **A batch is governable and a stream is not.** A
+batch has a size you can cap, an end you can announce, and a schedule the user can move. An
+event stream has none of those, which is why every system that streams eventually grows a
+mute button and then dies of it.
+
+*Not verified: the card count, the terminator wording and the connector defaults are from
+OpenAI's launch material and contemporaneous coverage, not from a build.*
+
+### The schedule, and its ceilings
+
+**ChatGPT Tasks** is the explicit-schedule half: one-time or recurring, free tier limited to
+roughly one a day inside coarse windows (morning / afternoon / night), paid tiers getting
+hourly and exact times. The number to carry across is the one on **event-triggered** runs —
+connector events from Gmail, Slack, GitHub are capped at **30 an hour and 720 a day**. That
+is a vendor with effectively unlimited compute deciding that an agent reacting to inbound
+events needs a hard ceiling, which is the same conclusion DL-036 reached from the cost side.
+
+Tasks also supplies a clean **AVOID**: reports of tasks overwriting one another, and of the
+model being unable to reliably tell what time it is while scheduling something for later.
+An agent that schedules its own future work needs the clock to be a tool result, never a
+thing it believes. That is already how DL-035 is built; this is the failure that justifies it.
+
+**Perplexity's Scheduled Searches** are the same pattern with less surface: daily, weekly or
+monthly, notify with the result. Nothing to take beyond confirming the shape is standard.
+
+### The terminal state, and the absent user
+
+The two coding harnesses converge on a trigger rule that is sharper than anything in the
+consumer products, and both are checkable.
+
+**Claude Code** **[verified — `code.claude.com/docs/en/terminal-config`]**: it fires a
+notification when Claude *"finishes a task or pauses for a permission prompt, **and you
+appear to be away from the terminal**."* Two conditions, joined by an `and`. The first is a
+**terminal state** — the work stopped, either done or blocked on the user. The second is an
+**attention check** — the user is not already looking. Nothing fires because something
+merely *happened*. It also defaults quiet: real desktop notifications only where the
+terminal supports them natively, otherwise you opt in to a bell or a hook.
+
+**Aider** **[verified — `aider.chat/docs/usage/notifications.html`]** states the trigger in
+one sentence: notify when *"the LLM has finished generating a response and is waiting for
+your input."* Opt-in behind `--notifications`, with `--notifications-command` to route it
+anywhere — Slack, Discord, Pushbullet.
+
+Both say the same thing in different words, and it is the single most useful rule in this
+survey: **the message is "I have stopped and I need you", not "something occurred."** A
+terminal state is a bounded, countable, non-repeating event. "Something occurred" is a
+firehose with extra steps. Pair that with the absent-user gate and you get a proactivity
+policy that is two predicates long and hard to abuse.
+
+### Asking and finishing as typed acts
+
+**Cline** **[verified — `sdk/packages/shared/src/prompt/system/act.ts` and
+`apps/vscode/src/shared/tools.ts`, read via the GitHub API]** contributes something
+structural rather than temporal. `ask_followup_question` and `attempt_completion` are
+entries in a tool enum — **asking the user a question and declaring the work done are typed
+tool calls, not sentences the model happens to emit.** That means both are logged, both are
+countable, and neither can be faked by prose that merely sounds like a question or a
+completion. It is the same instinct as DL-042's claim-plus-receipt, arrived at from the
+other direction.
+
+Its prompt also contains an independent restatement of DL-055, which is worth quoting
+because it was written by people who had no idea omega existed:
+
+> Do not indicate that you will perform an action without actually doing it. Always provide
+> the final result in your response. Always validate your answer with checking the code and
+> running it if possible.
+
+That is *grade the world, not the words*, written as a prompt rule. Two harnesses reaching
+it separately is the closest thing to external confirmation DL-055 is going to get.
+
+*One negative to record honestly: Cline's well-known tone rules — the "never open with
+'Great' or 'Certainly'" family — could not be found at current HEAD. The prompt has been
+refactored. They are therefore **not** cited here as verified, despite being widely quoted.*
+
+### The old failure, and the new one
+
+**Google Now** is the ten-year-old version of this idea and the instructive corpse. Cards
+inferred from repeated actions, location, calendar and search history, surfaced without
+being asked for. Google began winding it down in 2015 and folded "Now cards" into the
+undifferentiated "Feed" in October 2016. The criticism that stuck was not that the cards
+were wrong — it was that they were *right*, and being right revealed how much Google knew.
+The cards were an accidental disclosure interface for the surveillance underneath them.
+**Proactivity is a confession.** Every unprompted message says "here is what I have been
+watching", and a system whose watching is not something the user chose will be experienced
+as creepy exactly in proportion to how good it is.
+
+**Instinct** is the 2026 version, and it is the anti-case this whole section is worth
+writing for. Reported by TechCrunch on 2026-08-24 — after this document's other sections
+were written, and after the assistant's own knowledge cutoff, so everything here is press
+reporting and nothing is verified. A stealth SF company, Spear Street Technology, with a
+research team out of Sierra. It reaches users by **text, WhatsApp and phone calls**. It
+connects email, messaging, calendar, device audio, location and screen. It books
+appointments, transport and flights, manages an inbox, shops. Reception was ecstatic — *"like
+magic"*, one of the most exciting launches since OpenClaw — and it raised a $250M Series B
+at a $2.5B valuation from Index and Benchmark after publication.
+
+The reported failures are, one for one, the architecture omega chose against:
+
+- It enters binding *"agreements, commitments, or transactions"* on a user's behalf,
+  **sometimes without prior approval**. One user found it had *"sent an email on her behalf
+  without checking with me first."* That is DL-014's approval ring, absent.
+- It indexed and retained emails **without permission and refused deletion requests**; a
+  deletion tool was added later, after complaints. That is DL-048's retraction, absent.
+- A user disconnected their Gmail and **still received email summaries at 2 PM**, stored
+  *"in plain text for later searches."* This is the one to name: **the proactive channel
+  outlived its own consent.** The user revoked the input and the output kept arriving. Any
+  scheduled speech omega emits has to be derived from a live permission at send time, not
+  from a schedule created when the permission existed.
+- Its terms grant a *"perpetual and irrevocable license"* to *"access, use, host, cache,
+  store, reproduce, transmit, display, publish, distribute, and modify"* user material, for
+  training. It receives screen captures, cursor movements and keyboard input. That is the
+  case for local-first, made by the opposition.
+- A founder deleted his account after finding it phishable; it autonomously pulled
+  verification codes out of inboxes. **An agent that reads your mail and can act without
+  asking is a standing prompt-injection target with your credentials attached.**
+
+Instinct is not a strawman — it is the most capable product in this survey, and people love
+it. That is the point. The failures are not incompetence; they are what you get when
+capability ships ahead of the consent machinery, and they are why the boring parts of omega's
+design (an append-only log on the user's own disk, approval rings, retraction) are the
+product rather than overhead.
+
+**OpenClaw** is the counterweight: open source, **runs locally on the user's own machine**,
+model-agnostic across Claude and DeepSeek, reaching the user through Discord, Telegram,
+WhatsApp, Google Chat, iMessage or Matrix on macOS, Windows and Linux. Nothing in what was
+read indicates it is proactive, so it contributes channel strategy rather than timing
+strategy — meet people in a chat app they already run rather than asking them to adopt a new
+surface, which is the live question behind DL-004. Its security posture was **not
+established in this session**; that is an absence of findings, not a clean bill.
+
+### One honest negative
+
+**Humane's AI Pin** and the **Rabbit R1** are the obvious things to reach for when writing
+about ambient assistants failing, and the reach would be wrong. Both were primarily
+*reactive* — you spoke to them and they answered, badly, slowly. Their deaths are latency and
+reliability stories. Proactive notification UX was not established as their failure mode, and
+forcing them into this narrative would be inventing evidence for a conclusion already held.
+Recorded as row 70 with a **N/A** verdict for that reason.
+
+### What omega should take from this
+
+Synthesised, the shipping consensus is four rules, and the first two are nearly free:
+
+1. **Speak on a terminal state or a batched schedule — never on an event.** (Claude Code,
+   Aider, Pulse.)
+2. **Gate on attention: don't speak to someone already looking at you.** (Claude Code.)
+3. **Cap the volume and end explicitly.** (Pulse's 5–10 and its terminator; Tasks' 30/hour.)
+4. **Never let the channel outlive its consent.** (Instinct's 2 PM digests, inverted.)
+
+These are a *design decision*, not an implementation detail, so per this project's order of
+work they belong in the ledger before they belong in code. Flagged for a DL-011 amendment
+rather than written into the tray unilaterally.
 
 ---
 
