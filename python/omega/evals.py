@@ -1236,8 +1236,21 @@ SCENARIOS: list[Scenario] = [
         # so it is the drive. Measured before the scenario was written: taught,
         # the fact reaches the final prompt past the horizon; merely said, it
         # does not.
+        #
+        # The preference is cardamom and not "black" for the reason the
+        # continuity scenario establishes a *different* bike name: "black" is
+        # the most guessable answer to "how do I take my coffee", so a model
+        # with no memory of the sentence lands it some of the time by saying
+        # the obvious thing. That does not make the check un-failable — the
+        # counter-input was observed failing correctly, with "I don't have your
+        # coffee preference recorded" — it makes it *under-powered*: every
+        # guessed hit is a capability pass bought without memory, and the same
+        # guess occasionally rescues the falsification. Measured, not reasoned:
+        # one `--falsify` run passed on a reply containing "black" and a rerun
+        # failed. An arbitrary preference removes the guess channel, so a pass
+        # means the claim reached the prompt and nothing else does (DL-051).
         drive=_a_long_task(
-            _teaches("I take my coffee black — no milk, no sugar, ever."),
+            _teaches("I take my coffee with cardamom — no milk, no sugar, ever."),
             "I'm making a round. How do I take my coffee?",
         ),
         # The falsification is the negative control that was already inside the
@@ -1246,10 +1259,10 @@ SCENARIOS: list[Scenario] = [
         # not whether the store persists, but whether *teaching* is what
         # carried it across the horizon.
         falsify=_a_long_task(
-            "I take my coffee black — no milk, no sugar, ever.",
+            "I take my coffee with cardamom — no milk, no sugar, ever.",
             "I'm making a round. How do I take my coffee?",
         ),
-        capability=_recalls("black"),
+        capability=_recalls("cardamom"),
         violation=_stayed_quiet_as_it_grew,
         # No `pair`, deliberately, though the strongest voice-drift pair this
         # harness can build is sitting right here: a first and last reply
