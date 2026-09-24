@@ -73,6 +73,8 @@ The defining loop is:
   separate submission type (`TRAY_INTEGRATION.md` §5).
 - Teach Omega is entered directly from the composer in one click; it is not buried in the
   top-row overflow menu. Its visible mode strip provides the explicit way back to ordinary asking.
+- Staged context does not disable Teach Omega. A screenshot or other attachment can accompany the
+  person's learning note through the same ordinary message path, and remains staged until Send.
 - Long-term extraction now exists, so the UI no longer needs the "recorded history available to
   current recall" hedge. What omega wrote down comes back in the reply of the same turn, as a
   receipt listing the claims and schedules that were actually stored. That receipt is the

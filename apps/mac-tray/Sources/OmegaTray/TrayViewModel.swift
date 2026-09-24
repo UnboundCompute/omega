@@ -129,7 +129,7 @@ final class TrayViewModel: ObservableObject {
         let hasText = !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         return switch composerMode {
         case .ask: hasText || !stagedContext.isEmpty
-        case .teach: hasText && stagedContext.isEmpty
+        case .teach: hasText
         }
     }
 
@@ -151,7 +151,7 @@ final class TrayViewModel: ObservableObject {
     }
 
     var canBeginTeaching: Bool {
-        stagedContext.isEmpty && isConversationSettled && failedSend == nil
+        isConversationSettled && failedSend == nil
     }
 
     var composerPlaceholder: String {

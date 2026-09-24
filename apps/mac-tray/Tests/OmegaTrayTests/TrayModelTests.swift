@@ -18,6 +18,13 @@ final class TrayModelTests: XCTestCase {
     @MainActor
     func testTeachModeSendsTheUsersExactTextAsAnOrdinaryMessage() async throws {
         let (model, transport) = connectedModel()
+        let screenshot = StagedContext(
+            kind: .screen,
+            title: "Area capture",
+            detail: "Screen · Stored · Not sent",
+            attachmentState: .ready(transport.attachmentReference)
+        )
+        model.stagedContext = [screenshot]
         model.beginTeaching()
         model.draft = "Prefer concise status updates."
 
@@ -26,21 +33,23 @@ final class TrayModelTests: XCTestCase {
 
         let submission = try XCTUnwrap(transport.submissions.first)
         XCTAssertEqual(submission.text, "Prefer concise status updates.")
+        XCTAssertEqual(submission.context.first?.id, screenshot.id)
+        XCTAssertEqual(submission.context.first?.blob, transport.attachmentReference.blob)
         XCTAssertEqual(model.messages.first?.text, "Prefer concise status updates.")
         XCTAssertEqual(model.composerMode, .ask)
     }
 
     @MainActor
-    func testTeachModeRequiresTextAndRejectsStagedContext() {
+    func testTeachModeRequiresTextAndAllowsStagedContext() {
         let (model, _) = connectedModel()
+        model.stagedContext = [.init(kind: .screen, title: "Area capture", detail: "Screen · Not sent")]
+        XCTAssertTrue(model.canBeginTeaching)
+
         model.beginTeaching()
         XCTAssertFalse(model.canSend)
 
         model.draft = "A useful preference"
         XCTAssertTrue(model.canSend)
-
-        model.stagedContext = [.init(kind: .text, title: "Context", detail: "Text · Not sent")]
-        XCTAssertFalse(model.canSend)
     }
 
     @MainActor

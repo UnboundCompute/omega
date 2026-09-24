@@ -434,16 +434,16 @@ private struct ExpandedTrayView: View {
             }
 
             HStack(alignment: .bottom, spacing: 10) {
-                if viewModel.composerMode == .ask {
-                    Button(action: viewModel.pasteFromClipboard) {
-                        Image(systemName: "paperclip")
-                            .frame(width: 28, height: 28)
-                    }
-                    .buttonStyle(.plain)
-                    .foregroundStyle(TrayTheme.secondaryText)
-                    .accessibilityLabel("Add from clipboard")
-                    .help("Add from clipboard")
+                Button(action: viewModel.pasteFromClipboard) {
+                    Image(systemName: "paperclip")
+                        .frame(width: 28, height: 28)
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(TrayTheme.secondaryText)
+                .accessibilityLabel("Add from clipboard")
+                .help("Add from clipboard")
 
+                if viewModel.composerMode == .ask {
                     Button(action: viewModel.beginTeaching) {
                         Label("Teach", systemImage: "graduationcap")
                             .font(.system(size: 11, weight: .medium))
