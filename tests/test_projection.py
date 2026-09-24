@@ -288,6 +288,9 @@ def test_every_m1_kind_is_accounted_for() -> None:
         episodes.CLAIM_RETRACTED: episodes.claim_retracted(
             for_seq=1, claim_seq=2, at=AT
         ),
+        episodes.CLAIM_EXTRACTION_FAILED: episodes.claim_extraction_failed(
+            for_seq=1, reason="the model said no", at=AT
+        ),
     }
     assert set(made) == set(episodes.KINDS)
     for kind, payload in made.items():

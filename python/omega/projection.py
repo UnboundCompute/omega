@@ -147,12 +147,22 @@ class Update:
 #: reach the person, which `act.py` §1.6 refuses for the agent's output and
 #: which would be no better arriving through the projection. One turn, one
 #: outward voice; a turn that learns four things says so once.
+#:
+#: `claim.extraction_failed` is withheld for that same reason and deserves the
+#: argument spelled out, because it is the tempting one to project: it is bad
+#: news, and bad news wants a channel. It already has one. The receipt says *I
+#: could not write that down* in the reply of the very turn that failed, which
+#: is the moment the person can act — and DL-053 added the record for the
+#: question the receipt cannot answer, *has this been happening*, which is asked
+#: later and deliberately by someone running `--learned`, not pushed. Projecting
+#: it would make a failed teach arrive twice and put a second voice on the turn.
 NOT_PROJECTED = frozenset(
     {
         episodes.SCHEDULE_CREATED,
         episodes.SCHEDULE_CANCELLED,
         episodes.CLAIM_EXTRACTED,
         episodes.CLAIM_RETRACTED,
+        episodes.CLAIM_EXTRACTION_FAILED,
     }
 )
 

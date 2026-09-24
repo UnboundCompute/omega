@@ -58,6 +58,7 @@ __all__ = [
     "schedule_cancelled",
     "claim_extracted",
     "claim_retracted",
+    "claim_extraction_failed",
     "now",
 ]
 
@@ -76,6 +77,7 @@ SCHEDULE_CREATED = "schedule.created"
 SCHEDULE_CANCELLED = "schedule.cancelled"
 CLAIM_EXTRACTED = "claim.extracted"
 CLAIM_RETRACTED = "claim.retracted"
+CLAIM_EXTRACTION_FAILED = "claim.extraction_failed"
 
 #: The complete M1 kind set (§2.1: "and that is all of them").
 #:
@@ -96,6 +98,7 @@ KINDS = frozenset(
         SCHEDULE_CANCELLED,
         CLAIM_EXTRACTED,
         CLAIM_RETRACTED,
+        CLAIM_EXTRACTION_FAILED,
     }
 )
 
@@ -119,6 +122,15 @@ KINDS = frozenset(
 # `claim.retracted` is a record for exactly those two reasons again (DL-048):
 # forgetting something must not run a turn, and the forgetting has to be in the
 # log or a rebuild would resurrect what the person asked omega to drop.
+#
+# `claim.extraction_failed` is the one that is *only* here to be read later
+# (DL-053). It changes nothing about the turn — DL-043 #5 still stands, the turn
+# still records `spoke` and still keeps its reply — and it exists because a
+# configuration once left the `learn` role returning 400 on every call and the
+# log kept no trace of it: thirteen teach drops, thirteen receipts into a
+# scrollback, and a store whose honest summary was "I have been taught thirteen
+# times and could not record any of it" rendering as "I have not been taught
+# anything yet". A fact nobody can ask about afterwards is not recorded.
 
 #: The trigger vocabulary (DL-042), deliberately too weak to be interesting.
 #: Every field optional and ANDed; a claim with no trigger is always active,
@@ -612,6 +624,41 @@ def claim_retracted(
     return payload
 
 
+def claim_extraction_failed(
+    *,
+    for_seq: int,
+    reason: str,
+    at: Optional[str] = None,
+) -> dict[str, Any]:
+    """An extraction was attempted for this turn and did not produce claims (DL-053).
+
+    The counterpart of :func:`claim_extracted` on the branch that writes nothing.
+    Without it the two outcomes of a teach drop are *a claim in the log* and
+    *silence*, and silence is also what a note omega was never sent looks like —
+    so "has learning been working?" has no answer that survives the reply
+    scrolling away.
+
+    Attached to the turn (``for_seq``) rather than to the note, because the
+    failure is a property of the attempt and the attempt is the turn. It carries
+    no ``source_seq``: there is no claim, so there is nothing for a source to be
+    the source *of*, and a field that would always equal ``for_seq`` is a field
+    that will eventually disagree with it.
+
+    Records the failure, not the note. The note is already in the log as the
+    ``message.inbound`` this turn is answering, and copying its text here would
+    put the same sentence in two places with two lifetimes.
+    """
+    payload = {
+        "v": VERSION,
+        "kind": CLAIM_EXTRACTION_FAILED,
+        "for_seq": for_seq,
+        "reason": reason,
+        "at": at or now(),
+    }
+    _validate(payload)
+    return payload
+
+
 def _copy_trigger(trigger: dict[str, Any]) -> dict[str, Any]:
     copied = dict(trigger)
     if isinstance(copied.get("any"), list):
@@ -642,6 +689,7 @@ _REQUIRED: dict[str, tuple[str, ...]] = {
         "at",
     ),
     CLAIM_RETRACTED: ("for_seq", "claim_seq", "at"),
+    CLAIM_EXTRACTION_FAILED: ("for_seq", "reason", "at"),
 }
 
 #: The kinds that are *not* about one turn. Everything else names the inbound
@@ -768,6 +816,15 @@ def _validate(payload: dict[str, Any]) -> None:
                 # confusion of the two seqs, not a fact anyone meant to record.
                 raise BadPayload("supersedes must name a claim, not the source")
         _validate_trigger(payload["trigger"])
+
+    if kind == CLAIM_EXTRACTION_FAILED:
+        # Non-empty for `turn.completed`'s reason: a recorded failure whose
+        # cause field is blank says something went wrong and drops the only
+        # field that says what, which is how a real fault becomes a silent one.
+        # The reason the provider hands back is the diagnosis — it named the
+        # rejected parameter and the env var that fixes it — so it is kept whole
+        # rather than flattened to a category.
+        _require_str(payload, "reason", non_empty=True)
 
     if kind == CLAIM_RETRACTED:
         _require_seq(payload, "claim_seq")

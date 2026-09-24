@@ -741,6 +741,8 @@ def review(
     running: Sequence[Schedule] = (),
     broken: Optional[dict[str, str]] = None,
     current: Optional[bool] = None,
+    failed: int = 0,
+    last_failure: str = "",
 ) -> str:
     """Everything omega is currently carrying, in the person's own words (DL-048).
 
@@ -766,6 +768,15 @@ def review(
     so leaving it out would have made this a report that hides its own worst
     news.
 
+    ``failed`` is that same rule one layer up and is the whole of DL-053. An
+    extraction that fails says so in a receipt and then nothing keeps it, so a
+    store whose `learn` role has been returning 400 on every call reads exactly
+    like a store nobody has taught — *"I have not been taught anything yet"* was
+    the literal output of a log holding thirteen failed teach drops. When the
+    count is non-zero that sentence is replaced rather than decorated: omega has
+    not been taught nothing, it has been taught and could not write it down, and
+    those are different enough that the person's next action differs.
+
     ``current`` makes the empty answer three-valued in the way *fail closed on
     empty* requires. "Folded the whole log and omega has been taught nothing"
     and "folded none of it" are the same empty list, and only the first is an
@@ -781,12 +792,30 @@ def review(
     first turn folds it.
     """
     broken = broken or {}
+
+    def _failures() -> list[str]:
+        if failed <= 0:
+            return []
+        times = "once" if failed == 1 else f"{failed} times"
+        out = [f"I was taught something and could not record it ({times}):"]
+        if last_failure:
+            out.append(f"- {last_failure}")
+        return out
+
     if not (claims or running or broken):
+        if failed > 0:
+            # Before the `current` branch on purpose. A view that has not folded
+            # the whole log cannot say what omega knows, but it can say that
+            # what it *has* read contains failures — and that is the more urgent
+            # of the two things, because it is actionable and the other is not.
+            return "\n".join(_failures())
         if current:
             return "I have not been taught anything yet."
         return "I have not read the whole log, so I cannot tell you what I know."
 
-    lines: list[str] = []
+    lines: list[str] = _failures()
+    if lines:
+        lines.append("")
     if claims:
         lines.append("What I believe about you:")
         for claim in claims:

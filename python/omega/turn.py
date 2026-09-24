@@ -465,6 +465,16 @@ def _teach(
         )
     except Exception as exc:  # noqa: BLE001 - see the docstring
         reason = str(exc) or type(exc).__name__
+        try:
+            ctx.queue.append(
+                episodes.claim_extraction_failed(for_seq=pending.seq, reason=reason, at=at)
+            )
+        except Exception:  # noqa: BLE001
+            # The record is the diagnosis, not the work. If even the append
+            # fails the receipt below still reaches the person, and turning a
+            # failed *write about* a failure into a failed turn would lose the
+            # reply this function exists to protect (DL-043 #5).
+            pass
         return learn.receipt((), error=reason)
     return learn.receipt(
         written,

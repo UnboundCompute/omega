@@ -169,6 +169,8 @@ def review(store_dir: Path, *, write: Callable[[str], None]) -> int:
                 running=standing.schedules,
                 broken=standing.broken,
                 current=learned.through >= queue.head(),
+                failed=learned.failed,
+                last_failure=learned.last_failure,
             )
         )
     return 0

@@ -61,6 +61,11 @@ def test_every_kind_round_trips():
             at="2026-09-23T10:00:00+00:00",
         ),
         ep.schedule_cancelled(id="brief", at="2026-09-23T10:00:00+00:00"),
+        ep.claim_extraction_failed(
+            for_seq=41,
+            reason="400 Unsupported parameter: 'temperature'",
+            at="2026-09-23T10:00:00+00:00",
+        ),
         ep.claim_extracted(
             for_seq=41,
             text="prefers short replies",

@@ -348,6 +348,109 @@ def test_a_failed_extraction_does_not_fail_the_turn(store):
     assert _claims_in(q) == []
 
 
+def test_a_failed_extraction_is_recorded_and_says_why(store):
+    """DL-053, and the case that would have caught DL-052 on the first run.
+
+    The receipt was never the weak part — omega diagnosed its own outage in
+    plain language and put the fix in the reply. What was missing is that it did
+    so *once*, into a scrollback, and wrote nothing down, so a log holding
+    thirteen dead teach drops was byte-identical in every respect anyone could
+    query to a log nobody had ever taught.
+
+    The provider itself raises here rather than the answer being unparseable.
+    That is the shape the real outage had — a 400 from the model before any text
+    came back — and it is the branch the older failure case does not reach.
+    """
+    q = EventQueue(store)
+    q.append(episodes.inbound(_teach_text("Keep updates short."), channel="tray"))
+
+    def explode(role, messages):
+        raise RuntimeError(
+            "Error code: 400 - Unsupported parameter: 'temperature' is not "
+            "supported with this model."
+        )
+
+    _drain(q, _Teaching(learn_answer=explode, reply="Got it."))
+
+    failures = [
+        p
+        for _, p in _log(q)
+        if p.get("kind") == episodes.CLAIM_EXTRACTION_FAILED
+    ]
+    assert len(failures) == 1
+    # The provider's own words, kept whole: the part a person can act on is the
+    # named parameter, not the category "extraction failed".
+    assert "temperature" in failures[0]["reason"]
+
+    # DL-043 #5 is untouched by this. The turn still spoke and still kept the
+    # reply it had already composed — the record is additive, and a case that
+    # only asserted the new record would not notice if it had stopped being so.
+    outcomes = [
+        p.get("outcome") for _, p in _log(q) if p.get("kind") == episodes.TURN_COMPLETED
+    ]
+    assert outcomes == ["spoke"]
+    (reply,) = _replies(q)
+    assert "Got it." in reply
+
+    learned = derive.Learned.fold(_log(q))
+    assert learned.failed == 1
+    assert "temperature" in learned.last_failure
+
+
+def test_a_store_that_could_not_learn_does_not_report_learning_nothing(store):
+    """The sentence DL-052 actually produced, and the reason this is a fix.
+
+    ``--learned`` on the dead store answered *"I have not been taught anything
+    yet"*. True, and the most misleading true sentence available: the honest
+    answer was that omega had been taught and could not write any of it down.
+    Both are the empty claim list, so only a separate fact can tell them apart.
+    """
+    q = EventQueue(store)
+    q.append(episodes.inbound(_teach_text("Keep updates short."), channel="tray"))
+
+    def explode(role, messages):
+        raise RuntimeError("Error code: 400 - Unsupported parameter: 'temperature'")
+
+    _drain(q, _Teaching(learn_answer=explode))
+
+    learned = derive.Learned.fold(_log(q))
+    said = learn.review(
+        learned.claims(),
+        current=True,
+        failed=learned.failed,
+        last_failure=learned.last_failure,
+    )
+    assert "could not record it" in said
+    assert "temperature" in said
+    assert "not been taught anything" not in said
+
+
+def test_a_later_success_clears_the_failure_count(store):
+    """Counted since the last success, so a fixed fault stops being reported.
+
+    The alternative — counting for all time — makes the line permanent scar
+    tissue, and a warning that is always on is one the person learns to read
+    past. That is the notification firehose (DL-011) wearing a report's clothes,
+    and it would cost exactly the next real outage.
+    """
+    q = EventQueue(store)
+    q.append(episodes.inbound(_teach_text("Keep updates short."), channel="tray"))
+
+    def explode(role, messages):
+        raise RuntimeError("Error code: 400 - Unsupported parameter: 'temperature'")
+
+    _drain(q, _Teaching(learn_answer=explode))
+    assert derive.Learned.fold(_log(q)).failed == 1
+
+    q.append(episodes.inbound(_teach_text("Ignore billing."), channel="tray"))
+    _drain(q, _Teaching(learn_answer=_answer(_a_claim("ignore anything about billing"))))
+
+    learned = derive.Learned.fold(_log(q))
+    assert learned.failed == 0
+    assert learned.last_failure == ""
+    assert "could not record it" not in learn.review(learned.claims(), current=True)
+
+
 def test_a_silent_verdict_on_a_teach_still_records_and_still_answers(store):
     """The hole this closes: a teach omega says nothing about is
     indistinguishable from one it dropped.

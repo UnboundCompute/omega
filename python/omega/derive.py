@@ -312,11 +312,13 @@ class Learned:
     delete.
     """
 
-    __slots__ = ("_claims", "_through")
+    __slots__ = ("_claims", "_through", "_failed", "_last_failure")
 
     def __init__(self) -> None:
         self._claims: dict[int, Claim] = {}
         self._through = 0
+        self._failed = 0
+        self._last_failure = ""
 
     @property
     def through(self) -> int:
@@ -359,6 +361,16 @@ class Learned:
                 explicit=bool(payload.get("explicit", False)),
                 supersedes=None if supersedes is None else int(supersedes),
             )
+            # A claim reached the log, so whatever was failing is not failing
+            # now. Counting *since the last success* rather than for all time is
+            # what keeps this a live signal instead of a scar: a fault that was
+            # found and fixed should stop being reported, or the line teaches the
+            # person to skip it and the next real outage scrolls past inside it.
+            self._failed = 0
+            self._last_failure = ""
+        elif payload.get("kind") == episodes.CLAIM_EXTRACTION_FAILED:
+            self._failed += 1
+            self._last_failure = str(payload["reason"])
         elif payload.get("kind") == episodes.CLAIM_RETRACTED:
             # ``pop`` with a default for the same reason supersession uses one:
             # naming a claim that is no longer active is an ordinary race in an
@@ -372,6 +384,38 @@ class Learned:
     def claims(self) -> list[Claim]:
         """Every active claim, oldest first."""
         return sorted(self._claims.values(), key=lambda c: c.seq)
+
+    @property
+    def failed(self) -> int:
+        """Extractions that failed since the last one that filed a claim (DL-053).
+
+        Zero is the ordinary state and also the state of a log that has never
+        been taught anything, which is fine — the two are only confusable if you
+        read this as "learning is healthy" rather than as what it says, which is
+        a count. The question it answers is the one DL-052 could not:
+        ``--learned`` reporting nothing learned means *nothing was taught* when
+        this is 0 and *nothing could be recorded* when it is not.
+
+        One known bias, and it is deliberate. A teach whose extraction succeeds
+        but legitimately files nothing — a note that asks omega for nothing —
+        writes no record and so does not clear this, leaving a repaired fault
+        reported slightly too long. Over-reporting was chosen because the fault
+        underneath is total and silent for as long as it lasts, and a count that
+        lingers a teach too long is cheaper than one that goes quiet early.
+        """
+        return self._failed
+
+    @property
+    def last_failure(self) -> str:
+        """Why the most recent extraction failed, or ``""``.
+
+        The provider's own message, kept whole. It is the part that made DL-052
+        a one-line repair instead of an investigation: it named the rejected
+        parameter, the model that rejected it, and the environment variable that
+        turns it off. Summarising that into a category would throw away the only
+        part a person can act on.
+        """
+        return self._last_failure
 
     def matching(
         self, *, text: str, channel: str, at: str
