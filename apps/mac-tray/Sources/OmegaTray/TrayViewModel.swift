@@ -231,7 +231,7 @@ final class TrayViewModel: ObservableObject {
                 TrayContextReference(
                     id: $0.id,
                     kind: $0.kind.wireValue,
-                    title: $0.title,
+                    title: $0.submissionTitle,
                     attachment: $0.attachment
                 )
             },

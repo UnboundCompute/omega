@@ -19,6 +19,8 @@ become a second brain or an undeclared wire protocol.
   failure, preventing omega from covering or appearing inside the selected content.
 - Screen Recording permission request, denied state, and direct System Settings recovery.
 - File, image, URL, selected-text, and clipboard staging through native pasteboard/drop APIs.
+- Compact host labels for staged links while preserving the full canonical URL in the submitted
+  context title, so omega receives the actual destination rather than only `github.com`.
 - A resting drop target that expands before drop and states that the item will not be sent.
 - Explicit submission only; capture and drop never imply send.
 - Quick Look for staged file-backed context.

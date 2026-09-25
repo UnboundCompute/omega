@@ -89,6 +89,14 @@ struct StagedContext: Identifiable {
         return reference
     }
 
+    var submissionTitle: String {
+        guard kind == .link,
+              let text,
+              !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        else { return title }
+        return text
+    }
+
     var blocksSending: Bool {
         switch attachmentState {
         case .waiting, .uploading, .failed:

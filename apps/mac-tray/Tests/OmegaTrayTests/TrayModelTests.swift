@@ -16,6 +16,26 @@ final class TrayModelTests: XCTestCase {
     }
 
     @MainActor
+    func testLinkContextSendsCanonicalURLWhileKeepingCompactDisplayTitle() async throws {
+        let (model, transport) = connectedModel()
+        let repositoryURL = "https://github.com/unboundcompute/omega/tree/main/apps/mac-tray"
+        model.stagedContext = [
+            .init(
+                kind: .link,
+                title: "github.com",
+                detail: "Link · Not sent",
+                text: repositoryURL
+            )
+        ]
+
+        model.send()
+        await settleTasks()
+
+        XCTAssertEqual(transport.submissions.first?.context.first?.title, repositoryURL)
+        XCTAssertEqual(model.messages.first?.contextDescriptions, ["github.com"])
+    }
+
+    @MainActor
     func testTeachModeSendsTheUsersExactTextAsAnOrdinaryMessage() async throws {
         let (model, transport) = connectedModel()
         let screenshot = StagedContext(
