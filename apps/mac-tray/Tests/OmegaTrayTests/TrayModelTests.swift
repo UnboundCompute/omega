@@ -1,7 +1,17 @@
+import AppKit
 import XCTest
 @testable import OmegaTray
 
 final class TrayModelTests: XCTestCase {
+    func testClipboardCopiesTheExactMessageText() {
+        let pasteboard = NSPasteboard(name: .init("omega-tests-\(UUID().uuidString)"))
+        defer { pasteboard.releaseGlobally() }
+        let markdown = "**Done.**\n\n- First\n- Second"
+
+        XCTAssertTrue(TrayClipboard.copy(markdown, to: pasteboard))
+        XCTAssertEqual(pasteboard.string(forType: .string), markdown)
+    }
+
     @MainActor
     func testCannotSendAnEmptySubmission() {
         let model = TrayViewModel(transport: ScriptedTransport(), loadCursor: { nil }, persistCursor: { _ in })

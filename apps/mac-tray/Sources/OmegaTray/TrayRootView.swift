@@ -1,5 +1,14 @@
+import AppKit
 import SwiftUI
 import UniformTypeIdentifiers
+
+enum TrayClipboard {
+    @discardableResult
+    static func copy(_ text: String, to pasteboard: NSPasteboard = .general) -> Bool {
+        pasteboard.clearContents()
+        return pasteboard.setString(text, forType: .string)
+    }
+}
 
 struct TrayRootView: View {
     @ObservedObject var viewModel: TrayViewModel
@@ -566,20 +575,47 @@ private struct MessageView: View {
             .padding(.vertical, 9)
             .background(TrayTheme.instruction, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
             .frame(maxWidth: .infinity, alignment: .trailing)
+            .textSelection(.enabled)
+            .contextMenu {
+                Button("Copy message", systemImage: "doc.on.doc", action: copyMessage)
+            }
         case .omega:
             VStack(alignment: .leading, spacing: 7) {
-                Text("omega")
-                    .font(.system(size: 11, weight: .semibold))
-                    .foregroundStyle(TrayTheme.signal)
+                HStack(spacing: 8) {
+                    Text("omega")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(TrayTheme.signal)
+                    Spacer(minLength: 0)
+                    Button(action: copyMessage) {
+                        Image(systemName: "doc.on.doc")
+                            .font(.system(size: 10, weight: .medium))
+                            .frame(width: 22, height: 22)
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(TrayTheme.tertiaryText)
+                    .accessibilityLabel("Copy response")
+                    .help("Copy response")
+                }
                 MarkdownMessageView(source: message.text)
                     .foregroundStyle(TrayTheme.primaryText)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
+            .contextMenu {
+                Button("Copy response", systemImage: "doc.on.doc", action: copyMessage)
+            }
         case .status:
             Text(message.text)
                 .font(.system(size: 11))
                 .foregroundStyle(TrayTheme.secondaryText)
+                .textSelection(.enabled)
+                .contextMenu {
+                    Button("Copy status", systemImage: "doc.on.doc", action: copyMessage)
+                }
         }
+    }
+
+    private func copyMessage() {
+        TrayClipboard.copy(message.text)
     }
 }
 
