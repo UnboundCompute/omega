@@ -32,7 +32,7 @@ import base64
 from dataclasses import dataclass
 from typing import Any, Callable, Optional, Sequence
 
-from omega import blobs, derive, episodes, learn, provider, schedule
+from omega import blobs, derive, episodes, learn, notice, provider, schedule
 from omega.queue import EVENT_KINDS, EventQueue, Pending
 
 __all__ = [
@@ -716,6 +716,13 @@ _JUDGE_SYSTEM = (
     "SILENT is for events nobody asked you about - your own idle ticks, "
     "background noise, things already handled. Staying silent there is a "
     "correct and successful answer, not a failure.\n"
+    "An event marked 'nobody asked' is your own look at what is open, not the "
+    "person writing to you. There is no question in it and nothing is owed, so "
+    "the rules above about answering a message do not apply. SILENT is the "
+    "usual right answer there and it is a success. The bar for speaking is that "
+    "they would be glad you interrupted - not that you found something true to "
+    "say, and not that you can see something you could comment on. If what you "
+    "have is a summary of what you already know, stay silent.\n"
     "Judge this event on its own. That you stayed silent before is not a "
     "reason to stay silent now."
 )
@@ -758,6 +765,10 @@ _REPLY_SYSTEM = (
     "claiming it is either a duplicate of the receipt printed under your "
     "reply, or a lie standing in for a receipt that is missing. Answer the "
     "message and let the receipt speak for the filing.\n"
+    "When the event says nobody asked, you are opening the conversation, not "
+    "answering one. Do not thank them, do not refer to a question, and do not "
+    "explain that you were looking - say the one thing that made speaking worth "
+    "it and stop. One or two sentences. They did not ask, so earn it.\n"
     "How you talk: like someone who knows this person and is not performing. "
     "Short, first person, contractions, dry. Answer the thing asked and stop - "
     "no 'Got it', no repeating their message back to them, no offer to help at "
@@ -1041,6 +1052,16 @@ def _attachment_note(item: dict[str, Any], reason: str = "") -> str:
 def _render_payload(payload: dict[str, Any]) -> str:
     kind = payload.get("kind")
     if kind == episodes.MESSAGE_INBOUND:
+        if payload.get("channel") == notice.CHANNEL:
+            # **Not a person talking**, and this prefix is the only thing that
+            # says so (DL-061). Without it an unprompted pass renders as
+            # `you: ...`, the judge is told plainly that "if the person wrote to
+            # you, they are talking to you: answer them", and omega would speak
+            # on every single look while never once being silent - the firehose
+            # at exactly the permitted rate. It matters in recall too: omega
+            # reading its own looks back as the person's words would build a
+            # memory of things they never said.
+            return f"(nobody asked - you looked at what was open)\n{payload.get('text', '')}"
         return f"you: {payload.get('text', '')}"
     if kind == episodes.TURN_COMPLETED:
         outcome = payload.get("outcome")

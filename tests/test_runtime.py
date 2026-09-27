@@ -21,7 +21,7 @@ from typing import Sequence
 import pytest
 
 import invariants
-from omega import episodes, projection, provider
+from omega import episodes, notice, projection, provider
 from omega.channel import ChannelClient
 from omega.executor import INTERRUPTED_ERROR
 from omega.memory import EPISODES_FILENAME, MemoryStore
@@ -1008,6 +1008,98 @@ def test_a_runtime_given_no_usage_path_has_no_such_sense(
 
     kinds = {p.payload["kind"] for p in _every_episode(store_dir)}
     assert episodes.USAGE_DIGESTED not in kinds
+
+
+# --- the unprompted pass (DL-011, DL-061) -------------------------------------
+
+
+def test_the_drain_reaches_the_unprompted_pass_too(store_dir: Path) -> None:
+    """Wake condition (b) at the layer that ships it, per the rule above.
+
+    DL-011 decided two wake conditions in 2026-09 and the second one sat
+    unbuilt for the same reason reflection and ingestion once did: every piece
+    existed and nothing called it. So the assertion that matters is not that
+    `notice` works when invoked - `test_notice.py` covers that - but that a
+    runtime nobody is talking to raises the event by itself.
+    """
+    with runtime_at(store_dir, _reads_transcripts(), sense=0.0, nudge=0) as rt:
+        rt.say("morning")
+
+        # Waits for the look's *terminal*, not for the look. The look is an
+        # ordinary inbound and the drain finishes it on a later pass, so a wait
+        # that stops at the append can close the store mid-turn and then blame
+        # the pass for leaving it unfinished.
+        assert until(
+            lambda: any(
+                p.payload["kind"] == episodes.MESSAGE_INBOUND
+                and p.payload["channel"] == notice.CHANNEL
+                and any(
+                    q.payload.get("for_seq") == p.seq
+                    and episodes.is_terminal(q.payload)
+                    for q in _every_episode_of(rt)
+                )
+                for p in _every_episode_of(rt)
+            )
+        ), "the drain never reached the unprompted pass"
+
+    looks = [
+        p.payload
+        for p in _every_episode(store_dir)
+        if p.payload["kind"] == episodes.MESSAGE_INBOUND
+        and p.payload["channel"] == notice.CHANNEL
+    ]
+    assert looks, "no unprompted event was raised"
+    # The look is an ordinary inbound, so the ordinary machinery has to have
+    # finished it. A pass that raises events the drain then leaves sitting is a
+    # queue that grows, not a second wake condition.
+    for_seqs = {
+        p.payload["for_seq"]
+        for p in _every_episode(store_dir)
+        if episodes.is_terminal(p.payload) and "for_seq" in p.payload
+    }
+    raised = {
+        p.seq
+        for p in _every_episode(store_dir)
+        if p.payload["kind"] == episodes.MESSAGE_INBOUND
+        and p.payload["channel"] == notice.CHANNEL
+    }
+    assert raised <= for_seqs, f"unfinished looks: {sorted(raised - for_seqs)}"
+    assert graded(store_dir), str(graded(store_dir))
+
+
+def test_the_unprompted_pass_speaks_at_most_once_a_day(store_dir: Path) -> None:
+    """The violation metric paired with the capability above (DL-061).
+
+    A judge scripted to speak every time is exactly the firehose the day limit
+    exists to stop, and it is the honest test of it: with the limit in code the
+    log carries one spoken look however long the runtime idles, and the run that
+    proves the pass is reachable would otherwise prove it is unbounded.
+    """
+    with runtime_at(store_dir, _reads_transcripts(), sense=0.0, nudge=0) as rt:
+        rt.say("morning")
+        assert until(
+            lambda: any(
+                p.payload["kind"] == episodes.MESSAGE_INBOUND
+                and p.payload["channel"] == notice.CHANNEL
+                for p in _every_episode_of(rt)
+            )
+        ), "the drain never reached the unprompted pass"
+        for _ in range(4):
+            rt.say("still here")
+
+    spoken = [
+        p.payload
+        for p in _every_episode(store_dir)
+        if p.payload["kind"] == episodes.TURN_COMPLETED
+        and p.payload["outcome"] == "spoke"
+        and p.payload["for_seq"] in {
+            q.seq
+            for q in _every_episode(store_dir)
+            if q.payload["kind"] == episodes.MESSAGE_INBOUND
+            and q.payload["channel"] == notice.CHANNEL
+        }
+    ]
+    assert len(spoken) <= 1, f"{len(spoken)} unprompted nudges in one day"
 
 
 def _every_episode_of(rt: Runtime):

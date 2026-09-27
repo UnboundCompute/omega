@@ -56,7 +56,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-from omega import episodes, projection, provider
+from omega import episodes, notice, projection, provider
 from omega.blobs import BlobStore
 from omega.channel import DEFAULT_HOST, DEFAULT_PORT, Channel
 from omega.executor import Executor, StartupReport
@@ -271,6 +271,7 @@ class Runtime:
         poll: float = DEFAULT_POLL,
         tick: float = TICK_SECONDS,
         sense: float = SENSE_SECONDS,
+        nudge: int = notice.LOOK_EVERY_SECONDS,
         turn_timeout: float = DEFAULT_TURN_TIMEOUT,
     ) -> None:
         if poll <= 0:
@@ -291,6 +292,12 @@ class Runtime:
         self._poll = poll
         self._tick = tick
         self._sense_every = sense
+        # How long quiet has to last before the unprompted pass looks (DL-061).
+        # A separate knob from `sense` because they measure different things:
+        # `sense` is how often the passes are *asked*, and this is the gap the
+        # answer depends on. Tests dial it down for the same reason they dial
+        # `sense` down - waiting out a real hour is not a test.
+        self._nudge_every = nudge
         self._turn_timeout = turn_timeout
 
         self._store: Optional[MemoryStore] = None
@@ -632,6 +639,14 @@ class Runtime:
             executor.ingest(root=self._transcripts)
         if self._usage is not None:
             executor.digest_usage(path=self._usage)
+        # Last, and unconditional. Last because the three passes above *write
+        # memory* and this one *reads* it to decide whether to speak — running it
+        # first would have it judge a moment it had not yet finished perceiving.
+        # Unconditional because wake condition (b) is half of DL-011's loop, not
+        # an integration to be configured on: the two senses above take a path
+        # because they read something outside the store, and this reads only what
+        # omega already has (DL-061).
+        executor.notice(look_every_seconds=self._nudge_every)
 
     # --- the heartbeat thread ---------------------------------------------
 

@@ -26,9 +26,10 @@ append and never a second path into the loop.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Callable, Optional
 
-from omega import episodes, habits, learn, provider, transcripts
+from omega import episodes, habits, learn, notice, provider, transcripts
 from omega.derive import Learned, OpenWork
 from omega.memory import WriteKeyConflict
 from omega.queue import EVENT_KINDS, EventQueue, Pending
@@ -685,6 +686,74 @@ class Executor:
             self._queue.append(episodes.usage_digested(**receipt, reason=reason))
             return
         self._queue.append(episodes.usage_digested(**receipt, filed=len(filed)))
+
+    def notice(
+        self,
+        *,
+        now: Optional[datetime] = None,
+        look_every_seconds: int = notice.LOOK_EVERY_SECONDS,
+    ) -> bool:
+        """Wake condition (b): look at what is open, unasked (DL-011, DL-061).
+
+        Returns whether an unprompted event was appended — **not** whether omega
+        said anything. Those are different facts and the caller must not collapse
+        them: a pass that looked and chose silence returns ``True`` here and is a
+        success, which is DL-011's *"single most important consequence of the
+        time-wake"* and the regression `runtime.Said` already refuses.
+
+        This method **starts a turn and does not run one**. It appends one
+        ordinary inbound on the ``self`` channel and returns; the drain picks it
+        up like any other event, the judge decides, and the reply — if there is
+        one — reaches the tray through the subscriber fan-out. There is no second
+        engine here, on purpose (DL-011): initiative that grew its own loop would
+        grow its own voice and its own idea of what is open.
+
+        Structurally the sibling of :meth:`ingest` and :meth:`digest_usage` — a
+        pass at the idle moment, self-gating underneath, never raising — with one
+        difference worth naming: those two *write memory*, and this one *causes a
+        turn*. So it is the only idle pass that can reach the person, and the two
+        rate limits that decide whether it may are in :mod:`omega.notice`, in
+        code, never in the judge.
+
+        **Never raises**, for :meth:`digest_usage`'s reason. A sense that can kill
+        the drain thread stops every future turn, and that is a worse outcome
+        than a day with no nudge in it.
+        """
+        if not self._recovered:
+            return False
+        if self._queue.head() == 0:
+            # As in `ingest` and `digest_usage`: the first thing in an empty log
+            # must not be omega talking to itself about a person it has not met.
+            return False
+
+        moment = now or datetime.now(timezone.utc)
+        store = self._queue.store
+        try:
+            st = notice.standing(store)
+            if not notice.may_look(
+                st, now=moment, look_every_seconds=look_every_seconds
+            ):
+                return False
+            self._open.advance(store)
+            self._learned.advance(store)
+            text = notice.situation(
+                now=moment,
+                blocks=self._open.blocks(),
+                claims=self._learned.claims(),
+                schedules=self._standing_schedules(),
+                heard_at=st.heard_at,
+            )
+            # Stamped with ``moment``, not left to default to wall-clock now.
+            # ``notice.standing`` charges a spoken nudge to the day of the *look*
+            # (notice.py), so the look's own stamp is the day budget's ledger
+            # entry; letting it default would make the budget disagree with the
+            # clock the decision was made against.
+            self._queue.append(
+                episodes.inbound(text, channel=notice.CHANNEL, at=moment.isoformat())
+            )
+        except Exception:  # noqa: BLE001 - see the docstring
+            return False
+        return True
 
     def _handle(self, pending: Pending) -> Optional[TurnResult]:
         if not pending.is_event:
