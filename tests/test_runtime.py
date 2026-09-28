@@ -1067,6 +1067,60 @@ def test_the_drain_reaches_the_unprompted_pass_too(store_dir: Path) -> None:
     assert graded(store_dir), str(graded(store_dir))
 
 
+def test_a_nudge_reaches_the_wire_and_the_look_behind_it_does_not(
+    store_dir: Path,
+) -> None:
+    """What "will it actually send me something" means, at the layer that ships.
+
+    Two halves of one answer. The reply crosses as an ordinary `turn.completed`,
+    which is how the tray comes to show it - and when the panel is collapsed the
+    tray routes a non-active-turn reply to its proactive presentation, so an
+    unprompted nudge surfaces as a notification rather than a bubble nobody is
+    looking at. The look that produced it must *not* cross: the tray renders a
+    stray `message.inbound` as `role: .user`, so projecting it would put omega's
+    internal digest in the conversation as something the person said.
+    """
+    with runtime_at(store_dir, _reads_transcripts("you left it dirty"),
+                    sense=0.0, nudge=0) as rt:
+        rt.say("morning")
+        assert until(
+            lambda: any(
+                p.payload["kind"] == episodes.MESSAGE_INBOUND
+                and p.payload["channel"] == notice.CHANNEL
+                and any(
+                    q.payload.get("for_seq") == p.seq
+                    and episodes.is_terminal(q.payload)
+                    for q in _every_episode_of(rt)
+                )
+                for p in _every_episode_of(rt)
+            )
+        ), "the drain never reached the unprompted pass"
+
+    looks = {
+        p.seq
+        for p in _every_episode(store_dir)
+        if p.payload["kind"] == episodes.MESSAGE_INBOUND
+        and p.payload["channel"] == notice.CHANNEL
+    }
+    assert looks, "no unprompted event was raised"
+
+    with MemoryStore.open(store_dir) as store:
+        wire = [u.wire() for u in projection.updates_since(EventQueue(store), 0)]
+
+    assert not [w for w in wire if w["seq"] in looks], (
+        "omega's own look crossed to the tray, where it renders as the person "
+        "talking"
+    )
+    replies = [
+        w["reply"]
+        for w in wire
+        if w["kind"] == episodes.TURN_COMPLETED
+        and w.get("outcome") == "spoke"
+        and w["for_seq"] in looks
+    ]
+    assert replies == ["you left it dirty"], wire
+
+
 def test_the_unprompted_pass_speaks_at_most_once_a_day(store_dir: Path) -> None:
     """The violation metric paired with the capability above (DL-061).
 

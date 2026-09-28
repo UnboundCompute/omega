@@ -36,7 +36,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Iterator, Optional
 
-from omega import episodes
+from omega import episodes, notice
 from omega.queue import EventQueue, Pending
 
 __all__ = [
@@ -206,6 +206,25 @@ def project(payload: dict[str, Any], seq: int) -> Optional[Update]:
         return None
 
     if kind == episodes.MESSAGE_INBOUND:
+        if payload.get("channel") == notice.CHANNEL:
+            # The unprompted pass's own look at what is open (DL-061). Withheld
+            # for the same reason `reflection.done` and `usage.digested` are:
+            # it is omega noticing, not omega speaking, and the outward stream
+            # is deliberately narrower than the log.
+            #
+            # Concretely, without this the tray renders it as a **message from
+            # the person** - `TrayViewModel.handleUpdate` appends any
+            # non-active-turn `message.inbound` in the `understood` state as
+            # `role: .user` - so an hourly internal digest beginning "Nobody
+            # asked for this" would appear in the conversation as something they
+            # said. The wire carries no `channel`, so the tray has no way to
+            # tell it apart and no fix is possible on that side.
+            #
+            # The *reply* still crosses, on its own `turn.completed`: that path
+            # does not require the tray to have seen the event it answers
+            # (unknown `for_seq` simply takes normal urgency), so a nudge is
+            # delivered while the look that produced it stays in.
+            return None
         return Update(
             seq=seq,
             state=UNDERSTOOD,

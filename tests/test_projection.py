@@ -11,7 +11,7 @@ import json
 
 import pytest
 
-from omega import episodes, projection
+from omega import episodes, notice, projection
 from omega.memory import MemoryStore
 from omega.projection import (
     BLOCKED,
@@ -411,6 +411,32 @@ def test_updates_since_is_not_shortened_by_an_append_made_while_it_reads(
     # And the episodes that landed mid-read are not lost either: they are simply
     # after the cursor, which is what the next call asks for.
     assert [u.seq for u in updates_since(q, 2)] == [3, 4]
+
+
+def test_an_unprompted_look_is_withheld_but_its_reply_is_not() -> None:
+    """The look is omega noticing, not omega speaking (DL-061).
+
+    The tray appends any non-active-turn `message.inbound` in the `understood`
+    state as `role: .user`, and the wire carries no `channel`, so a projected
+    look would arrive in the conversation as something the *person* said -
+    an hourly internal digest opening "Nobody asked for this" attributed to
+    them. It is the same withheld category as `reflection.done`: noticed, not
+    said. The reply rides its own `turn.completed` and still crosses, which is
+    what makes the nudge a nudge rather than a silent log entry.
+    """
+    look = episodes.inbound("what is open", channel=notice.CHANNEL)
+    assert projection.project(look, 7) is None
+
+    heard = episodes.inbound("what is open", channel="tray")
+    crossed = projection.project(heard, 7)
+    assert crossed is not None and crossed.text == "what is open"
+
+    spoke = episodes.completed(
+        for_seq=7, outcome="spoke", reply="you left the branch dirty"
+    )
+    nudge = projection.project(spoke, 8)
+    assert nudge is not None, "the nudge itself must reach the person"
+    assert nudge.reply == "you left the branch dirty"
 
 
 def test_the_projection_holds_no_state_of_its_own(q: EventQueue) -> None:
