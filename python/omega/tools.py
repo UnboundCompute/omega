@@ -838,7 +838,7 @@ def fetch(
     max_bytes: int = MAX_FETCH_BYTES,
     resolve: Callable[[str, int], list[str]] = _resolve_host,
 ) -> str:
-    """Fetch a page. **External always** — the sub-loop stops and asks first.
+    """Fetch a page. **Exploration** — it runs without asking (DL-064).
 
     What comes back is untrusted input (DL-014) and the most untrusted thing
     omega reads: it is the first content someone else wrote. It is returned as
