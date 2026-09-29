@@ -143,12 +143,51 @@ def test_the_allowlist_matches_argv0_exactly_and_not_its_basename(
     assert decision.tier == EXTERNAL
 
 
-def test_fetch_is_always_external(box: ToolBox) -> None:
-    """Even for a plainly harmless URL. It is what stops read-then-send from
-    running end to end with nobody in the loop."""
+def test_fetch_is_always_exploration(box: ToolBox) -> None:
+    """DL-064. Reading a public page is a read, and it dispatches like one.
+
+    This is the capability half of DL-064, and it is written against the live
+    failure rather than a tidy URL: seq 396 was the person typing *"check Bigg
+    Boss 20 now"*, the exact words omega's own previous reply had asked for, and
+    five seconds later the turn ended blocked on a search URL it could never be
+    given permission to open.
+    """
     decision = box.classify("fetch", {"url": "https://example.com/docs"})
-    assert decision.tier == EXTERNAL
-    assert not decision.dispatches
+    assert decision.tier == EXPLORATION
+    assert decision.dispatches
+
+
+def test_ungating_fetch_did_not_ungate_the_address_checks(box: ToolBox) -> None:
+    """The violation half of DL-064, and the reason the tier could move at all.
+
+    The tier was never what kept `fetch` off `127.0.0.1:7717` and
+    `169.254.169.254`; these are. If a future change reads DL-064 as "fetch is
+    unguarded now", this is what goes red.
+    """
+    for address in ("127.0.0.1", "169.254.169.254", "10.0.0.5", "0.0.0.0", "224.0.0.1"):
+        assert tools.refusal_for_address(address) is not None, address
+
+    # Still a read that dispatches, and still refused on its way out.
+    decision = box.classify("fetch", {"url": "http://localhost:7717/admin"})
+    assert decision.dispatches
+    with pytest.raises(ToolError):
+        tools.check_url("http://localhost:7717/admin", resolve=lambda h, p: ["127.0.0.1"])
+
+    # And the non-address guards are equally untouched.
+    with pytest.raises(ToolError):
+        tools.check_url("file:///etc/passwd")
+    assert tools.refusal_for_content_type("application/pdf") is not None
+
+
+def test_ungating_fetch_did_not_ungate_anything_else(box: ToolBox, tmp_path: Path) -> None:
+    """DL-064 moved one tool. A change that quietly took the rest with it —
+    a write outside the store, a command off the allowlist — lands here."""
+    outside = box.classify("write_file", {"path": str(tmp_path / "x.txt"), "content": "x"})
+    assert outside.tier == EXTERNAL
+    assert not outside.dispatches
+    command = box.classify("run_code", {"argv": ["rm", "-rf", "/"], "cwd": str(tmp_path)})
+    assert command.tier == EXTERNAL
+    assert not command.dispatches
 
 
 # --- arguments that cannot be read are refused, never guessed ---------------
@@ -188,10 +227,17 @@ def test_non_object_arguments_are_rejected(box: ToolBox) -> None:
 # --- the gate is the invariant, not advice ----------------------------------
 
 
-def test_dispatch_refuses_an_external_decision(box: ToolBox) -> None:
+def test_dispatch_refuses_an_external_decision(box: ToolBox, tmp_path: Path) -> None:
     """A dispatch path reachable with an external decision would make the gate
-    advisory, and an advisory gate is one refactor from no gate."""
-    decision = box.classify("fetch", {"url": "https://example.com"})
+    advisory, and an advisory gate is one refactor from no gate.
+
+    The example is a write outside the store rather than a `fetch`: DL-064 made
+    `fetch` exploration, and this test is about the gate, not about that tool.
+    """
+    decision = box.classify(
+        "write_file", {"path": str(tmp_path / "outside.txt"), "content": "x"}
+    )
+    assert decision.tier == EXTERNAL
     with pytest.raises(ToolRejected):
         box.dispatch(decision)
 

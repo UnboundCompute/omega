@@ -154,14 +154,18 @@ def test_the_log_records_what_came_back_not_that_it_succeeded(
 # --- external ends the turn and dispatches nothing --------------------------
 
 
-def test_an_external_call_blocks_the_turn(q: EventQueue, box: ToolBox) -> None:
-    fp = acting(call("fetch", url="https://example.com/x"))
+def test_an_external_call_blocks_the_turn(
+    q: EventQueue, box: ToolBox, tmp_path: Path
+) -> None:
+    """The example is a command off the allowlist rather than a `fetch`:
+    DL-064 made `fetch` exploration, and this is about the tier, not the tool."""
+    fp = acting(call("run_code", argv=["rm", "-rf", "x"], cwd=str(tmp_path)))
     c = ctx_for(q, fp)
 
     result = act_loop(c, box=box)
 
     assert result.blocked_on is not None
-    assert "https://example.com/x" in result.blocked_on
+    assert "rm" in result.blocked_on
     assert result.error is None  # asking is not failing (§2.1)
     assert tool_episodes(q, c.seq) == []
 
@@ -193,15 +197,42 @@ def test_an_external_call_in_a_pass_stops_the_whole_pass(
 def test_the_question_names_every_external_call_not_just_the_first(
     q: EventQueue, box: ToolBox, tmp_path: Path
 ) -> None:
+    outside = tmp_path / "outside.txt"
     fp = acting(
         [
-            call("fetch", call_id="a", url="https://example.com/one"),
+            call("write_file", call_id="a", path=str(outside), content="x"),
             call("run_code", call_id="b", argv=["rm", "-rf", "x"], cwd=str(tmp_path)),
         ]
     )
     result = act_loop(ctx_for(q, fp), box=box)
-    assert "https://example.com/one" in (result.blocked_on or "")
+    assert str(outside) in (result.blocked_on or "")
     assert "rm" in (result.blocked_on or "")
+
+
+def test_a_fetch_no_longer_ends_the_turn(q: EventQueue, box: ToolBox) -> None:
+    """DL-064, end to end and without a network.
+
+    This is the liveness half, and it is the one that would have caught the live
+    defect: for 397 episodes `fetch` was the tool omega reached for and could
+    never run, because `EXTERNAL` had no grant and the turn simply ended. Here
+    the turn must *continue* — the call dispatches, the address guard refuses it
+    on its own terms, and the refusal comes back as a tool result the model can
+    read, rather than as a question nobody can answer.
+
+    The URL is loopback on purpose: `127.0.0.1` needs no DNS and reaches no
+    network, so this asserts the tier moved without the suite ever going out.
+    """
+    c = ctx_for(q, acting(call("fetch", url="http://127.0.0.1:1/x"), "couldn't."))
+
+    result = act_loop(c, box=box)
+
+    assert result.blocked_on is None
+    called, returned = tool_episodes(q, c.seq)
+    assert called["tool"] == "fetch"
+    # It ran and was refused on the guard's own terms, which is a tool result:
+    # `ok=False` with the reason, not a turn that ended.
+    assert returned["ok"] is False
+    assert "loopback" in returned["error"]
 
 
 def test_a_write_inside_the_store_runs_without_asking(

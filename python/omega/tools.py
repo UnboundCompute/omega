@@ -385,14 +385,34 @@ def _classify_run_code(box: "ToolBox", args: dict[str, Any]) -> Decision:
 
 def _classify_fetch(box: "ToolBox", args: dict[str, Any]) -> Decision:
     url = _text(FETCH, args, "url")
-    # External **always**, and not as a blanket rule about the network. It is
-    # what keeps `read_file` dispatching unasked from being an exfiltration
-    # path: read-then-send with nobody in the loop is the chain, and this is
-    # where it is broken.
+    # Exploration, always (DL-064). Reading a public web page is a read, and it
+    # is classified as one.
+    #
+    # This tier used to be `EXTERNAL`, on the reasoning that it broke the
+    # `read_file` → `fetch` exfiltration chain — read something private, send it
+    # out in a URL, nobody in the loop. That chain is real, and the address
+    # checks below do not touch it, because `evil.example` is an ordinary public
+    # host. It is not what this tier was doing, though. `EXTERNAL` has no grant:
+    # `act.py` returns `blocked_on` the moment a pass contains one and nothing
+    # anywhere turns a yes back into a dispatch, so the tier did not adjudicate
+    # the chain — it only guaranteed the tool never ran. Across the first 397
+    # episodes `fetch` ran zero times and blocked twice, both unclearable; the
+    # second was the person typing the exact words the previous reply had asked
+    # for. A gate that can be neither granted nor refused is an outage wearing a
+    # control's name.
+    #
+    # What actually guards this tool is below and does not move: `check_url`
+    # (http/https only), `refusal_for_address` (loopback, link-local, private,
+    # multicast, reserved, and a fail-closed `is_global` catch-all),
+    # `refusal_for_host` (every resolved address, not the first),
+    # `vetted_address` (closes the rebinding gap by connecting to the address
+    # that was checked) and `refusal_for_content_type`. If the read-then-send
+    # chain is ever worth controlling, the control belongs on the chain, not as
+    # a blanket tier over a read.
     return Decision(
         tool=FETCH,
-        tier=EXTERNAL,
-        why=f"fetch {url} — that reaches off this machine",
+        tier=EXPLORATION,
+        why=f"fetch {url}",
         args={"url": url},
     )
 
