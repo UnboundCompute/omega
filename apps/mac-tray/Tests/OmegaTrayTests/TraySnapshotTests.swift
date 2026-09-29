@@ -72,6 +72,12 @@ final class TraySnapshotTests: XCTestCase {
             to: directory.appendingPathComponent("mac-teach-mode.png")
         )
         model.cancelTeaching()
+        model.draft = "First line stays readable across the composer.\nSecond line remains visible while I keep writing."
+        try write(
+            TrayRootView(viewModel: model, presentation: .expanded, close: {}, open: {})
+                .frame(width: 460, height: 420),
+            to: directory.appendingPathComponent("mac-multiline-composer.png")
+        )
         model.draft = ""
 
         model.stagedContext = [

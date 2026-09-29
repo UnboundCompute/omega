@@ -506,13 +506,7 @@ private struct ExpandedTrayView: View {
                     .help("Teach omega")
                 }
 
-                TextField(viewModel.composerPlaceholder, text: $viewModel.draft, axis: .vertical)
-                    .textFieldStyle(.plain)
-                    .font(.system(size: 13))
-                    .foregroundStyle(TrayTheme.primaryText)
-                    .lineLimit(1...5)
-                    .focused($composerFocused)
-                    .onSubmit(viewModel.send)
+                composerTextField
 
                 Button(action: viewModel.send) {
                     Group {
@@ -531,6 +525,8 @@ private struct ExpandedTrayView: View {
                 .buttonStyle(.plain)
                 .disabled(!viewModel.canSubmit)
                 .accessibilityLabel(viewModel.composerMode == .teach ? "Teach omega" : "Send to omega")
+                .accessibilityHint("Command Return")
+                .help("Send (⌘↩)")
             }
         }
         .padding(10)
@@ -544,6 +540,24 @@ private struct ExpandedTrayView: View {
             composerFocused = true
         }
         .padding(12)
+    }
+
+    private var composerTextField: some View {
+        TextField(viewModel.composerPlaceholder, text: $viewModel.draft, axis: .vertical)
+            .textFieldStyle(.plain)
+            .font(.system(size: 13))
+            .foregroundStyle(TrayTheme.primaryText)
+            .lineLimit(1...5)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .layoutPriority(1)
+            .focused($composerFocused)
+            .onKeyPress(keys: [.return], phases: .down) { keyPress in
+                guard keyPress.modifiers.contains(.command) else { return .ignored }
+                if viewModel.canSubmit {
+                    viewModel.send()
+                }
+                return .handled
+            }
     }
 
     private var dropOverlay: some View {
