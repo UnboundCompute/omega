@@ -318,6 +318,8 @@ class Channel:
                 return self._say(request)
             if op == "attach":
                 return self._attach(request)
+            if op == "history":
+                return self._history(request)
             if op == "subscribe":
                 return self._subscribe(conn, request)
             if op == "ping":
@@ -446,6 +448,37 @@ class Channel:
         conn.cursor = since
         return {"v": PROTOCOL, "op": "subscribed", "since": since, "head": head}
 
+    def _history(self, request: dict[str, Any]) -> dict[str, Any]:
+        """One backward page of the outward projection, without moving a cursor."""
+        head = self._queue.head()
+        before = request.get("before", head + 1)
+        limit = request.get("limit", 50)
+        if not isinstance(before, int) or isinstance(before, bool):
+            raise ValueError("'before' must be a sequence number")
+        if before < 1 or before > head + 1:
+            raise ValueError(f"'before' must be between 1 and {head + 1}")
+        if (
+            not isinstance(limit, int)
+            or isinstance(limit, bool)
+            or not 1 <= limit <= 100
+        ):
+            raise ValueError("'limit' must be between 1 and 100")
+
+        pending = self._queue.recent(limit, before=before)
+        updates = []
+        for item in pending:
+            update = projection.project_pending(item)
+            if update is not None:
+                updates.append(update.wire())
+        next_before = pending[0].seq if pending else 1
+        return {
+            "v": PROTOCOL,
+            "op": "history",
+            "before": next_before,
+            "more": next_before > 1,
+            "updates": updates,
+        }
+
     def _existing(self, write_key: str) -> Any:
         """The episode already filed under this write key.
 
@@ -573,6 +606,9 @@ class ChannelClient:
 
     def attach(self, path: Any) -> dict[str, Any]:
         return self.request({"v": PROTOCOL, "op": "attach", "path": path})
+
+    def history(self, **kwargs: Any) -> dict[str, Any]:
+        return self.request({"v": PROTOCOL, "op": "history", **kwargs})
 
     def subscribe(self, since: int = 0) -> dict[str, Any]:
         return self.request({"v": PROTOCOL, "op": "subscribe", "since": since})

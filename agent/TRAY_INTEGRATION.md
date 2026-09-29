@@ -65,6 +65,7 @@ other.
 ```jsonc
 {"op":"say","text":"…","id":"<uuid>","channel":"tray","context":[…],"urgency":"normal","resumes_seq":41}
 {"op":"attach","path":"/abs/path/to/file.png"}
+{"op":"history","before":42,"limit":50}
 {"op":"subscribe","since":0}
 {"op":"ping"}
 ```
@@ -167,6 +168,7 @@ Responses:
 {"v":1,"op":"ack","seq":42,"duplicate":false}
 {"v":1,"op":"ack","seq":42,"duplicate":true,"conflict":"that id is already in the log carrying a different message"}
 {"v":1,"op":"attached","blob":"sha256:9f86d081…","mime":"image/png","bytes":184320}
+{"v":1,"op":"history","before":1,"more":false,"updates":[…]}
 {"v":1,"op":"subscribed","since":0,"head":41}
 {"v":1,"op":"pong","head":41}
 {"v":1,"op":"error","error":"…","request":"say"}
@@ -176,6 +178,13 @@ Responses:
 JSON but not an object, gets an error without it. The over-length error (`"line longer than
 1048576 bytes"`) also has no `request`, and the server closes the connection immediately
 after sending it.
+
+`history` is the read-only recovery path for the tray's active transcript. It pages backward
+through the same projection used by `subscribe`; it never reads a tray-owned transcript or changes
+the live subscription cursor. `before` is an exclusive episode sequence (omit it for the current
+head), `limit` bounds raw episodes scanned per page, and the response's `before`/`more` pair drives
+the next page. The tray reconstructs visible user and omega messages from the returned updates.
+This deliberately does not define named conversations, archive search, or a second memory store.
 
 Pushed updates, after `subscribe`:
 

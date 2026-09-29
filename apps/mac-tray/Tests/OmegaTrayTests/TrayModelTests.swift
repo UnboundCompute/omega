@@ -142,6 +142,38 @@ final class TrayModelTests: XCTestCase {
     }
 
     @MainActor
+    func testRestoreTranscriptRebuildsDurableMessagesAndSkipsWorkNoise() async {
+        let (model, transport) = connectedModel()
+        transport.transcriptUpdates = [
+            .init(
+                seq: 1,
+                forSeq: 1,
+                state: "understood",
+                kind: "message.inbound",
+                text: "Earlier question"
+            ),
+            .init(seq: 2, forSeq: 1, state: "working", kind: "tool.called", tool: "fetch"),
+            .init(
+                seq: 3,
+                forSeq: 1,
+                state: "complete",
+                kind: "turn.completed",
+                outcome: "spoke",
+                reply: "Earlier answer"
+            )
+        ]
+        model.messages = []
+
+        model.restoreTranscript()
+        await settleTasks()
+
+        XCTAssertEqual(model.messages.map(\.role), [.user, .omega])
+        XCTAssertEqual(model.messages.map(\.text), ["Earlier question", "Earlier answer"])
+        XCTAssertFalse(model.isRestoringTranscript)
+        XCTAssertNil(model.transcriptRestoreFailure)
+    }
+
+    @MainActor
     func testFileIsAttachedBeforeItsContextCanBeSent() async throws {
         let (model, transport) = connectedModel()
         let file = FileManager.default.temporaryDirectory
@@ -580,6 +612,7 @@ final class ScriptedTransport: TrayTransport {
     private(set) var resumeCursors: [Int] = []
     private var nextSequence = 1
     var bufferedUpdatesOnNextAck: [TrayUpdate] = []
+    var transcriptUpdates: [TrayUpdate] = []
     var attachmentError: Error?
     let attachmentReference = TrayAttachmentReference(
         blob: "sha256:" + String(repeating: "a", count: 64),
@@ -612,6 +645,10 @@ final class ScriptedTransport: TrayTransport {
             duplicate: !bufferedUpdatesOnNextAck.isEmpty,
             bufferedUpdates: bufferedUpdatesOnNextAck
         )
+    }
+
+    func transcript() async throws -> [TrayUpdate] {
+        transcriptUpdates
     }
 
     func setResumeCursor(_ seq: Int) {

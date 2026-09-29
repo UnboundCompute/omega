@@ -240,6 +240,35 @@ final class OmegaChannelClient: TrayTransport {
         throw OmegaChannelError.stopped
     }
 
+    func transcript() async throws -> [TrayUpdate] {
+        var before: Int?
+        var pages: [[TrayUpdate]] = []
+
+        repeat {
+            try Task.checkCancellation()
+            try await waitUntilSubscribed()
+            var requestObject: [String: Any] = ["op": "history", "limit": 50]
+            if let before { requestObject["before"] = before }
+            let line = try Self.encodeObject(requestObject)
+            let (response, bufferedUpdates) = try await request(line)
+            yieldUpdates(bufferedUpdates)
+
+            guard Self.integer(response["v"]) == 1,
+                  response["op"] as? String == "history",
+                  let nextBefore = Self.integer(response["before"]),
+                  let more = response["more"] as? Bool,
+                  let rawUpdates = response["updates"] as? [[String: Any]]
+            else {
+                throw Self.responseError(response, expected: "history")
+            }
+            pages.append(rawUpdates.compactMap(Self.decodeUpdate))
+            before = more ? nextBefore : nil
+            if !more { break }
+        } while true
+
+        return pages.reversed().flatMap { $0 }
+    }
+
     func setResumeCursor(_ seq: Int) {
         guard seq >= 0 else { return }
         if let current = requestedCursor, seq < current { return }
@@ -448,7 +477,7 @@ final class OmegaChannelClient: TrayTransport {
             )
             yieldUpdates(ready)
 
-        case "ack", "attached", "subscribed", "pong", "error":
+        case "ack", "attached", "history", "subscribed", "pong", "error":
             guard let pendingResponse else {
                 throw OmegaChannelError.invalidMessage("unsolicited response")
             }

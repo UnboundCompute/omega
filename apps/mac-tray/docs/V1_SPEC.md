@@ -62,7 +62,9 @@ The defining loop is:
 
 ### Conversation and delegation
 
-- v1 supports one active conversation well rather than exposing a history browser.
+- v1 supports one active conversation well rather than exposing a history browser. A Restore
+  Transcript action can repopulate that surface from omega's durable projected log after New Chat
+  or an app restart; it is recovery, not an archive, search surface, or separate thread system.
 - A New Chat action clears the local conversation surface without creating a second identity,
   deleting episodes, or isolating omega from its durable history. It is unavailable while a
   draft, staged context, or turn is active so nothing is silently discarded.
@@ -204,7 +206,7 @@ always paired with text, shape, or motion and never relies on color alone.
 ## Explicitly deferred to v2
 
 - Full application shell
-- Conversation archive and search
+- Conversation archive and search beyond restoring the durable transcript into the active surface
 - Memory browser, graph, profile, or correction dashboard
 - Multiple visible projects and threads
 - Integration management

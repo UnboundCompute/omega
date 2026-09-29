@@ -59,6 +59,8 @@ final class TrayViewModel: ObservableObject {
     @Published var composerMode: ComposerMode = .ask
     @Published var capturePermission: ScreenCapturePermission
     @Published var hotKeyRegistrationFailure: String?
+    @Published var isRestoringTranscript = false
+    @Published var transcriptRestoreFailure: String?
     @Published var isScreenLocked = false
     @Published var manualPrivacyMode = false
 
@@ -73,6 +75,8 @@ final class TrayViewModel: ObservableObject {
     private var eventTask: Task<Void, Never>?
     private var terminalTask: Task<Void, Never>?
     private var attachmentTasks: [UUID: Task<Void, Never>] = [:]
+    private var transcriptRestoreTask: Task<Void, Never>?
+    private var updatesDuringTranscriptRestore: [TrayUpdate] = []
     private var lastProcessedSeq: Int?
     private var pendingResumeSeq: Int?
     private var urgencyByTurn: [Int: String] = [:]
@@ -119,6 +123,7 @@ final class TrayViewModel: ObservableObject {
     deinit {
         eventTask?.cancel()
         terminalTask?.cancel()
+        transcriptRestoreTask?.cancel()
     }
 
     var workState: WorkState {
@@ -152,6 +157,15 @@ final class TrayViewModel: ObservableObject {
 
     var canBeginTeaching: Bool {
         isConversationSettled && failedSend == nil
+    }
+
+    var canRestoreTranscript: Bool {
+        !isRestoringTranscript
+            && connectionState == .connected
+            && draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && stagedContext.isEmpty
+            && isConversationSettled
+            && failedSend == nil
     }
 
     var composerPlaceholder: String {
@@ -277,6 +291,37 @@ final class TrayViewModel: ObservableObject {
         composerFocusRequest += 1
     }
 
+    func restoreTranscript() {
+        guard canRestoreTranscript else { return }
+        transcriptRestoreTask?.cancel()
+        isRestoringTranscript = true
+        transcriptRestoreFailure = nil
+        updatesDuringTranscriptRestore = []
+
+        transcriptRestoreTask = Task { [weak self] in
+            guard let self else { return }
+            do {
+                let history = try await transport.transcript()
+                try Task.checkCancellation()
+                let combined = history + updatesDuringTranscriptRestore
+                let unique = Dictionary(grouping: combined, by: \.seq)
+                    .compactMap { $0.value.last }
+                    .sorted { $0.seq < $1.seq }
+                let restored = transcriptMessages(from: unique)
+                messages = restored.isEmpty
+                    ? [.init(role: .status, text: "No earlier transcript was found.")]
+                    : restored
+            } catch is CancellationError {
+                return
+            } catch {
+                transcriptRestoreFailure = error.localizedDescription
+            }
+            updatesDuringTranscriptRestore = []
+            isRestoringTranscript = false
+            transcriptRestoreTask = nil
+        }
+    }
+
     func beginTeaching() {
         guard canBeginTeaching else { return }
         composerMode = .teach
@@ -363,6 +408,9 @@ final class TrayViewModel: ObservableObject {
             }
         case .update(let update):
             guard lastProcessedSeq.map({ update.seq > $0 }) ?? true else { return }
+            if isRestoringTranscript {
+                updatesDuringTranscriptRestore.append(update)
+            }
             handleUpdate(update)
             lastProcessedSeq = update.seq
             persistCursor(update.seq)
@@ -453,6 +501,29 @@ final class TrayViewModel: ObservableObject {
             }
         default:
             break
+        }
+    }
+
+    private func transcriptMessages(from updates: [TrayUpdate]) -> [TrayMessage] {
+        updates.compactMap { update in
+            switch update.state {
+            case "understood" where update.kind == "message.inbound":
+                let text = update.text?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                return TrayMessage(
+                    role: .user,
+                    text: text.isEmpty ? "Context shared with omega" : text,
+                    contextDescriptions: update.context.map { "\($0.kind.capitalized) context" },
+                    delivery: .sent
+                )
+            case "complete" where update.outcome == "spoke":
+                guard let reply = update.reply, !reply.isEmpty else { return nil }
+                return TrayMessage(role: .omega, text: reply)
+            case "failed":
+                let detail = update.error?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                return TrayMessage(role: .status, text: detail.isEmpty ? "A previous turn failed." : detail)
+            default:
+                return nil
+            }
         }
     }
 

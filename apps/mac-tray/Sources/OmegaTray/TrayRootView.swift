@@ -282,6 +282,13 @@ private struct ExpandedTrayView: View {
             }
             .buttonStyle(QuietButtonStyle())
             Menu {
+                Button(
+                    viewModel.isRestoringTranscript ? "Restoring transcript…" : "Restore transcript",
+                    systemImage: "clock.arrow.circlepath"
+                ) {
+                    viewModel.restoreTranscript()
+                }
+                .disabled(!viewModel.canRestoreTranscript)
                 Button("New chat", systemImage: "square.and.pencil") {
                     viewModel.startNewChat()
                 }
@@ -368,6 +375,16 @@ private struct ExpandedTrayView: View {
                 detail: detail,
                 actionTitle: "Retry",
                 action: viewModel.retryFailedAttachments
+            )
+        }
+
+        if let detail = viewModel.transcriptRestoreFailure {
+            RecoveryNotice(
+                icon: "clock.badge.exclamationmark",
+                title: "Transcript could not be restored",
+                detail: detail,
+                actionTitle: "Retry",
+                action: viewModel.restoreTranscript
             )
         }
 

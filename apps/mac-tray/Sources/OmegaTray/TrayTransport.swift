@@ -7,6 +7,7 @@ protocol TrayTransport: AnyObject {
     func start(since: Int?)
     func attach(fileAt url: URL) async throws -> TrayAttachmentReference
     func send(_ submission: TraySubmission) async throws -> TrayAcknowledgement
+    func transcript() async throws -> [TrayUpdate]
     func setResumeCursor(_ seq: Int)
     func stop()
 }

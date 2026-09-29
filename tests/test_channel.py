@@ -150,6 +150,32 @@ def test_a_subscriber_receives_the_whole_turn_in_order(
     assert second["reply"] == "hi back"
 
 
+def test_history_reads_the_projection_without_moving_the_live_cursor(
+    client: ChannelClient, q: EventQueue
+) -> None:
+    q.append(episodes.inbound("earlier question", channel="tray", at=AT))
+    drain(q, reply="earlier answer")
+    head = q.head()
+    client.subscribe(head)
+
+    page = client.history(limit=100)
+    visible = [
+        (item["state"], item.get("text"), item.get("reply"))
+        for item in page["updates"]
+    ]
+    assert visible == [
+        (UNDERSTOOD, "earlier question", None),
+        (COMPLETE, None, "earlier answer"),
+    ]
+    assert page["before"] == 1
+    assert page["more"] is False
+
+    live_seq = q.append(episodes.inbound("live question", channel="tray", at=AT))
+    live = client.read()
+    assert live["seq"] == live_seq
+    assert live["text"] == "live question"
+
+
 def test_a_silent_turn_reaches_the_client_as_a_success(
     client: ChannelClient, q: EventQueue
 ) -> None:

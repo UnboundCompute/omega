@@ -39,6 +39,8 @@ become a second brain or an undeclared wire protocol.
 - Exact draft and context restoration after a failed send; retry does not create a duplicate
   visible instruction.
 - One active in-memory conversation that survives close/reopen during the app process.
+- A read-only Restore Transcript action that pages the durable omega projection back into the
+  active conversation after New Chat or an app restart, without persisting a second tray transcript.
 - Proactive peek, unread collapse, no duplicate while open, and time-sensitive Notification
   Center fallback.
 - A non-focus-stealing response peek when a submitted turn finishes after the panel has been
