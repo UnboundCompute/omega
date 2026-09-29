@@ -12,6 +12,22 @@ final class TrayModelTests: XCTestCase {
         XCTAssertEqual(pasteboard.string(forType: .string), markdown)
     }
 
+    func testClipboardCopiesAConversationWithoutTransientStatusMessages() {
+        let pasteboard = NSPasteboard(name: .init("omega-tests-\(UUID().uuidString)"))
+        defer { pasteboard.releaseGlobally() }
+        let messages = [
+            TrayMessage(role: .user, text: "Check this"),
+            TrayMessage(role: .status, text: "Working"),
+            TrayMessage(role: .omega, text: "Done")
+        ]
+
+        XCTAssertTrue(TrayClipboard.copyConversation(messages, to: pasteboard))
+        XCTAssertEqual(
+            pasteboard.string(forType: .string),
+            "You:\nCheck this\n\nomega:\nDone"
+        )
+    }
+
     @MainActor
     func testCannotSendAnEmptySubmission() {
         let model = TrayViewModel(transport: ScriptedTransport(), loadCursor: { nil }, persistCursor: { _ in })

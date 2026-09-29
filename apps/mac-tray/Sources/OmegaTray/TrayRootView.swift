@@ -8,6 +8,30 @@ enum TrayClipboard {
         pasteboard.clearContents()
         return pasteboard.setString(text, forType: .string)
     }
+
+    static func conversationText(_ messages: [TrayMessage]) -> String {
+        messages.compactMap { message in
+            switch message.role {
+            case .user:
+                "You:\n\(message.text)"
+            case .omega:
+                "omega:\n\(message.text)"
+            case .status:
+                nil
+            }
+        }
+        .joined(separator: "\n\n")
+    }
+
+    @discardableResult
+    static func copyConversation(
+        _ messages: [TrayMessage],
+        to pasteboard: NSPasteboard = .general
+    ) -> Bool {
+        let text = conversationText(messages)
+        guard !text.isEmpty else { return false }
+        return copy(text, to: pasteboard)
+    }
 }
 
 struct TrayRootView: View {
@@ -262,6 +286,10 @@ private struct ExpandedTrayView: View {
                     viewModel.startNewChat()
                 }
                 .disabled(!viewModel.canStartNewChat)
+                Button("Copy conversation", systemImage: "doc.on.doc") {
+                    TrayClipboard.copyConversation(viewModel.messages)
+                }
+                .disabled(TrayClipboard.conversationText(viewModel.messages).isEmpty)
             } label: {
                 Image(systemName: "ellipsis")
                     .font(.system(size: 11, weight: .semibold))
@@ -289,6 +317,12 @@ private struct ExpandedTrayView: View {
                     }
                 }
                 .padding(16)
+            }
+            .onAppear {
+                guard let id = viewModel.messages.last?.id else { return }
+                DispatchQueue.main.async {
+                    proxy.scrollTo(id, anchor: .bottom)
+                }
             }
             .onChange(of: viewModel.messages.count) {
                 guard let id = viewModel.messages.last?.id else { return }
@@ -505,6 +539,10 @@ private struct ExpandedTrayView: View {
             RoundedRectangle(cornerRadius: 14, style: .continuous)
                 .stroke(composerFocused ? TrayTheme.signal.opacity(0.74) : Color.white.opacity(0.06), lineWidth: 1)
         }
+        .contentShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .onTapGesture {
+            composerFocused = true
+        }
         .padding(12)
     }
 
@@ -554,9 +592,21 @@ private struct MessageView: View {
         switch message.role {
         case .user:
             VStack(alignment: .trailing, spacing: 6) {
-                Text(message.text)
-                    .font(.system(size: 13))
-                    .foregroundStyle(TrayTheme.primaryText)
+                HStack(alignment: .top, spacing: 8) {
+                    Text(message.text)
+                        .font(.system(size: 13))
+                        .foregroundStyle(TrayTheme.primaryText)
+
+                    Button(action: copyMessage) {
+                        Image(systemName: "doc.on.doc")
+                            .font(.system(size: 10, weight: .medium))
+                            .frame(width: 22, height: 22)
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(TrayTheme.tertiaryText)
+                    .accessibilityLabel("Copy message")
+                    .help("Copy message")
+                }
 
                 if !message.contextDescriptions.isEmpty {
                     Text(message.contextDescriptions.joined(separator: " · "))

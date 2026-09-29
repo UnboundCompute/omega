@@ -115,7 +115,7 @@ final class OmegaPanelController: NSWindowController, CapturePresentationControl
             }
             NSApp.activate(ignoringOtherApps: true)
             window?.makeKey()
-            viewModel.composerFocusRequest += 1
+            requestComposerFocusAfterPresentation()
         }
     }
 
@@ -194,7 +194,7 @@ final class OmegaPanelController: NSWindowController, CapturePresentationControl
         if captureWasKey {
             NSApp.activate(ignoringOtherApps: true)
             window?.makeKey()
-            viewModel.composerFocusRequest += 1
+            requestComposerFocusAfterPresentation()
         }
         captureWasKey = false
     }
@@ -213,6 +213,12 @@ final class OmegaPanelController: NSWindowController, CapturePresentationControl
                 open: { [weak self] in self?.showExpanded() }
             )
         )
+    }
+
+    private func requestComposerFocusAfterPresentation() {
+        DispatchQueue.main.async { [weak self] in
+            self?.viewModel.composerFocusRequest += 1
+        }
     }
 
     private func resize(to size: NSSize, animate: Bool) {
