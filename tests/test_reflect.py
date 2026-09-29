@@ -237,17 +237,33 @@ def test_a_reflection_cannot_create_a_schedule(q: EventQueue) -> None:
     """The asymmetry DL-054 rests on: a wrong inferred claim is a bad sentence
     in a prompt, a wrong inferred schedule is a notification every morning
     forever. So the pass returns claims and the schedule keys are ignored even
-    when the model volunteers them."""
+    when the model volunteers them.
+
+    The schedule offered here is well formed on purpose, and the control below
+    is what proves it. An earlier version of this test volunteered ``{"phrase":
+    ..., "intent": ..., "hour": ...}``, which ``_parse_schedule_list`` rejects
+    for having no instruction — so the absence asserted underneath was
+    satisfied by a fixture the parser would have thrown out anyway, not by
+    reflection refusing anything. Wiring the reflect answer's schedules through
+    ``file_schedules`` left every one of the other checks in this suite green.
+    An input has to be valid in every respect except the one under test.
+    """
     _chatter(q, executor.REFLECT_EVERY)
+    volunteered = {"instruction": "brief them on what is open", "cron": "0 9 *"}
     answer = json.dumps(
-        {
-            "claims": [],
-            "schedules": [
-                {"phrase": "every morning at 9", "intent": "brief me", "hour": 9}
-            ],
-            "retract": [1],
-        }
+        {"claims": [], "schedules": [volunteered], "retract": [1]}
     )
+
+    # The control: this schedule *is* one the extractor accepts, so the
+    # absence asserted below is reflection refusing it rather than the parser
+    # throwing it out. Offered on its own, because the teach path validates
+    # `retract` against the claims it knows and this fixture has none.
+    taught = learn.extract(
+        _quiet(json.dumps({"claims": [], "schedules": [volunteered]})).complete,
+        note="set that up",
+    )
+    assert taught.schedules == [volunteered]
+
     teaching = _quiet(answer)
 
     _run(q, teaching)
