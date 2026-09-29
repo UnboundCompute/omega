@@ -41,7 +41,15 @@ from . import episodes
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from .memory import MemoryStore
 
-__all__ = ["OpenBlock", "OpenWork", "Claim", "Learned", "local_hour"]
+__all__ = [
+    "OpenBlock",
+    "OpenWork",
+    "Claim",
+    "Learned",
+    "Moment",
+    "Moments",
+    "local_hour",
+]
 
 
 @dataclass(frozen=True)
@@ -569,3 +577,180 @@ class Learned:
     def rebuild(cls, store: "MemoryStore") -> "Learned":
         """Replay the whole log. The boot path, and the only one."""
         return cls().advance(store)
+
+
+#: How old a moment can be and still be worth showing (DL-062). Three days,
+#: because the thing a moment is for is *what you were in the middle of*, and a
+#: week-old middle is not one — the person either finished it or dropped it, and
+#: omega has no way to tell which. Raising this does not make omega remember
+#: more; it makes it more confident about staler things, which is the direction
+#: that hurts.
+MOMENT_HORIZON_HOURS = 72
+
+#: How many moments may reach one situation, however many survived the horizon.
+#: The cap is here and not in the prompt because DL-014 puts every bound in code
+#: rather than model judgement, and because this is the limit that actually
+#: protects the digest: a busy week can file far more moments than claims (they
+#: are much easier to write), so without it the "what happened" section would
+#: crowd out the section that says what is true.
+MAX_MOMENTS_SHOWN = 5
+
+
+@dataclass(frozen=True)
+class Moment:
+    """One thing that happened, with a time on it (DL-062).
+
+    The deliberate counterpart to :class:`Claim`, and separate from it on
+    purpose. A claim is timeless and says what is *true*; a moment is stamped
+    and says what was *going on*. Keeping them in one set was the obvious
+    cheaper design and it is the wrong one: the reflection prompt's "remember
+    patterns, not events" is the guard that stops the learned set filling with
+    a slow fog of things omega half-believes, and a memory that admitted events
+    would have to weaken exactly that sentence. So the events get their own
+    kind, their own fold, and their own section, and the claim set keeps its
+    original strictness untouched.
+
+    ``at`` is when omega *filed* this, not when the thing happened. The
+    distinction is real and this is the weaker of the two: a moment noticed from
+    a transcript digest is stamped at the moment of noticing, which can be hours
+    after the work. It is honest about that rather than inventing a happening
+    time it cannot know, and the horizon below is generous enough to absorb the
+    lag.
+
+    No trigger and no ``fires_on``. A claim needs one because it is a standing
+    instruction that must not fire in the wrong situation; a moment is shown
+    because it is recent, and recency is the whole of its claim to attention.
+    """
+
+    seq: int
+    text: str
+    source_seq: int
+    at: str
+
+
+class Moments:
+    """What has happened lately, kept apart from what is true (DL-062).
+
+    A third view beside :class:`OpenWork` and :class:`Learned`, for the reason
+    :class:`Learned` gives for not being a field on the first: these answer
+    different questions and have different lifetimes. An obligation is
+    discharged by an answer. A claim persists until something contradicts it. A
+    moment is never contradicted and never discharged — it simply stops being
+    recent, and :meth:`recent` is where that happens.
+
+    **Nothing retracts a moment and nothing supersedes one**, so the fold is the
+    simplest of the three: append and forget. That is not an omission. A claim
+    can be wrong about the person and has to be removable; a moment is a record
+    that something was observed, and a record of an observation does not become
+    false, it becomes old. Settling — noticing from a later transcript that the
+    thing finished — is deliberately not built yet (DL-062), so until it is, a
+    moment leaves by ageing out and by nothing else.
+    """
+
+    __slots__ = ("_moments", "_through")
+
+    def __init__(self) -> None:
+        self._moments: list[Moment] = []
+        self._through = 0
+
+    @property
+    def through(self) -> int:
+        """The last seq folded in. 0 means nothing has been applied.
+
+        Same reason it exists on the other two views: "rebuilt and found nothing
+        happening" and "never rebuilt" must stay distinguishable, or an empty
+        section is a check that passes on empty.
+        """
+        return self._through
+
+    def apply(self, seq: int, payload: dict[str, Any]) -> None:
+        """Fold one episode in. Must be called in seq order.
+
+        Order is required here for consistency with its siblings rather than
+        for correctness — an append-only list with no supersession would survive
+        out-of-order application — but a view that accepted what the other two
+        refuse would be the one place a caller's ordering bug went unreported.
+        """
+        if seq <= self._through:
+            raise ValueError(
+                f"episodes must be folded in order: got seq {seq} after "
+                f"{self._through}"
+            )
+        if payload.get("kind") == episodes.MOMENT_NOTICED:
+            self._moments.append(
+                Moment(
+                    seq=seq,
+                    text=str(payload["text"]),
+                    source_seq=int(payload["source_seq"]),
+                    at=str(payload.get("at", "")),
+                )
+            )
+        self._through = seq
+
+    def recent(
+        self,
+        *,
+        now: str,
+        within_hours: int = MOMENT_HORIZON_HOURS,
+        limit: int = MAX_MOMENTS_SHOWN,
+    ) -> list[Moment]:
+        """The newest moments still inside the horizon, oldest first.
+
+        Both bounds apply and neither is optional, because they fail
+        differently: the horizon stops omega talking about a stale middle, and
+        the limit stops a single busy afternoon filling the whole section. A
+        quiet week is held back by the horizon alone; a heavy day by the limit
+        alone.
+
+        **A moment whose stamp will not parse is dropped, not kept.** The
+        alternative — treating an unreadable time as recent — would make the one
+        malformed record the most durable thing in the view, which is exactly
+        backwards.
+        """
+        cutoff = _parsed(now)
+        kept: list[Moment] = []
+        for moment in self._moments:
+            stamp = _parsed(moment.at)
+            if cutoff is None or stamp is None:
+                continue
+            if (cutoff - stamp).total_seconds() > within_hours * 3600:
+                continue
+            kept.append(moment)
+        # Newest `limit`, then back into log order: the cap picks *which* to
+        # show, it does not decide the order they read in, and a list of things
+        # that happened reads forwards.
+        return sorted(kept[-limit:], key=lambda m: m.seq)
+
+    @classmethod
+    def rebuild(cls, store: "MemoryStore") -> "Moments":
+        """Replay the whole log. The boot path, and the only one."""
+        return cls().advance(store)
+
+    def advance(self, store: "MemoryStore", *, upto: Optional[int] = None) -> "Moments":
+        """Fold what the log gained since :attr:`through`, to ``upto``. Returns self.
+
+        ``upto`` means what it means on the other two views, and the reason it
+        matters here is the one that is easiest to miss: a turn handling a
+        backlog that folded to the head would be told about things that had not
+        happened yet at the point it is answering from, and would open a
+        conversation about them.
+        """
+        for episode in store.episodes_since(self._through):
+            if upto is not None and episode.seq > upto:
+                break
+            self.apply(episode.seq, episodes.decode(episode.payload))
+        return self
+
+
+def _parsed(at: str) -> Optional[datetime]:
+    """An ISO stamp as an aware datetime, or ``None`` if it will not parse.
+
+    Naive stamps are read as UTC, matching :func:`local_hour`: everything omega
+    writes carries an offset, so a naive one came from somewhere else and UTC is
+    the only assumption that does not silently shift it by the machine's offset.
+    """
+    try:
+        parsed = datetime.fromisoformat(at)
+    except (TypeError, ValueError):
+        return None
+    return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed

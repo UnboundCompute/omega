@@ -61,10 +61,13 @@ __all__ = [
     "TEACH_MARKER",
     "MAX_CLAIMS_PER_NOTE",
     "MAX_INFERRED_PER_PASS",
+    "MAX_MOMENTS_PER_PASS",
+    "MAX_MOMENT_CHARS",
     "MAX_CLAIM_CHARS",
     "MAX_SCHEDULES_PER_NOTE",
     "MAX_INSTRUCTION_CHARS",
     "Extraction",
+    "Reflection",
     "NotExtracted",
     "Lens",
     "CONVERSATION",
@@ -76,6 +79,7 @@ __all__ = [
     "parse_answer",
     "parse_claims",
     "file_claims",
+    "file_moments",
     "file_schedules",
     "cancel_schedules",
     "retract_claims",
@@ -120,6 +124,21 @@ MAX_SCHEDULES_PER_NOTE = 4
 #: difference between a memory and a transcript.
 MAX_INFERRED_PER_PASS = 3
 
+#: Moments one reflection pass may file (DL-062). The same number as the claim
+#: cap and for a different reason. A claim is capped because the model must be
+#: made to *rank*; a moment is capped because it is far easier to write than a
+#: claim — "he is partway through X" passes the bar that "he always does X"
+#: fails — so an uncapped moments list is the shape the memory firehose would
+#: take once events were allowed in at all. This is the first of DL-062's three
+#: bounds; the other two live in `derive` and limit what reaches a digest.
+MAX_MOMENTS_PER_PASS = 3
+
+#: Shorter than a claim on purpose. A claim earns its length by applying on
+#: turns that have nothing to do with it; a moment is one line in a "what has
+#: been going on" list, and one that runs to a paragraph is a summary of the
+#: work rather than a handle on it.
+MAX_MOMENT_CHARS = 200
+
 
 @dataclass(frozen=True)
 class Lens:
@@ -140,6 +159,11 @@ class Lens:
     opening: tuple[str, ...]
     #: What the material is called when it is handed over.
     label: str
+    #: Whether this lens may also notice moments (DL-062). Off by default, so a
+    #: lens added later has to say it wants them: the question a moment answers
+    #: is *what is this person in the middle of*, and a lens that cannot see
+    #: unfinished work would answer it by inventing.
+    moments: bool = False
 
 
 #: Reflecting over omega's own recent conversation (DL-054).
@@ -149,6 +173,12 @@ CONVERSATION = Lens(
         "whether it shows anything worth remembering about this person.",
     ),
     label="The conversation",
+    # No moments, and this is the lens where that is least obvious. omega keeps
+    # its own conversation verbatim as `message.inbound`, so `recall` can already
+    # find anything said here and a moment would be a second, worse copy of a
+    # record that exists. The other two lenses digest what they read and throw
+    # the material away, which is exactly where a moment is the only way the
+    # thing survives at all.
 )
 
 #: Reflecting over a digest of work the person did in another agent (DL-057).
@@ -162,6 +192,11 @@ WORK = Lens(
         "about how they work — not for what the work was about.",
     ),
     label="The session",
+    # The lens moments were built for. `transcript.ingested` stores the session's
+    # id and nothing of its content, so what the person was in the middle of is
+    # gone the instant the digest is dropped — and this is by far the busiest
+    # sense omega has.
+    moments=True,
 )
 
 #: Reflecting over one day of the Mac's own usage record (DL-059). The weakest
@@ -179,12 +214,37 @@ DAY = Lens(
         "are deep in one thing. You do not know what they were working on.",
     ),
     label="The day",
+    # On, but this lens will rarely have anything honest to say: it knows which
+    # app was in front and not what was in it, so "in the middle of" is mostly
+    # not visible from here. It is allowed rather than encouraged, and the
+    # prompt's own "you do not know what they were working on" is what keeps it
+    # from inventing one.
+    moments=True,
 )
 
 #: A schedule's instruction is the whole text of a future turn, so it has room
 #: to be a sentence rather than a phrase — but not room to be a document that
 #: nobody will see again until it fires.
 MAX_INSTRUCTION_CHARS = 500
+
+
+@dataclass(frozen=True)
+class Reflection:
+    """What one reflection pass found: what is true, and what is going on.
+
+    Two lists rather than one because they are two different memories that must
+    not mix (DL-062), and the separation starts here rather than at the write:
+    a single list sorted out later is a single list that one refactor merges.
+    :func:`file_claims` and :func:`file_moments` append different kinds, into
+    different folds, read by different parts of the situation.
+
+    ``moments`` is empty for a lens that did not ask for them, and empty is also
+    what a lens that *did* ask returns most of the time. The field exists on
+    both so that a caller never has to know which lens it is holding.
+    """
+
+    claims: list[dict[str, Any]] = field(default_factory=list)
+    moments: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -394,8 +454,21 @@ def reflect(
         raise NotExtracted(f"the answer was not JSON: {exc}") from exc
     if not isinstance(answer, dict):
         raise NotExtracted("the answer was not a JSON object")
-    return _parse_claim_list(
-        answer.get("claims", []), known, limit=MAX_INFERRED_PER_PASS
+    return Reflection(
+        claims=_parse_claim_list(
+            answer.get("claims", []), known, limit=MAX_INFERRED_PER_PASS
+        ),
+        # Guarded by the lens and not by the answer's shape. A lens with moments
+        # off was never told the field exists, so a `moments` list coming back
+        # from one is the model answering a question nobody asked — dropped
+        # here rather than filed, because the alternative is that any future
+        # prompt drift silently switches on a second memory for a lens that was
+        # deliberately denied it.
+        moments=(
+            _parse_moment_list(answer.get("moments"))
+            if observing.moments
+            else []
+        ),
     )
 
 
@@ -423,6 +496,11 @@ def _reflection_messages(
     cannot reconstruct. The first is what a model reaches for by default, so the
     distinction is drawn explicitly and with both examples.
     """
+    shape = (
+        '  {"claims": [...], "moments": [...]}'
+        if observing.moments
+        else '  {"claims": [...]}'
+    )
     lines = [
         *observing.opening,
         "",
@@ -441,7 +519,7 @@ def _reflection_messages(
         "hints at a preference without stating it, that is not evidence.",
         "",
         "Answer with JSON and nothing else:",
-        '  {"claims": [...]}',
+        shape,
         "",
         f"At most {MAX_INFERRED_PER_PASS} claims. Each is an object:",
         '  "text"       what to remember, one sentence, written as an',
@@ -457,6 +535,29 @@ def _reflection_messages(
         '  {"hours": [9, 18]}        the local hour is at or after the first',
         "                            and before the second",
     ]
+    if observing.moments:
+        lines += [
+            "",
+            "Then, separately, note anything they are in the middle of. This is",
+            "the one place the rule above is reversed: a moment IS an event —",
+            "specifically one that has not finished. It goes in its own list and",
+            "never in claims.",
+            '  claim   "He clears flaky tests before starting anything new."',
+            '  moment  "He is partway through the retry logic in the uploader',
+            '           and has a test failing intermittently."',
+            "",
+            "The test is whether it is still open. Something that started and",
+            "finished in what you just read is not a moment. Neither is a habit, a",
+            "preference, or anything that is true in general — those are claims or",
+            "they are nothing.",
+            "",
+            f"At most {MAX_MOMENTS_PER_PASS} moments. Each is an object with one",
+            "field:",
+            '  "text"  what they are in the middle of, one sentence, said the way',
+            "          you would say it back to them",
+            "",
+            "An empty list is again an ordinary answer.",
+        ]
     if known:
         lines += [
             "",
@@ -567,6 +668,47 @@ def _parse_claim_list(
                 "supersedes": supersedes,
             }
         )
+    return out
+
+
+def _parse_moment_list(
+    raw: Any, limit: int = MAX_MOMENTS_PER_PASS
+) -> list[dict[str, Any]]:
+    """One field and three bounds, which is the whole of a moment (DL-062).
+
+    Absent is not an error, the way ``schedules`` and ``retract`` are not:
+    "nothing is open" is the ordinary answer and a model that expressed it by
+    omitting the key rather than sending ``[]`` has said the same thing. A
+    present-but-wrong-shaped ``moments`` is still refused — the leniency is
+    about silence, not about format.
+
+    No ``situation`` and no ``trigger``, deliberately. A claim needs the first
+    because a contradiction cannot be re-decided without knowing what omega was
+    looking at, and the second because it is a standing instruction that must
+    not fire in the wrong place. A moment's text *is* its situation, and its
+    only condition is being recent.
+    """
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise NotExtracted('"moments" was not a list')
+    if len(raw) > limit:
+        raise NotExtracted(
+            f"{len(raw)} moments from one pass, over the limit of {limit}"
+        )
+    out: list[dict[str, Any]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            raise NotExtracted("a moment was not an object")
+        text = item.get("text")
+        if not isinstance(text, str) or not text.strip():
+            raise NotExtracted("a moment had no text")
+        if len(text) > MAX_MOMENT_CHARS:
+            raise NotExtracted(
+                f"a moment was {len(text)} characters, over the limit of "
+                f"{MAX_MOMENT_CHARS}"
+            )
+        out.append({"text": text.strip()})
     return out
 
 
@@ -749,6 +891,50 @@ def file_claims(
                 source_seq=source_seq,
                 explicit=explicit,
                 supersedes=item["supersedes"],
+            )
+        )
+    return written
+
+
+def file_moments(
+    queue: Any,
+    moments: Sequence[dict[str, Any]],
+    *,
+    for_seq: int,
+    source_seq: int,
+    at: Optional[str] = None,
+) -> list[int]:
+    """Append each moment and return the seqs written, in order.
+
+    **Returns seqs rather than objects**, unlike :func:`file_claims`, because
+    nothing needs more. A filed claim goes straight back into a receipt that
+    shows its trigger and its text, so the caller needs the claim; a moment is
+    read back out of :class:`omega.derive.Moments` by whatever renders the
+    situation, and handing the caller a second copy here would be inventing a
+    path that has no user.
+
+    No ``explicit`` flag, and the absence is the point. That flag exists to
+    decide whether a contradiction is worth interrupting over, and a moment
+    cannot contradict anything: two moments that disagree are two things that
+    were going on, which is ordinary. Every moment is inferred — there is no
+    teach path into this kind and DL-062 did not build one — so a flag that
+    would read ``False`` on every record is a column, not information.
+
+    **No write key**, for the same reason :func:`file_claims` has none: a replay
+    of this window would raise on payloads that differ only by timestamp, and
+    the caller turns a raised pass into a reported failure. A duplicate moment
+    ages out on its own within three days; a false failure report does not.
+    """
+    written: list[int] = []
+    for item in moments:
+        written.append(
+            queue.append(
+                episodes.moment_noticed(
+                    for_seq=for_seq,
+                    text=item["text"],
+                    source_seq=source_seq,
+                    at=at,
+                )
             )
         )
     return written

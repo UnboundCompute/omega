@@ -30,7 +30,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Optional
 
 from omega import episodes, habits, learn, notice, provider, transcripts
-from omega.derive import Learned, OpenWork
+from omega.derive import Learned, Moments, OpenWork
 from omega.memory import WriteKeyConflict
 from omega.queue import EVENT_KINDS, EventQueue, Pending
 from omega.schedule import Schedule, Scheduler
@@ -170,6 +170,7 @@ class Executor:
         "_recovered",
         "_open",
         "_learned",
+        "_moments",
         "_standing",
     )
 
@@ -186,6 +187,10 @@ class Executor:
         self._recovered = False
         self._open = OpenWork()
         self._learned = Learned()
+        # A third view rather than a field on `_learned` (DL-062): what is
+        # true and what happened have different lifetimes, and keeping them
+        # in one fold is what would let events leak into the claim set.
+        self._moments = Moments()
         # Read-only: `due` and `fire` belong to the clock thread and are
         # never called from here. A second fold of the same log rather than
         # a shared object, because the clock mutates its copy on its own
@@ -481,14 +486,14 @@ class Executor:
         window = self._queue.recent(REFLECT_WINDOW)
         known = self._learned.claims()
         try:
-            claims = learn.reflect(
+            found = learn.reflect(
                 self._completer(),
                 transcript=_transcript(window),
                 known=known,
             )
             filed = learn.file_claims(
                 self._queue,
-                claims,
+                found.claims,
                 # There is no turn, so `for_seq` names the episode the pass read
                 # up to. The field is required of every attached kind and this
                 # is the honest value for it: the claim is *about* that stretch,
@@ -496,6 +501,16 @@ class Executor:
                 for_seq=head,
                 source_seq=head,
                 explicit=False,
+            )
+            # Filed unconditionally, not behind a check on the lens. `reflect`
+            # already returns nothing here for a lens that was not offered
+            # moments (DL-062), so a second guard would be a second place for
+            # the rule to drift, and this call is a no-op by construction.
+            learn.file_moments(
+                self._queue,
+                found.moments,
+                for_seq=head,
+                source_seq=head,
             )
         except Exception as exc:  # noqa: BLE001 - see the docstring
             reason = str(exc) or type(exc).__name__
@@ -580,7 +595,7 @@ class Executor:
             self._queue.append(episodes.transcript_ingested(**receipt, filed=0))
             return
         try:
-            claims = learn.reflect(
+            found = learn.reflect(
                 self._completer(),
                 transcript=digest,
                 known=self._learned.claims(),
@@ -588,12 +603,22 @@ class Executor:
             )
             filed = learn.file_claims(
                 self._queue,
-                claims,
+                found.claims,
                 # As in `reflect`: there is no turn, so the head at the moment
                 # the session was read is the honest cause to point at.
                 for_seq=head,
                 source_seq=head,
                 explicit=False,
+            )
+            # Filed unconditionally, not behind a check on the lens. `reflect`
+            # already returns nothing here for a lens that was not offered
+            # moments (DL-062), so a second guard would be a second place for
+            # the rule to drift, and this call is a no-op by construction.
+            learn.file_moments(
+                self._queue,
+                found.moments,
+                for_seq=head,
+                source_seq=head,
             )
         except Exception as exc:  # noqa: BLE001
             reason = str(exc) or type(exc).__name__
@@ -666,7 +691,7 @@ class Executor:
             self._queue.append(episodes.usage_digested(**receipt, filed=0))
             return
         try:
-            claims = learn.reflect(
+            found = learn.reflect(
                 self._completer(),
                 transcript=digest,
                 known=self._learned.claims(),
@@ -674,12 +699,22 @@ class Executor:
             )
             filed = learn.file_claims(
                 self._queue,
-                claims,
+                found.claims,
                 # As everywhere on this path: there is no turn, so the head at
                 # the moment the day was read is the honest cause to point at.
                 for_seq=head,
                 source_seq=head,
                 explicit=False,
+            )
+            # Filed unconditionally, not behind a check on the lens. `reflect`
+            # already returns nothing here for a lens that was not offered
+            # moments (DL-062), so a second guard would be a second place for
+            # the rule to drift, and this call is a no-op by construction.
+            learn.file_moments(
+                self._queue,
+                found.moments,
+                for_seq=head,
+                source_seq=head,
             )
         except Exception as exc:  # noqa: BLE001
             reason = str(exc) or type(exc).__name__
@@ -736,11 +771,17 @@ class Executor:
                 return False
             self._open.advance(store)
             self._learned.advance(store)
+            self._moments.advance(store)
             text = notice.situation(
                 now=moment,
                 blocks=self._open.blocks(),
                 claims=self._learned.claims(),
                 schedules=self._standing_schedules(),
+                # Bounded here rather than at the fold, so the horizon is read
+                # against the clock this look is being made at and not against
+                # wall-clock now. A backlog look would otherwise age out the
+                # very moments it is supposed to be looking at.
+                moments=self._moments.recent(now=moment.isoformat()),
                 heard_at=st.heard_at,
             )
             # Stamped with ``moment``, not left to default to wall-clock now.

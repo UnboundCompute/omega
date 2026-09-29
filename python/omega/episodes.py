@@ -39,6 +39,7 @@ __all__ = [
     "SCHEDULE_CREATED",
     "SCHEDULE_CANCELLED",
     "CLAIM_EXTRACTED",
+    "MOMENT_NOTICED",
     "CLAIM_RETRACTED",
     "TRANSCRIPT_INGESTED",
     "USAGE_DIGESTED",
@@ -81,6 +82,12 @@ WORK_FINISHED = "work.finished"
 SCHEDULE_CREATED = "schedule.created"
 SCHEDULE_CANCELLED = "schedule.cancelled"
 CLAIM_EXTRACTED = "claim.extracted"
+#: Something that happened, kept apart from what is true (DL-062). A claim is
+#: timeless and a moment carries a stamp, which is the whole reason the
+#: unprompted pass has anything that can differ between two looks. Called a
+#: moment and not an event because `queue.EVENT_KINDS` already means "an
+#: episode kind that drives a turn", which this is not.
+MOMENT_NOTICED = "moment.noticed"
 CLAIM_RETRACTED = "claim.retracted"
 CLAIM_EXTRACTION_FAILED = "claim.extraction_failed"
 REFLECTION_DONE = "reflection.done"
@@ -105,6 +112,7 @@ KINDS = frozenset(
         SCHEDULE_CREATED,
         SCHEDULE_CANCELLED,
         CLAIM_EXTRACTED,
+        MOMENT_NOTICED,
         CLAIM_RETRACTED,
         CLAIM_EXTRACTION_FAILED,
         REFLECTION_DONE,
@@ -600,6 +608,52 @@ def claim_extracted(
     return payload
 
 
+def moment_noticed(
+    *,
+    for_seq: int,
+    text: str,
+    source_seq: int,
+    at: Optional[str] = None,
+) -> dict[str, Any]:
+    """Something that happened, written down where a rebuild can reach it (DL-062).
+
+    A **record**, like a claim, and the deliberate counterpart to one. A claim
+    is a pattern and is true whenever it is read; a moment is an event and is
+    only ever *this far in the past*. That difference is the entire point of
+    having both: the unprompted pass (DL-061) reads a digest built from what
+    omega knows, and a digest built only from claims is the same digest at
+    every look forever, which is what the live log showed after DL-061 shipped.
+
+    Kept apart from `claim.extracted` rather than folded into it, because
+    ``_reflection_messages``' *"Remember patterns, not events"* is the
+    memory-firehose guard and must keep its exact strength over claims. Mixing
+    the two would either weaken that line or make one prompt hold two
+    instructions that contradict each other.
+
+    There is no ``situation`` field, and that is not an oversight. A claim needs
+    one because the sentence alone does not say what was going on when it was
+    learned and nobody can re-decide it later without that. A moment's text
+    *is* what was going on, and ``source_seq`` names the ingest record that says
+    which session it came from.
+
+    ``at`` is when the moment was filed, not when the thing happened. For the
+    lens this exists to serve those are within hours of each other, because a
+    session is ingested once it has finished and gone quiet. It would be wrong
+    for a backfill of old material, which is a reason not to backfill rather
+    than a reason to invent a second stamp nothing can populate honestly.
+    """
+    payload = {
+        "v": VERSION,
+        "kind": MOMENT_NOTICED,
+        "for_seq": for_seq,
+        "text": text,
+        "source_seq": source_seq,
+        "at": at or now(),
+    }
+    _validate(payload)
+    return payload
+
+
 def claim_retracted(
     *,
     for_seq: int,
@@ -829,6 +883,7 @@ _REQUIRED: dict[str, tuple[str, ...]] = {
         "trigger",
         "at",
     ),
+    MOMENT_NOTICED: ("for_seq", "text", "source_seq", "at"),
     CLAIM_RETRACTED: ("for_seq", "claim_seq", "at"),
     CLAIM_EXTRACTION_FAILED: ("for_seq", "reason", "at"),
     REFLECTION_DONE: ("through", "filed", "reason", "at"),
@@ -1001,6 +1056,10 @@ def _validate(payload: dict[str, Any]) -> None:
                 )
         if cron is not None:
             _require_str(payload, "cron", non_empty=True)
+
+    if kind == MOMENT_NOTICED:
+        _require_str(payload, "text", non_empty=True)
+        _require_seq(payload, "source_seq")
 
     if kind == CLAIM_EXTRACTED:
         _require_str(payload, "text", non_empty=True)

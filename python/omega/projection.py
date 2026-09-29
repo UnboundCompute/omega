@@ -182,6 +182,12 @@ NOT_PROJECTED = frozenset(
         episodes.SCHEDULE_CREATED,
         episodes.SCHEDULE_CANCELLED,
         episodes.CLAIM_EXTRACTED,
+        # DL-062. Same family and the same reason as its neighbours: a
+        # moment is filed by a background pass with no turn behind it, so
+        # there is nothing on the wire for it to attach to, and it is omega
+        # noticing rather than omega speaking. It reaches the person only
+        # through the situation the next unprompted look is built from.
+        episodes.MOMENT_NOTICED,
         episodes.CLAIM_RETRACTED,
         episodes.CLAIM_EXTRACTION_FAILED,
         episodes.REFLECTION_DONE,

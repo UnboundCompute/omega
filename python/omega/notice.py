@@ -47,7 +47,7 @@ from typing import TYPE_CHECKING, Optional, Sequence
 from omega import episodes
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
-    from omega.derive import Claim, OpenBlock
+    from omega.derive import Claim, Moment, OpenBlock
     from omega.memory import MemoryStore
     from omega.schedule import Schedule
 
@@ -279,16 +279,26 @@ def situation(
     blocks: Sequence["OpenBlock"] = (),
     claims: Sequence["Claim"] = (),
     schedules: Sequence["Schedule"] = (),
+    moments: Sequence["Moment"] = (),
     heard_at: Optional[str] = None,
     max_chars: int = MAX_L1_CHARS,
 ) -> str:
     """The L1 text: what is open, as far as omega already knows it.
 
     **Only what omega already has** (DL-061, decided with the user): open
-    obligations, what it has been taught, standing schedules, and the clock. A
+    obligations, what it has been taught, standing schedules, recent moments,
+    and the clock. A
     live now-sense — frontmost app, window titles, the last few minutes — was
     the alternative and was rejected for v1 as the largest privacy surface omega
     would take on, needing tray work that is not ours.
+
+    ``moments`` is the one part of this text that can differ between two looks
+    an hour apart (DL-062), and that is the whole reason it is here. Everything
+    else on this list is timeless or nearly so: the same claims, the same
+    schedules, a clock that moved. Two unprompted passes over that produce two
+    byte-identical digests and therefore the same verdict forever, which is how
+    a loop that runs on time ends up never having anything to say. What happened
+    is the only input that changes on its own.
 
     Recent conversation is deliberately **not** rendered here. The turn's own
     recall step already puts it in front of the judge, and writing it twice
@@ -320,6 +330,15 @@ def situation(
         lines.append("Standing schedules:")
         for sched in schedules:
             lines.append(f"- {getattr(sched, 'instruction', '')}")
+
+    if moments:
+        lines.append("")
+        # "Lately" and not "Recent events": the heading has to read as
+        # unfinished business rather than as a log, or the judge treats it as
+        # something already dealt with and there is nothing to say about it.
+        lines.append("Lately:")
+        for moment in moments:
+            lines.append(f"- {getattr(moment, 'text', '')}")
 
     lines.append("")
     lines.append(

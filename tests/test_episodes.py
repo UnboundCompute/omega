@@ -78,6 +78,12 @@ def test_every_kind_round_trips():
             trigger={"any": ["review"]},
             at="2026-09-23T10:00:00+00:00",
         ),
+        ep.moment_noticed(
+            for_seq=41,
+            text="partway through the retry logic in the uploader",
+            source_seq=41,
+            at="2026-09-23T10:00:00+00:00",
+        ),
         ep.claim_retracted(
             for_seq=41, claim_seq=12, at="2026-09-23T10:00:00+00:00"
         ),

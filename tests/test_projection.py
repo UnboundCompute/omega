@@ -285,6 +285,9 @@ def test_every_m1_kind_is_accounted_for() -> None:
         episodes.CLAIM_EXTRACTED: episodes.claim_extracted(
             for_seq=1, text="c", source_seq=1, situation="s", explicit=True, at=AT
         ),
+        episodes.MOMENT_NOTICED: episodes.moment_noticed(
+            for_seq=1, text="partway through the uploader", source_seq=1, at=AT
+        ),
         episodes.CLAIM_RETRACTED: episodes.claim_retracted(
             for_seq=1, claim_seq=2, at=AT
         ),
