@@ -476,7 +476,9 @@ private struct ExpandedTrayView: View {
                 .foregroundStyle(TrayTheme.signal)
             }
 
-            HStack(alignment: .bottom, spacing: 10) {
+            composerEditor
+
+            HStack(spacing: 8) {
                 Button(action: viewModel.pasteFromClipboard) {
                     Image(systemName: "paperclip")
                         .frame(width: 28, height: 28)
@@ -506,7 +508,12 @@ private struct ExpandedTrayView: View {
                     .help("Teach omega")
                 }
 
-                composerTextField
+                Spacer(minLength: 8)
+
+                Text("⇧↩ New line")
+                    .font(.system(size: 9, weight: .medium))
+                    .foregroundStyle(TrayTheme.tertiaryText)
+                    .accessibilityHidden(true)
 
                 Button(action: viewModel.send) {
                     Group {
@@ -525,8 +532,8 @@ private struct ExpandedTrayView: View {
                 .buttonStyle(.plain)
                 .disabled(!viewModel.canSubmit)
                 .accessibilityLabel(viewModel.composerMode == .teach ? "Teach omega" : "Send to omega")
-                .accessibilityHint("Command Return")
-                .help("Send (⌘↩)")
+                .accessibilityHint("Press Return to send. Press Shift Return for a new line.")
+                .help("Send (Return)")
             }
         }
         .padding(10)
@@ -542,22 +549,33 @@ private struct ExpandedTrayView: View {
         .padding(12)
     }
 
-    private var composerTextField: some View {
-        TextField(viewModel.composerPlaceholder, text: $viewModel.draft, axis: .vertical)
-            .textFieldStyle(.plain)
-            .font(.system(size: 13))
-            .foregroundStyle(TrayTheme.primaryText)
-            .lineLimit(1...5)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .layoutPriority(1)
-            .focused($composerFocused)
-            .onKeyPress(keys: [.return], phases: .down) { keyPress in
-                guard keyPress.modifiers.contains(.command) else { return .ignored }
-                if viewModel.canSubmit {
-                    viewModel.send()
-                }
-                return .handled
+    private var composerEditor: some View {
+        ZStack(alignment: .topLeading) {
+            if viewModel.draft.isEmpty {
+                Text(viewModel.composerPlaceholder)
+                    .font(.system(size: 13))
+                    .foregroundStyle(TrayTheme.secondaryText)
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 6)
+                    .allowsHitTesting(false)
             }
+
+            TextEditor(text: $viewModel.draft)
+                .scrollContentBackground(.hidden)
+                .font(.system(size: 13))
+                .foregroundStyle(TrayTheme.primaryText)
+                .focused($composerFocused)
+                .accessibilityLabel(viewModel.composerPlaceholder)
+                .accessibilityHint("Press Return to send. Press Shift Return for a new line.")
+                .onKeyPress(keys: [.return], phases: .down) { keyPress in
+                    guard !keyPress.modifiers.contains(.shift) else { return .ignored }
+                    if viewModel.canSubmit {
+                        viewModel.send()
+                    }
+                    return .handled
+                }
+        }
+        .frame(height: 54)
     }
 
     private var dropOverlay: some View {
