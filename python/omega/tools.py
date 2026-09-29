@@ -78,6 +78,8 @@ from pathlib import Path
 from typing import Any, Callable, Optional, Sequence
 from urllib.parse import urlsplit
 
+from omega import readable
+
 __all__ = [
     "EXPLORATION",
     "LOCAL",
@@ -211,13 +213,51 @@ FETCH_TIMEOUT = 20.0
 #: a page that lies about its length still cannot spend more than this.
 MAX_FETCH_BYTES = 1024 * 1024
 
+#: A fetched page's own cap, larger than `MAX_RESULT_CHARS` (DL-065).
+#:
+#: The shared 8,000 was sized when `fetch` returned raw HTML, where the budget
+#: bought `<head>` and inline script either way, so its size hardly mattered.
+#: Now that what comes back is prose, it is the difference between an article
+#: and its first two paragraphs: measured, a Wikipedia page extracts to ~61,000
+#: characters and a news front page to ~15,000, against the ~3,000-6,000 of a
+#: single article. 30,000 holds any ordinary article whole and most of a long
+#: reference page, without letting one fetch crowd out the rest of a turn.
+#:
+#: Other tools keep the smaller cap. A directory listing or a command's output
+#: that runs past 8,000 is nearly always a mistake worth truncating; a long
+#: page is not.
+MAX_FETCH_CHARS = 30_000
+
 #: Environment names never handed to a child process. `load_env` puts the API
 #: key into `os.environ` at startup, and a child inherits the environment, so
 #: without this every allowlisted `run_code` would be one `env` away from the
 #: key. Stripping is cheap and the omission would be permanent.
 _SECRET_ENV_PREFIXES = ("OPENAI_", "OMEGA_", "ANTHROPIC_")
 
-_USER_AGENT = "omega/1.0 (+https://localhost) M1"
+#: Sent as a browser, because servers answer browsers (DL-065).
+#:
+#: The previous value announced a bot and pointed at `localhost`, and a CDN in
+#: front of an ordinary news site refuses that: apnews.com answered **403** to
+#: it while serving the same page to a browser string. A fetch tool that is
+#: refused by the sites a person actually reads is not a fetch tool.
+#:
+#: This is about being served the public page a person could open themselves in
+#: their own browser, not about reaching anything they could not. Nothing here
+#: touches authentication, and the address, scheme, redirect and content-type
+#: guards are unchanged.
+_USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+)
+
+#: Asked for alongside it, for the same reason: a server that content-negotiates
+#: will hand a client with no `Accept` whatever it likes, which is sometimes XML
+#: or a mobile stub.
+_FETCH_HEADERS = {
+    "User-Agent": _USER_AGENT,
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+}
 
 
 class ToolError(RuntimeError):
@@ -864,7 +904,7 @@ def fetch(
         _CheckedRedirects(),
     )
     request = urllib.request.Request(  # noqa: S310 - scheme checked above
-        url, headers={"User-Agent": _USER_AGENT}, method="GET"
+        url, headers=dict(_FETCH_HEADERS), method="GET"
     )
     try:
         with opener.open(request, timeout=timeout) as response:
@@ -895,10 +935,17 @@ def fetch(
         # A charset nobody has heard of is the server's problem, not a reason
         # to fail the fetch; utf-8 with replacement is what we did before.
         text = body[:max_bytes].decode("utf-8", errors="replace")
+    if readable.looks_like_html(content_type):
+        # HTML becomes prose *before* the cap, which is the whole point of
+        # doing it here (DL-065). Capping first would spend the budget on the
+        # `<head>` and inline scripts and then strip the tags off whatever
+        # fragment survived. Resolved against `final`, not `url`, so a link on
+        # a page reached through a redirect points where a reader would go.
+        text = readable.to_text(text, base_url=final)
     head = f"{status} {final}" if final != url else f"{status} {url}"
     if truncated:
         text += f"\n... [truncated at {max_bytes} bytes]"
-    return _cap(f"{head}\n\n{text}")
+    return _cap(f"{head}\n\n{text}", MAX_FETCH_CHARS)
 
 
 def recall(claims: Sequence[Any], about: str = "") -> str:
@@ -960,10 +1007,10 @@ def recall(claims: Sequence[Any], about: str = "") -> str:
     return _cap("\n".join([header, *lines]))
 
 
-def _cap(text: str) -> str:
-    if len(text) <= MAX_RESULT_CHARS:
+def _cap(text: str, limit: int = MAX_RESULT_CHARS) -> str:
+    if len(text) <= limit:
         return text
-    return text[:MAX_RESULT_CHARS] + f"\n... [truncated at {MAX_RESULT_CHARS} characters]"
+    return text[:limit] + f"\n... [truncated at {limit} characters]"
 
 
 # --- the box ----------------------------------------------------------------
