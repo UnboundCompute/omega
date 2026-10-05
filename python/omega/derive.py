@@ -329,6 +329,7 @@ class Learned:
         "_since_reflection",
         "_ingested",
         "_digested",
+        "_heard",
     )
 
     def __init__(self) -> None:
@@ -340,6 +341,7 @@ class Learned:
         self._since_reflection = 0
         self._ingested: set[str] = set()
         self._digested: set[str] = set()
+        self._heard: set[str] = set()
 
     @property
     def through(self) -> int:
@@ -417,6 +419,18 @@ class Learned:
                 # reflection branch gives: this runs with nobody watching, and a
                 # reader whose `learn` role has died looks exactly like a run of
                 # sessions that genuinely held nothing.
+                self._failed += 1
+                self._last_failure = str(reason)
+        elif payload.get("kind") == episodes.AUDIO_CAPTURED:
+            # The set of recordings already heard (DL-066), keyed on the digest
+            # of the audio rather than on a filename, so the same meeting
+            # arriving twice — re-synced by iCloud, or dropped in again by a
+            # person who could not remember whether they had — is recognised as
+            # the one it is. A receipt exists whether the recording taught
+            # anything or not, for the reason its two neighbours give.
+            self._heard.add(str(payload["recording"]))
+            reason = payload.get("reason")
+            if reason:
                 self._failed += 1
                 self._last_failure = str(reason)
         elif payload.get("kind") == episodes.USAGE_DIGESTED:
@@ -515,6 +529,22 @@ class Learned:
         was silently never read.
         """
         return frozenset(self._digested)
+
+    @property
+    def heard(self) -> frozenset[str]:
+        """Digests of the recordings already listened to (DL-066).
+
+        A third set rather than a third kind of id in one of the others, for
+        :attr:`digested`'s reason: a collision between a content digest and a
+        session id would be undetectable, and would present as a meeting that
+        was silently never heard.
+
+        **Keyed on content, which is what makes this cursor correct.** A
+        filename cursor would re-hear a recording iCloud re-synced under a new
+        name and skip a different one that happened to reuse an old name; the
+        digest of the bytes cannot do either.
+        """
+        return frozenset(self._heard)
 
     @property
     def last_failure(self) -> str:

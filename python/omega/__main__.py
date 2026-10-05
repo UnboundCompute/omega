@@ -36,9 +36,12 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from omega import (
+    blobs,
     derive,
+    episodes,
     habits,
     learn,
+    listen,
     memory,
     provider,
     runtime,
@@ -185,6 +188,89 @@ def review(store_dir: Path, *, write: Callable[[str], None]) -> int:
     return 0
 
 
+def heard(
+    store_dir: Path, *, write: Callable[[str], None], last: bool = False
+) -> int:
+    """Print the recordings omega has heard, and their reviews (DL-066).
+
+    Offline and keyless for :func:`review`'s reasons, and with the same lock
+    caveat: this is the audit you sit down to do, not the question you ask in
+    passing. It carries one more reason of its own — a review is a *document*
+    and not memory (DL-066), so it is not in the log and not in recall, and
+    this is the only thing that reads it back.
+
+    Receipts come from the log and the text comes from the blob store beside
+    it, which is the split the ledger insists on: the log says a recording was
+    heard, the blobs hold what it said. A missing blob is reported rather than
+    skipped — a review omega wrote and then lost is a different problem from a
+    recording it never reviewed, and only one of them is a bug.
+    """
+    try:
+        store = memory.MemoryStore.open(store_dir)
+    except memory.AlreadyLocked:
+        write(f"omega is already running on {store_dir}.")
+        write("")
+        write("    Only one process may hold the log, so this cannot read it")
+        write("    while that one is up. Stop omega and run this again.")
+        return 2
+    except Exception as exc:  # noqa: BLE001 - a person's problem, not a traceback
+        write(f"omega could not open {store_dir}: {type(exc).__name__}: {exc}")
+        return 2
+
+    with store:
+        bits = blobs.BlobStore.open(store.root)
+        records = []
+        for ep in store.episodes_since(0):
+            try:
+                payload = episodes.decode(ep.payload)
+            except Exception:  # noqa: BLE001 - one bad episode is not a reason
+                continue       # to refuse to show the rest
+            if payload.get("kind") == episodes.AUDIO_CAPTURED:
+                records.append(payload)
+
+        if not records:
+            write("omega has not heard anything yet.")
+            write("")
+            write(f"    Drop a recording in {listen.folder_path()}")
+            write("    and it will be picked up the next time omega is idle.")
+            return 0
+
+        shown = records[-1:] if last else records
+        if last and len(records) > 1:
+            write(f"the most recent of {len(records)} recordings:")
+            write("")
+        for payload in shown:
+            title = payload["title"]
+            at = str(payload["at"])[:16].replace("T", " ")
+            length = payload.get("duration")
+            span = f", {length / 60:.0f} min" if length else ""
+            write(f"--- {title} ({at}{span}) ---")
+            reason = payload.get("reason")
+            if reason:
+                write(f"    omega could not finish this one: {reason}")
+            digest = payload.get("review")
+            if digest is None:
+                if not reason:
+                    # Not a failure and not a review: the recording had nothing
+                    # in it worth writing down, which is a real outcome.
+                    write("    (nothing in this one to review)")
+            else:
+                try:
+                    text = bits.path_for(digest).read_text(encoding="utf-8")
+                except OSError as exc:
+                    # Reported, not skipped. See the docstring.
+                    write(f"    the review is missing from the blob store: {exc}")
+                else:
+                    write("")
+                    write(text)
+            filed = payload.get("filed") or 0
+            if filed:
+                write("")
+                write(f"    ({filed} thing{'s' if filed != 1 else ''} also remembered)")
+            write("")
+    return 0
+
+
 def _startup_lines(rt: runtime.Runtime, *, interactive: bool = True) -> list[str]:
     """What omega says when it opens.
 
@@ -308,6 +394,19 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--heard",
+        action="store_true",
+        help=(
+            "print the reviews of what omega has listened to and exit; reads "
+            "the log and the blob store, starts nothing, needs no API key"
+        ),
+    )
+    parser.add_argument(
+        "--last",
+        action="store_true",
+        help="with --heard, print only the most recent recording",
+    )
+    parser.add_argument(
         "--no-listen",
         dest="listen",
         action="store_false",
@@ -339,6 +438,12 @@ def main(argv: Optional[list[str]] = None) -> int:
         parser.error("--serve requires the localhost listener")
     if args.learned and args.serve:
         parser.error("--learned reads the log and exits; it cannot also serve")
+    if args.heard and args.serve:
+        parser.error("--heard reads the log and exits; it cannot also serve")
+    if args.heard and args.learned:
+        parser.error("--heard and --learned each read the log and exit; pick one")
+    if args.last and not args.heard:
+        parser.error("--last only means something with --heard")
     write = _writer()
 
     store_dir = Path(args.store).expanduser()
@@ -349,6 +454,11 @@ def main(argv: Optional[list[str]] = None) -> int:
         # failing here for a missing key would be answering a question about
         # the log with a question about the network.
         return review(store_dir, write=write)
+    if args.heard:
+        # Before the provider for `--learned`'s reason, and one more: a review
+        # omega already wrote is a finished artefact, so needing a working key
+        # to read it back would make the record depend on the network twice.
+        return heard(store_dir, write=write, last=args.last)
     env_path, env_hint = resolve_env(args.env, store_dir)
     if args.env is not None and env_path is None:
         # A named file that is not there is worth a word. Silently ignoring an
@@ -394,6 +504,11 @@ def main(argv: Optional[list[str]] = None) -> int:
         # the breadth of that grant visible in the code rather than implied by a
         # default nobody reads.
         usage_path=habits.default_path(),
+        # And the one place the listening sense is granted (DL-066). Weakest
+        # authority of the three: a folder the person has to deliberately put a
+        # file into, which is why it needs no system permission and why it is
+        # the one of the three that can be revoked by moving a directory.
+        recordings=str(listen.folder_path()),
     )
     try:
         rt.start()

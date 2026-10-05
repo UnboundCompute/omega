@@ -193,6 +193,13 @@ NOT_PROJECTED = frozenset(
         episodes.REFLECTION_DONE,
         episodes.TRANSCRIPT_INGESTED,
         episodes.USAGE_DIGESTED,
+        # DL-066, and withheld for a *different* reason than the two receipts
+        # above it. Not sensitivity: the person pressed record, so a recording
+        # they handed over deliberately is the opposite of the usage case. It
+        # stays in because it is not a turn and has no state to report — and
+        # because DL-066 makes review pull-shaped, so what reaches the person
+        # is the review they ask for, not a line saying a file was read.
+        episodes.AUDIO_CAPTURED,
     }
 )
 

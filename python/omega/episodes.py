@@ -43,6 +43,7 @@ __all__ = [
     "CLAIM_RETRACTED",
     "TRANSCRIPT_INGESTED",
     "USAGE_DIGESTED",
+    "AUDIO_CAPTURED",
     "MIN_EVERY_SECONDS",
     "TRIGGER_FIELDS",
     "BadPayload",
@@ -65,6 +66,7 @@ __all__ = [
     "reflection_done",
     "transcript_ingested",
     "usage_digested",
+    "audio_captured",
     "now",
 ]
 
@@ -93,6 +95,7 @@ CLAIM_EXTRACTION_FAILED = "claim.extraction_failed"
 REFLECTION_DONE = "reflection.done"
 TRANSCRIPT_INGESTED = "transcript.ingested"
 USAGE_DIGESTED = "usage.digested"
+AUDIO_CAPTURED = "audio.captured"
 
 #: The complete M1 kind set (§2.1: "and that is all of them").
 #:
@@ -118,6 +121,7 @@ KINDS = frozenset(
         REFLECTION_DONE,
         TRANSCRIPT_INGESTED,
         USAGE_DIGESTED,
+        AUDIO_CAPTURED,
     }
 )
 
@@ -854,6 +858,71 @@ def usage_digested(
     return payload
 
 
+def audio_captured(
+    *,
+    recording: str,
+    source: str,
+    title: str,
+    mime: str,
+    bytes: int,
+    duration: Optional[float] = None,
+    transcript: Optional[str] = None,
+    review: Optional[str] = None,
+    filed: int = 0,
+    reason: Optional[str] = None,
+    at: Optional[str] = None,
+) -> dict[str, Any]:
+    """Something omega listened to was heard, transcribed and reviewed (DL-066).
+
+    The third sense, and the same object as the two receipts above it over a
+    third source. A separate kind rather than a ``source`` variant of either,
+    for the reason :func:`usage_digested` gives: the identities differ — a
+    session is a file, a day is a date, a recording is the digest of its own
+    bytes — and one shared kind would have to make every field optional, which
+    is how a cursor stops being checkable.
+
+    **This is the cursor, and ``recording`` is the key.** A recording is
+    identified by the digest of its audio, not by its filename, and that choice
+    is what makes re-ingestion idempotent *by construction*: the same meeting
+    dropped in twice, or re-synced by iCloud under a new name, hashes the same
+    and is recognised as already heard. A filename would not survive either.
+
+    ``title`` is the name the file arrived under. It is not needed to avoid
+    re-reading and is here for the reason a transcript receipt carries
+    ``project``: a receipt a person cannot place is a receipt they cannot check,
+    and nobody can place a recording by its hash.
+
+    **Deliberately not the audio and not the transcript.** Both are referenced
+    as blobs (DL-027) and stored beside the log, never in it — an hour of audio
+    is ~30 MB and its transcript ~60 KB, and DL-017 re-derives memory by
+    replaying every episode, so a byte carried here is a byte re-read on every
+    rebuild forever. ``transcript`` and ``review`` are therefore digests, and
+    both are ``None`` until their stage has actually run.
+
+    ``reason`` says why a recording did not come out the far end. It may stand
+    alongside a ``transcript`` — transcription succeeding and the review failing
+    is a real partial — but never alongside filed claims, which is the
+    all-or-nothing rule the other two receipts carry.
+    """
+    payload = {
+        "v": VERSION,
+        "kind": AUDIO_CAPTURED,
+        "recording": recording,
+        "source": source,
+        "title": title,
+        "mime": mime,
+        "bytes": bytes,
+        "duration": duration,
+        "transcript": transcript,
+        "review": review,
+        "filed": filed,
+        "reason": reason,
+        "at": at or now(),
+    }
+    _validate(payload)
+    return payload
+
+
 def _copy_trigger(trigger: dict[str, Any]) -> dict[str, Any]:
     copied = dict(trigger)
     if isinstance(copied.get("any"), list):
@@ -889,12 +958,27 @@ _REQUIRED: dict[str, tuple[str, ...]] = {
     REFLECTION_DONE: ("through", "filed", "reason", "at"),
     TRANSCRIPT_INGESTED: ("session", "source", "project", "filed", "reason", "at"),
     USAGE_DIGESTED: ("day", "source", "filed", "reason", "at"),
+    AUDIO_CAPTURED: (
+        "recording",
+        "source",
+        "title",
+        "mime",
+        "bytes",
+        "duration",
+        "transcript",
+        "review",
+        "filed",
+        "reason",
+        "at",
+    ),
 }
 
 #: The kinds that are *not* about one turn. Everything else names the inbound
 #: turn it belongs to; a schedule definition belongs to no turn, which is the
 #: whole reason it is a record the drain walks past.
-_UNATTACHED_KINDS = frozenset({MESSAGE_INBOUND, SCHEDULE_CREATED, SCHEDULE_CANCELLED})
+_UNATTACHED_KINDS = frozenset(
+    {MESSAGE_INBOUND, SCHEDULE_CREATED, SCHEDULE_CANCELLED, AUDIO_CAPTURED}
+)
 
 
 def _validate(payload: dict[str, Any]) -> None:
@@ -979,6 +1063,48 @@ def _validate(payload: dict[str, Any]) -> None:
             # carry: a record claiming both a failure and a write would be the
             # only evidence of a partial one.
             raise BadPayload("a failed digest cannot also have filed claims")
+    elif kind == AUDIO_CAPTURED:
+        # Identified by the digest of the audio itself, which is what makes
+        # re-ingestion idempotent: a filename changes when iCloud re-syncs a
+        # file and two recorders will happily both produce `audio.m4a`, so a
+        # cursor keyed on the name would re-hear some meetings and miss others.
+        if not is_digest(payload["recording"]):
+            raise BadPayload("recording must be a blob digest")
+        _require_str(payload, "source", non_empty=True)
+        _require_str(payload, "title", non_empty=True)
+        _require_str(payload, "mime", non_empty=True)
+        size = payload["bytes"]
+        if isinstance(size, bool) or not isinstance(size, int) or size <= 0:
+            # Zero is rejected rather than allowed: an empty file is a sync in
+            # flight, not a recording, and a receipt for one would permanently
+            # mark it heard.
+            raise BadPayload("bytes must be a positive count")
+        duration = payload["duration"]
+        if duration is not None:
+            if isinstance(duration, bool) or not isinstance(duration, (int, float)):
+                raise BadPayload("duration must be null or a number of seconds")
+            if duration <= 0:
+                raise BadPayload("duration must be positive when known")
+        for field in ("transcript", "review"):
+            value = payload[field]
+            if value is not None and not is_digest(value):
+                raise BadPayload(f"{field} must be null or a blob digest")
+        if payload["review"] is not None and payload["transcript"] is None:
+            # A review is derived from a transcript, so a receipt carrying one
+            # without the other claims a review of nothing — and would make the
+            # transcript look lost rather than never written.
+            raise BadPayload("a review cannot exist without its transcript")
+        filed = payload["filed"]
+        if isinstance(filed, bool) or not isinstance(filed, int) or filed < 0:
+            raise BadPayload("filed must be a non-negative count")
+        reason = payload["reason"]
+        if reason is not None and not (isinstance(reason, str) and reason.strip()):
+            raise BadPayload("reason must be null or a non-empty string")
+        if reason is not None and filed:
+            # The all-or-nothing rule the other learning receipts carry: a
+            # record claiming both a failure and a write would be the only
+            # evidence of a partial one.
+            raise BadPayload("a failed capture cannot also have filed claims")
     elif kind == REFLECTION_DONE:
         # No `for_seq` and no `id`: a reflection belongs to no turn and names no
         # standing thing. It is identified by the stretch of log it covered.

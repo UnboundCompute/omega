@@ -100,6 +100,18 @@ def test_every_kind_round_trips():
             filed=1,
             at="2026-09-23T10:00:00+00:00",
         ),
+        ep.audio_captured(
+            recording="sha256:" + "a" * 64,
+            source="icloud",
+            title="standup.m4a",
+            mime="audio/mp4",
+            bytes=380898,
+            duration=8.76,
+            transcript="sha256:" + "b" * 64,
+            review="sha256:" + "c" * 64,
+            filed=3,
+            at="2026-09-23T10:00:00+00:00",
+        ),
     ]
     assert {p["kind"] for p in built} == ep.KINDS, "a kind has no round-trip test"
     for payload in built:

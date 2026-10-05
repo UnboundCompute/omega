@@ -25,11 +25,13 @@ append and never a second path into the loop.
 
 from __future__ import annotations
 
+import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Callable, Optional
 
-from omega import episodes, habits, learn, notice, provider, transcripts
+from omega import blobs, episodes, habits, learn, listen, notice, provider, transcripts
 from omega.derive import Learned, Moments, OpenWork
 from omega.memory import WriteKeyConflict
 from omega.queue import EVENT_KINDS, EventQueue, Pending
@@ -625,6 +627,164 @@ class Executor:
             self._queue.append(episodes.transcript_ingested(**receipt, reason=reason))
             return
         self._queue.append(episodes.transcript_ingested(**receipt, filed=len(filed)))
+
+    def hear(
+        self, *, folder: Optional[Any] = None, now: Optional[Any] = None
+    ) -> int:
+        """Hear recordings dropped in the watched folder (DL-066).
+
+        Named ``hear`` and not ``listen`` on purpose: :mod:`omega.listen` is the
+        module this calls and ``listen=`` is already the flag that binds the
+        HTTP channel, so a third meaning of the word inside one class would make
+        every line of it ambiguous to read.
+
+        Returns how many were heard. Structurally :meth:`ingest` over a third
+        source, and deliberately so — the sense being added is a *source*, not
+        an engine, so the receipt-as-cursor, the ``explicit=False``, the refusal
+        to invent and the fold all arrive from the reflection path unchanged.
+
+        **Two things genuinely differ from its two siblings.**
+
+        One per pass, where a transcript pass takes three. Those digests are
+        mechanical; this one shells out to whisper, and an hour of audio takes
+        tens of minutes on this machine. The executor is a single consumer, so
+        that is time omega cannot answer a message — bounded at one recording,
+        unbounded at three. It is still a real stall, and the honest fix is a
+        detached sub-loop re-entering as ``work.finished`` (DL-016 §1.5) rather
+        than a smaller cap; that is not built, and this says so instead of
+        implying the cost away.
+
+        An environment check before the loop, not inside it. A receipt marks a
+        recording heard permanently, so writing one because whisper is missing
+        would burn every recording in the folder on a machine that had simply
+        not installed it yet. :func:`omega.listen.not_ready` answers that once,
+        and a pass that cannot run writes nothing at all — the same rule
+        :meth:`ingest` applies when it fails to *look*.
+
+        **Never raises**, for :meth:`reflect`'s reason: the drain thread must
+        not be something a malformed file on disk can stop.
+        """
+        if not self._recovered:
+            return 0
+        if self._queue.head() == 0:
+            # An omega with an empty log has never been spoken to, and the
+            # first thing in it should not be a belief about a person it has
+            # not met, inferred from a file it found on disk.
+            return 0
+        if listen.not_ready() is not None:
+            return 0
+        self._learned.advance(self._queue.store)
+        try:
+            waiting = listen.waiting(folder, now=now)
+        except Exception:  # noqa: BLE001 - see the docstring
+            # No receipt: nothing was heard, so there is no recording to name
+            # one after, and a failure to look is not a failure to hear.
+            return 0
+
+        heard = 0
+        for path in waiting[: listen.MAX_PER_PASS]:
+            self._hear_one(path, folder=folder)
+            heard += 1
+        return heard
+
+    def _hear_one(self, path: Any, *, folder: Optional[Any] = None) -> None:
+        # Advanced per recording for `_ingest_one`'s reason: the second
+        # recording of a pass must see what the first one filed.
+        self._learned.advance(self._queue.store)
+        head = self._queue.head()
+        store = blobs.BlobStore.open(self._queue.store.root)
+
+        try:
+            audio = store.put(path)
+        except Exception:  # noqa: BLE001
+            # No receipt, and this is the one place that is forced rather than
+            # chosen: the digest *is* the identity, so a failure to store the
+            # bytes leaves nothing to write a receipt about.
+            return
+
+        receipt: dict[str, Any] = {
+            "recording": audio.digest,
+            "source": "folder",
+            "title": path.name,
+            "mime": audio.mime,
+            "bytes": audio.bytes,
+        }
+        if audio.digest in self._learned.heard:
+            # Already heard. No second receipt — the cursor is the answer, and
+            # putting the bytes again was free because the store is content
+            # addressed. Filed away so the queue stops offering it.
+            listen.file_away(path, folder=folder)
+            return
+
+        try:
+            said = listen.transcribe(path)
+        except Exception as exc:  # noqa: BLE001
+            # About this recording, so it earns a receipt: the environment was
+            # checked once before the pass, which is what makes this failure
+            # attributable to the file rather than to the machine.
+            reason = str(exc) or type(exc).__name__
+            self._queue.append(episodes.audio_captured(**receipt, reason=reason))
+            listen.file_away(path, folder=folder)
+            return
+        receipt["duration"] = said.duration
+        receipt["transcript"] = self._put_text(store, said.text, ".txt")
+
+        try:
+            read = listen.review(said.text, complete=self._completer(), title=path.name)
+        except Exception as exc:  # noqa: BLE001
+            # A partial, and the payload is built to say so: the transcript
+            # digest stays on the receipt alongside the reason, so the work
+            # that did land is not reported as lost.
+            reason = str(exc) or type(exc).__name__
+            self._queue.append(episodes.audio_captured(**receipt, reason=reason))
+            listen.file_away(path, folder=folder)
+            return
+        rendered = read.render(title=path.name)
+        if rendered:
+            receipt["review"] = self._put_text(store, rendered, ".md")
+
+        try:
+            found = learn.reflect(
+                self._completer(),
+                transcript=said.text[: listen.MAX_REVIEW_CHARS],
+                known=self._learned.claims(),
+                observing=learn.ROOM,
+            )
+            filed = learn.file_claims(
+                self._queue,
+                found.claims,
+                # As in `_ingest_one`: there is no turn, so the head at the
+                # moment the recording was heard is the honest cause.
+                for_seq=head,
+                source_seq=head,
+                explicit=False,
+            )
+            learn.file_moments(
+                self._queue, found.moments, for_seq=head, source_seq=head
+            )
+        except Exception as exc:  # noqa: BLE001
+            reason = str(exc) or type(exc).__name__
+            self._queue.append(episodes.audio_captured(**receipt, reason=reason))
+            listen.file_away(path, folder=folder)
+            return
+
+        self._queue.append(episodes.audio_captured(**receipt, filed=len(filed)))
+        listen.file_away(path, folder=folder)
+
+    @staticmethod
+    def _put_text(store: "blobs.BlobStore", text: str, suffix: str) -> str:
+        """Store derived text as a blob and return its digest.
+
+        Through a temp file because :meth:`BlobStore.put` takes a path: the
+        store hashes a stream it opened itself, which is what lets it count
+        ``bytes`` off the content rather than trusting a ``stat()``. Writing the
+        text out to be read back is the price of not giving it a second entry
+        point that could disagree.
+        """
+        with tempfile.TemporaryDirectory(prefix="omega-heard-") as tmp:
+            scratch = Path(tmp) / f"text{suffix}"
+            scratch.write_text(text, encoding="utf-8")
+            return store.put(scratch).digest
 
     def digest_usage(
         self, *, path: Optional[Any] = None, now: Optional[Any] = None

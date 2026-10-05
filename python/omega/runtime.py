@@ -261,6 +261,13 @@ class Runtime:
         # broad system permission look like something the code assumed it had.
         # Granted in `__main__` or not at all.
         usage_path: Optional[PathLike] = None,
+        # Where recordings are dropped for omega to hear (DL-066). ``None`` for
+        # `transcripts_root`'s reason — a default here would make reading the
+        # person's iCloud Drive the default behaviour of the test suite — and
+        # spelled as a path rather than a bool because, unlike the channel, the
+        # thing being configured is *which folder*, and there is no honest
+        # default for that. `__main__` supplies `listen.DEFAULT_FOLDER`.
+        recordings: Optional[PathLike] = None,
         # On by default because DL-035's whole point is that omega acts on time
         # without being asked, and a proactivity that has to be switched on is
         # one that is off in every deployment nobody remembered to configure.
@@ -286,6 +293,7 @@ class Runtime:
             None if transcripts_root is None else Path(os.fspath(transcripts_root))
         )
         self._usage = None if usage_path is None else Path(os.fspath(usage_path))
+        self._recordings = None if recordings is None else Path(os.fspath(recordings))
         self._clock = clock
         self._host = host
         self._port = port
@@ -639,6 +647,12 @@ class Runtime:
             executor.ingest(root=self._transcripts)
         if self._usage is not None:
             executor.digest_usage(path=self._usage)
+        if self._recordings is not None:
+            # Last of the three writing passes, because it is by far the
+            # longest: a recording is transcribed by a subprocess that takes
+            # minutes, and the two cheap senses above should not sit behind it
+            # waiting for a meeting to finish being heard.
+            executor.hear(folder=str(self._recordings))
         # Last, and unconditional. Last because the three passes above *write
         # memory* and this one *reads* it to decide whether to speak — running it
         # first would have it judge a moment it had not yet finished perceiving.

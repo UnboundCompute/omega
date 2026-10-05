@@ -73,6 +73,7 @@ __all__ = [
     "CONVERSATION",
     "WORK",
     "DAY",
+    "ROOM",
     "teaching_note",
     "extract",
     "reflect",
@@ -221,6 +222,34 @@ DAY = Lens(
     # from inventing one.
     moments=True,
 )
+
+#: Reflecting over a transcript of something omega listened to (DL-066).
+#:
+#: **The first lens whose material contains other people.** The other three
+#: read omega's own conversation, a record of the person working alone, and a
+#: table of their app usage — every sentence in all three is either theirs or
+#: omega's. A meeting is not: most of the words in it belong to somebody else,
+#: and the obvious failure is a confident claim about the person built from a
+#: sentence their colleague said. The opening therefore spends most of its
+#: length on that one distinction, and names the transcript as a machine
+#: transcript so a garbled proper noun is not read as a fact.
+ROOM = Lens(
+    opening=(
+        "You are reviewing a machine transcript of something this person",
+        "recorded - usually a meeting. Other people are speaking in it and you",
+        "cannot reliably tell who said what, so only keep something when it is",
+        "clearly true of this person rather than of somebody else in the room.",
+        "The transcript has transcription errors and names in it are the least",
+        "reliable part, so do not build anything on a name.",
+    ),
+    label="The recording",
+    # On, for the WORK lens's reason and more sharply. The transcript is kept
+    # as a blob beside the log rather than in it, so `recall` cannot find it:
+    # what the person said they were in the middle of is, as far as memory is
+    # concerned, gone the moment the pass ends.
+    moments=True,
+)
+
 
 #: A schedule's instruction is the whole text of a future turn, so it has room
 #: to be a sentence rather than a phrase — but not room to be a document that

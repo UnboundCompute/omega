@@ -303,6 +303,14 @@ def test_every_m1_kind_is_accounted_for() -> None:
         episodes.USAGE_DIGESTED: episodes.usage_digested(
             day="2026-09-23", source="knowledgec", filed=0, at=AT
         ),
+        episodes.AUDIO_CAPTURED: episodes.audio_captured(
+            recording="sha256:" + "a" * 64,
+            source="icloud",
+            title="standup.m4a",
+            mime="audio/mp4",
+            bytes=380898,
+            at=AT,
+        ),
     }
     assert set(made) == set(episodes.KINDS)
     for kind, payload in made.items():
