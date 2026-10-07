@@ -36,7 +36,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Iterable, Optional
 
-from . import episodes
+from . import episodes, notice
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from .memory import MemoryStore
@@ -90,13 +90,31 @@ class OpenWork:
     exactly one turn and a turn blocks at most once — ``turn.blocked`` is
     terminal. An answer that itself blocks opens a *new* obligation under the
     answer's own seq, which is correct: that is a different question.
+
+    **A later turn in the same lane also discharges it (DL-071).** The tray
+    sends whatever is typed next as the answer, but it holds that link in
+    memory only, so after an app restart or a new chat the next message names
+    nothing and the question it moved past stays open for good: the df/du
+    go-request, asked again and done in a fresh message, was still listed as
+    "waiting on them" in every look hours later. So once a person's later
+    message has had its turn finish, completed or blocked, every earlier block
+    from that same channel is settled; a schedule's later fire settles that
+    schedule's earlier ones. The answering turn itself still sees the block,
+    because the turn's terminal record is what discharges and not the inbound.
+    Omega's own looks (``self``) are no lane: what it asked unprompted
+    survives until someone answers, which is DL-035's promise.
     """
 
-    __slots__ = ("_blocks", "_through")
+    __slots__ = ("_blocks", "_through", "_lane_of", "_block_lane")
 
     def __init__(self) -> None:
         self._blocks: dict[int, OpenBlock] = {}
         self._through = 0
+        # Inbound seq -> lane, held only until that inbound's turn ends, so it
+        # is bounded by what is in flight rather than by the log.
+        self._lane_of: dict[int, str] = {}
+        # Open block's for_seq -> the lane it was raised in.
+        self._block_lane: dict[int, str] = {}
 
     @property
     def through(self) -> int:
@@ -125,19 +143,42 @@ class OpenWork:
         kind = payload.get("kind")
         if kind == episodes.TURN_BLOCKED:
             for_seq = int(payload["for_seq"])
+            lane = self._lane_of.pop(for_seq, None)
+            self._settle(lane, before=for_seq)
             self._blocks[for_seq] = OpenBlock(
                 seq=seq,
                 for_seq=for_seq,
                 needs=str(payload.get("needs", "")),
                 at=str(payload.get("at", "")),
             )
-        elif kind == episodes.MESSAGE_INBOUND and "resumes_seq" in payload:
-            # ``pop`` with a default: an answer naming something that was never
-            # blocked is not an error here. It can arrive legitimately after a
-            # restart, and a derived view is not the place to adjudicate the
-            # channel's input.
-            self._blocks.pop(int(payload["resumes_seq"]), None)
+            if lane is not None:
+                self._block_lane[for_seq] = lane
+        elif kind == episodes.TURN_COMPLETED:
+            for_seq = int(payload["for_seq"])
+            self._settle(self._lane_of.pop(for_seq, None), before=for_seq)
+        elif kind == episodes.MESSAGE_INBOUND:
+            lane = _lane(payload)
+            if lane is not None:
+                self._lane_of[seq] = lane
+            if "resumes_seq" in payload:
+                # ``pop`` with a default: an answer naming something that was
+                # never blocked is not an error here. It can arrive
+                # legitimately after a restart, and a derived view is not the
+                # place to adjudicate the channel's input.
+                resumed = int(payload["resumes_seq"])
+                self._blocks.pop(resumed, None)
+                self._block_lane.pop(resumed, None)
         self._through = seq
+
+    def _settle(self, lane: Optional[str], *, before: int) -> None:
+        """Discharge every block in ``lane`` raised for an event before ``before``."""
+        if lane is None:
+            return
+        for for_seq in [
+            f for f, held in self._block_lane.items() if held == lane and f < before
+        ]:
+            self._blocks.pop(for_seq, None)
+            del self._block_lane[for_seq]
 
     def blocks(self) -> list[OpenBlock]:
         """Every open obligation, oldest first.
@@ -199,6 +240,22 @@ class OpenWork:
 
 
 # --- what omega has been taught (DL-042) -------------------------------------
+
+
+def _lane(payload: dict[str, Any]) -> Optional[str]:
+    """Which conversation an inbound belongs to, for :class:`OpenWork`.
+
+    A person's channel is one lane; each schedule is its own lane, since a
+    later fire of one watch says nothing about another; omega's own look is
+    none (see :class:`OpenWork`).
+    """
+    channel = payload.get("channel")
+    if not isinstance(channel, str) or channel == notice.CHANNEL:
+        return None
+    if channel == "schedule":
+        sid = payload.get("schedule_id")
+        return f"schedule:{sid}" if isinstance(sid, str) and sid else None
+    return f"channel:{channel}"
 
 
 def local_hour(at: str) -> Optional[int]:

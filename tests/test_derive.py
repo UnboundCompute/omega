@@ -430,10 +430,15 @@ def test_a_block_reaches_the_prompt_after_it_has_aged_out_of_recall(store):
 
 
 def test_the_open_section_is_bounded_and_says_what_it_dropped(store):
-    """A count is not a budget (DL-039) — including for this section."""
+    """A count is not a budget (DL-039) — including for this section.
+
+    Raised by omega's own looks, because that is how forty questions pile up:
+    nobody was there to answer them, and since DL-071 a person's later turn
+    settles what they themselves moved past.
+    """
     q = EventQueue(store)
     for i in range(40):
-        event = q.append(_typed(f"thing {i}"))
+        event = q.append(episodes.inbound(f"thing {i}", channel="self"))
         q.append(_blocked(for_seq=event, needs=f"question {i}: " + "x" * 400))
     q.append(_typed("and now this"))
 
@@ -799,3 +804,118 @@ def test_the_learned_section_is_bounded_and_drops_inferred_before_told(store):
     assert len(section) <= turn.MAX_LEARNED_CHARS + 400, "the section is not bounded"
     assert "not shown here" in section, "a silent drop is the bug, not the fix"
     assert "TOLD: the one that must survive" in section
+
+
+# --- moving on settles it (DL-071) ---------------------------------------
+
+
+def _done(*, for_seq: int):
+    return episodes.completed(for_seq=for_seq, outcome="spoke", reply="done")
+
+
+def _fire(sid: str, text: str = "check the news"):
+    return episodes.inbound(text, channel="schedule", schedule_id=sid)
+
+
+def _look(text: str = "nobody asked"):
+    return episodes.inbound(text, channel="self")
+
+
+def test_a_later_turn_on_the_same_channel_settles_an_unnamed_block():
+    """The live case: asked again after a restart, done, and still 'waiting'.
+
+    The tray forgets its pending resume when it restarts, so the next message
+    names nothing. Once that message's turn finishes, the question it moved
+    past is settled.
+    """
+    view = derive.OpenWork.fold(
+        [
+            (1, _typed("audit the disk")),
+            (2, _blocked(for_seq=1, needs="may I run df?")),
+            (3, _typed("audit the disk")),
+            (4, _done(for_seq=3)),
+        ]
+    )
+    assert view.blocks() == []
+
+
+def test_the_turn_answering_a_block_still_sees_it():
+    """The inbound does not discharge; its turn's end does."""
+    view = derive.OpenWork.fold(
+        [
+            (1, _typed("audit the disk")),
+            (2, _blocked(for_seq=1, needs="may I run df?")),
+            (3, _typed("it is approved, go ahead")),
+        ]
+    )
+    assert [b.needs for b in view.blocks()] == ["may I run df?"]
+
+
+def test_a_later_message_that_blocks_replaces_the_earlier_question():
+    view = derive.OpenWork.fold(
+        [
+            (1, _typed("fetch a")),
+            (2, _blocked(for_seq=1, needs="first")),
+            (3, _typed("fetch b")),
+            (4, _blocked(for_seq=3, needs="second")),
+        ]
+    )
+    assert [b.needs for b in view.blocks()] == ["second"]
+
+
+def test_another_channel_does_not_settle_it():
+    view = derive.OpenWork.fold(
+        [
+            (1, _typed("audit the disk")),
+            (2, _blocked(for_seq=1)),
+            (3, episodes.inbound("hi", channel="cli")),
+            (4, _done(for_seq=3)),
+        ]
+    )
+    assert len(view) == 1
+
+
+def test_a_schedule_settles_only_its_own_earlier_fires():
+    view = derive.OpenWork.fold(
+        [
+            (1, _fire("w1")),
+            (2, _blocked(for_seq=1, needs="w1 asks")),
+            (3, _fire("w2")),
+            (4, _blocked(for_seq=3, needs="w2 asks")),
+            (5, _fire("w1")),
+            (6, _done(for_seq=5)),
+        ]
+    )
+    assert [b.needs for b in view.blocks()] == ["w2 asks"]
+
+
+def test_a_person_does_not_settle_what_the_clock_asked():
+    """Nobody saw a schedule's question; typing about something else is not an answer."""
+    view = derive.OpenWork.fold(
+        [
+            (1, _fire("w1")),
+            (2, _blocked(for_seq=1)),
+            (3, _typed("hello")),
+            (4, _done(for_seq=3)),
+        ]
+    )
+    assert len(view) == 1
+
+
+def test_what_omega_asked_unprompted_survives_until_answered():
+    """DL-035: a look's question waits for someone to look, not for the next look."""
+    view = derive.OpenWork.fold(
+        [
+            (1, _look()),
+            (2, _blocked(for_seq=1, needs="may I tidy caches?")),
+            (3, _look()),
+            (4, _done(for_seq=3)),
+            (5, _typed("hello")),
+            (6, _done(for_seq=5)),
+        ]
+    )
+    assert [b.needs for b in view.blocks()] == ["may I tidy caches?"]
+    answered = derive.OpenWork.fold(
+        [(1, _look()), (2, _blocked(for_seq=1)), (3, _answer(resumes_seq=1))]
+    )
+    assert answered.blocks() == []
