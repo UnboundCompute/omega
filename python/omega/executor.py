@@ -47,6 +47,7 @@ from omega.memory import WriteKeyConflict
 from omega.queue import EVENT_KINDS, EventQueue, Pending
 from omega.schedule import Schedule, Scheduler
 from omega.turn import (
+    NOT_RECALLED,
     ActResult,
     TurnContext,
     TurnResult,
@@ -511,7 +512,10 @@ class Executor:
             return False
 
         head = self._queue.head()
-        window = self._queue.recent(REFLECT_WINDOW)
+        # Reports skipped for recall's reason (DL-072), and because their
+        # digests are already learned from by `work_reports` under their own
+        # lens; reflecting on them again here would file the same habit twice.
+        window = self._queue.recent(REFLECT_WINDOW, skipping=NOT_RECALLED)
         known = self._learned.claims()
         # Metered per pass, and the receipt says what it spent (DL-070).
         meter = provider.Meter(self._completer())

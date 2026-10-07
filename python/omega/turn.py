@@ -42,6 +42,7 @@ __all__ = [
     "STAY_SILENT",
     "VERDICTS",
     "RECALL_N",
+    "NOT_RECALLED",
     "MAX_EVENT_CHARS",
     "MAX_NEW_EVENT_CHARS",
     "MAX_RECALL_CHARS",
@@ -75,6 +76,12 @@ VERDICTS = frozenset({SPEAK, ACT_THEN_SPEAK, STAY_SILENT})
 #: recovered for a quality that can. **N is a labelled guess**, tuned in M3
 #: against the corpus M1 is here to start.
 RECALL_N = 40
+
+#: Kinds that never take a recall slot. A sense report is what the Mac read, not
+#: something said (DL-072); presence alone arrives every five minutes while the
+#: person works, so counting reports would push the conversation out of
+#: ``RECALL_N`` within hours. What the reports taught arrives as claims instead.
+NOT_RECALLED = frozenset({episodes.SENSE_REPORTED})
 
 #: **A count is not a budget** (DL-039). ``RECALL_N`` bounds how many episodes
 #: come back, which was mistaken for bounding how much *context* they cost.
@@ -320,7 +327,7 @@ def recall(queue: EventQueue, *, before: int, n: int = RECALL_N) -> list[Pending
     what's open". *What's open* is derived and lands in M2. This is the
     recent-N half, and it does not pretend otherwise.
     """
-    return queue.recent(n, before=before)
+    return queue.recent(n, before=before, skipping=NOT_RECALLED)
 
 
 def judge(ctx: TurnContext) -> Verdict:

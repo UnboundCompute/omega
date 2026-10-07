@@ -623,3 +623,62 @@ def test_presence_is_sent_on_a_flip_and_every_five_minutes_while_active() -> Non
 def test_hid_idle_time_parses_from_nanoseconds() -> None:
     assert machine.parse_idle('  |   "HIDIdleTime" = 2500000000\n') == pytest.approx(2.5)
     assert machine.parse_idle("no such key") is None
+
+
+# --- reports never take a recall slot ----------------------------------------
+
+
+def _conversation(q: EventQueue, exchanges: int) -> list[int]:
+    seqs = []
+    for n in range(exchanges):
+        seq = q.append(episodes.inbound(f"message {n}", channel="tray"))
+        seqs.append(seq)
+        seqs.append(q.append(episodes.completed(for_seq=seq, outcome="silent"), episodes.turn_write_key(seq)))
+    return seqs
+
+
+def _presence_reports(q: EventQueue, count: int) -> list[int]:
+    return [
+        _report(q, source="presence", unit=f"mac@{n}", body={"idle": 4.0}, at=AT)
+        for n in range(count)
+    ]
+
+
+def test_fifty_presence_reports_leave_the_conversation_in_recall(q: EventQueue) -> None:
+    from omega.turn import RECALL_N, recall
+
+    said = _conversation(q, RECALL_N // 2)
+    _presence_reports(q, 50)
+
+    recalled = recall(q, before=q.head() + 1)
+    assert [p.seq for p in recalled] == said
+    assert all(p.kind != episodes.SENSE_REPORTED for p in recalled)
+
+
+def test_recall_still_takes_n_when_reports_are_interleaved(q: EventQueue) -> None:
+    from omega.turn import recall
+
+    said = []
+    for n in range(30):
+        said.append(q.append(episodes.inbound(f"message {n}", channel="tray")))
+        _report(q, source="presence", unit=f"mac@{n}", body={"idle": 4.0}, at=AT)
+    assert [p.seq for p in recall(q, before=q.head() + 1, n=10)] == said[-10:]
+
+
+def test_a_log_of_only_reports_recalls_nothing_and_ends(q: EventQueue) -> None:
+    from omega.turn import recall
+
+    _presence_reports(q, 300)
+    assert recall(q, before=q.head() + 1) == []
+
+
+def test_the_reflection_window_skips_reports(store: MemoryStore, q: EventQueue) -> None:
+    fp = _learns()
+    ex = Executor(q, complete=fp.complete)
+    _conversation(q, 20)
+    _presence_reports(q, 50)
+    ex.recover()
+    assert ex.reflect() is True
+    prompt = "\n".join(m["content"] for m in fp.calls_for(provider.LEARN)[0])
+    assert "message 0" in prompt and "message 19" in prompt
+    assert "idle" not in prompt

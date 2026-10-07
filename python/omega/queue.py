@@ -192,16 +192,30 @@ class EventQueue:
             break
         raise LookupError(f"no episode at seq {seq}")
 
-    def recent(self, n: int, *, before: Optional[int] = None) -> list[Pending]:
+    def recent(
+        self,
+        n: int,
+        *,
+        before: Optional[int] = None,
+        skipping: frozenset[str] = frozenset(),
+    ) -> list[Pending]:
         """The last ``n`` episodes, oldest first, optionally strictly before a
         seq. This is what ``recall`` reads (§2.2) — through ``episodes_since``,
         never through the diagnostics hatch.
+
+        ``skipping`` names kinds that neither appear nor count toward ``n``.
+        It exists for sense reports (DL-072): a presence report every five
+        minutes would otherwise push the conversation out of a 40-episode
+        window within a few hours at the Mac. With it empty this is the plain
+        seq-range read it always was.
         """
         if n < 0:
             raise ValueError(f"n must not be negative, got {n}")
         last = self._store.head() if before is None else min(before - 1, self._store.head())
         if n == 0 or last < 1:
             return []
+        if skipping:
+            return self._recent_skipping(n, last, skipping)
         start = max(0, last - n)
         out = []
         for episode in self._store.episodes_since(start):
@@ -209,6 +223,32 @@ class EventQueue:
                 break
             out.append(self._decode(episode))
         return out
+
+    def _recent_skipping(
+        self, n: int, last: int, skipping: frozenset[str]
+    ) -> list[Pending]:
+        """Walk back from ``last`` until ``n`` kept episodes or the log's start.
+
+        The span doubles each round rather than stepping by ``n``: a read goes
+        from its start to the head, so fixed steps over a long run of skipped
+        kinds would cost quadratically, and doubling keeps it to a logarithmic
+        number of reads. It always ends — the span reaches seq 1 at the latest,
+        so a log of nothing but skipped kinds returns ``[]`` after reading
+        each episode a bounded number of times.
+        """
+        span = n
+        while True:
+            start = max(0, last - span)
+            kept = []
+            for episode in self._store.episodes_since(start):
+                if episode.seq > last:
+                    break
+                pending = self._decode(episode)
+                if pending.kind not in skipping:
+                    kept.append(pending)
+            if len(kept) >= n or start == 0:
+                return kept[-n:]
+            span *= 2
 
     def head(self) -> int:
         return self._store.head()
