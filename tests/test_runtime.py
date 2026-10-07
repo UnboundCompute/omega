@@ -1074,6 +1074,27 @@ def test_the_drain_reaches_the_unprompted_pass_too(store_dir: Path) -> None:
     # The look is an ordinary inbound, so the ordinary machinery has to have
     # finished it. A pass that raises events the drain then leaves sitting is a
     # queue that grows, not a second wake condition.
+    #
+    # With `nudge=0` there is no gap, so the pass can raise one more look in
+    # the instant between the wait above and the stop — and a stop is between
+    # turns, so that look is left *pending*, not interrupted. That is correct
+    # (the log is the queue), so the claim is checked where it is true: a
+    # restart drains whatever the last stop left, and then nothing is left.
+    with runtime_at(store_dir, _reads_transcripts(), sense=0.0) as rt:
+        assert until(
+            lambda: not [
+                p.seq
+                for p in _every_episode_of(rt)
+                if p.payload["kind"] == episodes.MESSAGE_INBOUND
+                and p.payload["channel"] == notice.CHANNEL
+                and not any(
+                    q.payload.get("for_seq") == p.seq
+                    and episodes.is_terminal(q.payload)
+                    for q in _every_episode_of(rt)
+                )
+            ]
+        ), "a restart did not finish the looks the last stop left pending"
+
     for_seqs = {
         p.payload["for_seq"]
         for p in _every_episode(store_dir)
@@ -1143,39 +1164,52 @@ def test_a_nudge_reaches_the_wire_and_the_look_behind_it_does_not(
     assert replies == ["you left it dirty"], wire
 
 
-def test_the_unprompted_pass_speaks_at_most_once_a_day(store_dir: Path) -> None:
-    """The violation metric paired with the capability above (DL-061).
+def test_a_conversation_in_progress_is_never_interrupted_by_a_look(
+    store_dir: Path,
+) -> None:
+    """The violation metric paired with the capability above (DL-068).
 
-    A judge scripted to speak every time is exactly the firehose the day limit
-    exists to stop, and it is the honest test of it: with the limit in code the
-    log carries one spoken look however long the runtime idles, and the run that
-    proves the pass is reachable would otherwise prove it is unbounded.
+    DL-061 paired it with a day cap; DL-068 lifted the cap, so this guards what
+    replaced it in code: the look gap runs against the last thing *heard*, so a
+    person mid-conversation — the one moment a nudge is certain to be unwelcome
+    — is never interrupted. Novelty, the other half of DL-068's guard, is a
+    prompt and is the judge's to honour, not something a scripted fake can
+    test. The judge here is scripted to speak every time, so a gap that failed
+    would show up as spoken looks, not hide as silent ones.
     """
-    with runtime_at(store_dir, _reads_transcripts(), sense=0.0, nudge=0) as rt:
-        rt.say("morning")
+    with runtime_at(store_dir, _reads_transcripts("interrupting"), sense=0.0) as rt:
+        for _ in range(5):
+            rt.say("still here")
+        # Not vacuous: every turn has to have finished, so the drain ran its
+        # unprompted pass after each one and chose not to look.
         assert until(
+            lambda: sum(
+                1
+                for p in _every_episode_of(rt)
+                if p.payload["kind"] == episodes.TURN_COMPLETED
+            )
+            >= 5
+        ), "the turns never finished, so the pass was never asked"
+        # The look is raised on the drain's idle sweep, *after* the last turn,
+        # so stopping the moment the turns finish would pass with no gap at
+        # all. Hold the runtime open well past the time a gapless look takes
+        # to appear (the capability case above sees one in milliseconds).
+        assert not until(
             lambda: any(
                 p.payload["kind"] == episodes.MESSAGE_INBOUND
                 and p.payload["channel"] == notice.CHANNEL
                 for p in _every_episode_of(rt)
-            )
-        ), "the drain never reached the unprompted pass"
-        for _ in range(4):
-            rt.say("still here")
+            ),
+            timeout=1.0,
+        ), "a look was raised while the conversation was still going"
 
-    spoken = [
-        p.payload
+    looks = [
+        p.seq
         for p in _every_episode(store_dir)
-        if p.payload["kind"] == episodes.TURN_COMPLETED
-        and p.payload["outcome"] == "spoke"
-        and p.payload["for_seq"] in {
-            q.seq
-            for q in _every_episode(store_dir)
-            if q.payload["kind"] == episodes.MESSAGE_INBOUND
-            and q.payload["channel"] == notice.CHANNEL
-        }
+        if p.payload["kind"] == episodes.MESSAGE_INBOUND
+        and p.payload["channel"] == notice.CHANNEL
     ]
-    assert len(spoken) <= 1, f"{len(spoken)} unprompted nudges in one day"
+    assert looks == [], f"{len(looks)} looks raised mid-conversation"
 
 
 def _every_episode_of(rt: Runtime):
