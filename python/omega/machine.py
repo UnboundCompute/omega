@@ -24,8 +24,9 @@ import re
 import shutil
 import socket
 import subprocess
-from dataclasses import dataclass
-from typing import Callable, Optional
+from dataclasses import asdict, dataclass, fields
+from datetime import datetime, timezone
+from typing import Any, Callable, Optional
 
 __all__ = [
     "Reading",
@@ -36,6 +37,20 @@ __all__ = [
     "parse_battery",
     "describe",
     "online",
+    "STALE_SECONDS",
+    "HEARTBEAT_SECONDS",
+    "BATTERY_STEP",
+    "AWAY_SECONDS",
+    "PRESENCE_EVERY_SECONDS",
+    "PRESENCE_STALE_SECONDS",
+    "as_body",
+    "from_body",
+    "changed",
+    "reported_lines",
+    "parse_idle",
+    "idle_seconds",
+    "is_away",
+    "at_the_mac",
 ]
 
 #: Below either of these the disk is called low. Both, because a fraction alone
@@ -176,3 +191,194 @@ def online(host: str = "api.openai.com", port: int = 443, timeout: float = 2.0) 
             return True
     except OSError:
         return False
+
+
+# --- readings that travel (DL-072, DL-073 §3) --------------------------------
+# Once the core left the Mac (DL-069) the reading above described the VM, which
+# is not the machine the person sits at. The Mac's relay now takes the same
+# reading and sends it, and the core shows both. Everything below is about a
+# reading that was taken *somewhere else, some time ago* — which is why each
+# piece of it is about age.
+
+#: Past this a reported reading is not shown as its last value (DL-072). A
+#: heartbeat comes every 30 minutes, so 90 is three missed heartbeats: long
+#: enough that one dropped connection is not "couldn't determine", short enough
+#: that a Mac asleep since lunch is not described as it was at lunch.
+STALE_SECONDS = 90 * 60
+
+#: How often an unchanged reading is resent anyway, so silence from the relay
+#: can be told apart from a machine whose condition simply has not moved.
+HEARTBEAT_SECONDS = 30 * 60
+
+#: A battery that moved this many points since the last report is a change.
+BATTERY_STEP = 10
+
+#: Idle at or past this, the person is away from the Mac (DL-073 §3).
+AWAY_SECONDS = 10 * 60
+
+#: How often a presence report is resent while the person is active. Shorter
+#: than :data:`PRESENCE_STALE_SECONDS` on purpose, so a person working steadily
+#: is never read as "unknown" between two reports.
+PRESENCE_EVERY_SECONDS = 5 * 60
+
+#: Past this a presence report says nothing, and nothing means "not at the Mac".
+PRESENCE_STALE_SECONDS = 10 * 60
+
+
+def as_body(reading: Reading) -> dict[str, Any]:
+    """A reading as the body of a ``report`` — its fields, by their names."""
+    return asdict(reading)
+
+
+def from_body(body: dict[str, Any]) -> Reading:
+    """The reverse, ignoring any field this version does not know."""
+    known = {f.name for f in fields(Reading)}
+    return Reading(**{k: v for k, v in body.items() if k in known})
+
+
+def _disk_low(r: Reading) -> Optional[bool]:
+    if r.disk_free is None or not r.disk_total:
+        return None
+    return r.disk_free < LOW_DISK_BYTES or r.disk_free / r.disk_total < LOW_DISK_FRACTION
+
+
+def _battery_low(r: Reading) -> Optional[bool]:
+    if r.battery_percent is None:
+        return None
+    return (
+        r.battery_percent <= LOW_BATTERY_PERCENT
+        and not r.charging
+        and r.on_battery is not False
+    )
+
+
+def changed(previous: Optional[Reading], current: Reading) -> bool:
+    """Is ``current`` worth sending, given the last one sent? (DL-072)
+
+    A low flag flipping, the battery moving by :data:`BATTERY_STEP`, or the
+    power source changing. Not the disk's exact byte count or the load, which
+    move on every reading and would turn "on change" into "always".
+    """
+    if previous is None:
+        return True
+    if _disk_low(previous) != _disk_low(current):
+        return True
+    if _battery_low(previous) != _battery_low(current):
+        return True
+    if previous.on_battery != current.on_battery:
+        return True
+    if (previous.battery_percent is None) != (current.battery_percent is None):
+        return True
+    if (
+        previous.battery_percent is not None
+        and current.battery_percent is not None
+        and abs(previous.battery_percent - current.battery_percent) >= BATTERY_STEP
+    ):
+        return True
+    return False
+
+
+def _age_seconds(at: str, now: datetime) -> Optional[float]:
+    """Seconds since ``at``, or ``None`` when ``at`` cannot be read as a time.
+
+    A reading stamped in the future (a clock ahead of the core's) counts as
+    fresh rather than as negative age; it is still the newest thing known.
+    """
+    try:
+        stamp = datetime.fromisoformat(at)
+    except (TypeError, ValueError):
+        return None
+    if stamp.tzinfo is None:
+        return None
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    return max(0.0, (now - stamp).total_seconds())
+
+
+def _ago(seconds: float) -> str:
+    minutes = int(seconds // 60)
+    if minutes < 120:
+        return f"{minutes} min ago"
+    return f"{minutes // 60} h ago"
+
+
+def reported_lines(device: str, at: str, body: dict[str, Any], *, now: datetime) -> list[str]:
+    """One reported device's lines for the look, labeled with the device.
+
+    **Fails closed on age** (DL-072). Past :data:`STALE_SECONDS`, or with a
+    stamp that cannot be read, the device renders as "couldn't determine" and
+    never as its last value — a battery at 80% three hours ago is not a battery
+    at 80%, and a look that said so would be a confident sentence about a
+    machine nobody has heard from.
+    """
+    age = _age_seconds(at, now)
+    if age is None:
+        return [f"{device}: couldn't determine (its last reading has no readable time)"]
+    if age > STALE_SECONDS:
+        return [f"{device}: couldn't determine (last reading {_ago(age)}, too old to trust)"]
+    lines = describe(from_body(body))
+    if not lines:
+        return [f"{device}: couldn't determine (its last reading held nothing)"]
+    return [f"{device}: {line}" for line in lines]
+
+
+def parse_idle(text: str) -> Optional[float]:
+    """``ioreg -c IOHIDSystem`` output as seconds since the last input.
+
+    ``HIDIdleTime`` is nanoseconds since the last keyboard, mouse or trackpad
+    event. It is the one number read: no app, no window, no content — the near
+    side of the line DL-061 drew, which DL-073 §3 keeps.
+    """
+    match = re.search(r'"HIDIdleTime"\s*=\s*(\d+)', text)
+    if match is None:
+        return None
+    return int(match.group(1)) / 1e9
+
+
+def idle_seconds() -> Optional[float]:
+    """Seconds since the person last touched this Mac, or ``None`` if unreadable.
+
+    Needs no permission prompt. ``None`` sends nothing, and nothing goes stale,
+    and stale reads as "not at the Mac" — so a failure here routes toward the
+    phone, which is the direction DL-073 chose for unknown.
+    """
+    try:
+        out = subprocess.run(
+            ["ioreg", "-c", "IOHIDSystem", "-d", "4"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return parse_idle(out)
+
+
+def is_away(idle: float) -> bool:
+    return idle >= AWAY_SECONDS
+
+
+def at_the_mac(presence: Optional[Any], *, now: datetime) -> bool:
+    """Is the person at the Mac right now? (DL-073 §3)
+
+    ``presence`` is the latest presence report — anything with ``at`` and
+    ``body`` (:class:`omega.derive.Reported`) — or ``None`` if none ever came.
+    True **only** when that report is under :data:`PRESENCE_STALE_SECONDS` old
+    *and* says idle under :data:`AWAY_SECONDS`. Missing, stale, unreadable or
+    away are all ``False``.
+
+    **It fails toward the phone.** Every way of not knowing answers "not at the
+    Mac", because the cost of being wrong is lopsided: a message sent to the
+    phone while the person was at the Mac buzzes twice, and one held for a Mac
+    nobody is sitting at is never seen.
+    """
+    if presence is None:
+        return False
+    age = _age_seconds(getattr(presence, "at", None), now)
+    if age is None or age >= PRESENCE_STALE_SECONDS:
+        return False
+    body = getattr(presence, "body", None)
+    idle = body.get("idle") if isinstance(body, dict) else None
+    if isinstance(idle, bool) or not isinstance(idle, (int, float)) or idle < 0:
+        return False
+    return not is_away(idle)

@@ -112,6 +112,14 @@ def test_every_kind_round_trips():
             filed=3,
             at="2026-09-23T10:00:00+00:00",
         ),
+        ep.sense_reported(
+            source="transcript",
+            unit="63815d72-59e0-4cf4-a771-e7e561b4bef8",
+            device="mac",
+            body="user: fix the retry\nassistant: done",
+            meta={"source": "claude-code", "project": "-Users-me-project"},
+            at="2026-09-23T10:00:00+00:00",
+        ),
     ]
     assert {p["kind"] for p in built} == ep.KINDS, "a kind has no round-trip test"
     for payload in built:

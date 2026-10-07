@@ -45,6 +45,16 @@ __all__ = [
     "TRANSCRIPT_INGESTED",
     "USAGE_DIGESTED",
     "AUDIO_CAPTURED",
+    "SENSE_REPORTED",
+    "REPORT_TRANSCRIPT",
+    "REPORT_USAGE",
+    "REPORT_RECORDING",
+    "REPORT_MACHINE",
+    "REPORT_PRESENCE",
+    "REPORT_MACHINE_FIELDS",
+    "REPORT_SOURCES",
+    "LEARNING_SOURCES",
+    "MAX_REPORT_CHARS",
     "MIN_EVERY_SECONDS",
     "TRIGGER_FIELDS",
     "BadPayload",
@@ -68,6 +78,8 @@ __all__ = [
     "transcript_ingested",
     "usage_digested",
     "audio_captured",
+    "sense_reported",
+    "report_write_key",
     "now",
 ]
 
@@ -97,6 +109,34 @@ REFLECTION_DONE = "reflection.done"
 TRANSCRIPT_INGESTED = "transcript.ingested"
 USAGE_DIGESTED = "usage.digested"
 AUDIO_CAPTURED = "audio.captured"
+#: What a sense relay on another machine read and digested (DL-072). The core's
+#: senses read paths that exist only on the Mac, so once the core left it
+#: (DL-069) they found nothing; the Mac now does the mechanical half and sends
+#: the result, and this is the record of it arriving.
+SENSE_REPORTED = "sense.reported"
+
+#: The senses a relay may report for, by the name of the sense rather than of
+#: the file it read. Three of them end in a learning receipt; the machine sense
+#: ends in nothing, because a reading is a condition to show the look and not a
+#: thing to learn from.
+REPORT_TRANSCRIPT = "transcript"
+REPORT_USAGE = "usage"
+REPORT_RECORDING = "recording"
+REPORT_MACHINE = "machine"
+#: Seconds since the person last touched the Mac (DL-073 §3). A reading, like
+#: the machine one: it ends in no receipt and is only ever asked "is it fresh,
+#: and what does it say".
+REPORT_PRESENCE = "presence"
+REPORT_SOURCES = frozenset(
+    {REPORT_TRANSCRIPT, REPORT_USAGE, REPORT_RECORDING, REPORT_MACHINE, REPORT_PRESENCE}
+)
+LEARNING_SOURCES = frozenset({REPORT_TRANSCRIPT, REPORT_USAGE, REPORT_RECORDING})
+
+#: The longest digest a report may carry. Above the largest of the three caps
+#: (48k for a heard transcript, DL-066) with room for the truncation marker the
+#: digests append, and well under the channel's one-mebibyte line. A sender is
+#: any device on the tailnet, so this is checked rather than trusted.
+MAX_REPORT_CHARS = 64_000
 
 #: The complete M1 kind set (§2.1: "and that is all of them").
 #:
@@ -123,6 +163,7 @@ KINDS = frozenset(
         TRANSCRIPT_INGESTED,
         USAGE_DIGESTED,
         AUDIO_CAPTURED,
+        SENSE_REPORTED,
     }
 )
 
@@ -311,6 +352,21 @@ def turn_write_key(for_seq: int) -> str:
     if not isinstance(for_seq, int) or isinstance(for_seq, bool) or for_seq < 1:
         raise BadPayload(f"for_seq must be a positive int, got {for_seq!r}")
     return f"turn:{for_seq}"
+
+
+def report_write_key(source: str, unit: str) -> str:
+    """The write key a :data:`SENSE_REPORTED` record carries (DL-072).
+
+    Lives here for the reason :func:`turn_write_key` does. Keyed on the sense
+    and the unit it read — never on when it was sent — so a relay that resends
+    after a lost ack lands on the log's own duplicate path instead of writing
+    the same session twice.
+    """
+    if source not in REPORT_SOURCES:
+        raise BadPayload(f"report source {source!r} not in {sorted(REPORT_SOURCES)}")
+    if not isinstance(unit, str) or not unit:
+        raise BadPayload("report unit must be a non-empty string")
+    return f"report:{source}:{unit}"
 
 
 # --- constructors -----------------------------------------------------------
@@ -946,6 +1002,141 @@ def audio_captured(
     return payload
 
 
+def sense_reported(
+    *,
+    source: str,
+    unit: str,
+    device: str,
+    body: Any,
+    meta: Optional[dict[str, Any]] = None,
+    reason: Optional[str] = None,
+    at: Optional[str] = None,
+) -> dict[str, Any]:
+    """A relay on another machine read one unit and sent its digest (DL-072).
+
+    **Arrival, not learning.** This records that the Mac sent something; the
+    learning receipt (``transcript.ingested``, ``usage.digested``,
+    ``audio.captured``) is still written by the core when it works the report,
+    so ``Learned.ingested/digested/heard`` stay one cursor whatever machine did
+    the reading. A report without its receipt is exactly "not worked yet".
+
+    ``source`` names the sense and ``unit`` the thing it read in that sense's
+    own identity — a session id, an ISO day, the digest of a recording's audio,
+    or ``<device>@<time>`` for a reading. ``device`` says which machine, so the
+    look can label two machines' conditions instead of merging them.
+
+    ``body`` is the *digest*, not the raw material: the same capped text the
+    local sense would have handed the model (a string), or for a reading the
+    reading itself (an object). ``meta`` carries the receipt's remaining
+    identity fields verbatim — ``source``/``project`` for a session, ``source``
+    for a day, ``source``/``title``/``mime``/``bytes``/``duration`` for a
+    recording — because the core cannot recover them without the file.
+    ``reason`` says the Mac could not digest the unit; the core then writes a
+    failed receipt rather than guessing.
+
+    **Never an event.** It wakes no turn and is not ``message.inbound``: a
+    relay is a sense, and a sense that could start a conversation would be a
+    second, unattended way to talk to omega.
+    """
+    payload: dict[str, Any] = {
+        "v": VERSION,
+        "kind": SENSE_REPORTED,
+        "source": source,
+        "unit": unit,
+        "device": device,
+        "body": dict(body) if isinstance(body, dict) else body,
+        "meta": dict(meta) if isinstance(meta, dict) else meta,
+        "reason": reason,
+        "at": at or now(),
+    }
+    _validate(payload)
+    return payload
+
+
+#: The fields a learning report's ``meta`` must carry — the receipt's identity
+#: fields other than the unit, which the core copies across unchanged.
+_REPORT_META: dict[str, tuple[str, ...]] = {
+    REPORT_TRANSCRIPT: ("source", "project"),
+    REPORT_USAGE: ("source",),
+    REPORT_RECORDING: ("source", "title", "mime", "bytes", "duration"),
+}
+
+#: A machine reading's fields, as :class:`omega.machine.Reading` names them.
+#: Each may be null — a desktop has no battery, and a failed read is unknown,
+#: not zero.
+REPORT_MACHINE_FIELDS = (
+    "disk_free",
+    "disk_total",
+    "battery_percent",
+    "charging",
+    "on_battery",
+    "load",
+    "cpus",
+)
+
+
+def _validate_report(payload: dict[str, Any]) -> None:
+    source = payload["source"]
+    if source not in REPORT_SOURCES:
+        raise BadPayload(f"report source {source!r} not in {sorted(REPORT_SOURCES)}")
+    _require_str(payload, "unit", non_empty=True)
+    _require_str(payload, "device", non_empty=True)
+    reason = payload["reason"]
+    if reason is not None and not (isinstance(reason, str) and reason.strip()):
+        raise BadPayload("reason must be null or a non-empty string")
+    body = payload["body"]
+    meta = payload["meta"]
+    if source in LEARNING_SOURCES:
+        if not isinstance(body, str):
+            raise BadPayload(f"a {source} report's body must be its digest text")
+        if len(body) > MAX_REPORT_CHARS:
+            raise BadPayload(f"report body is over {MAX_REPORT_CHARS} characters")
+        if reason is not None and body:
+            # Same all-or-nothing rule as the receipts: a report that both
+            # failed and carried a digest leaves the core to guess which.
+            raise BadPayload("a failed report cannot also carry a digest")
+        if not isinstance(meta, dict):
+            raise BadPayload(f"a {source} report needs meta")
+        missing = [f for f in _REPORT_META[source] if f not in meta]
+        if missing:
+            raise BadPayload(f"{source} report meta is missing {missing}")
+        extra = sorted(set(meta) - set(_REPORT_META[source]))
+        if extra:
+            raise BadPayload(f"{source} report meta has unknown fields {extra}")
+        # The receipt the core writes from this report must itself be valid, so
+        # check it now: a report the channel accepted but the core can never
+        # turn into a receipt would sit unworked in the log forever.
+        if source == REPORT_TRANSCRIPT:
+            transcript_ingested(session=payload["unit"], at="x", **meta)
+        elif source == REPORT_USAGE:
+            usage_digested(day=payload["unit"], at="x", **meta)
+        else:
+            audio_captured(recording=payload["unit"], at="x", **meta)
+    else:
+        if meta is not None:
+            raise BadPayload(f"a {source} report carries no meta")
+        if not isinstance(body, dict):
+            raise BadPayload(f"a {source} report's body must be an object")
+        if source == REPORT_MACHINE:
+            fields = REPORT_MACHINE_FIELDS
+        else:
+            fields = ("idle",)
+        if set(body) != set(fields):
+            raise BadPayload(f"a {source} reading has exactly the fields {list(fields)}")
+        for name, value in body.items():
+            if value is None:
+                if source == REPORT_PRESENCE:
+                    raise BadPayload("idle must be a number of seconds")
+                continue
+            if name in ("charging", "on_battery"):
+                if not isinstance(value, bool):
+                    raise BadPayload(f"{name} must be null or a boolean")
+            elif isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise BadPayload(f"{name} must be null or a number")
+            elif value < 0:
+                raise BadPayload(f"{name} must not be negative")
+
+
 def _copy_trigger(trigger: dict[str, Any]) -> dict[str, Any]:
     copied = dict(trigger)
     if isinstance(copied.get("any"), list):
@@ -994,6 +1185,7 @@ _REQUIRED: dict[str, tuple[str, ...]] = {
         "reason",
         "at",
     ),
+    SENSE_REPORTED: ("source", "unit", "device", "body", "meta", "reason", "at"),
 }
 
 #: The kinds that are *not* about one turn. Everything else names the inbound
@@ -1178,6 +1370,11 @@ def _validate(payload: dict[str, Any]) -> None:
             # record claiming both a failure and a write would be the only
             # evidence of a partial one.
             raise BadPayload("a failed capture cannot also have filed claims")
+    elif kind == SENSE_REPORTED:
+        # No `for_seq` and no `id`: a report belongs to no turn, and is
+        # identified by the sense and the unit it read, which the write key
+        # carries.
+        _validate_report(payload)
     elif kind == REFLECTION_DONE:
         # No `for_seq` and no `id`: a reflection belongs to no turn and names no
         # standing thing. It is identified by the stretch of log it covered.

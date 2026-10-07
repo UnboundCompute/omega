@@ -48,6 +48,8 @@ __all__ = [
     "Learned",
     "Moment",
     "Moments",
+    "Reported",
+    "Readings",
     "local_hour",
 ]
 
@@ -387,6 +389,7 @@ class Learned:
         "_ingested",
         "_digested",
         "_heard",
+        "_reports",
     )
 
     def __init__(self) -> None:
@@ -399,6 +402,12 @@ class Learned:
         self._ingested: set[str] = set()
         self._digested: set[str] = set()
         self._heard: set[str] = set()
+        # Every learning report a relay sent (DL-072), by (source, unit), to the
+        # seq it landed at. Kept apart from the three receipt sets rather than
+        # merged into them: a report is the Mac saying "here is a unit", the
+        # receipt is the core saying "I have learned from it", and the gap
+        # between the two is exactly the work still owed.
+        self._reports: dict[tuple[str, str], int] = {}
 
     @property
     def through(self) -> int:
@@ -499,6 +508,16 @@ class Learned:
             if reason:
                 self._failed += 1
                 self._last_failure = str(reason)
+        elif payload.get("kind") == episodes.SENSE_REPORTED:
+            # Only the learning senses: a machine or presence reading is a
+            # condition to show, never a unit to learn from, and lives in
+            # :class:`Readings`. ``setdefault`` because the first arrival is the
+            # one the write key kept; the log refuses a second under the same
+            # key, so a later seq for the same unit cannot occur.
+            if payload["source"] in episodes.LEARNING_SOURCES:
+                self._reports.setdefault(
+                    (str(payload["source"]), str(payload["unit"])), seq
+                )
         elif payload.get("kind") == episodes.MESSAGE_INBOUND:
             # What paces reflection: arriving messages, not raw log growth. A
             # turn that ran six tools writes six episodes and is still one thing
@@ -516,6 +535,35 @@ class Learned:
             # the decision was already made and this only replays it.
             self._claims.pop(int(payload["claim_seq"]), None)
         self._through = seq
+
+    def worked(self, source: str) -> frozenset[str]:
+        """The units of one reporting sense the core holds a receipt for.
+
+        One mapping from a report's sense to the receipt set that answers it,
+        so the channel's ``reported`` query and :meth:`unworked` cannot disagree
+        about which cursor a sense advances.
+        """
+        if source == episodes.REPORT_TRANSCRIPT:
+            return self.ingested
+        if source == episodes.REPORT_USAGE:
+            return self.digested
+        if source == episodes.REPORT_RECORDING:
+            return self.heard
+        raise ValueError(f"{source!r} is not a sense that ends in a receipt")
+
+    def unworked(self) -> list[tuple[int, str, str]]:
+        """Reports with no receipt yet, as ``(seq, source, unit)``, oldest first.
+
+        Answered against the same three sets the local senses use, so a unit
+        the core already read off its own disk is not worked a second time
+        because the Mac also sent it — and a report worked once is never worked
+        again, because the receipt it produced is what takes it off this list.
+        """
+        return sorted(
+            (seq, source, unit)
+            for (source, unit), seq in self._reports.items()
+            if unit not in self.worked(source)
+        )
 
     def claims(self) -> list[Claim]:
         """Every active claim, oldest first."""
@@ -663,6 +711,91 @@ class Learned:
     @classmethod
     def rebuild(cls, store: "MemoryStore") -> "Learned":
         """Replay the whole log. The boot path, and the only one."""
+        return cls().advance(store)
+
+
+@dataclass(frozen=True)
+class Reported:
+    """The latest reading one device reported for one sense (DL-072)."""
+
+    seq: int
+    device: str
+    at: str
+    body: dict[str, Any]
+
+
+class Readings:
+    """The newest machine and presence reading per device, folded from reports.
+
+    A view of its own rather than a field on :class:`Learned`, for DL-062's
+    reason: a reading is a condition with a shelf life, not something omega was
+    taught, and folding the two together is how a stale battery level would end
+    up treated like a belief. Holds only the latest per (sense, device), so its
+    size is the number of machines, not the number of heartbeats.
+
+    **Freshness is not decided here.** This keeps what arrived; whether it is
+    still true is asked against a clock by :mod:`omega.machine`, so the fold
+    stays a pure function of the log and a rebuild cannot change an answer.
+    """
+
+    __slots__ = ("_latest", "_through")
+
+    def __init__(self) -> None:
+        self._latest: dict[tuple[str, str], Reported] = {}
+        self._through = 0
+
+    @property
+    def through(self) -> int:
+        return self._through
+
+    def apply(self, seq: int, payload: dict[str, Any]) -> None:
+        if seq <= self._through:
+            raise ValueError(
+                f"episodes must be folded in order: got seq {seq} after "
+                f"{self._through}"
+            )
+        if (
+            payload.get("kind") == episodes.SENSE_REPORTED
+            and payload["source"] not in episodes.LEARNING_SOURCES
+        ):
+            # Latest by seq, not by the reading's own `at`: the log order is
+            # the order omega learned things in, and a device whose clock runs
+            # wrong must not be able to pin an old reading in place.
+            key = (str(payload["source"]), str(payload["device"]))
+            self._latest[key] = Reported(
+                seq=seq,
+                device=str(payload["device"]),
+                at=str(payload["at"]),
+                body=dict(payload["body"]),
+            )
+        self._through = seq
+
+    def latest(self, source: str, device: str) -> Optional[Reported]:
+        return self._latest.get((source, device))
+
+    def devices(self, source: str) -> list[Reported]:
+        """Every device's latest reading for one sense, by device name."""
+        return sorted(
+            (r for (s, _), r in self._latest.items() if s == source),
+            key=lambda r: r.device,
+        )
+
+    @classmethod
+    def fold(cls, decoded: Iterable[tuple[int, dict[str, Any]]]) -> "Readings":
+        view = cls()
+        for seq, payload in decoded:
+            view.apply(seq, payload)
+        return view
+
+    def advance(self, store: "MemoryStore", *, upto: Optional[int] = None) -> "Readings":
+        for episode in store.episodes_since(self._through):
+            if upto is not None and episode.seq > upto:
+                break
+            self.apply(episode.seq, episodes.decode(episode.payload))
+        return self
+
+    @classmethod
+    def rebuild(cls, store: "MemoryStore") -> "Readings":
         return cls().advance(store)
 
 

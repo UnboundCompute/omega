@@ -45,6 +45,7 @@ from omega import (
     machine,
     memory,
     provider,
+    relay as relaying,
     runtime,
     schedule as scheduling,
     transcripts,
@@ -60,6 +61,7 @@ __all__ = [
     "review",
     "repl",
     "serve",
+    "relay",
     "main",
 ]
 
@@ -363,6 +365,44 @@ def serve(
         signal.signal(signal.SIGINT, previous_int)
 
 
+def relay(
+    host: str,
+    port: int,
+    *,
+    write: Callable[[str], None],
+    wait: Optional[Callable[[threading.Event], None]] = None,
+) -> int:
+    """Run this Mac's senses for a core elsewhere until SIGTERM (DL-072).
+
+    The same four paths ``main`` grants a local runtime, granted here instead,
+    because this is the process that runs where they exist. ``wait`` is
+    injectable for :func:`serve`'s reason.
+    """
+    stopping = threading.Event()
+
+    def request_stop(_signum: int, _frame: object) -> None:
+        stopping.set()
+
+    sensor = relaying.Relay(
+        (host, port),
+        transcripts_root=transcripts.default_root(),
+        usage_path=habits.default_path(),
+        recordings=str(listen.folder_path()),
+        read_machine=machine.read,
+        read_idle=machine.idle_seconds,
+        log=write,
+    )
+    previous_term = signal.signal(signal.SIGTERM, request_stop)
+    previous_int = signal.signal(signal.SIGINT, request_stop)
+    try:
+        write(f"omega relay is reporting to {host}:{port}")
+        (wait or sensor.run)(stopping)
+        return 0
+    finally:
+        signal.signal(signal.SIGTERM, previous_term)
+        signal.signal(signal.SIGINT, previous_int)
+
+
 # --- entry point ------------------------------------------------------------
 
 
@@ -419,6 +459,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="run the resident listener without opening an interactive terminal",
     )
     parser.add_argument(
+        "--relay",
+        default=None,
+        metavar="HOST",
+        help=(
+            "run this Mac's senses for a core on HOST: read and digest here, "
+            "send the result there; no store, no API key"
+        ),
+    )
+    parser.add_argument(
         "--host", default=DEFAULT_HOST, metavar="HOST", help=argparse.SUPPRESS
     )
     parser.add_argument(
@@ -446,6 +495,14 @@ def main(argv: Optional[list[str]] = None) -> int:
     if args.last and not args.heard:
         parser.error("--last only means something with --heard")
     write = _writer()
+
+    if args.relay is not None:
+        if args.serve or args.learned or args.heard:
+            parser.error("--relay runs on its own; it has no store to serve or read")
+        # Before the store and the provider, and it never reaches either: the
+        # relay holds no log and no key (DL-072). What it knows about what has
+        # been learned it asks the core.
+        return relay(args.relay, args.port, write=write)
 
     store_dir = Path(args.store).expanduser()
     if args.learned:

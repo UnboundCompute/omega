@@ -12,6 +12,23 @@ struct AgentLaunchConfiguration: Codable, Equatable {
     static func decode(_ data: Data) throws -> AgentLaunchConfiguration {
         try PropertyListDecoder().decode(AgentLaunchConfiguration.self, from: data)
     }
+
+    /// The same launch, as the sense relay for a core on `host` (DL-072).
+    ///
+    /// Once the core runs elsewhere the senses still have to run here, where
+    /// the transcripts, the usage database and the recordings are. Derived
+    /// from the packaged configuration rather than a second plist so the
+    /// interpreter and checkout stay the ones the installer chose: `--serve`
+    /// is swapped for `--relay <host>` and every other argument is kept.
+    func relaying(to host: String) -> AgentLaunchConfiguration {
+        var relayed = arguments.filter { $0 != "--serve" }
+        relayed += ["--relay", host]
+        return AgentLaunchConfiguration(
+            executable: executable,
+            workingDirectory: workingDirectory,
+            arguments: relayed
+        )
+    }
 }
 
 @MainActor
@@ -35,7 +52,10 @@ final class AgentProcessController {
         self.logURL = logURL ?? AgentProcessController.defaultLogURL
     }
 
-    func start() {
+    /// Launch the local core, or — with `relayingTo` — the sense relay for a
+    /// remote one. One launcher for both, so the relay inherits the log file,
+    /// the failure reporting and the clean stop the core already had.
+    func start(relayingTo host: String? = nil) {
         guard process == nil else { return }
         guard let configurationURL else {
             onFailure?("The local agent launcher is missing. Reinstall omega from this checkout.")
@@ -43,7 +63,8 @@ final class AgentProcessController {
         }
 
         do {
-            let configuration = try AgentLaunchConfiguration.load(from: configurationURL)
+            let packaged = try AgentLaunchConfiguration.load(from: configurationURL)
+            let configuration = host.map(packaged.relaying(to:)) ?? packaged
             guard FileManager.default.isExecutableFile(atPath: configuration.executable) else {
                 throw AgentProcessError.executableMissing(configuration.executable)
             }

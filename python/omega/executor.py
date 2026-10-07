@@ -31,8 +31,18 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional, Sequence
 
-from omega import blobs, episodes, habits, learn, listen, notice, provider, transcripts
-from omega.derive import Learned, Moments, OpenWork
+from omega import (
+    blobs,
+    episodes,
+    habits,
+    learn,
+    listen,
+    machine,
+    notice,
+    provider,
+    transcripts,
+)
+from omega.derive import Learned, Moments, OpenWork, Readings
 from omega.memory import WriteKeyConflict
 from omega.queue import EVENT_KINDS, EventQueue, Pending
 from omega.schedule import Schedule, Scheduler
@@ -176,6 +186,7 @@ class Executor:
         "_standing",
         "_online",
         "_machine",
+        "_readings",
     )
 
     def __init__(
@@ -202,6 +213,12 @@ class Executor:
         # true and what happened have different lifetimes, and keeping them
         # in one fold is what would let events leak into the claim set.
         self._moments = Moments()
+        # What other machines reported about themselves (DL-072): the Mac's
+        # disk and battery, and whether the person is at it. A fourth view for
+        # the reason the third is one — a reading has a shelf life a claim
+        # does not, and folding the two together is how a stale value gets
+        # treated as a belief.
+        self._readings = Readings()
         # Read-only: `due` and `fire` belong to the clock thread and are
         # never called from here. A second fold of the same log rather than
         # a shared object, because the clock mutates its copy on its own
@@ -597,10 +614,8 @@ class Executor:
         return read
 
     def _ingest_one(self, session: transcripts.Session) -> None:
-        # Advanced per session, not once per pass: the second session of a pass
-        # must see what the first one filed, or a habit visible in both gets
-        # written twice instead of once and superseded.
-        self._learned.advance(self._queue.store)
+        # The head is taken before the digest, as it always was, so the claims
+        # name the log as it stood when the session was read.
         head = self._queue.head()
         receipt = {
             "session": session.id,
@@ -611,13 +626,54 @@ class Executor:
             digest = transcripts.digest(session)
         except Exception as exc:  # noqa: BLE001
             reason = str(exc) or type(exc).__name__
-            self._queue.append(episodes.transcript_ingested(**receipt, reason=reason))
+            self._learn_from_digest(
+                None, make=episodes.transcript_ingested, receipt=receipt,
+                lens=learn.WORK, reason=reason, cause=head,
+            )
             return
-        if digest is None:
-            # Not a failure. A session too short to show a pattern is the
-            # ordinary case, and calling it one would bury a real fault in the
-            # count that exists to surface it.
-            self._queue.append(episodes.transcript_ingested(**receipt, filed=0))
+        self._learn_from_digest(
+            digest, make=episodes.transcript_ingested, receipt=receipt,
+            lens=learn.WORK, cause=head,
+        )
+
+    def _learn_from_digest(
+        self,
+        digest: Optional[str],
+        *,
+        make: Callable[..., dict[str, Any]],
+        receipt: dict[str, Any],
+        lens: Any,
+        reason: Optional[str] = None,
+        cause: Optional[int] = None,
+    ) -> None:
+        """Reflect over one digest, file what it showed, write its receipt.
+
+        The half of a transcript or a usage day that does not depend on where
+        the digest was made (DL-072). A session read off this disk and a session
+        the Mac read and sent arrive here as the same string, so they are
+        reflected, filed and receipted by one body of code — which is what
+        keeps ``Learned.ingested`` and ``Learned.digested`` one cursor whatever
+        machine did the reading.
+
+        ``digest`` is ``None`` (or empty) for a unit too short to show anything,
+        which files a receipt with nothing filed; ``reason`` is a digest that
+        could not be made at all. ``cause`` is the episode the claims name —
+        the report they came from when there is one, else the head at the
+        moment the unit was read, because there is no turn behind it.
+        """
+        # Advanced per unit, not once per pass: the second session of a pass
+        # must see what the first one filed, or a habit visible in both gets
+        # written twice instead of once and superseded.
+        self._learned.advance(self._queue.store)
+        head = cause if cause is not None else self._queue.head()
+        if reason is not None:
+            self._queue.append(make(**receipt, reason=reason))
+            return
+        if not digest:
+            # Not a failure. A session too short to show a pattern, or a quiet
+            # day, is the ordinary case, and calling it one would bury a real
+            # fault in the count that exists to surface it.
+            self._queue.append(make(**receipt, filed=0))
             return
         # Metered per pass, and the receipt says what it spent (DL-070).
         meter = provider.Meter(self._completer())
@@ -626,13 +682,14 @@ class Executor:
                 meter,
                 transcript=digest,
                 known=self._learned.claims(),
-                observing=learn.WORK,
+                observing=lens,
             )
             filed = learn.file_claims(
                 self._queue,
                 found.claims,
                 # As in `reflect`: there is no turn, so the head at the moment
-                # the session was read is the honest cause to point at.
+                # the unit was read (or the report it arrived in) is the honest
+                # cause to point at.
                 for_seq=head,
                 source_seq=head,
                 explicit=False,
@@ -649,21 +706,9 @@ class Executor:
             )
         except Exception as exc:  # noqa: BLE001
             reason = str(exc) or type(exc).__name__
-            self._queue.append(
-                episodes.transcript_ingested(
-                    **receipt,
-                    reason=reason,
-                    usage=meter.usage(),
-                )
-            )
+            self._queue.append(make(**receipt, reason=reason, usage=meter.usage()))
             return
-        self._queue.append(
-            episodes.transcript_ingested(
-                **receipt,
-                filed=len(filed),
-                usage=meter.usage(),
-            )
-        )
+        self._queue.append(make(**receipt, filed=len(filed), usage=meter.usage()))
 
     def hear(
         self, *, folder: Optional[Any] = None, now: Optional[Any] = None
@@ -725,9 +770,12 @@ class Executor:
         return heard
 
     def _hear_one(self, path: Any, *, folder: Optional[Any] = None) -> None:
-        # Advanced per recording for `_ingest_one`'s reason: the second
+        # Advanced per recording for `_learn_from_digest`'s reason: the second
         # recording of a pass must see what the first one filed.
         self._learned.advance(self._queue.store)
+        # Taken before whisper runs, as it always was: a transcription takes
+        # minutes, messages arrive meanwhile, and the claims should name the
+        # log as it stood when the recording was picked up.
         head = self._queue.head()
         store = blobs.BlobStore.open(self._queue.store.root)
 
@@ -764,12 +812,34 @@ class Executor:
             listen.file_away(path, folder=folder)
             return
         receipt["duration"] = said.duration
-        receipt["transcript"] = self._put_text(store, said.text, ".txt")
+        self._learn_from_heard(said.text, receipt=receipt, store=store, cause=head)
+        listen.file_away(path, folder=folder)
+
+    def _learn_from_heard(
+        self,
+        text: str,
+        *,
+        receipt: dict[str, Any],
+        store: "blobs.BlobStore",
+        cause: Optional[int] = None,
+    ) -> None:
+        """Keep, review and reflect over one heard transcript, then receipt it.
+
+        The half of a recording that does not depend on where whisper ran
+        (DL-072): the Mac transcribes and sends the text, a core on the Mac
+        transcribes it itself, and both land here. ``receipt`` already names the
+        recording and its duration; this adds the transcript and review digests
+        and the outcome. ``cause`` is as in :meth:`_learn_from_digest`.
+        """
+        self._learned.advance(self._queue.store)
+        head = cause if cause is not None else self._queue.head()
+        title = str(receipt["title"])
+        receipt["transcript"] = self._put_text(store, text, ".txt")
 
         # Metered per pass, and the receipt says what it spent (DL-070).
         meter = provider.Meter(self._completer())
         try:
-            read = listen.review(said.text, complete=meter, title=path.name)
+            read = listen.review(text, complete=meter, title=title)
         except Exception as exc:  # noqa: BLE001
             # A partial, and the payload is built to say so: the transcript
             # digest stays on the receipt alongside the reason, so the work
@@ -782,24 +852,23 @@ class Executor:
                     usage=meter.usage(),
                 )
             )
-            listen.file_away(path, folder=folder)
             return
-        rendered = read.render(title=path.name)
+        rendered = read.render(title=title)
         if rendered:
             receipt["review"] = self._put_text(store, rendered, ".md")
 
         try:
             found = learn.reflect(
                 meter,
-                transcript=said.text[: listen.MAX_REVIEW_CHARS],
+                transcript=text[: listen.MAX_REVIEW_CHARS],
                 known=self._learned.claims(),
                 observing=learn.ROOM,
             )
             filed = learn.file_claims(
                 self._queue,
                 found.claims,
-                # As in `_ingest_one`: there is no turn, so the head at the
-                # moment the recording was heard is the honest cause.
+                # As in `_learn_from_digest`: there is no turn, so the head at
+                # the moment the recording was heard is the honest cause.
                 for_seq=head,
                 source_seq=head,
                 explicit=False,
@@ -816,7 +885,6 @@ class Executor:
                     usage=meter.usage(),
                 )
             )
-            listen.file_away(path, folder=folder)
             return
 
         self._queue.append(
@@ -826,7 +894,6 @@ class Executor:
                 usage=meter.usage(),
             )
         )
-        listen.file_away(path, folder=folder)
 
     @staticmethod
     def _put_text(store: "blobs.BlobStore", text: str, suffix: str) -> str:
@@ -889,69 +956,94 @@ class Executor:
         return read
 
     def _digest_one_day(self, day: habits.Day) -> None:
-        # Per day, not once per pass: the second day of a pass must see what the
-        # first one filed, or a rhythm visible in both gets written twice
-        # instead of once and superseded.
-        self._learned.advance(self._queue.store)
+        # Taken before the digest, as in `_ingest_one`.
         head = self._queue.head()
         receipt = {"day": day.id, "source": day.source}
         try:
             digest = habits.digest(day)
         except Exception as exc:  # noqa: BLE001
             reason = str(exc) or type(exc).__name__
-            self._queue.append(episodes.usage_digested(**receipt, reason=reason))
-            return
-        if digest is None:
-            # Not a failure, and the expected outcome for a weekend or a day
-            # away from the machine. Calling it one would bury a real schema
-            # break in the count that exists to surface it.
-            self._queue.append(episodes.usage_digested(**receipt, filed=0))
-            return
-        # Metered per pass, and the receipt says what it spent (DL-070).
-        meter = provider.Meter(self._completer())
-        try:
-            found = learn.reflect(
-                meter,
-                transcript=digest,
-                known=self._learned.claims(),
-                observing=learn.DAY,
-            )
-            filed = learn.file_claims(
-                self._queue,
-                found.claims,
-                # As everywhere on this path: there is no turn, so the head at
-                # the moment the day was read is the honest cause to point at.
-                for_seq=head,
-                source_seq=head,
-                explicit=False,
-            )
-            # Filed unconditionally, not behind a check on the lens. `reflect`
-            # already returns nothing here for a lens that was not offered
-            # moments (DL-062), so a second guard would be a second place for
-            # the rule to drift, and this call is a no-op by construction.
-            learn.file_moments(
-                self._queue,
-                found.moments,
-                for_seq=head,
-                source_seq=head,
-            )
-        except Exception as exc:  # noqa: BLE001
-            reason = str(exc) or type(exc).__name__
-            self._queue.append(
-                episodes.usage_digested(
-                    **receipt,
-                    reason=reason,
-                    usage=meter.usage(),
-                )
+            self._learn_from_digest(
+                None, make=episodes.usage_digested, receipt=receipt,
+                lens=learn.DAY, reason=reason, cause=head,
             )
             return
-        self._queue.append(
-            episodes.usage_digested(
-                **receipt,
-                filed=len(filed),
-                usage=meter.usage(),
-            )
+        self._learn_from_digest(
+            digest, make=episodes.usage_digested, receipt=receipt,
+            lens=learn.DAY, cause=head,
         )
+
+    def work_reports(self) -> int:
+        """Learn from what a sense relay sent and the core has not yet worked.
+
+        DL-072. Returns how many reports were worked. The Mac did the reading
+        and the digest; this does the rest — the reflection, the filing and the
+        receipt — through exactly the methods the local senses use, so a report
+        ends in the same receipt a local read would have written and moves the
+        same cursor. A report with a receipt is never worked again, and a unit
+        the core already read off its own disk is never worked from a report.
+
+        **The same per-pass caps as the local senses**, per sense: three
+        sessions, two days, one recording. A relay that sent a backlog is worked
+        off at the rate omega has always learned, not in one long stall.
+
+        **Never raises**, for :meth:`ingest`'s reason, and one more: what is in
+        a report was written by another machine, and the drain thread must not
+        be something it can stop.
+        """
+        if not self._recovered:
+            return 0
+        try:
+            self._learned.advance(self._queue.store)
+            owed = self._learned.unworked()
+        except Exception:  # noqa: BLE001 - see the docstring
+            return 0
+        caps = {
+            episodes.REPORT_TRANSCRIPT: transcripts.MAX_SESSIONS_PER_PASS,
+            episodes.REPORT_USAGE: habits.MAX_DAYS_PER_PASS,
+            episodes.REPORT_RECORDING: listen.MAX_PER_PASS,
+        }
+        worked = 0
+        for seq, source, unit in owed:
+            if caps.get(source, 0) <= 0:
+                continue
+            caps[source] -= 1
+            try:
+                self._work_report(seq, self._queue.at(seq).payload)
+            except Exception:  # noqa: BLE001 - see the docstring
+                # The report was validated against the receipt it will become
+                # when it was appended, so this is a bug rather than bad input.
+                # It stays unworked and is tried again next pass.
+                continue
+            worked += 1
+        return worked
+
+    def _work_report(self, seq: int, report: dict[str, Any]) -> None:
+        source, unit, meta = report["source"], report["unit"], dict(report["meta"])
+        reason = report.get("reason")
+        body = report["body"]
+        if source == episodes.REPORT_TRANSCRIPT:
+            self._learn_from_digest(
+                body, make=episodes.transcript_ingested,
+                receipt={"session": unit, **meta}, lens=learn.WORK,
+                reason=reason, cause=seq,
+            )
+        elif source == episodes.REPORT_USAGE:
+            self._learn_from_digest(
+                body, make=episodes.usage_digested,
+                receipt={"day": unit, **meta}, lens=learn.DAY,
+                reason=reason, cause=seq,
+            )
+        elif source == episodes.REPORT_RECORDING:
+            receipt = {"recording": unit, **meta}
+            if reason is not None:
+                # Whisper failed on the Mac. The receipt says so, for the
+                # reason a local transcription failure earns one: it is about
+                # this recording, not about the machine.
+                self._queue.append(episodes.audio_captured(**receipt, reason=reason))
+                return
+            store = blobs.BlobStore.open(self._queue.store.root)
+            self._learn_from_heard(body, receipt=receipt, store=store, cause=seq)
 
     def notice(
         self,
@@ -1011,6 +1103,7 @@ class Executor:
                     machine_lines = tuple(self._machine())
                 except Exception:  # noqa: BLE001 - a sense never kills the look
                     machine_lines = ()
+            machine_lines = self._machines(machine_lines, now=moment)
             self._open.advance(store)
             self._learned.advance(store)
             self._moments.advance(store)
@@ -1039,6 +1132,28 @@ class Executor:
         except Exception:  # noqa: BLE001 - see the docstring
             return False
         return True
+
+    def _machines(self, local: Sequence[str], *, now: datetime) -> Sequence[str]:
+        """The local machine's lines plus every reported one's, labeled.
+
+        With no reports — a core on the Mac and no relay — the local lines pass
+        through unchanged, so that look reads exactly as it did before DL-072.
+        With reports, each line names its machine, because a core on the VM
+        describing "the disk" without saying whose would be describing the one
+        the person does not use. A reported machine past
+        :data:`omega.machine.STALE_SECONDS` renders as "couldn't determine".
+        """
+        try:
+            self._readings.advance(self._queue.store)
+            reported = self._readings.devices(episodes.REPORT_MACHINE)
+        except Exception:  # noqa: BLE001 - a sense never kills the look
+            reported = []
+        if not reported:
+            return local
+        lines = [f"where omega runs: {line}" for line in local]
+        for r in reported:
+            lines.extend(machine.reported_lines(r.device, r.at, r.body, now=now))
+        return tuple(lines)
 
     def _handle(self, pending: Pending) -> Optional[TurnResult]:
         if not pending.is_event:

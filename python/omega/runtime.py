@@ -658,6 +658,12 @@ class Runtime:
             executor.ingest(root=self._transcripts)
         if self._usage is not None:
             executor.digest_usage(path=self._usage)
+        # What a sense relay sent (DL-072), after the local reads and before the
+        # recording, for the order's own reason: a sent session or day is one
+        # model call, and a sent recording — already transcribed on the Mac —
+        # is no longer the slow part. Unconditional, like the look below: it
+        # reads only the log, so there is no path to grant.
+        executor.work_reports()
         if self._recordings is not None:
             # Last of the three writing passes, because it is by far the
             # longest: a recording is transcribed by a subprocess that takes

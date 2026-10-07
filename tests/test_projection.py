@@ -311,6 +311,14 @@ def test_every_m1_kind_is_accounted_for() -> None:
             bytes=380898,
             at=AT,
         ),
+        episodes.SENSE_REPORTED: episodes.sense_reported(
+            source="usage",
+            unit="2026-09-23",
+            device="mac",
+            body="09:00-12:00 Xcode",
+            meta={"source": "knowledgec"},
+            at=AT,
+        ),
     }
     assert set(made) == set(episodes.KINDS)
     for kind, payload in made.items():

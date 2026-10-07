@@ -200,6 +200,11 @@ NOT_PROJECTED = frozenset(
         # because DL-066 makes review pull-shaped, so what reaches the person
         # is the review they ask for, not a line saying a file was read.
         episodes.AUDIO_CAPTURED,
+        # DL-072. Withheld for the receipts' reasons and one of its own: a
+        # report carries the digest itself — a session's text, a day's apps, a
+        # meeting's words — so projecting it would push exactly the firehose
+        # the two receipts above were withheld to prevent, verbatim.
+        episodes.SENSE_REPORTED,
     }
 )
 

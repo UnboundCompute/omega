@@ -31,6 +31,14 @@ demand. The server holds no copy of the stream: a client that was away comes
 back with ``since`` and is served from the log (DL-016 — zero authoritative
 state in RAM), which is also why a ``kill -9`` on either side costs nothing but
 a reconnect.
+
+**A sense relay is a second producer, and it can only report** (DL-072). Once
+the core moved off the Mac its senses read paths that are not there, so the
+Mac runs a relay that reads and digests and sends ``report``; the core appends
+``sense.reported`` and learns from it later, at its own idle moment. A report
+is a record, never an event: it wakes no turn, and the relay has no ``say``.
+``reported`` lets the relay ask which units already have receipts, so it does
+not digest — or run whisper over — something the core already learned from.
 """
 
 from __future__ import annotations
@@ -43,6 +51,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Iterator, Optional
 
 from omega import episodes, projection
+from omega.derive import Learned
 from omega.blobs import BlobError, BlobStore
 from omega.memory import WriteKeyConflict
 from omega.queue import EventQueue
@@ -185,6 +194,13 @@ class Channel:
         self._conns: list[_Conn] = []
         self._conns_lock = threading.Lock()
         self._stopping = threading.Event()
+        # The receipt cursor the `reported` query answers from. Its own fold,
+        # behind its own lock, for the reason the executor's scheduler keeps its
+        # own copy: it is derived from the log, so two folds agree by
+        # construction, and sharing the executor's would mean locking a view
+        # the drain thread mutates.
+        self._learned = Learned()
+        self._learned_lock = threading.Lock()
 
     # --- lifecycle --------------------------------------------------------
 
@@ -322,6 +338,10 @@ class Channel:
                 return self._history(request)
             if op == "subscribe":
                 return self._subscribe(conn, request)
+            if op == "report":
+                return self._report(request)
+            if op == "reported":
+                return self._reported(request)
             if op == "ping":
                 return {"v": PROTOCOL, "op": "pong", "head": self._queue.head()}
             return self._error(f"unknown op {op!r}")
@@ -401,6 +421,89 @@ class Channel:
         if not duplicate and self._on_append is not None:
             self._on_append(seq)
         return {"v": PROTOCOL, "op": "ack", "seq": seq, "duplicate": duplicate}
+
+    def _report(self, request: dict[str, Any]) -> dict[str, Any]:
+        """Append one ``sense.reported`` record. The seq is the acknowledgement.
+
+        ``{source, unit, device, body}`` plus, for a learning sense, ``meta`` —
+        the receipt's identity fields the core cannot see without the file —
+        and ``reason`` when the Mac could not digest the unit. Validated by the
+        episode constructor, so the channel cannot accept a report the log
+        would refuse or the core could never turn into a receipt.
+
+        **The write key is the unit, so a resend is the duplicate path** — the
+        same one ``say`` takes, answered the same way. A relay that lost an ack
+        sends again and is told its first copy landed, which is what lets it
+        file a recording away only once the core holds it.
+
+        **Never wakes the drain.** ``say`` calls ``on_append`` because an inbound
+        is a turn waiting; a report is not, and the core works it at the next
+        idle sense pass. Leaving the hook out here is what keeps "a report never
+        wakes a turn" true by construction rather than by the drain happening to
+        skip a record kind.
+        """
+        source = request.get("source")
+        unit = request.get("unit")
+        if not isinstance(source, str) or not isinstance(unit, str):
+            raise ValueError("'source' and 'unit' must be strings")
+        payload = episodes.sense_reported(
+            source=source,
+            unit=unit,
+            device=request.get("device"),  # type: ignore[arg-type]
+            body=request.get("body"),
+            meta=request.get("meta"),
+            reason=request.get("reason"),
+            # Stamped on arrival by the core's clock, never taken from the
+            # sender: staleness is judged against this, and a Mac whose clock
+            # runs ahead must not be able to keep its own reading fresh. The
+            # relay reads at send time and holds nothing back, so arrival is
+            # the reading's time to within a round trip.
+        )
+        write_key = episodes.report_write_key(source, unit)
+        head_before = self._queue.head()
+        try:
+            seq = self._queue.append(payload, write_key)
+        except WriteKeyConflict:
+            # The ordinary resend: `at` differs, so the bytes do, and the first
+            # copy stands. Named as a conflict only when what was reported
+            # differs too — a unit whose digest changed between sends.
+            existing = self._existing(write_key)
+            answer = {
+                "v": PROTOCOL,
+                "op": "ack",
+                "seq": existing.seq,
+                "duplicate": True,
+            }
+            if existing.payload.get("body") != payload["body"]:
+                answer["conflict"] = (
+                    "that unit is already in the log carrying a different report"
+                )
+            return answer
+        return {
+            "v": PROTOCOL,
+            "op": "ack",
+            "seq": seq,
+            "duplicate": seq <= head_before,
+        }
+
+    def _reported(self, request: dict[str, Any]) -> dict[str, Any]:
+        """The units of one learning sense the core holds a receipt for.
+
+        Receipts, not reports: a unit the Mac sent but the core has not worked
+        yet is still owed, and saying otherwise would let a relay file away a
+        recording the core never learned from. A machine or presence reading
+        has no receipt, so asking about one is an error rather than an empty
+        answer that looks like "nothing yet".
+        """
+        source = request.get("source")
+        if source not in episodes.LEARNING_SOURCES:
+            raise ValueError(
+                f"'source' must be one of {sorted(episodes.LEARNING_SOURCES)}"
+            )
+        with self._learned_lock:
+            self._learned.advance(self._queue.store)
+            units = sorted(self._learned.worked(source))
+        return {"v": PROTOCOL, "op": "reported", "source": source, "units": units}
 
     def _attach(self, request: dict[str, Any]) -> dict[str, Any]:
         """Ingest one file into the blob store and answer with its reference.
@@ -612,6 +715,22 @@ class ChannelClient:
 
     def subscribe(self, since: int = 0) -> dict[str, Any]:
         return self.request({"v": PROTOCOL, "op": "subscribe", "since": since})
+
+    def report(self, source: str, unit: str, *, device: str, body: Any, **kwargs: Any) -> dict[str, Any]:
+        return self.request(
+            {
+                "v": PROTOCOL,
+                "op": "report",
+                "source": source,
+                "unit": unit,
+                "device": device,
+                "body": body,
+                **kwargs,
+            }
+        )
+
+    def reported(self, source: str) -> dict[str, Any]:
+        return self.request({"v": PROTOCOL, "op": "reported", "source": source})
 
     def updates(self, count: int) -> Iterator[dict[str, Any]]:
         for _ in range(count):

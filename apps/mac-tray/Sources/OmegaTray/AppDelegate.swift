@@ -24,9 +24,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         agentProcessController.onFailure = { [weak self] detail in
             self?.viewModel.agentStartupFailure = detail
         }
-        if remoteAgentHost == nil {
-            agentProcessController.start()
-        }
+        // A remote core still needs this Mac's senses, so the tray runs the
+        // relay toward it instead of a second core (DL-072).
+        agentProcessController.start(relayingTo: remoteAgentHost)
 
         let panelController = OmegaPanelController(viewModel: viewModel)
         self.panelController = panelController
