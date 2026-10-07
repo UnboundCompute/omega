@@ -1,0 +1,9 @@
+[Unit]
+Description=Deploy a new omega core image if main has moved (DL-074)
+Wants=network-online.target
+After=network-online.target docker.service
+
+[Service]
+Type=oneshot
+Environment=COMPOSE_DIR=/home/riyandhiman/omega
+ExecStart=/usr/local/bin/omega-autodeploy

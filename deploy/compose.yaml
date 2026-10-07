@@ -6,13 +6,20 @@
 #   echo 'OPENAI_API_KEY=sk-...' | sudo tee /etc/omega/env && sudo chmod 600 /etc/omega/env
 #   sudo tailscale serve --bg --tcp 7717 tcp://127.0.0.1:7717
 #
-# Deploy (by hand — no auto-updater on the box that holds the memory):
-#   docker compose pull && docker compose up -d
-# Roll back: set OMEGA_TAG=sha-<previous> and run the same two commands.
+#   sudo install -m 755 autodeploy.sh /usr/local/bin/omega-autodeploy
+#   sudo cp omega-autodeploy.service omega-autodeploy.timer /etc/systemd/system/
+#   sudo systemctl enable --now omega-autodeploy.timer
+#
+# Deploys are pulled, not pushed (DL-074): every 15 min the timer asks GHCR for
+# `main` and, on a new digest, backs up the store, starts it pinned by digest in
+# ./.env, health-checks it and rolls back on failure. Watch it with
+#   journalctl -u omega-autodeploy
+# By hand, the pin in ./.env is what `sudo docker compose up -d` runs; to roll
+# back, put a previous digest there.
 
 services:
   omega:
-    image: ghcr.io/unboundcompute/omega:${OMEGA_TAG:-main}
+    image: ${OMEGA_IMAGE:-ghcr.io/unboundcompute/omega:main}
     # omega binds 127.0.0.1 and refuses anything else; host networking makes
     # that the VM's loopback, which `tailscale serve` forwards from the tailnet.
     network_mode: host

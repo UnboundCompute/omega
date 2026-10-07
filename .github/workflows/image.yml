@@ -6,6 +6,9 @@ name: image
 on:
   push:
     branches: ["main"]
+    # Not in the image (.dockerignore), so not a reason to move `main` and
+    # have the VM restart the core for nothing (DL-074).
+    paths-ignore: ["apps/**", "docs/**", "bench/**", "**/*.md"]
   pull_request:
   workflow_dispatch:
 

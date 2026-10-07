@@ -1,0 +1,10 @@
+[Unit]
+Description=Check GHCR for a new omega core every 15 minutes (DL-074)
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=15min
+RandomizedDelaySec=60
+
+[Install]
+WantedBy=timers.target
