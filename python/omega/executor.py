@@ -1124,6 +1124,8 @@ class Executor:
                 heard_at=st.heard_at,
                 machine=machine_lines,
                 said=st.said,
+                flagged_since=st.flagged_since,
+                machine_known=st.machine_known,
             )
             # Stamped with ``moment``, not left to default to wall-clock now.
             # ``notice.standing`` charges a spoken nudge to the day of the *look*
@@ -1131,7 +1133,12 @@ class Executor:
             # entry; letting it default would make the budget disagree with the
             # clock the decision was made against.
             self._queue.append(
-                episodes.inbound(text, channel=notice.CHANNEL, at=moment.isoformat())
+                episodes.inbound(
+                    text,
+                    channel=notice.CHANNEL,
+                    machine=list(machine_lines),
+                    at=moment.isoformat(),
+                )
             )
         except Exception:  # noqa: BLE001 - see the docstring
             return False

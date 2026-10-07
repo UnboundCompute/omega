@@ -384,6 +384,7 @@ def inbound(
     resumes_seq: Optional[int] = None,
     schedule_id: Optional[str] = None,
     schedule_slot: Optional[str] = None,
+    machine: Optional[list[str]] = None,
     at: Optional[str] = None,
 ) -> dict[str, Any]:
     """Something arrived that omega may need to respond to.
@@ -445,6 +446,10 @@ def inbound(
         payload["schedule_id"] = schedule_id
     if schedule_slot is not None:
         payload["schedule_slot"] = schedule_slot
+    if machine is not None:
+        # A look's machine readings, as the lines it showed (DL-076), so the
+        # next look can tell a flag that is new from one that has stood all day.
+        payload["machine"] = list(machine)
     _validate(payload)
     return payload
 
@@ -483,9 +488,14 @@ def completed(
     tools: Optional[list[str]] = None,
     error: Optional[str] = None,
     usage: Optional[list[dict[str, Any]]] = None,
+    judged: Optional[str] = None,
     at: Optional[str] = None,
 ) -> dict[str, Any]:
     """The turn ended. A terminal record.
+
+    ``judged`` is what the judge answered, word and reason (DL-076). Without
+    it a silent look is a row that says *that* omega stayed quiet and never
+    *why*, which is the question every silence gets asked.
 
     ``outcome="silent"`` with ``reply=None`` is the success case the loop exists
     to make possible, so it is spelled as a first-class outcome and not as an
@@ -501,6 +511,8 @@ def completed(
         "error": error,
         "at": at or now(),
     }
+    if judged is not None:
+        payload["judged"] = judged
     _with_usage(payload, usage)
     _validate(payload)
     return payload
@@ -1280,6 +1292,12 @@ def _validate(payload: dict[str, Any]) -> None:
             # schedule behind it — and additive, because an old payload
             # without the field still decodes (see VERSION).
             _require_str(payload, "schedule_id", non_empty=True)
+        if "machine" in payload:
+            lines = payload["machine"]
+            if not isinstance(lines, list) or not all(
+                isinstance(line, str) for line in lines
+            ):
+                raise BadPayload("machine must be a list of lines")
         if "schedule_slot" in payload:
             _require_str(payload, "schedule_slot", non_empty=True)
             if not payload.get("schedule_id"):
@@ -1400,6 +1418,8 @@ def _validate(payload: dict[str, Any]) -> None:
         _require_seq(payload, "for_seq")
 
     if kind == TURN_COMPLETED:
+        if "judged" in payload:
+            _require_str(payload, "judged", non_empty=True)
         if payload["outcome"] not in OUTCOMES:
             raise BadPayload(
                 f"outcome {payload['outcome']!r} not in {sorted(OUTCOMES)}"

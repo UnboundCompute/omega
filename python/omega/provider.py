@@ -118,7 +118,11 @@ ROLES = frozenset({JUDGE, ACT, LEARN})
 #: "whatever the client library defaults to" — an invisible default is a
 #: decision nobody made, and cost is the thing we are splitting roles over.
 _DEFAULT_MODELS = {
-    JUDGE: "gpt-4o-mini",
+    # Not the mini model, even though the judge runs on every event: live on
+    # the VM, with the setting missing, gpt-4o-mini stayed silent on a
+    # reminder, a watch and a low battery in one evening (DL-076). A missing
+    # setting must not quietly buy a judge that cannot hold the rules.
+    JUDGE: "gpt-4o",
     ACT: "gpt-4o",
     LEARN: "gpt-4o-mini",
 }

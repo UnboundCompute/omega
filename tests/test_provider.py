@@ -272,7 +272,9 @@ def test_defaults_are_explicit_rather_than_the_library_s():
     defaulted is cost."""
     assert pv.model_for(pv.JUDGE) == pv._DEFAULT_MODELS[pv.JUDGE]
     assert pv.model_for(pv.ACT) == pv._DEFAULT_MODELS[pv.ACT]
-    assert pv._DEFAULT_MODELS[pv.JUDGE] != pv._DEFAULT_MODELS[pv.ACT]
+    # DL-076: with the setting missing, the mini judge ignored a reminder, a
+    # watch and a low battery live. A missing setting must not downgrade it.
+    assert "mini" not in pv._DEFAULT_MODELS[pv.JUDGE]
     assert set(pv._DEFAULT_MODELS) == pv.ROLES, "a role with no default"
 
 

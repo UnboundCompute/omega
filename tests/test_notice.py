@@ -408,3 +408,203 @@ def test_a_spoken_nudge_is_shown_to_the_next_look_instead_of_closing_the_day(
     assert look["channel"] == notice.CHANNEL
     assert "You already told them" in look["text"]
     assert said[-1][1].split()[0] in look["text"]
+
+
+# --- DL-076: a look that nudges when it should, and says why it did not ------
+
+
+def _looked_with(q: EventQueue, when: datetime, lines: list[str]) -> int:
+    seq = q.append(
+        episodes.inbound(
+            "what is open", channel=notice.CHANNEL, machine=lines, at=_iso(when)
+        )
+    )
+    _silent(q, seq, when)
+    return seq
+
+
+def test_a_clock_fire_is_not_hearing_from_them(q: EventQueue) -> None:
+    """Live on the VM the hourly watch reset "heard from them" every hour: each
+    look waited behind it and then said "you last heard from them 30 minutes
+    ago" of a person who had been gone for hours."""
+    q.append(episodes.inbound("hello", channel="tray", at=_iso(QUIET)))
+    q.append(
+        episodes.inbound(
+            "Standing watch you agreed to keep for them: news",
+            channel="schedule",
+            schedule_id="w1",
+            at=_iso(NOW - timedelta(minutes=5)),
+        )
+    )
+    st = notice.standing(q.store)
+    assert st.heard_at == _iso(QUIET)
+    assert notice.may_look(st, now=NOW) is True
+
+
+def test_a_flag_new_since_the_last_look_is_called_new(q: EventQueue) -> None:
+    _looked_with(q, NOW - timedelta(hours=1), ["mac: Battery: 28%, on battery"])
+    st = notice.standing(q.store)
+    text = notice.situation(
+        now=NOW,
+        machine=["mac: Battery: 20%, on battery - LOW"],
+        flagged_since=st.flagged_since,
+        machine_known=st.machine_known,
+    )
+    assert "mac: Battery: 20%, on battery - LOW (new since your last look)" in text
+
+
+def test_a_flag_that_has_stood_says_since_when_and_what_it_read(
+    q: EventQueue,
+) -> None:
+    """A disk LOW all day is not news; the judge can only tell that if it is
+    shown when the flag started and what it read then."""
+    _looked_with(q, NOW - timedelta(hours=6), ["mac: Disk: 7 GB free of 228 GB (3%) - LOW"])
+    _looked_with(q, NOW - timedelta(hours=1), ["mac: Disk: 13 GB free of 228 GB (6%) - LOW"])
+    st = notice.standing(q.store)
+    text = notice.situation(
+        now=NOW,
+        machine=["mac: Disk: 13 GB free of 228 GB (6%) - LOW"],
+        flagged_since=st.flagged_since,
+        machine_known=st.machine_known,
+    )
+    assert "(first flagged 6 hours ago, when it read 7 GB free of 228 GB (3%))" in text
+    assert "new since" not in text
+
+
+def test_a_flag_that_cleared_and_came_back_is_new_again(q: EventQueue) -> None:
+    _looked_with(q, NOW - timedelta(hours=6), ["mac: Battery: 15%, on battery - LOW"])
+    _looked_with(q, NOW - timedelta(hours=3), ["mac: Battery: 90%, charging"])
+    st = notice.standing(q.store)
+    text = notice.situation(
+        now=NOW,
+        machine=["mac: Battery: 18%, on battery - LOW"],
+        flagged_since=st.flagged_since,
+        machine_known=st.machine_known,
+    )
+    assert "(new since your last look)" in text
+
+
+def test_with_no_earlier_readings_nothing_is_called_new(q: EventQueue) -> None:
+    """The first look after this shipped has nothing to compare with; calling
+    a week-old LOW disk "new" would be a nudge manufactured by a deploy."""
+    _looked(q, NOW - timedelta(hours=1))
+    st = notice.standing(q.store)
+    assert st.machine_known is False
+    text = notice.situation(
+        now=NOW,
+        machine=["mac: Disk: 7 GB free of 228 GB (3%) - LOW"],
+        flagged_since=st.flagged_since,
+        machine_known=st.machine_known,
+    )
+    assert "new since" not in text and "first flagged" not in text
+
+
+def test_an_unflagged_reading_carries_no_note(q: EventQueue) -> None:
+    _looked_with(q, NOW - timedelta(hours=1), ["mac: Load: 2.9 across 10 cores"])
+    st = notice.standing(q.store)
+    text = notice.situation(
+        now=NOW,
+        machine=["mac: Load: 3.1 across 10 cores"],
+        flagged_since=st.flagged_since,
+        machine_known=st.machine_known,
+    )
+    assert "- mac: Load: 3.1 across 10 cores\n" in text
+
+
+def test_a_watch_in_the_look_does_not_carry_its_own_way_out() -> None:
+    """The watch's instruction tells its own turn to answer "(nothing new)";
+    pasted whole into the look, it handed the look the same escape."""
+    from omega import tools
+
+    class _Sched:
+        instruction = tools.watch_instruction("Bigg Boss 20 updates")
+
+    text = notice.situation(now=NOW, schedules=[_Sched()])
+    assert "Bigg Boss 20 updates" in text
+    assert tools.NOTHING_NEW not in text
+
+
+def test_already_told_is_no_bar_to_something_that_got_worse() -> None:
+    text = notice.situation(
+        now=NOW, said=[(_iso(NOW - timedelta(hours=5)), "Disk space is low")]
+    )
+    assert "unless it has got worse or more urgent" in text
+
+
+def _judge_says(answer: str, seen: list[str]) -> provider.FakeProvider:
+    def judge(role, messages):
+        seen.append(str(messages))
+        return answer
+
+    def act(role, messages):
+        seen.append(str(messages))
+        return "Your battery is at 20% and unplugged - worth plugging in."
+
+    return provider.FakeProvider({provider.JUDGE: judge, provider.ACT: act})
+
+
+def _look_turn(q: EventQueue, answer: str, seen: list[str]) -> dict:
+    q.append(episodes.inbound("hello", channel="tray", at=_iso(QUIET)))
+    ex = Executor(
+        q,
+        complete=_judge_says(answer, seen).complete,
+        machine=lambda: ["Battery: 20%, on battery - LOW"],
+    )
+    ex.recover()
+    ex.drain()
+    seen.clear()  # the "hello" turn's prompts; only the look's are under test
+    assert ex.notice(now=NOW) is True
+    ex.drain()
+    return [
+        p.payload
+        for p in q.recent(q.head())
+        if p.payload["kind"] == episodes.TURN_COMPLETED
+    ][-1]
+
+
+def test_a_look_asks_for_a_nudge_and_its_reason_reaches_the_reply(
+    q: EventQueue,
+) -> None:
+    seen: list[str] = []
+    done = _look_turn(q, "NUDGE battery is LOW and on battery", seen)
+    assert "Do they need a nudge right now?" in seen[0]
+    assert done["outcome"] == "spoke"
+    assert done["judged"] == "NUDGE battery is LOW and on battery"
+    assert "You decided to speak up because: battery is LOW and on battery" in seen[1]
+
+
+def test_a_silent_look_records_why(q: EventQueue) -> None:
+    seen: list[str] = []
+    done = _look_turn(q, "SILENT the disk is unchanged and already told", seen)
+    assert done["outcome"] == "silent"
+    assert done["judged"] == "SILENT the disk is unchanged and already told"
+
+
+def test_the_look_keeps_its_readings_for_the_next_one(q: EventQueue) -> None:
+    _look_turn(q, "SILENT nothing new", [])
+    looks = [
+        p.payload
+        for p in q.recent(q.head())
+        if p.payload["kind"] == episodes.MESSAGE_INBOUND
+        and p.payload["channel"] == notice.CHANNEL
+    ]
+    assert looks[-1]["machine"] == ["Battery: 20%, on battery - LOW"]
+    st = notice.standing(q.store)
+    assert st.machine_known and st.flagged_since[0][0] == "Battery"
+
+
+def test_a_message_from_them_is_still_routed_with_one_word(q: EventQueue) -> None:
+    """The nudge question is the look's alone; a person writing in is
+    answered, not weighed for whether they need nudging."""
+    seen: list[str] = []
+    q.append(episodes.inbound("hi", channel="tray", at=_iso(NOW)))
+    ex = Executor(q, complete=_judge_says("SPEAK", seen).complete)
+    ex.recover()
+    ex.drain()
+    assert "one word - SPEAK, ACT, or SILENT" in seen[0]
+    assert "nudge right now?" not in seen[0].split("New event:")[-1]
+
+
+def test_check_reads_as_act() -> None:
+    assert turn.parse_verdict("CHECK the score").choice == turn.ACT_THEN_SPEAK
+    assert turn.parse_verdict("NUDGE: battery").choice == turn.SPEAK

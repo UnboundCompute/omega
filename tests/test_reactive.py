@@ -383,7 +383,7 @@ def test_auditing_the_disk_needs_no_go(q: EventQueue, tmp_path: Path) -> None:
         assert decision.tier == tools.EXTERNAL, argv
 
 
-# --- a reminder coming due always reaches them (DL-072) ----------------------
+# --- a reminder coming due always reaches them (DL-075) ----------------------
 
 
 def _reminder(q: EventQueue, what: str = "take a walk", *, channel: str = "schedule"):

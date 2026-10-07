@@ -124,9 +124,12 @@ class Standing:
     #: The ``at`` of the newest unprompted event, or ``None`` if there is none.
     looked_at: Optional[str] = None
 
-    #: The ``at`` of the newest inbound that was *not* one of omega's own — a
-    #: person, or the clock. Folded here rather than by a second scan, because
-    #: "how long since I heard from them" is part of the same question.
+    #: The ``at`` of the newest inbound a *person* sent. Not the clock: a watch
+    #: firing hourly is not them talking, and counting it both held every look
+    #: back behind the watch and told the look "you last heard from them 30
+    #: minutes ago" when they had been gone for hours (DL-076). Folded here
+    #: rather than by a second scan, because "how long since I heard from
+    #: them" is part of the same question.
     heard_at: Optional[str] = None
 
     #: Local dates on which an unprompted turn *spoke*. A day omega looked at
@@ -148,6 +151,17 @@ class Standing:
     #: shown so that "already told them" is something it can see rather than
     #: something it is asked to remember.
     said: tuple[tuple[str, str], ...] = ()
+
+    #: ``(key, at, line)`` for each machine line flagged at the newest look
+    #: that carried readings: the look at which that flag *started*, and the
+    #: line as it read then (DL-076). This is what lets a look tell a flag
+    #: that is new from one it has been staring at all day, in code, instead
+    #: of leaving the judge to diff two prompts it never sees side by side.
+    flagged_since: tuple[tuple[str, str, str], ...] = ()
+
+    #: Whether any look so far carried its readings. Without one there is no
+    #: earlier look to compare with, so nothing is called new.
+    machine_known: bool = False
 
 
 def standing(store: "MemoryStore") -> Standing:
@@ -172,6 +186,8 @@ def standing(store: "MemoryStore") -> Standing:
     heard_at: Optional[str] = None
     spoke: set[str] = set()
     through = 0
+    flagged: dict[str, tuple[str, str]] = {}
+    machine_known = False
 
     for episode in store.episodes_since(0):
         through = episode.seq
@@ -191,7 +207,14 @@ def standing(store: "MemoryStore") -> Standing:
                 mine[episode.seq] = at if isinstance(at, str) else ""
                 if isinstance(at, str):
                     looked_at = at
-            elif isinstance(at, str):
+                    lines = payload.get("machine")
+                    if isinstance(lines, list):
+                        machine_known = True
+                        flagged = _fold_flags(flagged, lines, at)
+            elif (
+                isinstance(at, str)
+                and payload.get("channel") not in UNPROMPTED_CHANNELS
+            ):
                 heard_at = at
         elif kind == episodes.TURN_COMPLETED:
             for_seq = payload.get("for_seq")
@@ -229,7 +252,35 @@ def standing(store: "MemoryStore") -> Standing:
         through=through,
         outstanding=len(set(mine) - completed),
         said=tuple(said),
+        flagged_since=tuple((k, a, l) for k, (a, l) in flagged.items()),
+        machine_known=machine_known,
     )
+
+
+def machine_key(line: str) -> str:
+    """What a machine line is *about*: ``"mac: Battery"`` for
+    ``"mac: Battery: 20%, on battery - LOW"``. The value never contains
+    ``": "``, so everything before the last one is the device and the reading."""
+    return line.rsplit(": ", 1)[0]
+
+
+def is_flagged(line: str) -> bool:
+    """Did code flag this reading (``- LOW``, ``- the machine is saturated``)?
+    :func:`omega.machine.describe` puts the flag after ``" - "`` in the value."""
+    return " - " in line.rsplit(": ", 1)[-1]
+
+
+def _fold_flags(
+    flagged: dict[str, tuple[str, str]], lines: Sequence[object], at: str
+) -> dict[str, tuple[str, str]]:
+    """The flags after one look: kept with their start if still flagged, started
+    now if newly flagged, dropped if the reading cleared or is gone."""
+    out: dict[str, tuple[str, str]] = {}
+    for line in lines:
+        if isinstance(line, str) and is_flagged(line):
+            key = machine_key(line)
+            out[key] = flagged.get(key, (at, line))
+    return out
 
 
 def may_look(
@@ -316,6 +367,8 @@ def situation(
     heard_at: Optional[str] = None,
     machine: Sequence[str] = (),
     said: Sequence[tuple[str, str]] = (),
+    flagged_since: Sequence[tuple[str, str, str]] = (),
+    machine_known: bool = False,
     max_chars: int = MAX_L1_CHARS,
 ) -> str:
     """The L1 text: what is open, as far as omega already knows it.
@@ -362,8 +415,9 @@ def situation(
     if machine:
         lines.append("")
         lines.append("Their machine right now:")
+        since = {key: (at, then) for key, at, then in flagged_since}
         for line in machine:
-            lines.append(f"- {line}")
+            lines.append(f"- {line}{_flag_note(line, since, machine_known, now)}")
 
     if blocks:
         lines.append("")
@@ -375,7 +429,12 @@ def situation(
         lines.append("")
         lines.append("Standing schedules:")
         for sched in schedules:
-            lines.append(f"- {getattr(sched, 'instruction', '')}")
+            # The first line only: what the schedule is about. A watch's
+            # instruction goes on to tell *its own* turn to answer "(nothing
+            # new)" when it finds nothing, and pasting that into the look
+            # handed the look the same way out (DL-076).
+            instruction = str(getattr(sched, "instruction", "")).strip()
+            lines.append(f"- {instruction.splitlines()[0] if instruction else ''}")
 
     if moments:
         lines.append("")
@@ -401,7 +460,10 @@ def situation(
             recent.append((ago, text))
     if recent:
         lines.append("")
-        lines.append("You already told them, unprompted (do not repeat it):")
+        lines.append(
+            "You already told them, unprompted (do not repeat it unless it "
+            "has got worse or more urgent since):"
+        )
         for ago, text in recent:
             one = " ".join(text.split())
             if len(one) > 200:
@@ -419,3 +481,30 @@ def situation(
     if len(text) > max_chars:
         text = text[: max_chars - 1].rstrip() + "…"
     return text
+
+
+def _flag_note(
+    line: str,
+    since: dict[str, tuple[str, str]],
+    machine_known: bool,
+    now: datetime,
+) -> str:
+    """How long a flagged reading has been flagged, or that it is new (DL-076).
+
+    The judge sees one look at a time, so it cannot tell a battery that just
+    went LOW from a disk that has been LOW for a week, and the first is a
+    nudge while the second, already told, is not. Code can tell, so code says.
+    An unflagged line gets nothing, and with no earlier look to compare with
+    nothing is called new.
+    """
+    if not is_flagged(line):
+        return ""
+    started = since.get(machine_key(line))
+    if started is None:
+        return " (new since your last look)" if machine_known else ""
+    at, then = started
+    ago = _since(now, at)
+    if ago is None:
+        return ""
+    was = then.rsplit(": ", 1)[-1].split(" - ")[0]
+    return f" (first flagged {ago}, when it read {was})"

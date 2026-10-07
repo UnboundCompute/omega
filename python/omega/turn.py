@@ -248,9 +248,30 @@ def unprompted(ctx: "TurnContext") -> bool:
     return str(ctx.event.get("channel", "")) in UNPROMPTED_CHANNELS
 
 
+def is_look(ctx: "TurnContext") -> bool:
+    """Is this omega's own look rather than something that arrived?"""
+    return str(ctx.event.get("channel", "")) == notice.CHANNEL
+
+
+def look_reason(ctx: "TurnContext", verdict: "Verdict") -> str:
+    """The reason a look's judge gave after its first word, or ``""``."""
+    if not is_look(ctx):
+        return ""
+    raw = (verdict.raw or "").strip()
+    parts = raw.split(None, 1)
+    return parts[1].strip(" :-\n") if len(parts) > 1 else ""
+
+
+def _judged(verdict: Optional["Verdict"]) -> Optional[str]:
+    """What the judge said, for the record (DL-076), capped like a log line."""
+    if verdict is None or not isinstance(verdict.raw, str) or not verdict.raw.strip():
+        return None
+    return " ".join(verdict.raw.split())[:300]
+
+
 def quiet_allowed(ctx: "TurnContext", text: str) -> bool:
     """May this reply end the turn in silence? Only an unprompted check that
-    found nothing, and never a reminder coming due (DL-072)."""
+    found nothing, and never a reminder coming due (DL-075)."""
     return unprompted(ctx) and not is_reminder(ctx.event) and nothing_new(text)
 
 
@@ -388,7 +409,9 @@ def reply(ctx: TurnContext, verdict: Verdict, acted: ActResult) -> Optional[str]
         # file and then say it could not (see :class:`ActResult`). The cheapest
         # correct reply is the one already written.
         return acted.text
-    response = ctx.complete(provider.ACT, _reply_messages(ctx, acted))
+    response = ctx.complete(
+        provider.ACT, _reply_messages(ctx, acted, look_reason(ctx, verdict))
+    )
     if quiet_allowed(ctx, response.text):
         return None
     if not response.text.strip():
@@ -413,6 +436,7 @@ def write_memory(
     error: Optional[str] = None,
     needs: Optional[str] = None,
     usage: Optional[list[dict[str, Any]]] = None,
+    judged: Optional[str] = None,
     at: Optional[str] = None,
 ) -> int:
     """Step 6 — append the turn's terminal record and return its seq.
@@ -441,6 +465,7 @@ def write_memory(
             tools=list(tools),
             error=error,
             usage=usage,
+            judged=judged,
             at=at,
         )
     return queue.append(payload, episodes.turn_write_key(seq))
@@ -611,7 +636,7 @@ def run_turn(
         if verdict.choice == STAY_SILENT and is_reminder(ctx.event):
             # A reminder coming due is a promise, and the prompt saying "never
             # SILENT" was not enough: live, the judge chose silence on a 6pm
-            # walk reminder and nobody heard it (DL-072). Code keeps the promise
+            # walk reminder and nobody heard it (DL-075). Code keeps the promise
             # the prompt only asked for; SPEAK, because a judge that saw nothing
             # to do saw nothing to look up. ``raw`` keeps what it said.
             verdict = Verdict(choice=SPEAK, raw=verdict.raw)
@@ -646,6 +671,7 @@ def run_turn(
             tools=acted.tools,
             error=error,
             usage=meter.usage(),
+            judged=_judged(verdict),
             at=at,
         )
         return TurnResult(
@@ -673,6 +699,7 @@ def run_turn(
             outcome="silent",
             tools=acted.tools,
             usage=meter.usage(),
+            judged=_judged(verdict),
             at=at,
         )
         return TurnResult(
@@ -698,6 +725,7 @@ def run_turn(
         reply_text=text,
         tools=acted.tools,
         usage=meter.usage(),
+        judged=_judged(verdict),
         at=at,
     )
     return TurnResult(
@@ -723,6 +751,9 @@ _VERDICT_WORDS = {
     "silent": STAY_SILENT,
     "stay_silent": STAY_SILENT,
     "nothing": STAY_SILENT,
+    # A look's words (DL-076).
+    "nudge": SPEAK,
+    "check": ACT_THEN_SPEAK,
 }
 
 
@@ -783,13 +814,17 @@ _JUDGE_SYSTEM = (
     "SILENT is a successful outcome, not a failure, for events that need "
     "nothing - background noise, things already handled.\n"
     "An event marked 'nobody asked' is your own look at their machine and "
-    "what is open, not the person writing to you. Speak up like a helper "
-    "would when something calls for it: the machine is in a state they "
-    "should know about, something is due or overdue, something is waiting "
-    "on them or on you, or something changed that they care about. If "
-    "something they care about could have changed and you can check it, "
-    "choose ACT and check before deciding. If nothing calls for it, or it "
-    "is only something you already told them, SILENT is right.\n"
+    "what is open, not the person writing to you, and the question it asks "
+    "is: do they need a nudge right now? A nudge is something they would "
+    "want to act on soon and would be sorry not to have heard: something due "
+    "or overdue, something waiting on them or on you, their machine needing "
+    "attention (a reading flagged LOW, above all one that is new since your "
+    "last look or worse than when it was first flagged), or a real change in "
+    "something they asked you to track. Trivia, news they did not ask for, "
+    "and anything you already told them that has not got worse or more "
+    "urgent are not nudges. If a nudge may be due but you would have to "
+    "check something first, check. A look is answered in the form its end "
+    "asks for, with a reason.\n"
     "A standing watch firing is a check you promised them: choose ACT. A "
     "reminder firing is a promise coming due: never SILENT. If keeping it "
     "means looking something up or doing something first (the weather, a "
@@ -925,19 +960,38 @@ _JUDGE_SUFFIX = (
     "Your entire reply is one word - SPEAK, ACT, or SILENT."
 )
 
+#: The end of the judge's turn for a look (DL-076). A look gets its own
+#: question - does the person need a nudge right now - and must give its
+#: reason on the same line. The reason is the guard on both sides: a nudge has
+#: to name what needs their attention, which "here is some news" cannot, and a
+#: silence is recorded with why, which the log could never say before.
+#: ``NUDGE`` reads as SPEAK and ``CHECK`` as ACT; the first word still decides.
+_LOOK_JUDGE_SUFFIX = (
+    "\n\n---\n"
+    "This is your own look, not a message to answer. Do they need a nudge "
+    "right now?\n"
+    "Answer on one line: NUDGE, CHECK, or SILENT as the first word, then a "
+    "short reason - what needs their attention, what you will check, or why "
+    "nothing does."
+)
+
 
 def _judge_messages(ctx: TurnContext) -> list[provider.Message]:
+    suffix = _LOOK_JUDGE_SUFFIX if is_look(ctx) else _JUDGE_SUFFIX
     return [
         provider.system(_JUDGE_SYSTEM),
-        _event_turn(ctx, images=False, suffix=_JUDGE_SUFFIX),
+        _event_turn(ctx, images=False, suffix=suffix),
     ]
 
 
-def _reply_messages(ctx: TurnContext, acted: ActResult) -> list[provider.Message]:
+def _reply_messages(
+    ctx: TurnContext, acted: ActResult, reason: str = ""
+) -> list[provider.Message]:
     work = f"\n\nWork done this turn: {', '.join(acted.tools)}" if acted.tools else ""
+    why = f"\n\nYou decided to speak up because: {reason}" if reason else ""
     return [
         provider.system(_REPLY_SYSTEM),
-        _event_turn(ctx, images=True, suffix=work),
+        _event_turn(ctx, images=True, suffix=work + why),
     ]
 
 

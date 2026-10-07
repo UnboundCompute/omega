@@ -219,7 +219,7 @@ def remind_instruction(what: str) -> str:
 
 
 def is_reminder(event: dict[str, Any]) -> bool:
-    """Is this event a reminder coming due, which must reach them (DL-072)?
+    """Is this event a reminder coming due, which must reach them (DL-075)?
 
     Read off the fire itself, the clock's inbound on the ``schedule`` channel
     carrying :func:`remind_instruction`'s text, so it also holds for reminders
