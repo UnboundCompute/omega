@@ -102,6 +102,19 @@ def test_a_reminder_is_one_shot_and_has_no_way_to_stay_quiet(
     assert tools.NOTHING_NEW not in created["instruction"]
 
 
+def test_a_reminder_that_needs_a_lookup_may_act_rather_than_only_speak() -> None:
+    """The live failure after DL-068 shipped: "remind me in 2 min ... the
+    current weather" fired on time, but the judge was told to SPEAK on every
+    reminder, so the turn had no tools and said "I need to check live
+    weather" instead of checking. A reminder must be able to reach ACT."""
+    from omega import turn
+
+    rule = turn._JUDGE_SYSTEM.split("reminder firing")[1]
+    assert "ACT" in rule
+    assert "never SILENT" in rule
+    assert "looked up" in tools.remind_instruction("the weather")
+
+
 def test_a_reminder_rounds_up_and_is_bounded(q: EventQueue, tmp_path: Path) -> None:
     box = _box(q, tmp_path)
     assert box.classify("remind", {"what": "x", "in_minutes": 0.3}).args["in_minutes"] == 1

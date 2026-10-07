@@ -207,7 +207,8 @@ def remind_instruction(what: str) -> str:
     that it is not worth mentioning is a broken promise, not discretion."""
     return (
         f"Reminder you promised them: {what}\n"
-        "It is time. Remind them now, in a sentence."
+        "It is time. Keep it now: if it needs something looked up or done, "
+        "do that first, then tell them in a sentence or two."
     )
 
 #: How many claims one ``recall`` answers with.

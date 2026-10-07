@@ -756,7 +756,9 @@ _JUDGE_SYSTEM = (
     "choose ACT and check before deciding. If nothing calls for it, or it "
     "is only something you already told them, SILENT is right.\n"
     "A standing watch firing is a check you promised them: choose ACT. A "
-    "reminder firing is a promise coming due: choose SPEAK and remind them.\n"
+    "reminder firing is a promise coming due: never SILENT. If keeping it "
+    "means looking something up or doing something first (the weather, a "
+    "score, a file), choose ACT; otherwise choose SPEAK and remind them.\n"
     "Judge this event on its own. That you stayed silent before is not a "
     "reason to stay silent now."
 )
