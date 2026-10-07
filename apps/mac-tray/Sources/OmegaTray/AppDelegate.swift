@@ -3,7 +3,10 @@ import Combine
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
-    private let transport = OmegaChannelClient()
+    // Read once, at launch: switching cores under a live subscription would
+    // carry one log's cursor into another, so a change waits for a relaunch.
+    private let remoteAgentHost = AppSettings.shared.remoteAgentHost
+    private lazy var transport = OmegaChannelClient(host: remoteAgentHost ?? "127.0.0.1")
     private lazy var viewModel = TrayViewModel(transport: transport)
     private let agentProcessController = AgentProcessController()
     private var panelController: OmegaPanelController?
@@ -21,7 +24,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         agentProcessController.onFailure = { [weak self] detail in
             self?.viewModel.agentStartupFailure = detail
         }
-        agentProcessController.start()
+        if remoteAgentHost == nil {
+            agentProcessController.start()
+        }
 
         let panelController = OmegaPanelController(viewModel: viewModel)
         self.panelController = panelController

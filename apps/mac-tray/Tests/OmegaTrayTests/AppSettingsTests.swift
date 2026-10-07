@@ -15,6 +15,23 @@ final class AppSettingsTests: XCTestCase {
         XCTAssertEqual(settings.hotKey.title, "Control–Space")
     }
 
+    @MainActor
+    func testAgentHostDefaultsToThisMacAndPersists() {
+        let suiteName = "OmegaTrayTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let settings = AppSettings(defaults: defaults)
+        XCTAssertNil(settings.remoteAgentHost)
+
+        settings.agentHost = "  omega.example.ts.net \n"
+        XCTAssertEqual(defaults.string(forKey: "agentHost"), "  omega.example.ts.net \n")
+        XCTAssertEqual(AppSettings(defaults: defaults).remoteAgentHost, "omega.example.ts.net")
+
+        settings.agentHost = "   "
+        XCTAssertNil(settings.remoteAgentHost, "whitespace is not a host")
+    }
+
     func testEveryShortcutChoiceHasAUniqueIdentifier() {
         let identifiers = (HotKeyChoice.panelChoices + HotKeyChoice.captureAreaChoices).map(\.id)
         XCTAssertEqual(Set(identifiers).count, identifiers.count)

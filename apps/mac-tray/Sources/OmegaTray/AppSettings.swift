@@ -80,6 +80,13 @@ final class AppSettings: ObservableObject {
     @Published var hideProactivePreviews: Bool {
         didSet { defaults.set(hideProactivePreviews, forKey: Keys.hideProactivePreviews) }
     }
+    /// Where the agent core runs (DL-069). Empty means this Mac: the tray
+    /// starts the local agent and talks to it over loopback. A host means the
+    /// core runs there, reached over the tailnet, and the tray must *not* start
+    /// a local agent — two cores would be two logs, and memory would split.
+    @Published var agentHost: String {
+        didSet { defaults.set(agentHost, forKey: Keys.agentHost) }
+    }
     @Published private(set) var launchAtLogin = false
     @Published private(set) var launchAtLoginMessage: String?
 
@@ -96,6 +103,12 @@ final class AppSettings: ObservableObject {
 
     private let defaults: UserDefaults
 
+    /// The remote core's host, or `nil` when the core runs on this Mac.
+    var remoteAgentHost: String? {
+        let host = agentHost.trimmingCharacters(in: .whitespacesAndNewlines)
+        return host.isEmpty ? nil : host
+    }
+
     var hotKey: HotKeyChoice {
         HotKeyChoice.panelChoices.first { $0.id == hotKeyID } ?? .panelFallback
     }
@@ -109,6 +122,7 @@ final class AppSettings: ObservableObject {
         static let captureAreaHotKeyID = "captureAreaHotKeyID"
         static let hideProactivePreviews = "hideProactivePreviews"
         static let projectionCursor = "projectionCursor"
+        static let agentHost = "agentHost"
     }
 
     init(defaults: UserDefaults = .standard) {
@@ -122,6 +136,7 @@ final class AppSettings: ObservableObject {
             captureAreaHotKeyID = HotKeyChoice.captureAreaFallback.id
         }
         hideProactivePreviews = defaults.object(forKey: Keys.hideProactivePreviews) as? Bool ?? true
+        agentHost = defaults.string(forKey: Keys.agentHost) ?? ""
         if savedCaptureAreaHotKeyID != captureAreaHotKeyID {
             defaults.set(captureAreaHotKeyID, forKey: Keys.captureAreaHotKeyID)
         }

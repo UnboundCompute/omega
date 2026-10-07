@@ -49,6 +49,14 @@ private struct SettingsView: View {
                 }
             }
 
+            Section("Agent") {
+                TextField("omega server", text: $settings.agentHost, prompt: Text("This Mac"))
+                    .autocorrectionDisabled()
+                Text("Leave empty to run omega on this Mac. Enter a tailnet host, such as omega.example.ts.net, to use an omega running there instead; this Mac then starts no agent of its own. Takes effect when omega is reopened.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
+
             Section("Privacy") {
                 Toggle("Hide proactive message previews", isOn: $settings.hideProactivePreviews)
                 Text("When enabled, the camera-area peek only says that omega has something for you. Open the tray to read it.")
