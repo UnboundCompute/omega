@@ -49,7 +49,9 @@ final class OmegaPanelController: NSWindowController, CapturePresentationControl
             .dropFirst()
             .sink { [weak self] _, _ in
                 guard let self, self.presentation == .expanded else { return }
-                self.resize(to: self.expandedSize(), animate: true)
+                self.resize(to: self.expandedSize(), animate: true) { [weak self] in
+                    self?.requestConversationScrollAfterLayout()
+                }
             }
 
         dropObservation = viewModel.$isDropTargeted
@@ -104,7 +106,9 @@ final class OmegaPanelController: NSWindowController, CapturePresentationControl
         } else {
             viewModel.proactivePeek = nil
         }
-        resize(to: expandedSize(), animate: true)
+        resize(to: expandedSize(), animate: true) { [weak self] in
+            self?.requestConversationScrollAfterLayout()
+        }
         updateContent()
         window?.orderFrontRegardless()
 
@@ -221,7 +225,14 @@ final class OmegaPanelController: NSWindowController, CapturePresentationControl
         }
     }
 
-    private func resize(to size: NSSize, animate: Bool) {
+    private func requestConversationScrollAfterLayout() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.presentation == .expanded else { return }
+            self.viewModel.conversationScrollRequest += 1
+        }
+    }
+
+    private func resize(to size: NSSize, animate: Bool, completion: (() -> Void)? = nil) {
         guard let window else { return }
         let targetFrame = frame(for: size)
 
@@ -230,9 +241,12 @@ final class OmegaPanelController: NSWindowController, CapturePresentationControl
                 context.duration = 0.24
                 context.timingFunction = CAMediaTimingFunction(controlPoints: 0.22, 0.82, 0.2, 1)
                 window.animator().setFrame(targetFrame, display: true)
+            } completionHandler: {
+                completion?()
             }
         } else {
             window.setFrame(targetFrame, display: true)
+            completion?()
         }
     }
 

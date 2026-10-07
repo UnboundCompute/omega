@@ -187,6 +187,10 @@ private struct ProactivePeekView: View {
 }
 
 private struct ExpandedTrayView: View {
+    private enum ConversationScrollTarget: Hashable {
+        case bottom
+    }
+
     @ObservedObject var viewModel: TrayViewModel
     let close: () -> Void
     @FocusState private var composerFocused: Bool
@@ -322,27 +326,36 @@ private struct ExpandedTrayView: View {
                                 .id(message.id)
                         }
                     }
+                    Color.clear
+                        .frame(height: 1)
+                        .id(ConversationScrollTarget.bottom)
                 }
                 .padding(16)
             }
             .onAppear {
-                guard let id = viewModel.messages.last?.id else { return }
-                DispatchQueue.main.async {
-                    proxy.scrollTo(id, anchor: .bottom)
-                }
+                scrollToConversationEnd(using: proxy, animated: false)
             }
-            .onChange(of: viewModel.messages.count) {
-                guard let id = viewModel.messages.last?.id else { return }
-                if reduceMotion {
-                    proxy.scrollTo(id, anchor: .bottom)
-                } else {
-                    withAnimation(.timingCurve(0.22, 0.82, 0.2, 1, duration: 0.2)) {
-                        proxy.scrollTo(id, anchor: .bottom)
-                    }
-                }
+            .onChange(of: viewModel.messages.last?.id) {
+                scrollToConversationEnd(using: proxy, animated: true)
+            }
+            .onChange(of: viewModel.conversationScrollRequest) {
+                scrollToConversationEnd(using: proxy, animated: false)
             }
         }
         .frame(maxHeight: .infinity)
+    }
+
+    private func scrollToConversationEnd(using proxy: ScrollViewProxy, animated: Bool) {
+        guard !viewModel.messages.isEmpty else { return }
+        DispatchQueue.main.async {
+            if animated, !reduceMotion {
+                withAnimation(.timingCurve(0.22, 0.82, 0.2, 1, duration: 0.2)) {
+                    proxy.scrollTo(ConversationScrollTarget.bottom, anchor: .bottom)
+                }
+            } else {
+                proxy.scrollTo(ConversationScrollTarget.bottom, anchor: .bottom)
+            }
+        }
     }
 
     @ViewBuilder

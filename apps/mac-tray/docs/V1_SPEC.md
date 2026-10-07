@@ -39,8 +39,8 @@ The defining loop is:
 - If a response lands after the panel is closed, omega shows the same non-focus-stealing
   top-center peek and unread treatment used for proactive messages.
 - The hotkey or an explicit close control closes the panel.
-- Closing and reopening preserves the active conversation, staged context, and scroll
-  position.
+- Closing and reopening preserves the active conversation and staged context, and presents
+  the newest message rather than returning to an earlier scroll position.
 
 ### Capture and staging
 
@@ -86,6 +86,8 @@ The defining loop is:
 - Omega responses render native Markdown structure—paragraphs, emphasis, links, lists, quotes,
   headings, inline code, and fenced code—without exposing raw formatting markers.
 - The panel grows with the exchange to a safe maximum height, then scrolls internally.
+- Opening, restoring a transcript, or receiving a new message keeps the newest message in view
+  after the panel finishes resizing.
 - The composer remains available at the bottom.
 - Delegated work has durable plain-language states: understood, working, blocked, failed,
   and verified complete.

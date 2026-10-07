@@ -56,6 +56,7 @@ final class TrayViewModel: ObservableObject {
     @Published var hasUnread = false
     @Published var proactivePeek: String?
     @Published var composerFocusRequest = 0
+    @Published var conversationScrollRequest = 0
     @Published var composerMode: ComposerMode = .ask
     @Published var capturePermission: ScreenCapturePermission
     @Published var hotKeyRegistrationFailure: String?
