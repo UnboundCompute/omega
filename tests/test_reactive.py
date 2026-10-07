@@ -381,3 +381,53 @@ def test_auditing_the_disk_needs_no_go(q: EventQueue, tmp_path: Path) -> None:
     for argv in (["sysctl", "-w", "x=1"], ["pmset", "-a", "sleep", "0"]):
         decision = box.classify("run_code", {"argv": argv, "cwd": str(tmp_path)})
         assert decision.tier == tools.EXTERNAL, argv
+
+
+# --- a reminder coming due always reaches them (DL-072) ----------------------
+
+
+def _reminder(q: EventQueue, what: str = "take a walk", *, channel: str = "schedule"):
+    extra = {"schedule_id": "r9-0001"} if channel == "schedule" else {}
+    text = tools.remind_instruction(what)
+    seq = q.append(episodes.inbound(text, channel=channel, at=AT, **extra))
+    q.claim(seq)
+    return q.at(seq)
+
+
+def test_a_reminder_the_judge_would_silence_is_still_spoken(q: EventQueue) -> None:
+    """The live failure: a 6pm walk reminder fired, the judge said SILENT, and
+    nobody heard it. Code overrides the verdict; the prompt only asked."""
+    fp = provider.FakeProvider(
+        {provider.JUDGE: "SILENT", provider.ACT: "Time for your walk."}
+    )
+    result = run_turn(q, _reminder(q), complete=fp.complete, at=AT)
+    assert result.outcome == "spoke"
+    assert result.reply == "Time for your walk."
+    assert result.verdict.raw == "SILENT", "what the judge said is kept"
+
+
+def test_a_late_reminder_is_still_a_reminder(q: EventQueue) -> None:
+    text = tools.remind_instruction("take a walk") + "\n\n(Scheduled for 18:00, running 9 minutes late.)"
+    assert tools.is_reminder({"channel": "schedule", "text": text})
+
+
+def test_a_reminder_cannot_answer_nothing_new(q: EventQueue) -> None:
+    fp = provider.FakeProvider({provider.JUDGE: "ACT", provider.ACT: ["unused"]})
+    result = run_turn(
+        q, _reminder(q), complete=fp.complete, act=_act_says("(nothing new)"), at=AT
+    )
+    assert result.outcome == "spoke"
+
+
+def test_a_watch_may_still_stay_silent(q: EventQueue) -> None:
+    fp = provider.FakeProvider({provider.JUDGE: "SILENT", provider.ACT: ["unused"]})
+    result = run_turn(q, _put(q, "schedule"), complete=fp.complete, at=AT)
+    assert result.outcome == "silent"
+
+
+def test_only_the_clock_can_fire_a_reminder() -> None:
+    """Typing the reminder's words is a message, not a promise coming due."""
+    text = tools.remind_instruction("take a walk")
+    assert tools.is_reminder({"channel": "schedule", "text": text})
+    assert not tools.is_reminder({"channel": "tray", "text": text})
+    assert not tools.is_reminder({"channel": "schedule", "text": tools.watch_instruction("news")})

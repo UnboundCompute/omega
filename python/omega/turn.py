@@ -33,7 +33,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Optional, Sequence
 
 from omega import blobs, derive, episodes, learn, notice, provider, schedule
-from omega.tools import NOTHING_NEW
+from omega.tools import NOTHING_NEW, is_reminder
 from omega.queue import EVENT_KINDS, EventQueue, Pending
 
 __all__ = [
@@ -241,6 +241,12 @@ def unprompted(ctx: "TurnContext") -> bool:
     return str(ctx.event.get("channel", "")) in UNPROMPTED_CHANNELS
 
 
+def quiet_allowed(ctx: "TurnContext", text: str) -> bool:
+    """May this reply end the turn in silence? Only an unprompted check that
+    found nothing, and never a reminder coming due (DL-072)."""
+    return unprompted(ctx) and not is_reminder(ctx.event) and nothing_new(text)
+
+
 def nothing_new(text: str) -> bool:
     """Is this the sentinel, allowing for the quoting and punctuation a model
     wraps around an answer it was told to give exactly?"""
@@ -365,7 +371,7 @@ def reply(ctx: TurnContext, verdict: Verdict, acted: ActResult) -> Optional[str]
     if not verdict.speaks:
         return None
     if acted.text is not None and acted.text.strip():
-        if unprompted(ctx) and nothing_new(acted.text):
+        if quiet_allowed(ctx, acted.text):
             # Checked, and found nothing worth interrupting them for. On a
             # channel nobody typed on that is a decision, not an empty answer.
             return None
@@ -376,7 +382,7 @@ def reply(ctx: TurnContext, verdict: Verdict, acted: ActResult) -> Optional[str]
         # correct reply is the one already written.
         return acted.text
     response = ctx.complete(provider.ACT, _reply_messages(ctx, acted))
-    if unprompted(ctx) and nothing_new(response.text):
+    if quiet_allowed(ctx, response.text):
         return None
     if not response.text.strip():
         # DL-011, stated as sharply as it deserves: a model that **returns no
@@ -595,6 +601,13 @@ def run_turn(
     acted = ActResult()
     try:
         verdict = judge(ctx)
+        if verdict.choice == STAY_SILENT and is_reminder(ctx.event):
+            # A reminder coming due is a promise, and the prompt saying "never
+            # SILENT" was not enough: live, the judge chose silence on a 6pm
+            # walk reminder and nobody heard it (DL-072). Code keeps the promise
+            # the prompt only asked for; SPEAK, because a judge that saw nothing
+            # to do saw nothing to look up. ``raw`` keeps what it said.
+            verdict = Verdict(choice=SPEAK, raw=verdict.raw)
         if verdict.choice == ACT_THEN_SPEAK:
             acted = act(ctx)
             if acted.blocked_on:

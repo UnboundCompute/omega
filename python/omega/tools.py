@@ -99,6 +99,8 @@ __all__ = [
     "NOTHING_NEW",
     "watch_instruction",
     "remind_instruction",
+    "REMINDER_LEAD",
+    "is_reminder",
     "TOOL_NAMES",
     "MAX_RECALLED",
     "READ_ONLY_ARGV0",
@@ -201,15 +203,32 @@ def watch_instruction(what: str) -> str:
     )
 
 
+#: How every reminder's fire text begins, and so how a turn knows it is one.
+REMINDER_LEAD = "Reminder you promised them: "
+
+
 def remind_instruction(what: str) -> str:
     """The text a reminder fires with. Deliberately *without* the
     :data:`NOTHING_NEW` way out a watch has: a reminder that decides on its own
     that it is not worth mentioning is a broken promise, not discretion."""
     return (
-        f"Reminder you promised them: {what}\n"
+        f"{REMINDER_LEAD}{what}\n"
         "It is time. Keep it now: if it needs something looked up or done, "
         "do that first, then tell them in a sentence or two."
     )
+
+
+def is_reminder(event: dict[str, Any]) -> bool:
+    """Is this event a reminder coming due, which must reach them (DL-072)?
+
+    Read off the fire itself, the clock's inbound on the ``schedule`` channel
+    carrying :func:`remind_instruction`'s text, so it also holds for reminders
+    filed before this existed. A late fire only appends to that text.
+    """
+    return event.get("channel") == "schedule" and str(
+        event.get("text", "")
+    ).startswith(REMINDER_LEAD)
+
 
 #: How many claims one ``recall`` answers with.
 #:
