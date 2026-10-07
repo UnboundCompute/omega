@@ -44,6 +44,7 @@ from omega.tools import (
     ToolBox,
     ToolError,
     ToolRejected,
+    hosted,
     schemas,
 )
 
@@ -158,7 +159,9 @@ def act_loop(
         # `recall` would wait on itself.
         box = ToolBox(store_root=ctx.queue.store.root, remembered=tuple(ctx.known))
 
-    offered = schemas()
+    # Ring 1 plus whatever the provider runs itself (DL-067). The second half
+    # never reaches `box.classify`; its tier was decided where it is declared.
+    offered = schemas() + hosted()
     messages = _act_messages(ctx, box)
     used: list[str] = []
     seen: set[tuple[str, str]] = set()
@@ -166,6 +169,22 @@ def act_loop(
     for _ in range(max_passes):
         response = ctx.complete(provider.ACT, messages, offered)
         calls = response.tool_calls
+
+        # Searches the provider already ran, written down as tool pairs so the
+        # log answers "what did it look up" the same way for every tool. After
+        # the fact, not before: there is no "before" omega can see, and a
+        # search has no side effect a crash could repeat.
+        for search in response.hosted:
+            _called(ctx, search.tool, dict(search.args))
+            _returned(
+                ctx,
+                search.tool,
+                ok=search.ok,
+                result=search.result if search.ok else None,
+                error=None if search.ok else (search.error or "failed"),
+            )
+            if search.ok:
+                used.append(search.tool)
 
         if not calls:
             # Done. The model asking for nothing is the signal (§1.5) — and it

@@ -108,13 +108,15 @@ def test_tools_are_offered_to_act_and_to_nobody_else(q: EventQueue, box: ToolBox
     act_loop(ctx_for(q, fp), box=box)
     offered = fp.offers_for(provider.ACT)[0]
     assert offered is not None
-    assert {s["function"]["name"] for s in offered} == {
+    assert {s["function"]["name"] for s in offered if "function" in s} == {
         "read_file",
         "write_file",
         "run_code",
         "fetch",
         "recall",
     }
+    # Beside Ring 1, not in it (DL-067): the provider's own search.
+    assert [s for s in offered if "function" not in s] == [{"type": "web_search"}]
 
 
 # --- the log ----------------------------------------------------------------

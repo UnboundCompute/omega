@@ -80,6 +80,7 @@ __all__ = [
     "Message",
     "Part",
     "ToolCall",
+    "HostedCall",
     "Response",
     "Provider",
     "ProviderError",
@@ -234,6 +235,27 @@ class ToolCall:
     arguments: dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class HostedCall:
+    """One tool the *provider* ran inside the call, reported after the fact.
+
+    Not a :class:`ToolCall`: nothing is asked of omega and nothing is handed
+    back. A hosted search has already happened by the time the response
+    arrives, so the only thing left to do with it is write it down — which is
+    the whole reason it is read at all (DL-067). A search omega cannot see in
+    its own log is a search nobody can audit.
+
+    ``args`` and ``result`` are shaped like a Ring 1 tool's so the log reads
+    the same either way: what was asked, and what came back.
+    """
+
+    tool: str
+    args: dict[str, Any] = field(default_factory=dict)
+    ok: bool = True
+    result: Optional[str] = None
+    error: Optional[str] = None
+
+
 def assistant_tool_calls(
     tool_calls: Sequence[ToolCall], content: str = ""
 ) -> Message:
@@ -288,6 +310,9 @@ class Response:
 
     ``tool_calls`` is empty for every call that offered no tools, which is
     every call `judge` and `reply` make.
+
+    ``hosted`` is what the provider ran on its own side — today, only web
+    search (DL-067). Already finished; carried so it can be logged.
     """
 
     text: str
@@ -296,6 +321,7 @@ class Response:
     prompt_tokens: Optional[int] = None
     completion_tokens: Optional[int] = None
     tool_calls: tuple[ToolCall, ...] = ()
+    hosted: tuple[HostedCall, ...] = ()
 
     @property
     def total_tokens(self) -> Optional[int]:
@@ -544,6 +570,15 @@ def _config_hint(
             f"OMEGA_MODEL applies to every role, including this one."
         )
 
+    if "web_search" in text:
+        # Checked before the generic tool hint, which would point at the
+        # model — when the cheaper fix is to stop offering search (DL-067).
+        return (
+            f"\n\n{model} rejected the hosted web_search tool. Either set "
+            f"OMEGA_WEB_SEARCH=off to stop offering it, or point "
+            f"OMEGA_MODEL_{role.upper()} at a model that supports it."
+        )
+
     if tools and ("tool" in text or "function" in text):
         return (
             f"\n\n{model} was offered {len(tools)} tools and rejected them. The "
@@ -651,6 +686,11 @@ class OpenAIProvider:
             # none sends no `tools` key at all — the property DL-028 rests on,
             # kept true across the change of transport.
             request["tools"] = _as_tool_schemas(tools)
+            if any(t.get("type") == "web_search" for t in tools):
+                # Without this the search item carries the query but not what
+                # it read, and "what did omega look at" would be unanswerable
+                # from the log — the property DL-067 chose hosted search on.
+                request["include"] = ["web_search_call.action.sources"]
         try:
             raw = self._client.responses.create(**request)
         except Exception as exc:  # noqa: BLE001 - every remote failure is one class
@@ -659,7 +699,7 @@ class OpenAIProvider:
                 f"{_config_hint(role, model, tools, exc)}"
             ) from exc
 
-        text, tool_calls = _read_output(role, model, raw)
+        text, tool_calls, hosted = _read_output(role, model, raw)
 
         if text is None and not tool_calls:
             # Never let this become an empty string: `judge` reading "" would be
@@ -687,13 +727,14 @@ class OpenAIProvider:
             prompt_tokens=getattr(usage, "input_tokens", None),
             completion_tokens=getattr(usage, "output_tokens", None),
             tool_calls=tool_calls,
+            hosted=hosted,
         )
 
 
 def _read_output(
     role: str, model: str, raw: Any
-) -> tuple[Optional[str], tuple[ToolCall, ...]]:
-    """The response's ``output`` list as text plus tool calls.
+) -> tuple[Optional[str], tuple[ToolCall, ...], tuple[HostedCall, ...]]:
+    """The response's ``output`` list as text, tool calls and hosted calls.
 
     Responses returns a *list of items* where chat completions returned one
     message with optional fields, so reading it is a walk rather than two
@@ -714,11 +755,14 @@ def _read_output(
 
     parts: list[str] = []
     calls: list[ToolCall] = []
+    hosted: list[HostedCall] = []
     spoke = False
     for item in items:
         kind = getattr(item, "type", None)
         if kind == "function_call":
             calls.append(_read_tool_call(role, model, item))
+        elif kind == "web_search_call":
+            hosted.append(_read_web_search(item))
         elif kind == "message":
             # Seen at all, even carrying no text. That is the distinction the
             # caller's guard turns on: a model that produced a message and put
@@ -731,7 +775,60 @@ def _read_output(
                 chunk = getattr(block, "text", None)
                 if chunk:
                     parts.append(chunk)
-    return ("".join(parts) if spoke else None), tuple(calls)
+    return ("".join(parts) if spoke else None), tuple(calls), tuple(hosted)
+
+
+def _field(obj: Any, name: str) -> Any:
+    """One field off an SDK object or a plain dict — the SDK hands back
+    objects, a recorded response is a dict, and both are the same answer."""
+    if isinstance(obj, dict):
+        return obj.get(name)
+    return getattr(obj, name, None)
+
+
+def _read_web_search(item: Any) -> HostedCall:
+    """A ``web_search_call`` item as a :class:`HostedCall`.
+
+    **Never raises.** The search already happened and the answer built on it
+    is in the same response; failing the whole call because the *record* of a
+    search had a shape we did not expect would throw away a good answer to
+    protect a log line. An unfamiliar shape is written down as what it is.
+
+    Three actions exist — ``search``, ``open_page``, ``find_in_page`` — and
+    each is logged with the argument that identifies it, so the log says
+    "searched for X" or "opened Y" rather than an opaque item id.
+    """
+    action = _field(item, "action")
+    status = _field(item, "status")
+    kind = _field(action, "type") if action is not None else None
+
+    args: dict[str, Any] = {"action": kind or "unknown"}
+    for key in ("query", "url", "pattern"):
+        value = _field(action, key) if action is not None else None
+        if isinstance(value, str) and value:
+            args[key] = value
+    queries = _field(action, "queries") if action is not None else None
+    if isinstance(queries, (list, tuple)) and len(queries) > 1:
+        args["queries"] = [q for q in queries if isinstance(q, str)]
+
+    urls: list[str] = []
+    for source in (_field(action, "sources") if action is not None else None) or ():
+        url = _field(source, "url")
+        if isinstance(url, str) and url and url not in urls:
+            urls.append(url)
+
+    if status not in (None, "completed"):
+        return HostedCall(
+            tool="web_search", args=args, ok=False, error=f"search {status}"
+        )
+    return HostedCall(
+        tool="web_search",
+        args=args,
+        ok=True,
+        # "No sources" is said, not left blank: an empty result reads as the
+        # log having lost it, and a search that found nothing is a fact.
+        result="\n".join(urls) if urls else "(no sources reported)",
+    )
 
 
 def _read_tool_call(role: str, model: str, raw: Any) -> ToolCall:

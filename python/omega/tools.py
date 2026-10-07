@@ -104,6 +104,8 @@ __all__ = [
     "Decision",
     "ToolBox",
     "schemas",
+    "hosted",
+    "WEB_SEARCH",
     "refusal_for_address",
     "refusal_for_host",
     "refusal_for_content_type",
@@ -1085,7 +1087,9 @@ _TOOLS: dict[str, _Tool] = {
         dispatch=lambda box, args: fetch(args["url"]),
         schema=_schema(
             FETCH,
-            "Fetch a web page over http or https. Always stops to ask first.",
+            "Read one web page whose URL you already have, over http or "
+            "https. To find something, use web_search instead: a search "
+            "engine's results page will not load here.",
             {"url": {"type": "string", "description": "The http(s) URL to fetch."}},
             ["url"],
         ),
@@ -1115,6 +1119,30 @@ assert set(_TOOLS) == TOOL_NAMES, "the tool set and its registry disagree"
 def schemas() -> list[dict[str, Any]]:
     """What is offered to the model, in the order the tools are declared."""
     return [_TOOLS[name].schema for name in (READ_FILE, WRITE_FILE, RUN_CODE, FETCH, RECALL)]
+
+
+#: The provider's own search, offered beside Ring 1 and **not in it** (DL-067).
+WEB_SEARCH = "web_search"
+
+
+def hosted() -> list[dict[str, Any]]:
+    """Tools the provider runs itself, inside the model call.
+
+    Outside :data:`TOOL_NAMES` on purpose. Ring 1 is what *omega* dispatches,
+    and it is closed (DL-014); a hosted search never reaches
+    :meth:`ToolBox.classify`, because there is no moment between the model
+    asking and the search running in which omega holds the call. So its tier
+    is decided here, once, in code, rather than per call: **exploration**. It
+    exposes strictly less than `fetch`, which is already exploration — this
+    machine contacts nobody, and the query goes only to the provider, which
+    already holds the whole conversation.
+
+    ``OMEGA_WEB_SEARCH=off`` stops offering it, because a model that does not
+    support it rejects *every* act call, and that remedy must not need code.
+    """
+    if os.environ.get("OMEGA_WEB_SEARCH", "").strip().lower() in ("off", "0", "false", "no"):
+        return []
+    return [{"type": WEB_SEARCH}]
 
 
 @dataclass(frozen=True)
