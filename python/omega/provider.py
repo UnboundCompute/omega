@@ -82,6 +82,7 @@ __all__ = [
     "ToolCall",
     "HostedCall",
     "Response",
+    "Meter",
     "Provider",
     "ProviderError",
     "ProviderNotConfigured",
@@ -320,6 +321,11 @@ class Response:
     finish_reason: Optional[str] = None
     prompt_tokens: Optional[int] = None
     completion_tokens: Optional[int] = None
+    #: Of ``prompt_tokens``, how many were served from the provider's prompt
+    #: cache (billed cheaper); of ``completion_tokens``, how many were hidden
+    #: reasoning (billed as output). Both ``None`` when the provider did not say.
+    cached_tokens: Optional[int] = None
+    reasoning_tokens: Optional[int] = None
     tool_calls: tuple[ToolCall, ...] = ()
     hosted: tuple[HostedCall, ...] = ()
 
@@ -328,6 +334,64 @@ class Response:
         if self.prompt_tokens is None or self.completion_tokens is None:
             return None
         return self.prompt_tokens + self.completion_tokens
+
+
+class Meter:
+    """What one pass spent on the model, for costing (DL-070).
+
+    Wraps a ``complete`` callable and is called exactly like one, so a turn or
+    an idle pass meters itself by handing this in where it handed the bare
+    callable before. Every response that comes back is tallied per
+    ``(role, model)``; :meth:`usage` is the tally as the ``usage`` field the
+    pass's own terminal record carries.
+
+    Per pass rather than per call, and on the record the pass already writes,
+    because recall reads the last N episodes of every kind: a record per call
+    would push conversation out of that window three to five times per turn.
+
+    A response whose provider reported no token counts is counted in
+    ``unmetered`` and adds nothing to the sums, so a total can never look
+    complete when it is not. A call that raised is not counted: there is no
+    response to read, and the error is already on the record.
+    """
+
+    __slots__ = ("_complete", "_rows")
+
+    _FIELDS = ("input", "cached", "output", "reasoning")
+
+    def __init__(self, complete: Callable[..., "Response"]) -> None:
+        self._complete = complete
+        self._rows: dict[tuple[str, str], dict[str, int]] = {}
+
+    def __call__(self, role: str, messages: Any, *args: Any, **kwargs: Any) -> "Response":
+        response = self._complete(role, messages, *args, **kwargs)
+        self.record(role, response)
+        return response
+
+    def record(self, role: str, response: "Response") -> None:
+        row = self._rows.setdefault(
+            (role, response.model),
+            {"calls": 0, **{f: 0 for f in self._FIELDS}, "unmetered": 0},
+        )
+        row["calls"] += 1
+        if response.prompt_tokens is None or response.completion_tokens is None:
+            row["unmetered"] += 1
+            return
+        row["input"] += response.prompt_tokens
+        row["output"] += response.completion_tokens
+        row["cached"] += response.cached_tokens or 0
+        row["reasoning"] += response.reasoning_tokens or 0
+
+    def usage(self) -> Optional[list[dict[str, Any]]]:
+        """The tally, or ``None`` when nothing was called — so a pass that
+        never reached the model writes no ``usage`` field rather than an empty
+        one."""
+        if not self._rows:
+            return None
+        return [
+            {"role": role, "model": model, **row}
+            for (role, model), row in sorted(self._rows.items())
+        ]
 
 
 class Provider(Protocol):
@@ -726,6 +790,12 @@ class OpenAIProvider:
             # Responses counts the same two things under different names.
             prompt_tokens=getattr(usage, "input_tokens", None),
             completion_tokens=getattr(usage, "output_tokens", None),
+            cached_tokens=getattr(
+                getattr(usage, "input_tokens_details", None), "cached_tokens", None
+            ),
+            reasoning_tokens=getattr(
+                getattr(usage, "output_tokens_details", None), "reasoning_tokens", None
+            ),
             tool_calls=tool_calls,
             hosted=hosted,
         )

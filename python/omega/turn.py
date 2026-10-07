@@ -399,6 +399,7 @@ def write_memory(
     tools: Sequence[str] = (),
     error: Optional[str] = None,
     needs: Optional[str] = None,
+    usage: Optional[list[dict[str, Any]]] = None,
     at: Optional[str] = None,
 ) -> int:
     """Step 6 — append the turn's terminal record and return its seq.
@@ -418,7 +419,7 @@ def write_memory(
     if outcome == "blocked":
         if not needs:
             raise ValueError("a blocked turn must say what it needs")
-        payload = episodes.blocked(for_seq=seq, needs=needs, at=at)
+        payload = episodes.blocked(for_seq=seq, needs=needs, usage=usage, at=at)
     else:
         payload = episodes.completed(
             for_seq=seq,
@@ -426,6 +427,7 @@ def write_memory(
             reply=reply_text,
             tools=list(tools),
             error=error,
+            usage=usage,
             at=at,
         )
     return queue.append(payload, episodes.turn_write_key(seq))
@@ -569,7 +571,12 @@ def run_turn(
     going to fire alongside it, and *what do you remember about me* is a
     question about the set rather than about the turn.
     """
-    complete = complete or provider.complete
+    # Metered here, once, so every model call the turn makes — judge, act
+    # loop, reply and teach extraction all go through `ctx.complete` — lands
+    # on the one terminal record the turn writes, whichever path ends it
+    # (DL-070).
+    meter = provider.Meter(complete or provider.complete)
+    complete = meter
     event = perceive(pending)
     recalled = recall(queue, before=pending.seq, n=recall_n)
     ctx = TurnContext(
@@ -596,6 +603,7 @@ def run_turn(
                     seq=pending.seq,
                     outcome="blocked",
                     needs=acted.blocked_on,
+                    usage=meter.usage(),
                     at=at,
                 )
                 return TurnResult(
@@ -617,6 +625,7 @@ def run_turn(
             outcome="failed",
             tools=acted.tools,
             error=error,
+            usage=meter.usage(),
             at=at,
         )
         return TurnResult(
@@ -639,7 +648,12 @@ def run_turn(
         # Silence. A success, recorded as one, with `reply` null rather than
         # empty so that "said nothing" can never be read as "said ''".
         record = write_memory(
-            queue, seq=pending.seq, outcome="silent", tools=acted.tools, at=at
+            queue,
+            seq=pending.seq,
+            outcome="silent",
+            tools=acted.tools,
+            usage=meter.usage(),
+            at=at,
         )
         return TurnResult(
             seq=pending.seq,
@@ -663,6 +677,7 @@ def run_turn(
         outcome="spoke",
         reply_text=text,
         tools=acted.tools,
+        usage=meter.usage(),
         at=at,
     )
     return TurnResult(

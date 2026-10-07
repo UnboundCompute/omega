@@ -496,9 +496,11 @@ class Executor:
         head = self._queue.head()
         window = self._queue.recent(REFLECT_WINDOW)
         known = self._learned.claims()
+        # Metered per pass, and the receipt says what it spent (DL-070).
+        meter = provider.Meter(self._completer())
         try:
             found = learn.reflect(
-                self._completer(),
+                meter,
                 transcript=_transcript(window),
                 known=known,
             )
@@ -525,9 +527,21 @@ class Executor:
             )
         except Exception as exc:  # noqa: BLE001 - see the docstring
             reason = str(exc) or type(exc).__name__
-            self._queue.append(episodes.reflection_done(through=head, reason=reason))
+            self._queue.append(
+                episodes.reflection_done(
+                    through=head,
+                    reason=reason,
+                    usage=meter.usage(),
+                )
+            )
             return True
-        self._queue.append(episodes.reflection_done(through=head, filed=len(filed)))
+        self._queue.append(
+            episodes.reflection_done(
+                through=head,
+                filed=len(filed),
+                usage=meter.usage(),
+            )
+        )
         return True
 
     def ingest(self, *, root: Optional[Any] = None, now: Optional[Any] = None) -> int:
@@ -605,9 +619,11 @@ class Executor:
             # count that exists to surface it.
             self._queue.append(episodes.transcript_ingested(**receipt, filed=0))
             return
+        # Metered per pass, and the receipt says what it spent (DL-070).
+        meter = provider.Meter(self._completer())
         try:
             found = learn.reflect(
-                self._completer(),
+                meter,
                 transcript=digest,
                 known=self._learned.claims(),
                 observing=learn.WORK,
@@ -633,9 +649,21 @@ class Executor:
             )
         except Exception as exc:  # noqa: BLE001
             reason = str(exc) or type(exc).__name__
-            self._queue.append(episodes.transcript_ingested(**receipt, reason=reason))
+            self._queue.append(
+                episodes.transcript_ingested(
+                    **receipt,
+                    reason=reason,
+                    usage=meter.usage(),
+                )
+            )
             return
-        self._queue.append(episodes.transcript_ingested(**receipt, filed=len(filed)))
+        self._queue.append(
+            episodes.transcript_ingested(
+                **receipt,
+                filed=len(filed),
+                usage=meter.usage(),
+            )
+        )
 
     def hear(
         self, *, folder: Optional[Any] = None, now: Optional[Any] = None
@@ -738,14 +766,22 @@ class Executor:
         receipt["duration"] = said.duration
         receipt["transcript"] = self._put_text(store, said.text, ".txt")
 
+        # Metered per pass, and the receipt says what it spent (DL-070).
+        meter = provider.Meter(self._completer())
         try:
-            read = listen.review(said.text, complete=self._completer(), title=path.name)
+            read = listen.review(said.text, complete=meter, title=path.name)
         except Exception as exc:  # noqa: BLE001
             # A partial, and the payload is built to say so: the transcript
             # digest stays on the receipt alongside the reason, so the work
             # that did land is not reported as lost.
             reason = str(exc) or type(exc).__name__
-            self._queue.append(episodes.audio_captured(**receipt, reason=reason))
+            self._queue.append(
+                episodes.audio_captured(
+                    **receipt,
+                    reason=reason,
+                    usage=meter.usage(),
+                )
+            )
             listen.file_away(path, folder=folder)
             return
         rendered = read.render(title=path.name)
@@ -754,7 +790,7 @@ class Executor:
 
         try:
             found = learn.reflect(
-                self._completer(),
+                meter,
                 transcript=said.text[: listen.MAX_REVIEW_CHARS],
                 known=self._learned.claims(),
                 observing=learn.ROOM,
@@ -773,11 +809,23 @@ class Executor:
             )
         except Exception as exc:  # noqa: BLE001
             reason = str(exc) or type(exc).__name__
-            self._queue.append(episodes.audio_captured(**receipt, reason=reason))
+            self._queue.append(
+                episodes.audio_captured(
+                    **receipt,
+                    reason=reason,
+                    usage=meter.usage(),
+                )
+            )
             listen.file_away(path, folder=folder)
             return
 
-        self._queue.append(episodes.audio_captured(**receipt, filed=len(filed)))
+        self._queue.append(
+            episodes.audio_captured(
+                **receipt,
+                filed=len(filed),
+                usage=meter.usage(),
+            )
+        )
         listen.file_away(path, folder=folder)
 
     @staticmethod
@@ -859,9 +907,11 @@ class Executor:
             # break in the count that exists to surface it.
             self._queue.append(episodes.usage_digested(**receipt, filed=0))
             return
+        # Metered per pass, and the receipt says what it spent (DL-070).
+        meter = provider.Meter(self._completer())
         try:
             found = learn.reflect(
-                self._completer(),
+                meter,
                 transcript=digest,
                 known=self._learned.claims(),
                 observing=learn.DAY,
@@ -887,9 +937,21 @@ class Executor:
             )
         except Exception as exc:  # noqa: BLE001
             reason = str(exc) or type(exc).__name__
-            self._queue.append(episodes.usage_digested(**receipt, reason=reason))
+            self._queue.append(
+                episodes.usage_digested(
+                    **receipt,
+                    reason=reason,
+                    usage=meter.usage(),
+                )
+            )
             return
-        self._queue.append(episodes.usage_digested(**receipt, filed=len(filed)))
+        self._queue.append(
+            episodes.usage_digested(
+                **receipt,
+                filed=len(filed),
+                usage=meter.usage(),
+            )
+        )
 
     def notice(
         self,

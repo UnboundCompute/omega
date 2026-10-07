@@ -33,6 +33,7 @@ __all__ = [
     "MESSAGE_INBOUND",
     "TURN_BLOCKED",
     "TURN_COMPLETED",
+    "METERED_KINDS",
     "TOOL_CALLED",
     "TOOL_RETURNED",
     "WORK_FINISHED",
@@ -393,7 +394,11 @@ def inbound(
 
 
 def blocked(
-    *, for_seq: int, needs: str, at: Optional[str] = None
+    *,
+    for_seq: int,
+    needs: str,
+    usage: Optional[list[dict[str, Any]]] = None,
+    at: Optional[str] = None,
 ) -> dict[str, Any]:
     """omega stopped to ask. A terminal record: it ends the turn.
 
@@ -409,6 +414,7 @@ def blocked(
         "needs": needs,
         "at": at or now(),
     }
+    _with_usage(payload, usage)
     _validate(payload)
     return payload
 
@@ -420,6 +426,7 @@ def completed(
     reply: Optional[str] = None,
     tools: Optional[list[str]] = None,
     error: Optional[str] = None,
+    usage: Optional[list[dict[str, Any]]] = None,
     at: Optional[str] = None,
 ) -> dict[str, Any]:
     """The turn ended. A terminal record.
@@ -438,6 +445,7 @@ def completed(
         "error": error,
         "at": at or now(),
     }
+    _with_usage(payload, usage)
     _validate(payload)
     return payload
 
@@ -740,6 +748,7 @@ def reflection_done(
     through: int,
     filed: int = 0,
     reason: Optional[str] = None,
+    usage: Optional[list[dict[str, Any]]] = None,
     at: Optional[str] = None,
 ) -> dict[str, Any]:
     """One reflection pass happened and covered the log up to ``through`` (DL-054).
@@ -772,6 +781,7 @@ def reflection_done(
         "reason": reason,
         "at": at or now(),
     }
+    _with_usage(payload, usage)
     _validate(payload)
     return payload
 
@@ -783,6 +793,7 @@ def transcript_ingested(
     project: str,
     filed: int = 0,
     reason: Optional[str] = None,
+    usage: Optional[list[dict[str, Any]]] = None,
     at: Optional[str] = None,
 ) -> dict[str, Any]:
     """One session of somebody else's agent transcript was read (DL-057).
@@ -819,6 +830,7 @@ def transcript_ingested(
         "reason": reason,
         "at": at or now(),
     }
+    _with_usage(payload, usage)
     _validate(payload)
     return payload
 
@@ -829,6 +841,7 @@ def usage_digested(
     source: str,
     filed: int = 0,
     reason: Optional[str] = None,
+    usage: Optional[list[dict[str, Any]]] = None,
     at: Optional[str] = None,
 ) -> dict[str, Any]:
     """One finished day of the Mac's own usage record was read (DL-059).
@@ -861,6 +874,7 @@ def usage_digested(
         "reason": reason,
         "at": at or now(),
     }
+    _with_usage(payload, usage)
     _validate(payload)
     return payload
 
@@ -877,6 +891,7 @@ def audio_captured(
     review: Optional[str] = None,
     filed: int = 0,
     reason: Optional[str] = None,
+    usage: Optional[list[dict[str, Any]]] = None,
     at: Optional[str] = None,
 ) -> dict[str, Any]:
     """Something omega listened to was heard, transcribed and reviewed (DL-066).
@@ -926,6 +941,7 @@ def audio_captured(
         "reason": reason,
         "at": at or now(),
     }
+    _with_usage(payload, usage)
     _validate(payload)
     return payload
 
@@ -988,6 +1004,52 @@ _UNATTACHED_KINDS = frozenset(
 )
 
 
+#: The kinds a pass ends on, and so the only ones that may carry ``usage``
+#: (DL-070): what that pass spent on the model, per role and model, as
+#: :meth:`omega.provider.Meter.usage` tallies it. Optional and additive — a
+#: payload without it is unchanged, and an old log still decodes.
+METERED_KINDS = frozenset(
+    {
+        TURN_COMPLETED,
+        TURN_BLOCKED,
+        REFLECTION_DONE,
+        TRANSCRIPT_INGESTED,
+        USAGE_DIGESTED,
+        AUDIO_CAPTURED,
+    }
+)
+
+_USAGE_COUNTS = ("calls", "input", "cached", "output", "reasoning", "unmetered")
+
+
+def _with_usage(payload: dict[str, Any], usage: Optional[list[dict[str, Any]]]) -> None:
+    """Attach ``usage`` only when there is some, so a pass that never called
+    the model writes the same bytes it always did."""
+    if usage is not None:
+        # Copied so a caller mutating its tally later cannot edit the record;
+        # anything that is not a row is left for `_validate_usage` to refuse.
+        payload["usage"] = [dict(r) if isinstance(r, dict) else r for r in usage]
+
+
+def _validate_usage(usage: Any) -> None:
+    if not isinstance(usage, list) or not usage:
+        raise BadPayload("usage must be a non-empty list when present")
+    for row in usage:
+        if not isinstance(row, dict):
+            raise BadPayload("each usage row must be an object")
+        for key in ("role", "model"):
+            if not isinstance(row.get(key), str) or not row[key]:
+                raise BadPayload(f"usage row needs a non-empty {key}")
+        for key in _USAGE_COUNTS:
+            value = row.get(key)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise BadPayload(f"usage {key} must be a non-negative count")
+        if row["calls"] < 1 or row["unmetered"] > row["calls"]:
+            raise BadPayload("usage calls must be at least 1 and cover unmetered")
+        if row["cached"] > row["input"] or row["reasoning"] > row["output"]:
+            raise BadPayload("cached is part of input and reasoning part of output")
+
+
 def _validate(payload: dict[str, Any]) -> None:
     """The one gate. Both constructors and :func:`decode` run it, so a payload
     cannot be valid going in and invalid coming out."""
@@ -1006,6 +1068,10 @@ def _validate(payload: dict[str, Any]) -> None:
     missing = [f for f in _REQUIRED[kind] if f not in payload]
     if missing:
         raise BadPayload(f"{kind} is missing {missing}")
+    if "usage" in payload:
+        if kind not in METERED_KINDS:
+            raise BadPayload(f"{kind} cannot carry usage")
+        _validate_usage(payload["usage"])
 
     if kind == MESSAGE_INBOUND:
         _require_str(payload, "text")
