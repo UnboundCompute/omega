@@ -33,6 +33,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Optional, Sequence
 
 from omega import blobs, derive, episodes, learn, notice, provider, schedule
+from omega.tools import NOTHING_NEW
 from omega.queue import EVENT_KINDS, EventQueue, Pending
 
 __all__ = [
@@ -226,6 +227,26 @@ class TurnContext:
     #: this process has locked.
     known: Sequence[derive.Claim] = ()
 
+    #: Schedules standing when this turn began, so the act loop's ``unwatch``
+    #: can name what it is stopping (DL-068).
+    running: Sequence[schedule.Schedule] = ()
+
+
+#: Channels whose events nobody typed: omega's own look (DL-061) and the clock
+#: (DL-035). Only on these may a turn that checked end in silence (DL-068 #2).
+UNPROMPTED_CHANNELS = notice.UNPROMPTED_CHANNELS
+
+
+def unprompted(ctx: "TurnContext") -> bool:
+    return str(ctx.event.get("channel", "")) in UNPROMPTED_CHANNELS
+
+
+def nothing_new(text: str) -> bool:
+    """Is this the sentinel, allowing for the quoting and punctuation a model
+    wraps around an answer it was told to give exactly?"""
+    core = text.strip().strip("`*\"'. ").lower()
+    return core == NOTHING_NEW.strip("()").lower() or core == NOTHING_NEW.lower()
+
 
 @dataclass(frozen=True)
 class TurnResult:
@@ -344,6 +365,10 @@ def reply(ctx: TurnContext, verdict: Verdict, acted: ActResult) -> Optional[str]
     if not verdict.speaks:
         return None
     if acted.text is not None and acted.text.strip():
+        if unprompted(ctx) and nothing_new(acted.text):
+            # Checked, and found nothing worth interrupting them for. On a
+            # channel nobody typed on that is a decision, not an empty answer.
+            return None
         # The sub-loop already answered, holding every tool result. Composing
         # again here would ask a model that cannot see any of them to describe
         # work it did not watch — which is exactly how omega came to write a
@@ -351,6 +376,8 @@ def reply(ctx: TurnContext, verdict: Verdict, acted: ActResult) -> Optional[str]
         # correct reply is the one already written.
         return acted.text
     response = ctx.complete(provider.ACT, _reply_messages(ctx, acted))
+    if unprompted(ctx) and nothing_new(response.text):
+        return None
     if not response.text.strip():
         # DL-011, stated as sharply as it deserves: a model that **returns no
         # content** is a failure, and a model that **decides not to speak** is a
@@ -554,6 +581,7 @@ def run_turn(
         open_work=tuple(open_work),
         learned=tuple(learned),
         known=tuple(known),
+        running=tuple(running),
     )
 
     verdict: Optional[Verdict] = None
@@ -699,9 +727,9 @@ _JUDGE_SYSTEM = (
     "ACT - do some work first, then answer\n"
     "SILENT - say nothing\n"
     "You have a body: you can read and write files, run read-only shell "
-    "commands, search the web, read a page, and look at the notes you have "
-    "written about this "
-    "person. ACT is the verdict that reaches them, and it is the only one that "
+    "commands, search the web, read a page, look at the notes you have "
+    "written about this person, keep a standing watch on something for "
+    "them, and set a reminder. ACT is the verdict that reaches them, and it is the only one that "
     "does. Choose ACT whenever answering well means looking something up on "
     "this machine, changing a file, or searching the web - do not guess at an "
     "answer you could go and check.\n"
@@ -714,16 +742,21 @@ _JUDGE_SYSTEM = (
     "something you think is obvious. Do not stay silent on a message addressed "
     "to you. A question about this machine, this project or a file on it is "
     "still a question for you; SILENT is never the right answer to a question.\n"
-    "SILENT is for events nobody asked you about - your own idle ticks, "
-    "background noise, things already handled. Staying silent there is a "
-    "correct and successful answer, not a failure.\n"
-    "An event marked 'nobody asked' is your own look at what is open, not the "
-    "person writing to you. There is no question in it and nothing is owed, so "
-    "the rules above about answering a message do not apply. SILENT is the "
-    "usual right answer there and it is a success. The bar for speaking is that "
-    "they would be glad you interrupted - not that you found something true to "
-    "say, and not that you can see something you could comment on. If what you "
-    "have is a summary of what you already know, stay silent.\n"
+    "If they ask you to keep checking, monitor, or let them know about "
+    "something, or to remind them of something later, choose ACT: you can "
+    "set a watch or a reminder that wakes you on its own.\n"
+    "SILENT is a successful outcome, not a failure, for events that need "
+    "nothing - background noise, things already handled.\n"
+    "An event marked 'nobody asked' is your own look at their machine and "
+    "what is open, not the person writing to you. Speak up like a helper "
+    "would when something calls for it: the machine is in a state they "
+    "should know about, something is due or overdue, something is waiting "
+    "on them or on you, or something changed that they care about. If "
+    "something they care about could have changed and you can check it, "
+    "choose ACT and check before deciding. If nothing calls for it, or it "
+    "is only something you already told them, SILENT is right.\n"
+    "A standing watch firing is a check you promised them: choose ACT. A "
+    "reminder firing is a promise coming due: choose SPEAK and remind them.\n"
     "Judge this event on its own. That you stayed silent before is not a "
     "reason to stay silent now."
 )
@@ -755,6 +788,11 @@ _REPLY_SYSTEM = (
     "person. Never tell the person you cannot reach their filesystem or the "
     "network - that is false - and never hand them a shell command to run "
     "themselves in place of doing it.\n"
+    "You also run in the background: you look at their machine and what is "
+    "open on your own, you can keep a standing watch on something and "
+    "tell them when there is news, and you can remind them of something "
+    "later. Never tell them you cannot check in the "
+    "background or message them on your own - that is false.\n"
     "Only a few of your notes are ever in front of you: the ones that matched "
     "this message. There are many more. So 'I don't have any details about "
     "you' is wrong - what is true is that none are in front of you right now, "
@@ -770,7 +808,8 @@ _REPLY_SYSTEM = (
     "When the event says nobody asked, you are opening the conversation, not "
     "answering one. Do not thank them, do not refer to a question, and do not "
     "explain that you were looking - say the one thing that made speaking worth "
-    "it and stop. One or two sentences. They did not ask, so earn it.\n"
+    "it and stop. One or two sentences. They did not ask, so earn it. If it "
+    f"turns out there is nothing worth it, answer exactly {NOTHING_NEW}\n"
     "How you talk: like someone who knows this person and is not performing. "
     "Short, first person, contractions, dry. Answer the thing asked and stop - "
     "no 'Got it', no repeating their message back to them, no offer to help at "

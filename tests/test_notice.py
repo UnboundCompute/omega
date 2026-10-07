@@ -121,12 +121,21 @@ def test_silence_spends_no_daily_budget(q: EventQueue) -> None:
     assert notice.may_look(st, now=NOW) is True
 
 
-def test_having_spoken_today_stops_even_looking(q: EventQueue) -> None:
-    """Cheaper than looking and being forced quiet: no situation is built and no
-    model is called."""
+def test_having_spoken_today_does_not_stop_the_next_look(q: EventQueue) -> None:
+    """DL-068: no day budget by default. Speech is bounded by novelty (what it
+    already said is in the situation), not by a count."""
     seq = _looked(q, NOW - timedelta(hours=5))
     _spoke(q, seq, NOW - timedelta(hours=5))
-    assert notice.may_look(notice.standing(q.store), now=NOW) is False
+    assert notice.MAX_PER_DAY is None
+    assert notice.may_look(notice.standing(q.store), now=NOW) is True
+
+
+def test_an_opted_in_day_cap_still_stops_even_looking(q: EventQueue) -> None:
+    """The cap survives as an argument, and when passed it is still checked
+    before anything is built: cheaper than looking and being forced quiet."""
+    seq = _looked(q, NOW - timedelta(hours=5))
+    _spoke(q, seq, NOW - timedelta(hours=5))
+    assert notice.may_look(notice.standing(q.store), now=NOW, max_per_day=1) is False
 
 
 def test_the_budget_is_a_local_day_and_yesterday_does_not_spend_today(
@@ -198,7 +207,7 @@ def test_standing_scans_the_whole_log_because_resuming_would_fail_open(
     _spoke(q, seq, NOW - timedelta(hours=6))
     for i in range(30):  # plenty of later episodes to scan past
         q.append(episodes.inbound(f"msg {i}", channel="tray", at=_iso(QUIET)))
-    assert notice.may_look(notice.standing(q.store), now=NOW) is False
+    assert notice.may_look(notice.standing(q.store), now=NOW, max_per_day=1) is False
 
 
 # --- the situation text ----------------------------------------------------
@@ -381,12 +390,21 @@ def test_the_look_is_stamped_with_the_moment_it_was_taken(q: EventQueue) -> None
     assert notice.standing(q.store).looked_at == _iso(far)
 
 
-def test_a_spoken_nudge_closes_the_day_at_the_executor(q: EventQueue) -> None:
+def test_a_spoken_nudge_is_shown_to_the_next_look_instead_of_closing_the_day(
+    q: EventQueue,
+) -> None:
+    """DL-068: the day no longer closes after one nudge. What closes the
+    repeat is novelty - the next look is shown what it already said."""
     q.append(episodes.inbound("hello", channel="tray", at=_iso(QUIET)))
     ex = Executor(q, complete=_fake("SPEAK").complete)
     ex.recover()
     ex.drain()
     assert ex.notice(now=NOW) is True
     ex.drain()
-    assert ex.notice(now=NOW + timedelta(hours=6)) is False
-    assert ex.notice(now=NOW + timedelta(days=1)) is True
+    said = notice.standing(q.store).said
+    assert said, "a spoken unprompted turn must be remembered as said"
+    assert ex.notice(now=NOW + timedelta(hours=6)) is True
+    look = episodes.decode(list(q.store.episodes_since(0))[-1].payload)
+    assert look["channel"] == notice.CHANNEL
+    assert "You already told them" in look["text"]
+    assert said[-1][1].split()[0] in look["text"]

@@ -29,7 +29,7 @@ import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Sequence
 
 from omega import blobs, episodes, habits, learn, listen, notice, provider, transcripts
 from omega.derive import Learned, Moments, OpenWork
@@ -174,6 +174,8 @@ class Executor:
         "_learned",
         "_moments",
         "_standing",
+        "_online",
+        "_machine",
     )
 
     def __init__(
@@ -182,10 +184,17 @@ class Executor:
         *,
         complete: Optional[Callable[..., provider.Response]] = None,
         act: Callable[[TurnContext], ActResult] = no_act_loop_yet,
+        online: Optional[Callable[[], bool]] = None,
+        machine: Optional[Callable[[], Sequence[str]]] = None,
     ) -> None:
         self._queue = queue
         self._complete = complete
         self._act = act
+        # DL-068's two senses for the unprompted look, both injected so a test
+        # never opens a socket or runs pmset. ``None`` means "assume online"
+        # and "no machine line" — the behaviour before DL-068.
+        self._online = online
+        self._machine = machine
         self._recovered = False
         self._open = OpenWork()
         self._learned = Learned()
@@ -929,6 +938,17 @@ class Executor:
                 st, now=moment, look_every_seconds=look_every_seconds
             ):
                 return False
+            if self._online is not None and not self._online():
+                # DL-068 #5: a look with no network is a turn that fails on its
+                # first model call. Skipped, not appended — the next idle
+                # moment looks again, and nothing is lost by waiting.
+                return False
+            machine_lines: Sequence[str] = ()
+            if self._machine is not None:
+                try:
+                    machine_lines = tuple(self._machine())
+                except Exception:  # noqa: BLE001 - a sense never kills the look
+                    machine_lines = ()
             self._open.advance(store)
             self._learned.advance(store)
             self._moments.advance(store)
@@ -943,6 +963,8 @@ class Executor:
                 # very moments it is supposed to be looking at.
                 moments=self._moments.recent(now=moment.isoformat()),
                 heard_at=st.heard_at,
+                machine=machine_lines,
+                said=st.said,
             )
             # Stamped with ``moment``, not left to default to wall-clock now.
             # ``notice.standing`` charges a spoken nudge to the day of the *look*

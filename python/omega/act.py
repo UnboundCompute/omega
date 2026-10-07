@@ -40,6 +40,7 @@ from omega import episodes, provider
 from omega.tools import (
     EXTERNAL,
     LOCAL,
+    NOTHING_NEW,
     Decision,
     ToolBox,
     ToolError,
@@ -86,12 +87,20 @@ _ACT_SYSTEM = (
     "will return the same thing and the loop will stop.\n"
     "run_code has no shell: give argv as a list, and pipes, redirection and "
     "$(...) will not work.\n"
-    "Writing outside omega's own store, running anything that is not a "
-    "read-only command, and fetching a URL are the person's decision, not "
-    "yours. When the work genuinely needs one, ask for the tool: omega stops "
-    "the turn and puts the request to them itself. Do not ask for permission "
-    "in your reply instead - that leaves the work undone and gives them "
-    "nothing to approve."
+    "Searching the web and reading a page are yours to do; just do them. "
+    "Writing outside omega's own store and running anything that is not a "
+    "read-only command are the person's decision, not yours. When the work "
+    "genuinely needs one, ask for the tool: omega stops the turn and puts the "
+    "request to them itself. Do not ask for permission in your reply instead "
+    "- that leaves the work undone and gives them nothing to approve.\n"
+    "When they ask you to keep checking or let them know about something, set "
+    "a watch - you will be woken to check it and can tell them on your own. "
+    "When they ask to be reminded of something in a while, set a reminder. "
+    "Never tell them you cannot check in the background or message them "
+    "unprompted; that is false.\n"
+    "When nobody asked - your own look, or a watch firing - say only what is "
+    "worth interrupting them for, in a sentence or two. If nothing is, answer "
+    f"exactly {NOTHING_NEW}"
 )
 
 
@@ -157,7 +166,13 @@ def act_loop(
         # The claims come from the turn, not from the store (DL-060): this
         # process holds the log's lock, so a box that opened it to answer
         # `recall` would wait on itself.
-        box = ToolBox(store_root=ctx.queue.store.root, remembered=tuple(ctx.known))
+        box = ToolBox(
+            store_root=ctx.queue.store.root,
+            remembered=tuple(ctx.known),
+            append=ctx.queue.append,
+            for_seq=ctx.seq,
+            running=tuple(ctx.running),
+        )
 
     # Ring 1 plus whatever the provider runs itself (DL-067). The second half
     # never reaches `box.classify`; its tier was decided where it is declared.

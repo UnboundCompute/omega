@@ -512,6 +512,7 @@ def schedule_created(
     every: Optional[int] = None,
     cron: Optional[str] = None,
     at: Optional[str] = None,
+    once: bool = False,
 ) -> dict[str, Any]:
     """A standing intention to wake omega up (DL-035).
 
@@ -524,6 +525,10 @@ def schedule_created(
     tool name is the part that keeps the clock from becoming a second engine:
     a fire produces an ordinary event with ordinary text, and everything that
     then happens is the ordinary loop.
+
+    ``once`` (DL-068) makes it a reminder rather than a standing intention:
+    ``every`` is then the delay, and the first fire retires it. Additive and
+    written only when true, so every schedule before it reads unchanged.
     """
     payload = {
         "v": VERSION,
@@ -534,6 +539,8 @@ def schedule_created(
         "cron": cron,
         "at": at or now(),
     }
+    if once:
+        payload["once"] = True
     _validate(payload)
     return payload
 
@@ -1182,6 +1189,12 @@ def _validate(payload: dict[str, Any]) -> None:
                 )
         if cron is not None:
             _require_str(payload, "cron", non_empty=True)
+        if "once" in payload:
+            if payload["once"] is not True:
+                raise BadPayload("once, when present, must be true")
+            if every is None:
+                # A one-shot cron would be a date, which this subset cannot say.
+                raise BadPayload("a once schedule needs every (its delay)")
 
     if kind == MOMENT_NOTICED:
         _require_str(payload, "text", non_empty=True)

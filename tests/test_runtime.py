@@ -601,13 +601,35 @@ def test_a_schedule_fires_a_real_turn_with_nobody_typing(store_dir: Path) -> Non
     with runtime_at(store_dir, speaking("brief"), clock=True, tick=0.05) as rt:
         assert until(lambda: rt.turns >= 1), "no turn ran from the clock alone"
         assert rt.fires == 1
-        fired = [
-            u
-            for u in projection.updates_since(rt.queue, 0)
-            if u.kind == episodes.MESSAGE_INBOUND
-        ]
+        wire = list(projection.updates_since(rt.queue, 0))
 
-    assert [u.text for u in fired] == ["write the morning brief"]
+    # DL-068: the fire's own text is withheld (it would read as the person
+    # speaking); what omega said in answer to it is what reaches them.
+    assert not [u for u in wire if u.kind == episodes.MESSAGE_INBOUND]
+    assert any(u.kind == episodes.TURN_COMPLETED and u.reply for u in wire)
+
+
+def test_no_network_holds_the_fire_and_reconnecting_releases_it_once(
+    store_dir: Path,
+) -> None:
+    """DL-068 #5: a fire with no route to the model is not written as a turn
+    that fails. It waits, and the coalescing clock owes exactly one fire."""
+    up = {"now": False}
+    with runtime_at(store_dir, speaking("brief"), clock=False) as rt:
+        rt.append(every_minute("write the morning brief"))
+
+    with runtime_at(
+        store_dir,
+        speaking("brief"),
+        clock=True,
+        tick=0.02,
+        online=lambda: up["now"],
+    ) as rt:
+        time.sleep(0.3)
+        assert rt.fires == 0 and rt.turns == 0
+        up["now"] = True
+        assert until(lambda: rt.turns >= 1)
+        assert rt.fires == 1
 
 
 def test_the_clock_appends_and_does_not_run_the_turn_itself(store_dir: Path) -> None:

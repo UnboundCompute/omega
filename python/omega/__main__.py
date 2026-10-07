@@ -42,6 +42,7 @@ from omega import (
     habits,
     learn,
     listen,
+    machine,
     memory,
     provider,
     runtime,
@@ -509,6 +510,11 @@ def main(argv: Optional[list[str]] = None) -> int:
         # file into, which is why it needs no system permission and why it is
         # the one of the three that can be revoked by moving a directory.
         recordings=str(listen.folder_path()),
+        # DL-068: the machine sense (disk, battery, load) for the unprompted
+        # look, and the reachability check that skips a look or a fire with
+        # no network rather than spending it on a turn that fails.
+        online=machine.online,
+        machine=lambda: machine.describe(machine.read()),
     )
     try:
         rt.start()

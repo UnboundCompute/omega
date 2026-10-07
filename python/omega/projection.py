@@ -219,8 +219,11 @@ def project(payload: dict[str, Any], seq: int) -> Optional[Update]:
         return None
 
     if kind == episodes.MESSAGE_INBOUND:
-        if payload.get("channel") == notice.CHANNEL:
-            # The unprompted pass's own look at what is open (DL-061). Withheld
+        if payload.get("channel") in notice.UNPROMPTED_CHANNELS:
+            # The unprompted pass's own look at what is open (DL-061), and
+            # since DL-068 a clock fire too: a watch's instruction text is
+            # omega's note to itself, and rendered it would read as the person
+            # asking "Standing watch you agreed to keep...". Withheld
             # for the same reason `reflection.done` and `usage.digested` are:
             # it is omega noticing, not omega speaking, and the outward stream
             # is deliberately narrower than the log.

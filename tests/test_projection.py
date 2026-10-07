@@ -325,10 +325,11 @@ def test_every_m1_kind_is_accounted_for() -> None:
         assert update.state in STATES
 
 
-def test_a_scheduled_fire_is_visible_to_the_tray() -> None:
-    """omega acting on its own must not happen invisibly. A fire is an
-    ordinary inbound, so it reaches the wire like any arriving message —
-    that is the user-facing half of DL-035's 'ordinary event' rule."""
+def test_a_scheduled_fire_is_withheld_from_the_tray() -> None:
+    """DL-068: a fire's text is omega's note to itself ("Standing watch you
+    agreed to keep..."), and the tray renders any inbound as the *person*
+    speaking. So it is withheld like the self channel's look; what omega does
+    with it stays visible as the reply (see test_runtime)."""
     fire = episodes.inbound(
         "morning brief",
         channel="schedule",
@@ -339,7 +340,9 @@ def test_a_scheduled_fire_is_visible_to_the_tray() -> None:
 
     update = project(fire, 7)
 
-    assert update is not None and update.state == "understood"
+    assert update is None
+    typed = episodes.inbound("morning brief", channel="tray", at=AT)
+    assert project(typed, 8) is not None, "only unprompted channels are withheld"
 
 
 # --- reading a stream out of the log ---------------------------------------

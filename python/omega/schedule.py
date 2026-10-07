@@ -249,6 +249,10 @@ class Schedule:
     created_at: datetime
     every: Optional[int] = None
     cron: Optional[str] = None
+    #: A reminder (DL-068): fires once, ``every`` seconds after creation, and
+    #: the fire itself retires it — read back from the log, so a restart
+    #: between fire and turn does not fire it twice.
+    once: bool = False
 
 
 @dataclass(frozen=True)
@@ -327,6 +331,7 @@ class Scheduler:
                 created_at=_parse_at(payload["at"]),
                 every=payload.get("every"),
                 cron=cron,
+                once=payload.get("once") is True,
             )
         elif kind == episodes.SCHEDULE_CANCELLED:
             self._defs.pop(payload["id"], None)
@@ -342,6 +347,9 @@ class Scheduler:
                 self._last_fire[sid] = _parse_at(
                     payload.get("schedule_slot") or payload["at"]
                 )
+                done = self._defs.get(sid)
+                if done is not None and done.once:
+                    self._defs.pop(sid, None)
 
     @property
     def schedules(self) -> list[Schedule]:

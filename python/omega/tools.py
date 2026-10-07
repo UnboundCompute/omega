@@ -71,6 +71,7 @@ import ipaddress
 import os
 import socket
 import subprocess
+import zlib
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
@@ -78,7 +79,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional, Sequence
 from urllib.parse import urlsplit
 
-from omega import readable
+from omega import episodes, readable
 
 __all__ = [
     "EXPLORATION",
@@ -90,6 +91,14 @@ __all__ = [
     "RUN_CODE",
     "FETCH",
     "RECALL",
+    "WATCH",
+    "UNWATCH",
+    "REMIND",
+    "MIN_WATCH_MINUTES",
+    "MAX_REMIND_MINUTES",
+    "NOTHING_NEW",
+    "watch_instruction",
+    "remind_instruction",
     "TOOL_NAMES",
     "MAX_RECALLED",
     "READ_ONLY_ARGV0",
@@ -138,6 +147,9 @@ WRITE_FILE = "write_file"
 RUN_CODE = "run_code"
 FETCH = "fetch"
 RECALL = "recall"
+WATCH = "watch"
+UNWATCH = "unwatch"
+REMIND = "remind"
 
 #: Ring 1's remainder, and it is closed (DL-014). Spelled as a frozenset so
 #: that "the set does not grow" is a fact about an object and not a promise in
@@ -151,7 +163,52 @@ RECALL = "recall"
 #: to have their trigger words said out loud — which is not omega being able to
 #: look at what it believes. So this fills a declared slot that was assumed
 #: complete and never was.
-TOOL_NAMES = frozenset({READ_FILE, WRITE_FILE, RUN_CODE, FETCH, RECALL})
+#:
+#: ``watch`` and ``unwatch`` are the set growing, and DL-068 is the entry that
+#: grows it. Asked to check something hourly, omega told the person it could
+#: not run background checks — false, the clock (DL-035) does exactly that —
+#: because the only door into the clock was a Remember drop. These are that
+#: door, opened from an ordinary turn: they write the same ``schedule.created``
+#: / ``schedule.cancelled`` records a teach does, and nothing else.
+TOOL_NAMES = frozenset(
+    {READ_FILE, WRITE_FILE, RUN_CODE, FETCH, RECALL, WATCH, UNWATCH, REMIND}
+)
+
+#: The shortest gap a watch may keep. Each fire is a turn that usually searches,
+#: and a search is a few cents (DL-067), so the floor is a cost bound, not a
+#: taste: fifteen minutes is already ~100 turns a day for one watch.
+MIN_WATCH_MINUTES = 15
+
+#: A reminder is a promise about a moment, so it is bounded like one: a week
+#: out is the far edge of "remind me", and anything longer is a calendar.
+MAX_REMIND_MINUTES = 7 * 24 * 60
+
+#: What an unprompted turn answers when it checked and found nothing worth the
+#: person's attention (DL-068 #2). Recorded as ``silent``, and only on the
+#: ``self`` and ``schedule`` channels — anywhere else an empty answer is still a
+#: failure, which is DL-011's line and this does not move it.
+NOTHING_NEW = "(nothing new)"
+
+
+def watch_instruction(what: str) -> str:
+    """The text a watch fires with. It is the whole of the watch's behaviour,
+    because a fire is an ordinary inbound and the turn reads only its text."""
+    return (
+        f"Standing watch you agreed to keep for them: {what}\n"
+        "Nobody is asking right now; this is your own check. Look, then tell "
+        "them only what is new since you last told them about it. If nothing "
+        f"is worth interrupting them for, answer exactly {NOTHING_NEW}"
+    )
+
+
+def remind_instruction(what: str) -> str:
+    """The text a reminder fires with. Deliberately *without* the
+    :data:`NOTHING_NEW` way out a watch has: a reminder that decides on its own
+    that it is not worth mentioning is a broken promise, not discretion."""
+    return (
+        f"Reminder you promised them: {what}\n"
+        "It is time. Remind them now, in a sentence."
+    )
 
 #: How many claims one ``recall`` answers with.
 #:
@@ -389,6 +446,101 @@ def _classify_recall(box: "ToolBox", args: dict[str, Any]) -> Decision:
         why=f"recall what is known about {phrase!r}" if phrase else "recall everything known",
         args={"about": phrase},
     )
+
+
+def _classify_watch(box: "ToolBox", args: dict[str, Any]) -> Decision:
+    what = _text(WATCH, args, "what").strip()
+    if not what:
+        raise ToolRejected(f"{WATCH} needs something to keep an eye on")
+    minutes = args.get("every_minutes")
+    if isinstance(minutes, bool) or not isinstance(minutes, (int, float)):
+        raise ToolRejected(f"{WATCH}'s 'every_minutes' must be a number")
+    minutes = int(minutes)
+    if minutes < MIN_WATCH_MINUTES:
+        raise ToolRejected(
+            f"{WATCH} checks at most every {MIN_WATCH_MINUTES} minutes, not {minutes}"
+        )
+    # Local: it writes one record into omega's own log and `unwatch` undoes it.
+    # Each fire is then an ordinary turn, gated call by call like any other.
+    return Decision(
+        tool=WATCH,
+        tier=LOCAL,
+        why=f"keep an eye on {what!r} every {minutes} minutes",
+        args={"what": what, "every_minutes": minutes},
+    )
+
+
+def _classify_remind(box: "ToolBox", args: dict[str, Any]) -> Decision:
+    what = _text(REMIND, args, "what").strip()
+    if not what:
+        raise ToolRejected(f"{REMIND} needs something to remind them about")
+    minutes = args.get("in_minutes")
+    if isinstance(minutes, bool) or not isinstance(minutes, (int, float)):
+        raise ToolRejected(f"{REMIND}'s 'in_minutes' must be a number")
+    # Rounded up, never down: "in 30 seconds" becomes a minute, and the
+    # schema's floor (`episodes.MIN_EVERY_SECONDS`) is never undercut.
+    whole = max(1, int(-(-minutes // 1)))
+    if whole > MAX_REMIND_MINUTES:
+        raise ToolRejected(
+            f"{REMIND} reaches at most {MAX_REMIND_MINUTES} minutes ahead, not {whole}"
+        )
+    return Decision(
+        tool=REMIND,
+        tier=LOCAL,
+        why=f"remind them about {what!r} in {whole} minutes",
+        args={"what": what, "in_minutes": whole},
+    )
+
+
+def _classify_unwatch(box: "ToolBox", args: dict[str, Any]) -> Decision:
+    sid = _text(UNWATCH, args, "id").strip()
+    return Decision(tool=UNWATCH, tier=LOCAL, why=f"stop watch {sid}", args={"id": sid})
+
+
+def _watch(box: "ToolBox", args: dict[str, Any]) -> str:
+    if box.append is None:
+        raise ToolError("watches cannot be set from here: this box has no log")
+    what = args["what"]
+    # Derived, as `learn.schedule_id` derives teach ids: the turn plus the text,
+    # so two watches from one turn cannot collide and a replayed turn names the
+    # same one.
+    sid = f"w{box.for_seq}-{zlib.crc32(what.encode()) & 0xFFFF:04x}"
+    box.append(
+        episodes.schedule_created(
+            id=sid, instruction=watch_instruction(what), every=args["every_minutes"] * 60
+        )
+    )
+    return f"watching {what!r} every {args['every_minutes']} minutes (id {sid})"
+
+
+def _remind(box: "ToolBox", args: dict[str, Any]) -> str:
+    if box.append is None:
+        raise ToolError("reminders cannot be set from here: this box has no log")
+    what = args["what"]
+    sid = f"r{box.for_seq}-{zlib.crc32(what.encode()) & 0xFFFF:04x}"
+    box.append(
+        episodes.schedule_created(
+            id=sid,
+            instruction=remind_instruction(what),
+            every=args["in_minutes"] * 60,
+            once=True,
+        )
+    )
+    return f"reminder set for {args['in_minutes']} minutes from now: {what!r} (id {sid})"
+
+
+def _unwatch(box: "ToolBox", args: dict[str, Any]) -> str:
+    if box.append is None:
+        raise ToolError("watches cannot be stopped from here: this box has no log")
+    sid = args["id"]
+    known = {getattr(s, "id", None) for s in box.running}
+    if sid not in known:
+        listing = ", ".join(
+            f"{s.id}: {s.instruction.splitlines()[0][:80]}" for s in box.running
+        ) or "none"
+        raise ToolError(f"there is no running schedule {sid!r}; running: {listing}")
+    box.append(episodes.schedule_cancelled(id=sid))
+    return f"stopped {sid}"
 
 
 def _classify_write_file(box: "ToolBox", args: dict[str, Any]) -> Decision:
@@ -1111,6 +1263,59 @@ _TOOLS: dict[str, _Tool] = {
             [],
         ),
     ),
+    WATCH: _Tool(
+        classify=_classify_watch,
+        dispatch=_watch,
+        schema=_schema(
+            WATCH,
+            "Keep an eye on something for them in the background: you will be "
+            "woken every so often to check it, and you tell them only when "
+            "there is something new. Use it whenever they ask you to keep "
+            "checking, monitor, or let them know about something.",
+            {
+                "what": {
+                    "type": "string",
+                    "description": "What to check and what counts as worth telling them.",
+                },
+                "every_minutes": {
+                    "type": "integer",
+                    "description": f"How often to check, at least {MIN_WATCH_MINUTES}.",
+                },
+            },
+            ["what", "every_minutes"],
+        ),
+    ),
+    UNWATCH: _Tool(
+        classify=_classify_unwatch,
+        dispatch=_unwatch,
+        schema=_schema(
+            UNWATCH,
+            "Stop a watch, reminder or schedule you are running, by its id.",
+            {"id": {"type": "string", "description": "The schedule's id."}},
+            ["id"],
+        ),
+    ),
+    REMIND: _Tool(
+        classify=_classify_remind,
+        dispatch=_remind,
+        schema=_schema(
+            REMIND,
+            "Remind them about something once, a set number of minutes from "
+            "now: you will be woken then and tell them. Use it whenever they "
+            "say remind me, ping me, or tell me in N minutes.",
+            {
+                "what": {
+                    "type": "string",
+                    "description": "What to remind them about, in their words.",
+                },
+                "in_minutes": {
+                    "type": "integer",
+                    "description": "Minutes from now, at least 1.",
+                },
+            },
+            ["what", "in_minutes"],
+        ),
+    ),
 }
 
 assert set(_TOOLS) == TOOL_NAMES, "the tool set and its registry disagree"
@@ -1118,7 +1323,12 @@ assert set(_TOOLS) == TOOL_NAMES, "the tool set and its registry disagree"
 
 def schemas() -> list[dict[str, Any]]:
     """What is offered to the model, in the order the tools are declared."""
-    return [_TOOLS[name].schema for name in (READ_FILE, WRITE_FILE, RUN_CODE, FETCH, RECALL)]
+    return [
+        _TOOLS[name].schema
+        for name in (
+            READ_FILE, WRITE_FILE, RUN_CODE, FETCH, RECALL, WATCH, UNWATCH, REMIND
+        )
+    ]
 
 
 #: The provider's own search, offered beside Ring 1 and **not in it** (DL-067).
@@ -1169,9 +1379,22 @@ class ToolBox:
     #: that was handed nothing can say.
     remembered: tuple[Any, ...] = ()
 
+    #: How ``watch`` and ``unwatch`` write (DL-068): the turn's own queue append,
+    #: so a watch lands in the same log, in the same order, as the turn that set
+    #: it. ``None`` makes both tools refuse rather than pretend.
+    append: Optional[Callable[[dict[str, Any]], int]] = None
+
+    #: The turn that built this box, for deriving watch ids.
+    for_seq: int = 0
+
+    #: Schedules standing when the turn began, so ``unwatch`` can refuse an id
+    #: that names nothing instead of filing a cancel for it.
+    running: tuple[Any, ...] = ()
+
     def __post_init__(self) -> None:
         object.__setattr__(self, "store_root", Path(self.store_root).resolve())
         object.__setattr__(self, "remembered", tuple(self.remembered))
+        object.__setattr__(self, "running", tuple(self.running))
 
     def classify(self, name: str, arguments: dict[str, Any]) -> Decision:
         """The gate. Static, code-only, and it runs **before** dispatch.

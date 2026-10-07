@@ -1,4 +1,4 @@
-"""Wake condition (b) — the pass omega runs when nobody asked. DL-011, DL-061.
+"""Wake condition (b) — the pass omega runs when nobody asked. DL-011, DL-061, DL-068.
 
 **This is not a second engine.** It appends one ordinary ``message.inbound`` on
 the :data:`CHANNEL` channel and gets out of the way: the drain picks it up, the
@@ -12,24 +12,20 @@ omega's name."* So there is no new episode kind here, no new verdict, no second
 prompt and no delivery path. A fire on the ``schedule`` channel already proved
 the door works (`episodes.py:121`); this walks through the same one.
 
-**The whole of this module is the two rate limits and the situation text.**
+**The whole of this module is the look's rate limit and the situation text.**
 Everything else already existed.
 
-**Two limits, not one, and both here in code rather than in the judge.**
-DL-061 fixes the budget at roughly one unprompted nudge a day, on the argument
-that volume rather than wrongness is the failure mode here. But a nudge is *speech*, and DL-011 makes
-silence a successful outcome of a time-wake — which only means anything if the
-pass looks more often than it speaks. So omega **looks** at most hourly and
-**speaks** at most once a local day, and when it has already spoken today it
-does not look at all: that spends nothing to be forced quiet. A limit the model
-is asked to honour is a limit that is sometimes not honoured, which is DL-014's
-argument one layer out.
-
-The accepted cost is real: a nudge spent at 09:00 means a better one at 16:00 is
-lost. v1 takes that trade because the ledger asked for starvation on purpose —
-*"Starving it is the only way to tell good judgement from noise"* — and an
-under-eager omega is correctable from evidence, where a firehose is muted before
-any evidence accumulates.
+**DL-068 lifted the day budget.** DL-061 capped unprompted speech at one a
+day on the argument that volume, not wrongness, is the failure mode. The
+evidence came back the other way: sixty looks, zero spoken, and the person
+asking for omega to say things "based on condition of system or something it
+noticed" — not "x message per day". So speech is now bounded by *novelty*
+rather than by a count: the situation shows the look what it already told
+them (:attr:`Standing.said`), and the judge is told that repeating it is a
+reason for silence. The day cap survives only as an opt-in argument to
+:func:`may_look`. The risk this trades into is the firehose DL-061 feared, and
+the ledger records it as disagree-and-log; the guard is novelty plus a look
+gap that still only fires when the conversation has gone quiet.
 
 **Undeterminable breaks closed**, as everywhere on this path. An unreadable
 timestamp, a missing local date, a store that cannot be scanned back far enough
@@ -56,6 +52,9 @@ __all__ = [
     "LOOK_EVERY_SECONDS",
     "MAX_PER_DAY",
     "MAX_L1_CHARS",
+    "SAID_KEPT",
+    "SAID_WITHIN_SECONDS",
+    "UNPROMPTED_CHANNELS",
     "Standing",
     "local_date",
     "standing",
@@ -68,11 +67,23 @@ __all__ = [
 #: distinguishing a clock fire (`episodes.py:121`).
 CHANNEL = "self"
 
-#: How often omega may *look*. Not how often it may speak.
-LOOK_EVERY_SECONDS = 60 * 60
+#: The channels nobody typed on: omega's own look and the clock. What omega
+#: said on these is what it said *unprompted*, which is what novelty is about.
+UNPROMPTED_CHANNELS = frozenset({CHANNEL, "schedule"})
 
-#: How often omega may *speak* unprompted, per local calendar day.
-MAX_PER_DAY = 1
+#: How often omega may *look*. Not how often it may speak. Halved from an hour
+#: by DL-068, which also gave the look a machine sense that can change in it.
+LOOK_EVERY_SECONDS = 30 * 60
+
+#: No cap on unprompted speech per day (DL-068). ``None`` rather than a large
+#: number, so that "unlimited" cannot be mistaken for a tuned value.
+MAX_PER_DAY: Optional[int] = None
+
+#: The novelty memory: the last few things omega said unprompted, from the
+#: last day. Small, because it is a prompt, and a day, because "I told you
+#: this yesterday" stops being a reason for silence after about that long.
+SAID_KEPT = 5
+SAID_WITHIN_SECONDS = 24 * 60 * 60
 
 #: The situation text is a prompt, so it is capped like one. Small on purpose:
 #: the turn's own recall already puts recent conversation and the matched claims
@@ -132,6 +143,12 @@ class Standing:
     #: one another, so an outstanding one means *do not look*.
     outstanding: int = 0
 
+    #: ``(at, reply)`` for the newest unprompted turns that spoke, oldest first,
+    #: at most :data:`SAID_KEPT`. The novelty guard (DL-068): what the look is
+    #: shown so that "already told them" is something it can see rather than
+    #: something it is asked to remember.
+    said: tuple[tuple[str, str], ...] = ()
+
 
 def standing(store: "MemoryStore") -> Standing:
     """Fold the log for what the unprompted pass has already done.
@@ -147,6 +164,9 @@ def standing(store: "MemoryStore") -> Standing:
     """
     # seq -> the stamp of the look itself, not of whatever finished it.
     mine: dict[int, str] = {}
+    # Every unprompted inbound (look or clock fire), for the novelty memory.
+    unprompted: dict[int, str] = {}
+    said: list[tuple[str, str]] = []
     completed: set[int] = set()
     looked_at: Optional[str] = None
     heard_at: Optional[str] = None
@@ -165,6 +185,8 @@ def standing(store: "MemoryStore") -> Standing:
         kind = payload.get("kind")
         if kind == episodes.MESSAGE_INBOUND:
             at = payload.get("at")
+            if payload.get("channel") in UNPROMPTED_CHANNELS:
+                unprompted[episode.seq] = at if isinstance(at, str) else ""
             if payload.get("channel") == CHANNEL:
                 mine[episode.seq] = at if isinstance(at, str) else ""
                 if isinstance(at, str):
@@ -173,6 +195,15 @@ def standing(store: "MemoryStore") -> Standing:
                 heard_at = at
         elif kind == episodes.TURN_COMPLETED:
             for_seq = payload.get("for_seq")
+            reply = payload.get("reply")
+            if (
+                for_seq in unprompted
+                and payload.get("outcome") == "spoke"
+                and isinstance(reply, str)
+                and reply.strip()
+            ):
+                said.append((unprompted[for_seq], reply.strip()))
+                del said[:-SAID_KEPT]
             if for_seq in mine:
                 completed.add(for_seq)
                 if payload.get("outcome") == "spoke":
@@ -197,6 +228,7 @@ def standing(store: "MemoryStore") -> Standing:
         spoke_on=frozenset(spoke),
         through=through,
         outstanding=len(set(mine) - completed),
+        said=tuple(said),
     )
 
 
@@ -205,13 +237,13 @@ def may_look(
     *,
     now: datetime,
     look_every_seconds: int = LOOK_EVERY_SECONDS,
-    max_per_day: int = MAX_PER_DAY,
+    max_per_day: Optional[int] = MAX_PER_DAY,
 ) -> bool:
-    """Both limits, in the order that spends the least.
+    """The look's limits, in the order that spends the least.
 
-    The day check comes first because it is the one that can skip the look
-    entirely: if today's single nudge is already spent, there is no reason to
-    build a situation and call a model only to be forced silent.
+    The day check is off by default since DL-068 (``max_per_day=None``). When
+    a caller passes a number it still runs first, because it is the one that
+    can skip the look entirely.
 
     ``look_every_seconds`` is a gap against **two** stamps, the last look and
     the last thing *heard*, and the second one is not an extra nicety. DL-011
@@ -226,11 +258,12 @@ def may_look(
     if st.outstanding:
         return False
 
-    today = local_date(now.isoformat())
-    if today is None:
-        return False  # undeterminable day, so no budget
-    if len(st.spoke_on & {today}) >= max_per_day:
-        return False
+    if max_per_day is not None:
+        today = local_date(now.isoformat())
+        if today is None:
+            return False  # undeterminable day, so no budget
+        if len(st.spoke_on & {today}) >= max_per_day:
+            return False
 
     gap = timedelta(seconds=look_every_seconds)
     for stamp in (st.looked_at, st.heard_at):
@@ -281,6 +314,8 @@ def situation(
     schedules: Sequence["Schedule"] = (),
     moments: Sequence["Moment"] = (),
     heard_at: Optional[str] = None,
+    machine: Sequence[str] = (),
+    said: Sequence[tuple[str, str]] = (),
     max_chars: int = MAX_L1_CHARS,
 ) -> str:
     """The L1 text: what is open, as far as omega already knows it.
@@ -300,6 +335,11 @@ def situation(
     a loop that runs on time ends up never having anything to say. What happened
     is the only input that changes on its own.
 
+    ``machine`` (DL-068) is the other input that changes on its own: disk,
+    battery, load, already worded and flagged by :mod:`omega.machine`. ``said``
+    is the novelty guard - what omega already told them unprompted in the last
+    day - rendered so that repeating it is visibly repeating it.
+
     Recent conversation is deliberately **not** rendered here. The turn's own
     recall step already puts it in front of the judge, and writing it twice
     would spend the prompt twice to say one thing.
@@ -318,6 +358,12 @@ def situation(
         lines.append("You have not heard from them yet.")
     else:
         lines.append(f"You last heard from them {heard}.")
+
+    if machine:
+        lines.append("")
+        lines.append("Their machine right now:")
+        for line in machine:
+            lines.append(f"- {line}")
 
     if blocks:
         lines.append("")
@@ -339,6 +385,28 @@ def situation(
         lines.append("Lately:")
         for moment in moments:
             lines.append(f"- {getattr(moment, 'text', '')}")
+
+    recent = []
+    for at, text in said:
+        ago = _since(now, at)
+        if ago is None:
+            continue
+        try:
+            then = datetime.fromisoformat(at)
+        except (TypeError, ValueError):
+            continue
+        if then.tzinfo is None:
+            then = then.replace(tzinfo=timezone.utc)
+        if (now - then).total_seconds() <= SAID_WITHIN_SECONDS:
+            recent.append((ago, text))
+    if recent:
+        lines.append("")
+        lines.append("You already told them, unprompted (do not repeat it):")
+        for ago, text in recent:
+            one = " ".join(text.split())
+            if len(one) > 200:
+                one = one[:199].rstrip() + "…"
+            lines.append(f"- {ago}: {one}")
 
     lines.append("")
     lines.append(

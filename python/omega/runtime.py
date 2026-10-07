@@ -54,7 +54,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Sequence
 
 from omega import episodes, notice, projection, provider
 from omega.blobs import BlobStore
@@ -268,6 +268,11 @@ class Runtime:
         # thing being configured is *which folder*, and there is no honest
         # default for that. `__main__` supplies `listen.DEFAULT_FOLDER`.
         recordings: Optional[PathLike] = None,
+        # DL-068's two senses. ``None`` for the same reason as the paths above:
+        # a default that opened a socket or ran pmset would make the network
+        # and the OS part of every test. `__main__` passes `omega.machine`'s.
+        online: Optional[Callable[[], bool]] = None,
+        machine: Optional[Callable[[], Sequence[str]]] = None,
         # On by default because DL-035's whole point is that omega acts on time
         # without being asked, and a proactivity that has to be switched on is
         # one that is off in every deployment nobody remembered to configure.
@@ -294,6 +299,8 @@ class Runtime:
         )
         self._usage = None if usage_path is None else Path(os.fspath(usage_path))
         self._recordings = None if recordings is None else Path(os.fspath(recordings))
+        self._online = online
+        self._machine = machine
         self._clock = clock
         self._host = host
         self._port = port
@@ -357,7 +364,11 @@ class Runtime:
             self._blobs = BlobStore.open(self._blobs_dir())
             self._queue = EventQueue(self._store)
             self._executor = Executor(
-                self._queue, complete=self._complete, act=self._act
+                self._queue,
+                complete=self._complete,
+                act=self._act,
+                online=self._online,
+                machine=self._machine,
             )
             self._report = self._executor.recover()
             self._thread = threading.Thread(
@@ -696,6 +707,11 @@ class Runtime:
         """
         scheduler = self._scheduler
         if scheduler is None or self._stopping.is_set():  # pragma: no cover
+            return
+        if self._online is not None and not self._online():
+            # DL-068 #5: nothing is fired into a turn that cannot reach the
+            # model. Not lost either — fires coalesce (`schedule.previous_match`),
+            # so the first tick back online fires it once, marked late.
             return
         seqs = scheduler.tick()
         if seqs:
