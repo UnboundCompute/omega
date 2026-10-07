@@ -5,9 +5,11 @@
 #   sudo mkdir -p /var/lib/omega /var/lib/omega-discord /etc/omega
 #   sudo chown 10001 /var/lib/omega /var/lib/omega-discord   # the image's `omega` user
 #   echo 'OPENAI_API_KEY=sk-...' | sudo tee /etc/omega/env && sudo chmod 600 /etc/omega/env
-#   # The adapter's two lines go in the same file; without them it logs why and exits:
-#   echo 'DISCORD_TOKEN=...' | sudo tee -a /etc/omega/env
-#   echo 'DISCORD_OWNER_ID=<your Discord user id>' | sudo tee -a /etc/omega/env
+#   # The adapter's own file, so it never holds the model key (and the core
+#   # never holds the bot token); without these it logs why and exits:
+#   echo 'DISCORD_TOKEN=...' | sudo tee /etc/omega/discord.env
+#   echo 'DISCORD_OWNER_ID=<your Discord user id>' | sudo tee -a /etc/omega/discord.env
+#   sudo chmod 600 /etc/omega/discord.env
 #   sudo tailscale serve --bg --tcp 7717 tcp://127.0.0.1:7717
 #
 #   sudo install -m 755 autodeploy.sh /usr/local/bin/omega-autodeploy
@@ -43,8 +45,9 @@ services:
     # The image's `omega` user, as for the core.
     user: "10001"
     network_mode: host
-    # DISCORD_TOKEN and DISCORD_OWNER_ID; the token is never in the image.
-    env_file: /etc/omega/env
+    # DISCORD_TOKEN and DISCORD_OWNER_ID only; the token is never in the image,
+    # and the model key is not in this container at all.
+    env_file: /etc/omega/discord.env
     volumes:
       # Only its delivery cursor lives here.
       - /var/lib/omega-discord:/state
