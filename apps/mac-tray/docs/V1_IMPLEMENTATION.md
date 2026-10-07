@@ -59,8 +59,9 @@ become a second brain or an undeclared wire protocol.
 - Start a non-interactive omega runtime when the packaged tray launches, reuse an already-running
   resident process, stop the owned process on app quit, and surface startup failures in the tray.
 - Add a lossless New Chat surface reset and a one-shot Teach Omega composer mode. Teach Omega is
-  only a writing affordance: it sends the person's exact note through the ordinary `say` path,
-  and omega's normal reply provides the durable claim or schedule receipt. A dedicated composer
+  a writing affordance over the ordinary `say` path: it wraps the person's note in the teaching
+  instruction that the backend recognizes, while the visible conversation keeps only the plain
+  note. Omega's normal reply provides the durable claim or schedule receipt. A dedicated composer
   control enters the mode in one click; the overflow menu is not part of the learning path. Staged
   screenshots and other context remain attached and do not disable the teaching control.
 - Preserve indented continuation lines in learning receipts so replacement details stay attached

@@ -241,7 +241,7 @@ final class TrayViewModel: ObservableObject {
         let sentContext = stagedContext
         let sentMode = composerMode
         let submission = TraySubmission(
-            text: text,
+            text: sentMode == .teach ? teachingInstruction(for: text) : text,
             context: sentContext.map {
                 TrayContextReference(
                     id: $0.id,
@@ -510,9 +510,10 @@ final class TrayViewModel: ObservableObject {
             switch update.state {
             case "understood" where update.kind == "message.inbound":
                 let text = update.text?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                let visibleText = visibleTranscriptInstruction(text)
                 return TrayMessage(
                     role: .user,
-                    text: text.isEmpty ? "Context shared with omega" : text,
+                    text: visibleText.isEmpty ? "Context shared with omega" : visibleText,
                     contextDescriptions: update.context.map { "\($0.kind.capitalized) context" },
                     delivery: .sent
                 )
@@ -526,6 +527,23 @@ final class TrayViewModel: ObservableObject {
                 return nil
             }
         }
+    }
+
+    private func teachingInstruction(for note: String) -> String {
+        """
+        Teaching note from me. Treat this as something to remember and apply in future conversations, not as a task to execute. Briefly confirm what you learned.
+
+        \(note)
+        """
+    }
+
+    private func visibleTranscriptInstruction(_ text: String) -> String {
+        guard let separator = text.range(of: "\n\n"),
+              text[..<separator.lowerBound].contains("remember and apply in future conversations")
+        else { return text }
+
+        return String(text[separator.upperBound...])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     private func urgency(for seq: Int) -> ProactiveUrgency {

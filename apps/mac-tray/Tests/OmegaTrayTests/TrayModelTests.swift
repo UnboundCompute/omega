@@ -62,7 +62,7 @@ final class TrayModelTests: XCTestCase {
     }
 
     @MainActor
-    func testTeachModeSendsTheUsersExactTextAsAnOrdinaryMessage() async throws {
+    func testTeachModeWrapsTheOutgoingNoteButKeepsTheVisibleMessagePlain() async throws {
         let (model, transport) = connectedModel()
         let screenshot = StagedContext(
             kind: .screen,
@@ -78,7 +78,14 @@ final class TrayModelTests: XCTestCase {
         await settleTasks()
 
         let submission = try XCTUnwrap(transport.submissions.first)
-        XCTAssertEqual(submission.text, "Prefer concise status updates.")
+        XCTAssertEqual(
+            submission.text,
+            """
+            Teaching note from me. Treat this as something to remember and apply in future conversations, not as a task to execute. Briefly confirm what you learned.
+
+            Prefer concise status updates.
+            """
+        )
         XCTAssertEqual(submission.context.first?.id, screenshot.id)
         XCTAssertEqual(submission.context.first?.blob, transport.attachmentReference.blob)
         XCTAssertEqual(model.messages.first?.text, "Prefer concise status updates.")
@@ -171,6 +178,29 @@ final class TrayModelTests: XCTestCase {
         XCTAssertEqual(model.messages.map(\.text), ["Earlier question", "Earlier answer"])
         XCTAssertFalse(model.isRestoringTranscript)
         XCTAssertNil(model.transcriptRestoreFailure)
+    }
+
+    @MainActor
+    func testRestoreTranscriptHidesTheTeachingInstruction() async {
+        let (model, transport) = connectedModel()
+        transport.transcriptUpdates = [
+            .init(
+                seq: 1,
+                forSeq: 1,
+                state: "understood",
+                kind: "message.inbound",
+                text: """
+                Teaching note from me. Treat this as something to remember and apply in future conversations, not as a task to execute. Briefly confirm what you learned.
+
+                I prefer short answers
+                """
+            )
+        ]
+
+        model.restoreTranscript()
+        await settleTasks()
+
+        XCTAssertEqual(model.messages.map(\.text), ["I prefer short answers"])
     }
 
     @MainActor

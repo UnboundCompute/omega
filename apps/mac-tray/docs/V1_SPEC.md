@@ -69,10 +69,10 @@ The defining loop is:
   deleting episodes, or isolating omega from its durable history. It is unavailable while a
   draft, staged context, or turn is active so nothing is silently discarded.
 - A one-shot Teach Omega composer mode accepts an explicit fact, preference, or working rule and
-  submits it as a durable learning instruction rather than a task. **It is a framing affordance
-  only** — it helps the person phrase a durable fact well, and then sends a plain message like
-  any other. Omega decides what was a teach drop; the tray does not label it and there is no
-  separate submission type (`TRAY_INTEGRATION.md` §5).
+  submits it as a durable learning instruction rather than a task. It wraps the person's plain
+  note in the backend-recognized teaching instruction over the ordinary message path; the wrapper
+  is never shown as user-authored conversation text, and there is no separate submission type
+  (`TRAY_INTEGRATION.md` §5).
 - Teach Omega is entered directly from the composer in one click; it is not buried in the
   top-row overflow menu. Its visible mode strip provides the explicit way back to ordinary asking.
 - Staged context does not disable Teach Omega. A screenshot or other attachment can accompany the
