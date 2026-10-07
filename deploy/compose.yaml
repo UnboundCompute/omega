@@ -1,9 +1,13 @@
-# The core on the VM (DL-069). One service, one writer.
+# The core on the VM (DL-069), and the Discord adapter beside it (DL-073).
+# One writer: the adapter is a channel client and holds only a cursor.
 #
 # Once, on the VM:
-#   sudo mkdir -p /var/lib/omega /etc/omega
-#   sudo chown 10001 /var/lib/omega          # the image's `omega` user
+#   sudo mkdir -p /var/lib/omega /var/lib/omega-discord /etc/omega
+#   sudo chown 10001 /var/lib/omega /var/lib/omega-discord   # the image's `omega` user
 #   echo 'OPENAI_API_KEY=sk-...' | sudo tee /etc/omega/env && sudo chmod 600 /etc/omega/env
+#   # The adapter's two lines go in the same file; without them it logs why and exits:
+#   echo 'DISCORD_TOKEN=...' | sudo tee -a /etc/omega/env
+#   echo 'DISCORD_OWNER_ID=<your Discord user id>' | sudo tee -a /etc/omega/env
 #   sudo tailscale serve --bg --tcp 7717 tcp://127.0.0.1:7717
 #
 #   sudo install -m 755 autodeploy.sh /usr/local/bin/omega-autodeploy
@@ -11,8 +15,8 @@
 #   sudo systemctl enable --now omega-autodeploy.timer
 #
 # Deploys are pulled, not pushed (DL-074): every 15 min the timer asks GHCR for
-# `main` and, on a new digest, backs up the store, starts it pinned by digest in
-# ./.env, health-checks it and rolls back on failure. Watch it with
+# `main` and, on a new digest, backs up the store, starts both services pinned by
+# digest in ./.env, health-checks the core and rolls back on failure. Watch it with
 #   journalctl -u omega-autodeploy
 # By hand, the pin in ./.env is what `sudo docker compose up -d` runs; to roll
 # back, put a previous digest there.
@@ -29,3 +33,21 @@ services:
     restart: unless-stopped
     # SIGTERM asks for a clean, between-turn stop; give a turn time to finish.
     stop_grace_period: 120s
+
+  discord:
+    # The same image and the same pin as the core, so a deploy or a rollback
+    # moves both together. A loopback client of the core's channel (127.0.0.1:7717),
+    # hence host networking; it listens on nothing.
+    image: ${OMEGA_IMAGE:-ghcr.io/unboundcompute/omega:main}
+    entrypoint: ["python", "-m", "omega.discord"]
+    # The image's `omega` user, as for the core.
+    user: "10001"
+    network_mode: host
+    # DISCORD_TOKEN and DISCORD_OWNER_ID; the token is never in the image.
+    env_file: /etc/omega/env
+    volumes:
+      # Only its delivery cursor lives here.
+      - /var/lib/omega-discord:/state
+    restart: unless-stopped
+    depends_on:
+      - omega

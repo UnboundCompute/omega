@@ -53,7 +53,7 @@ PASS_SECONDS = 60
 #: How this machine names itself in a report. One word the look can print, and
 #: the name DL-073 routes on; a hostname would put the person's machine name in
 #: the log for no gain.
-DEVICE = "mac"
+DEVICE = machine.MAC
 
 #: The only ops a relay sends. See the module docstring.
 ALLOWED_OPS = frozenset({"report", "reported"})

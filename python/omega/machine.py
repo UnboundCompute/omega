@@ -50,6 +50,7 @@ __all__ = [
     "parse_idle",
     "idle_seconds",
     "is_away",
+    "MAC",
     "at_the_mac",
 ]
 
@@ -356,6 +357,12 @@ def idle_seconds() -> Optional[float]:
 
 def is_away(idle: float) -> bool:
     return idle >= AWAY_SECONDS
+
+
+#: The device name the Mac relay reports under, and the one "at the Mac" reads.
+#: Here rather than in the relay so the core can ask about presence without
+#: importing the relay (which imports the channel).
+MAC = "mac"
 
 
 def at_the_mac(presence: Optional[Any], *, now: datetime) -> bool:

@@ -39,6 +39,11 @@ Mac runs a relay that reads and digests and sends ``report``; the core appends
 is a record, never an event: it wakes no turn, and the relay has no ``say``.
 ``reported`` lets the relay ask which units already have receipts, so it does
 not digest — or run whisper over — something the core already learned from.
+
+**``presence`` answers one question: is the person at the Mac?** (DL-073 §3.)
+The Discord adapter asks it before it buzzes the phone with something nobody
+asked for. Read-only, folded from the latest presence report, and it fails
+toward the phone: no report, a stale one or an unreadable one is ``False``.
 """
 
 from __future__ import annotations
@@ -48,10 +53,11 @@ import socket
 import threading
 from collections import deque
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any, Callable, Iterator, Optional
 
-from omega import episodes, projection
-from omega.derive import Learned
+from omega import episodes, machine, projection
+from omega.derive import Learned, Readings
 from omega.blobs import BlobError, BlobStore
 from omega.memory import WriteKeyConflict
 from omega.queue import EventQueue
@@ -171,6 +177,7 @@ class Channel:
         port: int = DEFAULT_PORT,
         poll: float = 0.02,
         on_append: Optional[Callable[[int], None]] = None,
+        now: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
     ) -> None:
         if host not in LOOPBACK:
             raise ValueError(
@@ -201,6 +208,11 @@ class Channel:
         # the drain thread mutates.
         self._learned = Learned()
         self._learned_lock = threading.Lock()
+        # The presence fold behind ``presence``, kept apart from the receipts
+        # for the same reason: its own view, its own lock, derived from the log.
+        self._readings = Readings()
+        self._readings_lock = threading.Lock()
+        self._now = now
 
     # --- lifecycle --------------------------------------------------------
 
@@ -342,6 +354,8 @@ class Channel:
                 return self._report(request)
             if op == "reported":
                 return self._reported(request)
+            if op == "presence":
+                return self._presence()
             if op == "ping":
                 return {"v": PROTOCOL, "op": "pong", "head": self._queue.head()}
             return self._error(f"unknown op {op!r}")
@@ -504,6 +518,24 @@ class Channel:
             self._learned.advance(self._queue.store)
             units = sorted(self._learned.worked(source))
         return {"v": PROTOCOL, "op": "reported", "source": source, "units": units}
+
+    def _presence(self) -> dict[str, Any]:
+        """``{at_the_mac}`` from the Mac's latest presence report (DL-073 §3).
+
+        The whole decision is :func:`omega.machine.at_the_mac`, against the
+        core's clock; this only folds the log up to now and asks it. Nothing
+        else crosses — not the idle seconds, not the report's age — because the
+        one client that asks needs one bit, and a wider answer is a wider
+        surface for no reader.
+        """
+        with self._readings_lock:
+            self._readings.advance(self._queue.store)
+            latest = self._readings.latest(episodes.REPORT_PRESENCE, machine.MAC)
+        return {
+            "v": PROTOCOL,
+            "op": "presence",
+            "at_the_mac": machine.at_the_mac(latest, now=self._now()),
+        }
 
     def _attach(self, request: dict[str, Any]) -> dict[str, Any]:
         """Ingest one file into the blob store and answer with its reference.
@@ -731,6 +763,9 @@ class ChannelClient:
 
     def reported(self, source: str) -> dict[str, Any]:
         return self.request({"v": PROTOCOL, "op": "reported", "source": source})
+
+    def presence(self) -> dict[str, Any]:
+        return self.request({"v": PROTOCOL, "op": "presence"})
 
     def updates(self, count: int) -> Iterator[dict[str, Any]]:
         for _ in range(count):

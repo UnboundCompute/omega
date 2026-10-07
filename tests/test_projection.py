@@ -439,7 +439,7 @@ def test_an_unprompted_look_is_withheld_but_its_reply_is_not() -> None:
     """The look is omega noticing, not omega speaking (DL-061).
 
     The tray appends any non-active-turn `message.inbound` in the `understood`
-    state as `role: .user`, and the wire carries no `channel`, so a projected
+    state as `role: .user` and does not read `channel`, so a projected
     look would arrive in the conversation as something the *person* said -
     an hourly internal digest opening "Nobody asked for this" attributed to
     them. It is the same withheld category as `reflection.done`: noticed, not

@@ -97,6 +97,7 @@ class Update:
     ok: Optional[bool] = None
     outcome: Optional[str] = None
     urgency: Optional[str] = None
+    channel: Optional[str] = None
     context: list[dict[str, str]] = field(default_factory=list)
 
     def wire(self) -> dict[str, Any]:
@@ -116,7 +117,7 @@ class Update:
         if self.outcome is not None:
             out["outcome"] = self.outcome
             out["reply"] = self.reply
-        for name in ("text", "needs", "error", "tool", "urgency"):
+        for name in ("text", "needs", "error", "tool", "urgency", "channel"):
             value = getattr(self, name)
             if value is not None:
                 out[name] = value
@@ -238,8 +239,9 @@ def project(payload: dict[str, Any], seq: int) -> Optional[Update]:
             # non-active-turn `message.inbound` in the `understood` state as
             # `role: .user` - so an hourly internal digest beginning "Nobody
             # asked for this" would appear in the conversation as something they
-            # said. The wire carries no `channel`, so the tray has no way to
-            # tell it apart and no fix is possible on that side.
+            # said. The tray does not read `channel` (an inbound carries it
+            # since DL-073, for the Discord adapter), so withholding here is
+            # still the only fix.
             #
             # The *reply* still crosses, on its own `turn.completed`: that path
             # does not require the tray to have seen the event it answers
@@ -254,6 +256,12 @@ def project(payload: dict[str, Any], seq: int) -> Optional[Update]:
             kind=kind,
             text=str(payload.get("text", "")),
             urgency=str(payload.get("urgency", "normal")),
+            # Where the person said it (DL-073 §2). A reply goes back to the
+            # channel its message came from, and the reply's own update only
+            # names the turn (`for_seq`), so this is how an adapter tells its
+            # own turns from the tray's. The *name* of a channel, never anything
+            # about its content; unprompted channels never get this far.
+            channel=str(payload.get("channel", "")),
             context=_context(payload.get("context") or []),
         )
 

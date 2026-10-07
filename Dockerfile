@@ -58,10 +58,15 @@ FROM python:3.11-slim-bookworm
 
 COPY --from=test /src/.linux-suite-green /etc/omega.linux-suite-green
 COPY --from=build /wheels /wheels
-RUN pip install --no-cache-dir /wheels/*.whl && rm -rf /wheels
+# With the `discord` extra: the Discord adapter (DL-073) runs from this same
+# image as a second service, `python -m omega.discord`. The loop is there
+# because `[discord]` after a glob would be read as a character class.
+RUN for wheel in /wheels/*.whl; do pip install --no-cache-dir "${wheel}[discord]"; done \
+    && rm -rf /wheels
 
 # The store is a host mount (DL-069 #4); the uid is fixed so the host
-# directory can be chowned to it once.
+# directory can be chowned to it once. The Discord adapter runs as the same
+# user, so its cursor directory is chowned to the same uid.
 RUN useradd --system --uid 10001 --home-dir /data omega \
     && mkdir /data && chown omega /data
 USER omega

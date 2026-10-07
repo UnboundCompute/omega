@@ -18,6 +18,11 @@ classifiers = [
     "Programming Language :: Python :: Implementation :: CPython",
 ]
 
+[project.optional-dependencies]
+# The Discord adapter (DL-073), `python -m omega.discord`. Optional and imported
+# lazily by its shim alone, so the core and the test suite never need it.
+discord = ["discord.py>=2.4,<3"]
+
 [tool.maturin]
 python-source = "python"
 module-name = "omega._log"
