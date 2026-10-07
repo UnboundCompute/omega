@@ -1,0 +1,24 @@
+# The core on the VM (DL-069). One service, one writer.
+#
+# Once, on the VM:
+#   sudo mkdir -p /var/lib/omega /etc/omega
+#   sudo chown 10001 /var/lib/omega          # the image's `omega` user
+#   echo 'OPENAI_API_KEY=sk-...' | sudo tee /etc/omega/env && sudo chmod 600 /etc/omega/env
+#   sudo tailscale serve --bg --tcp 7717 tcp://127.0.0.1:7717
+#
+# Deploy (by hand — no auto-updater on the box that holds the memory):
+#   docker compose pull && docker compose up -d
+# Roll back: set OMEGA_TAG=sha-<previous> and run the same two commands.
+
+services:
+  omega:
+    image: ghcr.io/unboundcompute/omega:${OMEGA_TAG:-main}
+    # omega binds 127.0.0.1 and refuses anything else; host networking makes
+    # that the VM's loopback, which `tailscale serve` forwards from the tailnet.
+    network_mode: host
+    env_file: /etc/omega/env
+    volumes:
+      - /var/lib/omega:/data
+    restart: unless-stopped
+    # SIGTERM asks for a clean, between-turn stop; give a turn time to finish.
+    stop_grace_period: 120s

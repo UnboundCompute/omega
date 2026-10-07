@@ -1,0 +1,24 @@
+# The image is public (the repo is), so this list is a security boundary, not
+# tidiness: a local `docker build` would otherwise copy the key in `.env`.
+.env
+.env.*
+!.env.example
+secrets/
+*.local
+AGENT.md
+
+# Rebuilt inside the image; a host .so is the wrong platform anyway.
+target/
+.venv/
+*.so
+__pycache__/
+.pytest_cache/
+
+# Not part of the core.
+.git/
+.github/
+.impeccable/
+apps/
+bench/
+docs/
+agent/
