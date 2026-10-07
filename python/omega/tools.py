@@ -238,19 +238,31 @@ READ_ONLY_ARGV0 = frozenset(
     {
         "cat",
         "date",
+        # DL-070: the machine sense made omega notice a nearly full disk, and
+        # then asking "where is the space going?" needed a go for `df` and `du`.
+        # These eight have no flag that writes or changes the system; `sysctl`
+        # (-w) and `pmset` stay out because they do.
+        "df",
+        "du",
         "echo",
         "file",
         "grep",
         "head",
         "hostname",
+        "id",
         "ls",
+        "ps",
         "pwd",
         "stat",
+        "sw_vers",
         "tail",
         "true",
         "uname",
+        "uptime",
+        "vm_stat",
         "wc",
         "which",
+        "whoami",
     }
 )
 

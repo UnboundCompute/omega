@@ -367,3 +367,17 @@ def test_said_counts_clock_fires_and_looks_but_not_typed_turns(q: EventQueue) ->
     q.append(episodes.completed(for_seq=look, outcome="silent", at=AT))
 
     assert [text for _, text in notice.standing(q.store).said] == ["News: X."]
+
+
+def test_auditing_the_disk_needs_no_go(q: EventQueue, tmp_path: Path) -> None:
+    """The live failure: omega's machine sense flagged the disk LOW, and
+    "where is the space going?" blocked on a go for `df` and `du` — two
+    programs with no flag that writes. The settings-changing neighbours stay
+    asked-about."""
+    box = _box(q, tmp_path)
+    for argv in (["df", "-h"], ["du", "-x", "-h", "-d", "1", str(tmp_path)]):
+        decision = box.classify("run_code", {"argv": argv, "cwd": str(tmp_path)})
+        assert decision.tier == tools.EXPLORATION, argv
+    for argv in (["sysctl", "-w", "x=1"], ["pmset", "-a", "sleep", "0"]):
+        decision = box.classify("run_code", {"argv": argv, "cwd": str(tmp_path)})
+        assert decision.tier == tools.EXTERNAL, argv
