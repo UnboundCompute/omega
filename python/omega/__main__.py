@@ -47,6 +47,7 @@ from omega import (
     provider,
     relay as relaying,
     runtime,
+    sarvam,
     schedule as scheduling,
     transcripts,
 )
@@ -374,18 +375,32 @@ def relay(
     *,
     write: Callable[[str], None],
     wait: Optional[Callable[[threading.Event], None]] = None,
+    env_path: Optional[Path] = None,
 ) -> int:
     """Run this Mac's senses for a core elsewhere until SIGTERM (DL-072).
 
     The same four paths ``main`` grants a local runtime, granted here instead,
     because this is the process that runs where they exist. ``wait`` is
     injectable for :func:`serve`'s reason.
+
+    ``env_path`` is the ``.env`` the core would read, and only the
+    ``SARVAM_*`` names are taken from it (DL-078): the relay still holds no
+    model key.
     """
     stopping = threading.Event()
 
     def request_stop(_signum: int, _frame: object) -> None:
         stopping.set()
 
+    chosen = sarvam.settings(env_path)
+    not_ready: Callable[[], Optional[str]] = listen.not_ready
+    if chosen is not None:
+        # `listen.not_ready` answers about whisper, and with a key whisper is
+        # only the fallback: a Mac without it must still transcribe through
+        # Sarvam. The cost is that a Sarvam failure on such a Mac ends in
+        # whisper's NotHeard receipt for that one recording, which DL-078
+        # accepts — the file is filed away, never deleted.
+        not_ready = lambda: None  # noqa: E731
     sensor = relaying.Relay(
         (host, port),
         transcripts_root=transcripts.default_root(),
@@ -393,12 +408,18 @@ def relay(
         recordings=str(listen.folder_path()),
         read_machine=machine.read,
         read_idle=machine.idle_seconds,
+        transcribe=sarvam.with_fallback(chosen, log=write),
+        not_ready=not_ready,
         log=write,
     )
     previous_term = signal.signal(signal.SIGTERM, request_stop)
     previous_int = signal.signal(signal.SIGINT, request_stop)
     try:
         write(f"omega relay is reporting to {host}:{port}")
+        if chosen is not None:
+            write(f"omega relay transcribes with sarvam ({chosen.model}), whisper as fallback")
+        else:
+            write("omega relay transcribes with local whisper")
         (wait or sensor.run)(stopping)
         return 0
     finally:
@@ -504,8 +525,10 @@ def main(argv: Optional[list[str]] = None) -> int:
             parser.error("--relay runs on its own; it has no store to serve or read")
         # Before the store and the provider, and it never reaches either: the
         # relay holds no log and no key (DL-072). What it knows about what has
-        # been learned it asks the core.
-        return relay(args.relay, args.port, write=write)
+        # been learned it asks the core. It does find the core's `.env`, the
+        # same way, but only to take the SARVAM_* names from it (DL-078).
+        env_path, _ = resolve_env(args.env, Path(args.store).expanduser())
+        return relay(args.relay, args.port, write=write, env_path=env_path)
 
     store_dir = Path(args.store).expanduser()
     if args.learned:

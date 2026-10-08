@@ -89,6 +89,7 @@ __all__ = [
     "FakeProvider",
     "OpenAIProvider",
     "load_env",
+    "read_env",
     "provider_from_env",
     "system",
     "user",
@@ -416,6 +417,37 @@ class Provider(Protocol):
 # --- configuration ----------------------------------------------------------
 
 
+def read_env(path: Path) -> dict[str, str]:
+    """Parse a ``.env`` file into a dict, touching nothing else.
+
+    The parser :func:`load_env` uses, split out so a caller that must take
+    only *some* names from the file (the relay takes ``SARVAM_*`` and never
+    the model key, DL-078) can do so without the rest reaching
+    ``os.environ``. A missing file is an empty dict, for ``load_env``'s
+    reason.
+    """
+    if not path.exists():
+        return {}
+    values: dict[str, str] = {}
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export ") :].lstrip()
+        if "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+            value = value[1:-1]
+        if not key:
+            continue
+        values[key] = value
+    return values
+
+
 def load_env(path: Optional[Path] = None, *, override: bool = False) -> dict[str, str]:
     """Read a ``.env`` file into ``os.environ`` and return what it set.
 
@@ -433,28 +465,10 @@ def load_env(path: Optional[Path] = None, *, override: bool = False) -> dict[str
     file to be authoritative.
     """
     path = path or Path.cwd() / ".env"
-    if not path.exists():
-        return {}
-
-    set_values: dict[str, str] = {}
-    for raw_line in path.read_text(encoding="utf-8").splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
-            continue
-        if line.startswith("export "):
-            line = line[len("export ") :].lstrip()
-        if "=" not in line:
-            continue
-        key, _, value = line.partition("=")
-        key = key.strip()
-        value = value.strip()
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
-            value = value[1:-1]
-        if not key:
-            continue
+    set_values = read_env(path)
+    for key, value in set_values.items():
         if override or key not in os.environ:
             os.environ[key] = value
-        set_values[key] = value
     return set_values
 
 

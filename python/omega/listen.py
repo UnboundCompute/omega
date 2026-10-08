@@ -16,13 +16,18 @@ file is therefore folder in, text out — testable with neither a log nor a key 
 and the store-touching wrapper lives beside ``ingest()`` and ``digest()`` in the
 executor.
 
-**Transcription is local and the model is pinned.** Local because the entire
-premise is a private second brain, and a recording of a meeting is a recording of
-other people: shipping the room's audio to a vendor is the one thing this feature
-must not quietly do. Pinned because the whisper CLI's own default is ``turbo``,
-which is **not** cached — unpinned, the first meeting would trigger a silent
-multi-gigabyte download at the moment of use. :func:`transcribe` refuses to run
-against an uncached model rather than letting the network decide.
+**Transcription here is local and the model is pinned.** Local because the
+premise is a private second brain, and a recording of a meeting is a recording
+of other people: shipping the room's audio to a vendor is the one thing this
+feature must not *quietly* do. It is no longer the only path: when the person
+sets ``SARVAM_API_KEY``, the relay sends recordings to Sarvam first, because
+they asked for it and it hears Hindi and English mixed (DL-078,
+:mod:`omega.sarvam`), and this module becomes the fallback that runs whenever
+Sarvam does not answer — so the local path still has to work on its own.
+Pinned because the whisper CLI's own default is ``turbo``, which is **not**
+cached — unpinned, the first meeting would trigger a silent multi-gigabyte
+download at the moment of use. :func:`transcribe` refuses to run against an
+uncached model rather than letting the network decide.
 """
 
 from __future__ import annotations
