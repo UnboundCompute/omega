@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import base64
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Callable, Optional, Sequence
 
 from omega import blobs, derive, episodes, learn, notice, provider, schedule
@@ -915,6 +916,7 @@ def _event_turn(
     # turn rather than a failed request.
     event = _elide(_render_event(ctx.event), MAX_NEW_EVENT_CHARS)
     text = (
+        f"{_clock_line(ctx.event)}"
         f"{_learned_section(ctx.learned)}"
         f"Recent history:\n{_transcript(ctx.recalled)}\n\n"
         f"{_open_section(ctx.open_work)}"
@@ -924,6 +926,27 @@ def _event_turn(
     if not parts:
         return provider.user(text)
     return provider.user([provider.text_part(text), *parts])
+
+
+def _clock_line(event: dict[str, Any]) -> str:
+    """When this event arrived, in the person's zone (DL-079).
+
+    Every role used to infer "now" from whatever look last printed a time; at
+    11:43 IST the newest one said 05:52 (UTC, before the VM had a zone), and
+    "remind me at 1" became 428 minutes. Read off the event's own ``at``, not
+    the wall clock, so a replayed turn sees the moment it saw live.
+    """
+    raw = event.get("at")
+    if not isinstance(raw, str) or not raw.strip():
+        return ""
+    try:
+        moment = datetime.fromisoformat(raw.strip())
+    except ValueError:
+        return ""
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    local = moment.astimezone()
+    return f"It is now {local:%A %d %B %Y, %H:%M}, {schedule.zone_label(local)}.\n"
 
 
 #: Repeated at the very end of the judge's user turn, after the transcript.

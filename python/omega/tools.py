@@ -503,14 +503,7 @@ def _watch_cron(at: Any, days: Any) -> str:
     """``at`` ("HH:MM", their clock) and optional ``days`` as the cron the
     scheduler already runs (DL-078). Refused rather than guessed: a time read
     wrong is a schedule that fires at the wrong hour and says nothing."""
-    if not isinstance(at, str):
-        raise ToolRejected(f"{WATCH}'s 'at' must be a time like \"10:00\"")
-    parts = at.strip().split(":")
-    if len(parts) != 2 or not all(p.isdigit() for p in parts):
-        raise ToolRejected(f"{WATCH}'s 'at' must be 24-hour HH:MM, not {at!r}")
-    hour, minute = int(parts[0]), int(parts[1])
-    if not (0 <= hour <= 23 and 0 <= minute <= 59):
-        raise ToolRejected(f"{WATCH}'s 'at' is not a time of day: {at!r}")
+    hour, minute = _clock_time(WATCH, at)
     if days is None:
         dow = "*"
     else:
@@ -566,10 +559,81 @@ def _classify_watch(box: "ToolBox", args: dict[str, Any]) -> Decision:
     )
 
 
+def _now() -> datetime:
+    """The local wall clock. A seam, so a test can pin it (DL-079)."""
+    return datetime.now().astimezone()
+
+
+def _clock_time(tool: str, at: Any) -> tuple[int, int]:
+    """``at`` as (hour, minute), or refused: a time read wrong is a promise
+    kept at the wrong hour without a word (DL-078, DL-079)."""
+    if not isinstance(at, str):
+        raise ToolRejected(f"{tool}'s 'at' must be a time like \"13:00\"")
+    parts = at.strip().split(":")
+    if len(parts) != 2 or not all(p.isdigit() for p in parts):
+        raise ToolRejected(f"{tool}'s 'at' must be 24-hour HH:MM, not {at!r}")
+    hour, minute = int(parts[0]), int(parts[1])
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        raise ToolRejected(f"{tool}'s 'at' is not a time of day: {at!r}")
+    return hour, minute
+
+
+def _remind_due(at: Any, date: Any, now: datetime) -> datetime:
+    """When a clock-time reminder is due, in the local zone: ``date`` if
+    given, otherwise the next ``at`` - today, or tomorrow once it has passed.
+    The model names the time; the arithmetic is done here, because doing it in
+    the model is how "at 1" became 428 minutes (DL-079)."""
+    hour, minute = _clock_time(REMIND, at)
+    if date is None:
+        due = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if due <= now:
+            due += timedelta(days=1)
+        return due
+    if not isinstance(date, str):
+        raise ToolRejected(f"{REMIND}'s 'date' must be YYYY-MM-DD")
+    try:
+        day = datetime.strptime(date.strip(), "%Y-%m-%d")
+    except ValueError:
+        raise ToolRejected(f"{REMIND}'s 'date' must be YYYY-MM-DD, not {date!r}") from None
+    due = day.replace(hour=hour, minute=minute).astimezone()
+    if due <= now:
+        raise ToolRejected(
+            f"{REMIND} cannot be due in the past: {due:%a %d %b %H:%M} is before now "
+            f"({now:%a %d %b %H:%M})"
+        )
+    return due
+
+
+def _due_phrase(due: datetime, now: datetime) -> str:
+    """"13:00 today, IST (UTC+05:30) - in 77 minutes", for a receipt."""
+    days = (due.date() - now.date()).days
+    day = {0: "today", 1: "tomorrow"}.get(days, due.strftime("%a %d %b"))
+    minutes = max(1, -(-int((due - now).total_seconds()) // 60))
+    return f"{due:%H:%M} {day}, {zone_label(due)} - in {minutes} minutes"
+
+
 def _classify_remind(box: "ToolBox", args: dict[str, Any]) -> Decision:
     what = _text(REMIND, args, "what").strip()
     if not what:
         raise ToolRejected(f"{REMIND} needs something to remind them about")
+    at = args.get("at")
+    if at is not None:
+        if args.get("in_minutes") is not None:
+            raise ToolRejected(
+                f"{REMIND} takes 'at' (a time of day) or 'in_minutes', not both"
+            )
+        now = _now()
+        due = _remind_due(at, args.get("date"), now)
+        if (due - now) > timedelta(minutes=MAX_REMIND_MINUTES):
+            raise ToolRejected(f"{REMIND} reaches at most {MAX_REMIND_MINUTES} minutes ahead")
+        return Decision(
+            tool=REMIND,
+            tier=LOCAL,
+            why=f"remind them about {what!r} at {_due_phrase(due, now)}",
+            args={"what": what, "due": due.isoformat()},
+        )
+    if args.get("date") is not None:
+        raise ToolRejected(f"{REMIND}'s 'date' needs an 'at' time")
     minutes = args.get("in_minutes")
     if isinstance(minutes, bool) or not isinstance(minutes, (int, float)):
         raise ToolRejected(f"{REMIND}'s 'in_minutes' must be a number")
@@ -614,7 +678,7 @@ def _watch(box: "ToolBox", args: dict[str, Any]) -> str:
         )
         # The receipt names the zone and the next run, read off the stored
         # expression, so "10:00" on a host left on UTC says so here (DL-078).
-        now = datetime.now().astimezone()
+        now = _now()
         upcoming = next_match(cron, now)
         nxt = upcoming.strftime("%a %d %b %H:%M") if upcoming else "not within a week"
         return (
@@ -637,15 +701,27 @@ def _remind(box: "ToolBox", args: dict[str, Any]) -> str:
         raise ToolError("reminders cannot be set from here: this box has no log")
     what = args["what"]
     sid = f"r{box.for_seq}-{zlib.crc32(what.encode()) & 0xFFFF:04x}"
+    # Whole seconds, because that is how the stamp below is written: the
+    # delay is counted from it, so the fire lands on the named minute.
+    now = _now().replace(microsecond=0)
+    if "due" in args:
+        due = datetime.fromisoformat(args["due"])
+        every = max(episodes.MIN_EVERY_SECONDS, int((due - now).total_seconds()))
+    else:
+        every = args["in_minutes"] * 60
+        due = now + timedelta(seconds=every)
     box.append(
         episodes.schedule_created(
             id=sid,
             instruction=remind_instruction(what),
-            every=args["in_minutes"] * 60,
+            every=every,
             once=True,
+            at=now.astimezone(timezone.utc).isoformat(timespec="seconds"),
         )
     )
-    return f"reminder set for {args['in_minutes']} minutes from now: {what!r} (id {sid})"
+    # The clock time, not a count of minutes: "428 minutes" read as fine to
+    # everyone, and "18:51 today" would not have (DL-079).
+    return f"reminder set for {_due_phrase(due, now)}: {what!r} (id {sid})"
 
 
 def _unwatch(box: "ToolBox", args: dict[str, Any]) -> str:
@@ -1478,20 +1554,32 @@ _TOOLS: dict[str, _Tool] = {
         dispatch=_remind,
         schema=_schema(
             REMIND,
-            "Remind them about something once, a set number of minutes from "
-            "now: you will be woken then and tell them. Use it whenever they "
-            "say remind me, ping me, or tell me in N minutes.",
+            "Remind them about something once: you will be woken then and "
+            "tell them. Use it whenever they say remind me, ping me, or tell me "
+            "at a time or in N minutes. Give exactly one of 'at' or "
+            "'in_minutes': a clock time (\"at 1\", \"at 6pm\", \"tomorrow at "
+            "9\") goes in 'at' (plus 'date' for another day) - never work it "
+            "out as minutes yourself. Tell them the time exactly as the result "
+            "states it.",
             {
                 "what": {
                     "type": "string",
                     "description": "What to remind them about, in their words.",
                 },
+                "at": {
+                    "type": "string",
+                    "description": "Time of day, 24-hour HH:MM in their local time, e.g. \"13:00\". Without 'date' it means the next such time. With no am/pm, take the sooner one still to come (\"at 1\" said at 11:43 is 13:00).",
+                },
+                "date": {
+                    "type": "string",
+                    "description": "With 'at': the day, YYYY-MM-DD, when it is not the next occurrence (e.g. tomorrow morning when that time is still to come today).",
+                },
                 "in_minutes": {
                     "type": "integer",
-                    "description": "Minutes from now, at least 1.",
+                    "description": "Instead of 'at': minutes from now, at least 1.",
                 },
             },
-            ["what", "in_minutes"],
+            ["what"],
         ),
     ),
 }

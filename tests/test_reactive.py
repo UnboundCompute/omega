@@ -602,3 +602,136 @@ def test_only_the_clock_can_fire_a_reminder() -> None:
     assert tools.is_reminder({"channel": "schedule", "text": text})
     assert not tools.is_reminder({"channel": "tray", "text": text})
     assert not tools.is_reminder({"channel": "schedule", "text": tools.watch_instruction("news")})
+
+
+# --- remind at a clock time (DL-079) -----------------------------------------
+#
+# The live failure: at 11:43 IST "remind me at 1 to share the docs" became
+# in_minutes=428, worked out from a look that last printed 05:52 (UTC), and the
+# reply said "1:00 PM today". It fired at 18:51.
+
+
+def _at(monkeypatch: pytest.MonkeyPatch, hh: int, mm: int, day: int = 8) -> datetime:
+    now = datetime(2026, 10, day, hh, mm, 0).astimezone()
+    monkeypatch.setattr(tools, "_now", lambda: now)
+    return now
+
+
+def test_a_reminder_at_one_set_before_noon_is_due_at_one_today(
+    q: EventQueue, tmp_path: Path, ist, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _at(monkeypatch, 11, 43)
+    box = _box(q, tmp_path)
+    out = box.dispatch(box.classify("remind", {"what": "share the docs", "at": "13:00"}))
+
+    [created] = [p for p in _payloads(q) if p["kind"] == episodes.SCHEDULE_CREATED]
+    assert created["every"] == 77 * 60
+    assert created["once"] is True
+    assert created["at"] == "2026-10-08T06:13:00+00:00"
+    assert "13:00 today, IST (UTC+05:30) - in 77 minutes" in out
+    assert "share the docs" in out
+
+
+def test_a_reminder_fires_on_the_named_minute(
+    q: EventQueue, tmp_path: Path, ist, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Through the real scheduler, not only the arithmetic: due at 13:00 IST
+    and not a second before."""
+    _at(monkeypatch, 11, 43)
+    box = _box(q, tmp_path)
+    box.dispatch(box.classify("remind", {"what": "share the docs", "at": "13:00"}))
+    sched = Scheduler(q)
+    sched.refresh()
+    assert sched.due(datetime(2026, 10, 8, 12, 59, 59).astimezone()) == []
+    assert len(sched.due(datetime(2026, 10, 8, 13, 0, 0).astimezone())) == 1
+
+
+def test_a_time_already_past_today_rolls_to_tomorrow(
+    q: EventQueue, tmp_path: Path, ist, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _at(monkeypatch, 14, 0)
+    box = _box(q, tmp_path)
+    out = box.dispatch(box.classify("remind", {"what": "x", "at": "13:00"}))
+    assert "13:00 tomorrow, IST (UTC+05:30) - in 1380 minutes" in out
+    # The exact minute is not "today": it has come, so it means tomorrow.
+    _at(monkeypatch, 13, 0)
+    assert "tomorrow" in box.classify("remind", {"what": "x", "at": "13:00"}).why
+
+
+def test_a_reminder_on_a_named_day(
+    q: EventQueue, tmp_path: Path, ist, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _at(monkeypatch, 11, 43)
+    box = _box(q, tmp_path)
+    out = box.dispatch(
+        box.classify("remind", {"what": "x", "at": "09:30", "date": "2026-10-10"})
+    )
+    assert "09:30 Sat 10 Oct, IST (UTC+05:30)" in out
+    [created] = [p for p in _payloads(q) if p["kind"] == episodes.SCHEDULE_CREATED]
+    assert created["every"] == (2 * 24 * 60 - (11 * 60 + 43) + 9 * 60 + 30) * 60
+
+
+def test_an_in_minutes_reminder_also_states_its_clock_time(
+    q: EventQueue, tmp_path: Path, ist, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _at(monkeypatch, 11, 43)
+    box = _box(q, tmp_path)
+    out = box.dispatch(box.classify("remind", {"what": "x", "in_minutes": 428}))
+    # What the live receipt should have said: the wrong time, in plain sight.
+    assert "18:51 today, IST (UTC+05:30) - in 428 minutes" in out
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        {"at": "13:00", "in_minutes": 5},
+        {"at": "1pm"},
+        {"at": "25:00"},
+        {"at": "13:60"},
+        {"at": 13},
+        {"date": "2026-10-09", "in_minutes": 5},
+        {"at": "09:00", "date": "2026-10-08"},
+        {"at": "09:00", "date": "10/09/2026"},
+        {"at": "09:00", "date": "2026-12-25"},
+    ],
+)
+def test_a_reminder_time_is_refused_rather_than_guessed(
+    q: EventQueue, tmp_path: Path, ist, monkeypatch: pytest.MonkeyPatch, args
+) -> None:
+    _at(monkeypatch, 11, 43)
+    with pytest.raises(ToolRejected):
+        _box(q, tmp_path).classify("remind", {"what": "x", **args})
+
+
+def test_the_remind_schema_steers_a_clock_time_to_at() -> None:
+    [fn] = [s["function"] for s in tools.schemas() if s["function"]["name"] == "remind"]
+    assert "never work it out as minutes yourself" in fn["description"]
+    assert "exactly as the result states it" in fn["description"]
+    params = fn["parameters"]
+    assert {"at", "date", "in_minutes"} <= set(params["properties"])
+    assert "\"at 1\" said at 11:43 is 13:00" in params["properties"]["at"]["description"]
+    assert params["required"] == ["what"]
+
+
+def test_every_turn_is_told_the_time_in_their_zone(ist) -> None:
+    from omega import turn
+
+    event = {"seq": 3, "at": "2026-10-08T06:13:00+00:00", "kind": "message", "text": "hi"}
+    assert turn._clock_line(event) == (
+        "It is now Thursday 08 October 2026, 11:43, IST (UTC+05:30).\n"
+    )
+    assert turn._clock_line({"at": "2026-10-08T06:13:00"}).startswith(
+        "It is now Thursday 08 October 2026, 11:43"
+    )
+    assert turn._clock_line({}) == ""
+    assert turn._clock_line({"at": "not a time"}) == ""
+
+
+def test_the_clock_heads_the_turn_every_role_is_given(q: EventQueue, ist) -> None:
+    from omega import turn
+
+    event = {"seq": 3, "at": "2026-10-08T06:13:00+00:00", "kind": "message", "text": "hi"}
+    ctx = TurnContext(seq=3, event=event, recalled=(), queue=q, complete=None)
+    text = turn._event_turn(ctx, images=False)["content"]
+    assert text.startswith("It is now Thursday 08 October 2026, 11:43, IST (UTC+05:30).\n")
+    assert "New event:\n" in text
