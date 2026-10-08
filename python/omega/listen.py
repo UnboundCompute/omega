@@ -277,8 +277,8 @@ def not_ready(model: str = WHISPER_MODEL) -> Optional[str]:
     """
     if whisper_binary() is None:
         return (
-            "whisper is not installed; omega transcribes locally and will not "
-            "send audio to a provider"
+            "whisper is not installed, and it is the local transcriber "
+            "(the only one without SARVAM_API_KEY)"
         )
     if not model_is_cached(model):
         return f"the whisper {model!r} model is not in {model_cache()}"
@@ -424,8 +424,8 @@ def transcribe(
     exe = whisper_binary(binary)
     if exe is None:
         raise NotHeard(
-            "whisper is not installed; omega transcribes locally and will not "
-            "send audio to a provider"
+            "whisper is not installed, and it is the local transcriber "
+            "(the only one without SARVAM_API_KEY)"
         )
     if not model_is_cached(model):
         # Refused rather than downloaded. A silent multi-gigabyte fetch at the
