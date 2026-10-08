@@ -56,6 +56,8 @@ def test_ring_one_is_closed_and_the_registry_agrees() -> None:
     # DL-068 added three, ledger first: `watch`/`unwatch` and `remind` are how
     # omega acts on time from an ordinary message. They write only omega's own
     # schedule records, which DL-035 already allowed a teach drop to write.
+    # DL-077 added `schedules`: the read half of those, so omega can see the
+    # ids `unwatch` needs.
     assert tools.TOOL_NAMES == {
         "read_file",
         "write_file",
@@ -65,6 +67,7 @@ def test_ring_one_is_closed_and_the_registry_agrees() -> None:
         "watch",
         "unwatch",
         "remind",
+        "schedules",
     }
     assert {s["function"]["name"] for s in tools.schemas()} == tools.TOOL_NAMES
 

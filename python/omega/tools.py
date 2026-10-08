@@ -75,11 +75,13 @@ import zlib
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional, Sequence
 from urllib.parse import urlsplit
 
 from omega import episodes, readable
+from omega.schedule import describe_cron
 
 __all__ = [
     "EXPLORATION",
@@ -152,6 +154,7 @@ RECALL = "recall"
 WATCH = "watch"
 UNWATCH = "unwatch"
 REMIND = "remind"
+SCHEDULES = "schedules"
 
 #: Ring 1's remainder, and it is closed (DL-014). Spelled as a frozenset so
 #: that "the set does not grow" is a fact about an object and not a promise in
@@ -173,7 +176,7 @@ REMIND = "remind"
 #: door, opened from an ordinary turn: they write the same ``schedule.created``
 #: / ``schedule.cancelled`` records a teach does, and nothing else.
 TOOL_NAMES = frozenset(
-    {READ_FILE, WRITE_FILE, RUN_CODE, FETCH, RECALL, WATCH, UNWATCH, REMIND}
+    {READ_FILE, WRITE_FILE, RUN_CODE, FETCH, RECALL, WATCH, UNWATCH, REMIND, SCHEDULES}
 )
 
 #: The shortest gap a watch may keep. Each fire is a turn that usually searches,
@@ -192,11 +195,15 @@ MAX_REMIND_MINUTES = 7 * 24 * 60
 NOTHING_NEW = "(nothing new)"
 
 
+#: How every watch's fire text begins.
+WATCH_LEAD = "Standing watch you agreed to keep for them: "
+
+
 def watch_instruction(what: str) -> str:
     """The text a watch fires with. It is the whole of the watch's behaviour,
     because a fire is an ordinary inbound and the turn reads only its text."""
     return (
-        f"Standing watch you agreed to keep for them: {what}\n"
+        f"{WATCH_LEAD}{what}\n"
         "Nobody is asking right now; this is your own check. Look, then tell "
         "them only what is new since you last told them about it. If nothing "
         f"is worth interrupting them for, answer exactly {NOTHING_NEW}"
@@ -524,6 +531,12 @@ def _classify_remind(box: "ToolBox", args: dict[str, Any]) -> Decision:
     )
 
 
+def _classify_schedules(box: "ToolBox", args: dict[str, Any]) -> Decision:
+    # Exploration: it reads the turn's own snapshot of the clock and writes
+    # nothing, so it is `recall`'s twin for schedules (DL-077).
+    return Decision(tool=SCHEDULES, tier=EXPLORATION, why="list what is scheduled", args={})
+
+
 def _classify_unwatch(box: "ToolBox", args: dict[str, Any]) -> Decision:
     sid = _text(UNWATCH, args, "id").strip()
     return Decision(tool=UNWATCH, tier=LOCAL, why=f"stop watch {sid}", args={"id": sid})
@@ -572,7 +585,39 @@ def _unwatch(box: "ToolBox", args: dict[str, Any]) -> str:
         ) or "none"
         raise ToolError(f"there is no running schedule {sid!r}; running: {listing}")
     box.append(episodes.schedule_cancelled(id=sid))
-    return f"stopped {sid}"
+    # The definition, not the id: "stopped w41-1a2b" is a confirmation nobody
+    # can check (DL-044 #6, DL-077).
+    [stopped] = [s for s in box.running if s.id == sid]
+    return f"stopped {describe_schedule(stopped)}"
+
+
+def describe_schedule(s: Any, *, now: Optional[datetime] = None) -> str:
+    """One running schedule as the person would recognise it: what kind it
+    is, when it runs, and what it is about, read off the stored definition."""
+    first = s.instruction.splitlines()[0] if s.instruction else ""
+    if first.startswith(REMINDER_LEAD):
+        kind, what = "reminder", first[len(REMINDER_LEAD):]
+    elif first.startswith(WATCH_LEAD):
+        kind, what = "watch", first[len(WATCH_LEAD):]
+    else:
+        kind, what = "schedule", first
+    if s.cron:
+        when = describe_cron(s.cron)
+    elif s.once and s.every:
+        left = s.created_at + timedelta(seconds=s.every) - (now or datetime.now(timezone.utc))
+        minutes = max(0, round(left.total_seconds() / 60))
+        when = f"once, due in about {minutes} minutes" if minutes else "once, due now"
+    elif s.every:
+        when = f"every {s.every // 60} minutes"
+    else:
+        when = "with no time it can run at"
+    return f"{kind}, {when}: {what[:120]}"
+
+
+def _schedules(box: "ToolBox", args: dict[str, Any]) -> str:
+    if not box.running:
+        return "nothing is scheduled: no watches, reminders or schedules are running"
+    return "\n".join(f"{s.id} — {describe_schedule(s)}" for s in box.running)
 
 
 def _classify_write_file(box: "ToolBox", args: dict[str, Any]) -> Decision:
@@ -1322,9 +1367,23 @@ _TOOLS: dict[str, _Tool] = {
         dispatch=_unwatch,
         schema=_schema(
             UNWATCH,
-            "Stop a watch, reminder or schedule you are running, by its id.",
+            "Stop a watch, reminder or schedule you are running, by its id. "
+            f"Call {SCHEDULES} first if you do not know the id.",
             {"id": {"type": "string", "description": "The schedule's id."}},
             ["id"],
+        ),
+    ),
+    SCHEDULES: _Tool(
+        classify=_classify_schedules,
+        dispatch=_schedules,
+        schema=_schema(
+            SCHEDULES,
+            "List every watch, reminder and schedule you are running, with its "
+            "id, when it runs and what it is about. Use it when they ask what "
+            "you are keeping an eye on or reminding them of, and before "
+            f"{UNWATCH} when you need an id.",
+            {},
+            [],
         ),
     ),
     REMIND: _Tool(
@@ -1358,7 +1417,7 @@ def schemas() -> list[dict[str, Any]]:
     return [
         _TOOLS[name].schema
         for name in (
-            READ_FILE, WRITE_FILE, RUN_CODE, FETCH, RECALL, WATCH, UNWATCH, REMIND
+            READ_FILE, WRITE_FILE, RUN_CODE, FETCH, RECALL, WATCH, UNWATCH, REMIND, SCHEDULES
         )
     ]
 

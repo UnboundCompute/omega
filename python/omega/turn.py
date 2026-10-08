@@ -235,7 +235,8 @@ class TurnContext:
     known: Sequence[derive.Claim] = ()
 
     #: Schedules standing when this turn began, so the act loop's ``unwatch``
-    #: can name what it is stopping (DL-068).
+    #: can name what it is stopping (DL-068) and ``schedules`` can list them
+    #: from the same snapshot (DL-077).
     running: Sequence[schedule.Schedule] = ()
 
 

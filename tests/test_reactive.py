@@ -186,6 +186,63 @@ def test_unwatch_stops_only_what_is_running(q: EventQueue, tmp_path: Path) -> No
     assert after.schedules == []
 
 
+# --- schedules (DL-077) --------------------------------------------------------
+
+
+def _running(q: EventQueue) -> tuple:
+    clock = Scheduler(q)
+    clock.refresh()
+    return tuple(clock.schedules)
+
+
+def test_schedules_lists_what_is_running_by_id_and_in_words(
+    q: EventQueue, tmp_path: Path
+) -> None:
+    now = datetime.now(timezone.utc)
+    q.append(episodes.schedule_created(
+        id="w1", instruction=tools.watch_instruction("Bigg Boss news"), every=3600, at=AT
+    ))
+    q.append(episodes.schedule_created(
+        id="r1", instruction=tools.remind_instruction("call mum"), every=600,
+        once=True, at=now.isoformat(),
+    ))
+    q.append(episodes.schedule_created(id="s1", instruction="water the plants", cron="0 9 *", at=AT))
+    q.append(episodes.schedule_created(id="gone", instruction="old", every=900, at=AT))
+    q.append(episodes.schedule_cancelled(id="gone", at=AT))
+    box = _box(q, tmp_path, running=_running(q))
+    before = len(_payloads(q))
+
+    decision = box.classify("schedules", {})
+    assert decision.tier == tools.EXPLORATION
+    out = box.dispatch(decision)
+
+    lines = dict(line.split(" — ", 1) for line in out.splitlines())
+    assert set(lines) == {"w1", "r1", "s1"}, "a cancelled schedule is not listed"
+    assert lines["w1"] == "watch, every 60 minutes: Bigg Boss news"
+    assert lines["r1"].startswith("reminder, once, due in about 1") and lines["r1"].endswith(": call mum")
+    assert lines["s1"].startswith("schedule, at 9:00") and lines["s1"].endswith(": water the plants")
+    assert len(_payloads(q)) == before, "listing writes nothing"
+
+
+def test_schedules_says_so_when_nothing_is_running(q: EventQueue, tmp_path: Path) -> None:
+    box = _box(q, tmp_path)
+    out = box.dispatch(box.classify("schedules", {}))
+    assert out.startswith("nothing is scheduled")
+    assert _payloads(q) == []
+
+
+def test_unwatch_receipt_names_what_stopped_not_the_id(q: EventQueue, tmp_path: Path) -> None:
+    q.append(episodes.schedule_created(
+        id="w1", instruction=tools.watch_instruction("flight prices"), every=900, at=AT
+    ))
+    q.append(episodes.schedule_created(id="w2", instruction="other", every=900, at=AT))
+    box = _box(q, tmp_path, running=_running(q))
+    out = box.dispatch(box.classify("unwatch", {"id": "w1"}))
+    assert out == "stopped watch, every 15 minutes: flight prices"
+    cancelled = [p for p in _payloads(q) if p["kind"] == episodes.SCHEDULE_CANCELLED]
+    assert [p["id"] for p in cancelled] == ["w1"], "only the named one is cancelled"
+
+
 # --- the silence sentinel ----------------------------------------------------
 
 
