@@ -9,9 +9,20 @@ read, not a record of anything.
 becomes a ``say`` on the ``discord`` channel with the write key
 ``discord:<message id>``, so a redelivery is the channel's duplicate ack, not a
 second message. Guild messages, other users, other bots and this bot itself are
-ignored without a word. An attachment is refused with a plain reply: the only
-attach path the channel has reads a file *by path on the core's machine*, and a
-Discord upload is not one (never attach-by-path).
+ignored without a word.
+
+**Audio is heard here, on the VM, and handed in as text** (DL-079). The core
+stays audio-free and holds no Sarvam key; the adapter downloads the attachment,
+transcribes it with :func:`omega.sarvam.transcribe` off the event loop, and
+sends words. A Discord *voice message* is the person talking to omega, so it is
+an ordinary ``say`` under the same ``discord:<message id>`` key, marked
+:data:`VOICE_MARK`. Any other audio file is a *recording*, filed as a
+``report`` exactly as the Mac relay files one (DL-072): the unit is the digest
+of the audio, so the same file sent twice is the channel's duplicate ack. There
+is no whisper on the VM, so a failure is told to the person in the DM, never
+dropped. Anything that is not audio is refused with a plain reply: the only
+attach path the channel has reads a file *by path on the core's machine*, and
+a Discord upload is not one (never attach-by-path).
 
 **Out.** It subscribes from its cursor and decides per update:
 
@@ -42,14 +53,18 @@ Never logs a message's text or the token.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import os
 import sys
+import tempfile
 import threading
 import time
+from collections import OrderedDict
 from pathlib import Path
-from typing import Any, Callable, Mapping, Optional
+from typing import Any, Awaitable, Callable, Mapping, Optional
 
-from omega import projection
+from omega import blobs, episodes, listen, projection, sarvam
+from omega.relay import _sha256
 from omega.channel import DEFAULT_HOST, DEFAULT_PORT, PROTOCOL, ChannelClient, ChannelError
 
 __all__ = [
@@ -59,6 +74,9 @@ __all__ = [
     "ENV_OWNER",
     "accepts",
     "say_request",
+    "report_request",
+    "is_audio",
+    "Dm",
     "chunks",
     "decide",
     "Cursor",
@@ -82,9 +100,22 @@ DEFAULT_STATE = "/state"
 CURSOR_FILE = "cursor"
 
 ATTACHMENTS_REFUSED = (
-    "Attachments aren't supported here yet, so I didn't pass that on. "
-    "Send the words on their own."
+    "Only audio attachments are supported here, so I didn't pass that on. "
+    "Send the words on their own, or a voice note."
 )
+#: What a transcribed voice note starts with, so the log and the model can tell
+#: spoken words (and their mishearings) from typed ones.
+VOICE_MARK = "(voice note) "
+NO_KEY = (
+    "I can't transcribe audio here: no Sarvam key is set up for the Discord "
+    "side, so that wasn't passed on. Type it instead?"
+)
+#: How much of a failure's reason reaches the DM. The reason is Sarvam's or
+#: ffmpeg's last line, already scrubbed of the key.
+REASON_CHARS = 300
+#: How many handled message ids are remembered, so a gateway replay of the
+#: same message is not downloaded and transcribed a second time.
+SEEN_MAX = 512
 CORE_UNREACHABLE = "I couldn't reach omega just now, so that didn't land. Try again in a minute."
 TURN_FAILED = "That one failed on my side, so there's no answer. Try again?"
 
@@ -114,6 +145,55 @@ def accepts(
     if self_id is not None and author_id == self_id:
         return False
     return author_id == owner_id
+
+
+def is_audio(filename: str, content_type: Optional[str]) -> bool:
+    """Audio by its declared type, else by the suffix the Mac relay hears.
+
+    A file Discord labels video or image is not audio even with an ``.mp4`` or
+    ``.webm`` name, which :data:`listen.AUDIO_SUFFIXES` would otherwise admit.
+    """
+    kind = (content_type or "").split(";")[0].strip().lower()
+    if kind.startswith("audio/"):
+        return True
+    if kind.startswith(("video/", "image/")):
+        return False
+    return Path(filename or "").suffix.lower() in listen.AUDIO_SUFFIXES
+
+
+def report_request(
+    digest: str,
+    *,
+    title: str,
+    mime: str,
+    size: int,
+    body: str,
+    duration: Optional[float] = None,
+    reason: Optional[str] = None,
+) -> dict[str, Any]:
+    """The ``report`` an audio file becomes: the relay's recording, from here.
+
+    The unit is the digest of the audio because the core's receipt is keyed on
+    it (``audio.captured.recording`` must be a blob digest), which is also what
+    makes a second send of the same file a duplicate rather than a second
+    review. ``meta.source`` says it came over Discord rather than a folder.
+    """
+    return {
+        "v": PROTOCOL,
+        "op": "report",
+        "source": episodes.REPORT_RECORDING,
+        "unit": digest,
+        "device": CHANNEL,
+        "body": body,
+        "meta": {
+            "source": CHANNEL,
+            "title": title,
+            "mime": mime,
+            "bytes": size,
+            "duration": duration,
+        },
+        "reason": reason,
+    }
 
 
 def say_request(message_id: Any, text: str) -> dict[str, Any]:
@@ -151,7 +231,12 @@ class Inbound:
         self._note = log
 
     def say(self, message_id: Any, text: str) -> Optional[dict[str, Any]]:
-        request = say_request(message_id, text)
+        return self.send(say_request(message_id, text))
+
+    def send(self, request: dict[str, Any]) -> Optional[dict[str, Any]]:
+        """Any one request, with the same retries. Only ``say`` and ``report``
+        are ever sent, and both carry a write key, so a retry is idempotent."""
+        op = request.get("op")
         delay = BACKOFF_FIRST
         for attempt in range(1, self._attempts + 1):
             try:
@@ -161,11 +246,210 @@ class Inbound:
                 finally:
                     client.close()
             except (OSError, ChannelError, ValueError) as exc:
-                self._note(f"say attempt {attempt} failed: {type(exc).__name__}")
+                self._note(f"{op} attempt {attempt} failed: {type(exc).__name__}")
                 if attempt < self._attempts:
                     self._sleep(delay)
                     delay = min(delay * 2, BACKOFF_MAX)
         return None
+
+
+def _scrub(reason: str, key: Optional[str]) -> str:
+    """One line, short, and never the key — a last guard, not the plan."""
+    if key:
+        reason = reason.replace(key, "[key]")
+    reason = " ".join(reason.split())
+    return reason[:REASON_CHARS] or "no reason given"
+
+
+async def _save(attachment: Any, path: Path) -> None:
+    """The real download: discord.py's own ``Attachment.save``."""
+    await attachment.save(path)
+
+
+class Dm:
+    """One owner DM, start to finish: text, voice note, recording, refusal.
+
+    Duck-typed over discord.py's ``Message`` (``id``, ``content``,
+    ``attachments``, ``flags.voice``, ``channel.send``) so a test hands it a
+    plain object. ``fetch`` (the download), ``transcribe`` and ``not_ready``
+    (ffmpeg present?) are the seams; the blocking parts — the transcription and
+    the channel requests — run in a worker thread so the gateway heartbeat
+    keeps beating through a long recording.
+
+    **Once per message.** The core's write keys make a resend land on the
+    duplicate path; the ``seen`` memory is what keeps a gateway replay from
+    paying for a second download and transcription before it gets there.
+    """
+
+    def __init__(
+        self,
+        inbound: Inbound,
+        *,
+        hearing: Optional[sarvam.Settings],
+        fetch: Callable[[Any, Path], Awaitable[None]] = _save,
+        transcribe: Callable[..., listen.Heard] = sarvam.transcribe,
+        not_ready: Callable[[], Optional[str]] = sarvam.not_ready,
+        log: Callable[[str], None] = _stderr,
+    ) -> None:
+        self._inbound = inbound
+        self._hearing = hearing
+        self._fetch = fetch
+        self._transcribe = transcribe
+        self._not_ready = not_ready
+        self._note = log
+        self._seen: OrderedDict[Any, None] = OrderedDict()
+
+    async def handle(self, message: Any) -> None:
+        if message.id in self._seen:
+            self._note("skipped a DM already handled")
+            return
+        self._seen[message.id] = None
+        while len(self._seen) > SEEN_MAX:
+            self._seen.popitem(last=False)
+
+        attachments = list(getattr(message, "attachments", None) or [])
+        audio = [a for a in attachments if is_audio(a.filename, getattr(a, "content_type", None))]
+        if len(audio) < len(attachments):
+            # The whole message, as before audio was heard: passing on half of
+            # it would leave the person guessing which half arrived.
+            self._note(f"refused a DM with {len(attachments) - len(audio)} non-audio attachment(s)")
+            await message.channel.send(ATTACHMENTS_REFUSED)
+            return
+        # Typed words go in as typed, exactly as before audio was heard.
+        text = getattr(message, "content", "") or ""
+        if not text.strip():
+            text = ""
+        flags = getattr(message, "flags", None)
+        voice = bool(getattr(flags, "voice", False)) and bool(audio)
+
+        if voice:
+            spoken = await self._hear_voice(message, audio[0])
+            if spoken is not None:
+                text = f"{text}\n\n{spoken}" if text else spoken
+            audio = audio[1:]
+        if text:
+            await self._say(message, text)
+        for attachment in audio:
+            await self._recording(message, attachment)
+
+    async def _say(self, message: Any, text: str) -> None:
+        ack = await asyncio.to_thread(self._inbound.say, message.id, text)
+        if ack is None or ack.get("op") != "ack":
+            self._note("a DM did not reach the core")
+            await message.channel.send(CORE_UNREACHABLE)
+            return
+        self._note(f"DM filed as seq {ack['seq']}{' (duplicate)' if ack.get('duplicate') else ''}")
+        try:
+            await message.channel.typing()
+        except Exception:  # noqa: BLE001 - a typing hint is decoration
+            pass
+
+    def _unready(self) -> Optional[str]:
+        """Why nothing can be heard on this machine, as the DM says it."""
+        if self._hearing is None:
+            return NO_KEY
+        why = self._not_ready()
+        if why is not None:
+            return f"I can't transcribe audio here right now ({why}), so that wasn't passed on."
+        return None
+
+    async def _heard(
+        self, attachment: Any, folder: Path
+    ) -> tuple[Path, Optional[listen.Heard], Optional[str]]:
+        """Download and transcribe one attachment: ``(path, heard, reason)``."""
+        name = Path(attachment.filename or "audio").name or "audio"
+        path = folder / name
+        try:
+            await self._fetch(attachment, path)
+        except Exception as exc:  # noqa: BLE001 - told to the person, not raised
+            return path, None, f"the download from Discord failed ({type(exc).__name__})"
+        assert self._hearing is not None
+        chosen = self._hearing
+        try:
+            heard = await asyncio.to_thread(
+                self._transcribe, path, key=chosen.key, model=chosen.model,
+                language=chosen.language, mode=chosen.mode,
+            )
+        except Exception as exc:  # noqa: BLE001 - NotHeard, or anything else
+            return path, None, _scrub(str(exc) or type(exc).__name__, chosen.key)
+        return path, heard, None
+
+    async def _hear_voice(self, message: Any, attachment: Any) -> Optional[str]:
+        """The voice note's words, marked; ``None`` after telling why not."""
+        unready = self._unready()
+        if unready is not None:
+            await message.channel.send(unready)
+            return None
+        with tempfile.TemporaryDirectory(prefix="omega-discord-") as tmp:
+            _, heard, reason = await self._heard(attachment, Path(tmp))
+        if heard is None:
+            self._note("a voice note could not be transcribed")
+            await message.channel.send(
+                f"I couldn't transcribe that voice note ({reason}), so it wasn't "
+                "passed on. Try again, or type it?"
+            )
+            return None
+        return VOICE_MARK + heard.text.strip()
+
+    async def _recording(self, message: Any, attachment: Any) -> None:
+        """One audio file, filed as the relay files a recording."""
+        title = Path(attachment.filename or "audio").name or "audio"
+        unready = self._unready()
+        if unready is not None:
+            # About this machine, not the file, so no report: one would mark
+            # the recording heard for good (the relay's rule, DL-072).
+            await message.channel.send(unready)
+            return
+        try:
+            await message.channel.typing()
+        except Exception:  # noqa: BLE001
+            pass
+        with tempfile.TemporaryDirectory(prefix="omega-discord-") as tmp:
+            path, heard, reason = await self._heard(attachment, Path(tmp))
+            if not path.is_file() or path.stat().st_size == 0:
+                # Nothing to key a report on: the digest *is* the identity.
+                await message.channel.send(
+                    f"I couldn't get {title} from Discord "
+                    f"({reason or 'the file was empty'}), so it wasn't passed on."
+                )
+                return
+            digest, size = await asyncio.to_thread(_sha256, path)
+        mime = (getattr(attachment, "content_type", None) or "").split(";")[0].strip()
+        mime = mime or blobs.mime_for(title)
+        if heard is not None:
+            body = heard.text[: listen.MAX_REVIEW_CHARS]
+            duration = heard.duration if heard.duration and heard.duration > 0 else None
+        else:
+            body, duration = "", None
+        request = report_request(
+            digest, title=title, mime=mime, size=size, body=body,
+            duration=duration, reason=reason,
+        )
+        ack = await asyncio.to_thread(self._inbound.send, request)
+        if ack is None or ack.get("op") != "ack":
+            self._note("a recording did not reach the core")
+            await message.channel.send(CORE_UNREACHABLE)
+            return
+        self._note(
+            f"recording filed as seq {ack['seq']}"
+            f"{' (duplicate)' if ack.get('duplicate') else ''}"
+        )
+        if ack.get("duplicate"):
+            await message.channel.send(
+                f"omega already has {title} (the same audio came in before), "
+                "so it wasn't filed again."
+            )
+        elif reason is not None:
+            await message.channel.send(
+                f"I couldn't transcribe {title} ({reason}). omega has a note "
+                "that it arrived, but nothing from it."
+            )
+        else:
+            await message.channel.send(
+                f"Got {title} and transcribed it. omega reviews it in the "
+                "background and keeps what matters; the review isn't sent "
+                "here, so ask about it when you want it."
+            )
 
 
 # --- out --------------------------------------------------------------------
@@ -427,11 +711,15 @@ def main(
     if not state.is_dir():
         log(f"the state directory {state} does not exist; the Discord adapter is off")
         return 0
+    hearing = sarvam.settings(None, environ=environ)
+    if hearing is None:
+        log("SARVAM_API_KEY is not set; audio sent over Discord will be refused")
     return (run or _run)(
         token=token,
         owner_id=owner,
         address=(args.host, args.port),
         cursor=Cursor(state / CURSOR_FILE),
+        hearing=hearing,
         log=log,
     )
 
@@ -445,10 +733,10 @@ def _run(
     owner_id: int,
     address: tuple[str, int],
     cursor: Cursor,
+    hearing: Optional[sarvam.Settings] = None,
     log: Callable[[str], None],
 ) -> int:
     """The only code that touches discord.py. Kept thin on purpose."""
-    import asyncio
     import signal
 
     import discord  # the optional extra; imported here so nothing else needs it
@@ -457,6 +745,7 @@ def _run(
     # so the default intents are enough and the bot needs no portal toggle.
     client = discord.Client(intents=discord.Intents.default())
     inbound = Inbound(address, log=log)
+    dms = Dm(inbound, hearing=hearing, log=log)
     stopping = threading.Event()
     started = threading.Event()
 
@@ -488,22 +777,7 @@ def _run(
             author_is_bot=bool(message.author.bot),
         ):
             return
-        if message.attachments:
-            log(f"refused a DM with {len(message.attachments)} attachment(s)")
-            await message.channel.send(ATTACHMENTS_REFUSED)
-            return
-        if not message.content.strip():
-            return
-        ack = await asyncio.to_thread(inbound.say, message.id, message.content)
-        if ack is None or ack.get("op") != "ack":
-            log("a DM did not reach the core")
-            await message.channel.send(CORE_UNREACHABLE)
-            return
-        log(f"DM filed as seq {ack['seq']}{' (duplicate)' if ack.get('duplicate') else ''}")
-        try:
-            await message.channel.typing()
-        except Exception:  # noqa: BLE001 - a typing hint is decoration
-            pass
+        await dms.handle(message)
 
     async def runner() -> None:
         loop = asyncio.get_running_loop()

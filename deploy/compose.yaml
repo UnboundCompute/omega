@@ -12,6 +12,10 @@
 #   # never holds the bot token); without these it logs why and exits:
 #   echo 'DISCORD_TOKEN=...' | sudo tee /etc/omega/discord.env
 #   echo 'DISCORD_OWNER_ID=<your Discord user id>' | sudo tee -a /etc/omega/discord.env
+#   # Optional: lets the adapter transcribe audio sent over Discord (DL-079);
+#   # without it, audio is refused with a reply. SARVAM_STT_MODEL / _LANGUAGE /
+#   # _MODE (e.g. codemix) may be added the same way.
+#   echo 'SARVAM_API_KEY=...' | sudo tee -a /etc/omega/discord.env
 #   sudo chmod 600 /etc/omega/discord.env
 #   sudo tailscale serve --bg --tcp 7717 tcp://127.0.0.1:7717
 #
@@ -48,8 +52,8 @@ services:
     # The image's `omega` user, as for the core.
     user: "10001"
     network_mode: host
-    # DISCORD_TOKEN and DISCORD_OWNER_ID only; the token is never in the image,
-    # and the model key is not in this container at all.
+    # DISCORD_TOKEN, DISCORD_OWNER_ID and optionally SARVAM_API_KEY; the token
+    # is never in the image, and the model key is not in this container at all.
     env_file: /etc/omega/discord.env
     volumes:
       # Only its delivery cursor lives here.

@@ -49,6 +49,7 @@ __all__ = [
     "PACE_SECONDS",
     "Settings",
     "settings",
+    "not_ready",
     "transcribe",
     "with_fallback",
 ]
@@ -89,6 +90,9 @@ class Settings:
     key: str
     model: str = DEFAULT_MODEL
     language: str = DEFAULT_LANGUAGE
+    #: ``codemix`` and the like (DL-079). ``None`` sends no ``mode`` field at
+    #: all, so the API's own default applies.
+    mode: Optional[str] = None
 
 
 def settings(
@@ -97,7 +101,7 @@ def settings(
     """The Sarvam settings, or ``None`` when there is no key.
 
     The environment wins over the file, as in :func:`provider.load_env`. The
-    file is *parsed*, never loaded: only the three ``SARVAM_*`` names are taken
+    file is *parsed*, never loaded: only the four ``SARVAM_*`` names are taken
     from it, so nothing else in it reaches ``os.environ``.
     """
     env = os.environ if environ is None else environ
@@ -113,7 +117,17 @@ def settings(
         key=key,
         model=pick("SARVAM_STT_MODEL") or DEFAULT_MODEL,
         language=pick("SARVAM_STT_LANGUAGE") or DEFAULT_LANGUAGE,
+        mode=pick("SARVAM_STT_MODE") or None,
     )
+
+
+def not_ready() -> Optional[str]:
+    """Why this machine cannot cut audio for Sarvam, or ``None`` when it can.
+
+    About the machine, not a file: a caller checks it before taking a recording
+    on, so a missing ffmpeg is never written down as one recording's failure.
+    """
+    return None if _ffmpeg() else "ffmpeg is not installed"
 
 
 def _ffmpeg() -> Optional[str]:
@@ -133,10 +147,16 @@ def _post(url: str, headers: Mapping[str, str], body: bytes) -> tuple[int, bytes
         return exc.code, exc.read() or b""
 
 
-def _multipart(piece: Path, model: str, language: str) -> tuple[str, bytes]:
+def _multipart(
+    piece: Path, model: str, language: str, mode: Optional[str] = None
+) -> tuple[str, bytes]:
     boundary = "omega-" + uuid.uuid4().hex
     parts: list[bytes] = []
-    for name, value in (("model", model), ("language_code", language)):
+    fields = [("model", model), ("language_code", language)]
+    if mode:
+        # Only when set: an unset mode is the API's default, not an empty one.
+        fields.append(("mode", mode))
+    for name, value in fields:
         parts.append(
             f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n'
             f"{value}\r\n".encode()
@@ -193,6 +213,7 @@ def _transcribe(
     key: str,
     model: str,
     language: str,
+    mode: Optional[str],
     run: Callable[..., object],
     post: Post,
     sleep: Callable[[float], None],
@@ -225,7 +246,7 @@ def _transcribe(
         for index, piece in enumerate(pieces):
             if index:
                 sleep(PACE_SECONDS)
-            content_type, body = _multipart(piece, model, language)
+            content_type, body = _multipart(piece, model, language, mode)
             headers = {"api-subscription-key": key, "Content-Type": content_type}
             where = f"piece {index + 1} of {len(pieces)}"
             try:
@@ -264,6 +285,7 @@ def transcribe(
     key: str,
     model: str = DEFAULT_MODEL,
     language: str = DEFAULT_LANGUAGE,
+    mode: Optional[str] = None,
     run: Optional[Callable[..., object]] = None,
     post: Optional[Post] = None,
     sleep: Optional[Callable[[float], None]] = None,
@@ -276,7 +298,7 @@ def transcribe(
     """
     try:
         return _transcribe(
-            path, key=key, model=model, language=language,
+            path, key=key, model=model, language=language, mode=mode,
             run=run or subprocess.run, post=post or _post, sleep=sleep or time.sleep,
         )
     except listen.NotHeard as exc:
@@ -303,7 +325,10 @@ def with_fallback(
 
     def hear(path: Path) -> listen.Heard:
         try:
-            return sarvam(path, key=chosen.key, model=chosen.model, language=chosen.language)
+            return sarvam(
+                path, key=chosen.key, model=chosen.model,
+                language=chosen.language, mode=chosen.mode,
+            )
         except listen.NotHeard as exc:
             log(f"relay: sarvam failed ({exc}); using whisper")
             return whisper(path)

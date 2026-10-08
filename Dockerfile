@@ -8,7 +8,8 @@
 #           BuildKit cannot produce this stage without the suite going green.
 #
 # The repo is public, so the image is public: no secret is ever copied in.
-# OPENAI_API_KEY arrives at run time from the host (see deploy/compose.yaml).
+# OPENAI_API_KEY (and the adapter's SARVAM_API_KEY) arrive at run time from the
+# host (see deploy/compose.yaml).
 
 FROM python:3.11-slim-bookworm AS build
 
@@ -57,6 +58,12 @@ RUN cargo test \
 FROM python:3.11-slim-bookworm
 
 COPY --from=test /src/.linux-suite-green /etc/omega.linux-suite-green
+# ffmpeg for the Discord adapter (DL-079): Sarvam takes 30 s a request, so
+# audio sent over Discord is cut into 25 s pieces here first. Not in `test`:
+# the suite fakes it.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
 COPY --from=build /wheels /wheels
 # With the `discord` extra: the Discord adapter (DL-073) runs from this same
 # image as a second service, `python -m omega.discord`. The loop is there

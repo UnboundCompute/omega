@@ -119,6 +119,24 @@ def test_header_and_fields(tmp_path: Path) -> None:
     assert b'name="file"; filename="part0000.wav"\r\nContent-Type: audio/wav' in body
 
 
+def test_mode_is_sent_only_when_set(tmp_path: Path) -> None:
+    unset = Api([_ok("hello")])
+    sarvam.transcribe(_recording(tmp_path), key=KEY, run=_cutter(1), post=unset,
+                      sleep=lambda s: None)
+    assert b'name="mode"' not in unset.posts[0][2]
+
+    codemix = Api([_ok("hello")])
+    sarvam.transcribe(_recording(tmp_path), key=KEY, mode="codemix", run=_cutter(1),
+                      post=codemix, sleep=lambda s: None)
+    assert b'name="mode"\r\n\r\ncodemix\r\n' in codemix.posts[0][2]
+
+
+def test_mode_comes_from_the_environment_and_defaults_to_none() -> None:
+    assert sarvam.settings(None, environ={"SARVAM_API_KEY": KEY}).mode is None
+    chosen = sarvam.settings(None, environ={"SARVAM_API_KEY": KEY, "SARVAM_STT_MODE": "codemix"})
+    assert chosen.mode == "codemix"
+
+
 def test_duration_is_read_from_the_pieces(tmp_path: Path) -> None:
     heard = sarvam.transcribe(
         _recording(tmp_path), key=KEY, run=_cutter(2, wav_seconds=2.5),
@@ -227,7 +245,7 @@ def test_fallback_prefers_sarvam_and_passes_settings(tmp_path: Path) -> None:
         whisper=_whisper(whispered), sarvam=ok,
     )
     assert hear(_recording(tmp_path)).text == "from sarvam"
-    assert seen == {"key": KEY, "model": "m", "language": "en-IN"}
+    assert seen == {"key": KEY, "model": "m", "language": "en-IN", "mode": None}
     assert whispered == []
 
 
@@ -244,7 +262,10 @@ def test_no_key_is_whisper_directly() -> None:
 
 
 def test_settings_take_only_the_sarvam_names(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    for name in ("OPENAI_API_KEY", "SARVAM_API_KEY", "SARVAM_STT_MODEL", "SARVAM_STT_LANGUAGE"):
+    for name in (
+        "OPENAI_API_KEY", "SARVAM_API_KEY", "SARVAM_STT_MODEL", "SARVAM_STT_LANGUAGE",
+        "SARVAM_STT_MODE",
+    ):
         monkeypatch.delenv(name, raising=False)
     env = tmp_path / ".env"
     env.write_text(
@@ -284,7 +305,10 @@ def _relay_with(monkeypatch: pytest.MonkeyPatch, env_path: Path | None) -> tuple
 
 
 def test_relay_wires_sarvam_when_a_key_is_filed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    for name in ("OPENAI_API_KEY", "SARVAM_API_KEY", "SARVAM_STT_MODEL", "SARVAM_STT_LANGUAGE"):
+    for name in (
+        "OPENAI_API_KEY", "SARVAM_API_KEY", "SARVAM_STT_MODEL", "SARVAM_STT_LANGUAGE",
+        "SARVAM_STT_MODE",
+    ):
         monkeypatch.delenv(name, raising=False)
     env = tmp_path / ".env"
     env.write_text(f"OPENAI_API_KEY=sk-openai-must-not-load\nSARVAM_API_KEY={KEY}\n")
