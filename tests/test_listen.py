@@ -241,15 +241,15 @@ def test_an_uncached_model_is_refused_not_downloaded(
 def test_a_missing_whisper_never_reaches_for_a_provider(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The privacy case, and it is the whole reason transcription is local.
+    """The privacy case: whisper's own path never reaches for a provider.
 
-    A recording of a meeting is a recording of other people. The failure mode
-    this forbids is a well-meaning fallback to a cloud transcription API when
-    the local one is absent, so the error says so in the text a person reads.
+    A recording of a meeting is a recording of other people. Sending it to a
+    vendor happens only through `sarvam`, which runs when the person has set
+    SARVAM_API_KEY (DL-078), never as a quiet fallback from in here.
     """
     monkeypatch.setattr(listen, "whisper_binary", lambda explicit=None: None)
 
-    with pytest.raises(listen.NotHeard, match="will not"):
+    with pytest.raises(listen.NotHeard, match="whisper is not installed"):
         listen.transcribe(_recording(tmp_path))
 
 
