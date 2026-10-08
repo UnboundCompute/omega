@@ -522,24 +522,37 @@ def _watch_cron(at: Any, days: Any) -> str:
     return cron
 
 
+def _given(value: Any) -> bool:
+    """Whether an optional argument was really given. Live, the model fills
+    every field it is offered: `remind` arrived as ``at="20:00", date="",
+    in_minutes=0`` eight times running, each refused as "not both", and no
+    reminder was set (DL-079). A zero, an empty string or an empty list is a
+    blank, not a second answer."""
+    return value is not None and value != "" and value != [] and not (
+        isinstance(value, (int, float)) and not isinstance(value, bool) and value == 0
+    )
+
+
 def _classify_watch(box: "ToolBox", args: dict[str, Any]) -> Decision:
     what = _text(WATCH, args, "what").strip()
     if not what:
         raise ToolRejected(f"{WATCH} needs something to keep an eye on")
     at = args.get("at")
-    if at is not None:
-        if args.get("every_minutes") is not None:
+    days = args.get("days") if _given(args.get("days")) else None
+    if _given(at):
+        if _given(args.get("every_minutes")):
             raise ToolRejected(
-                f"{WATCH} takes 'at' (a time of day) or 'every_minutes', not both"
+                f"{WATCH} takes 'at' (a time of day) or 'every_minutes', not both: "
+                f"leave 'every_minutes' out to run at {at}"
             )
-        cron = _watch_cron(at, args.get("days"))
+        cron = _watch_cron(at, days)
         return Decision(
             tool=WATCH,
             tier=LOCAL,
             why=f"keep an eye on {what!r} {describe_cron(cron)}",
             args={"what": what, "cron": cron},
         )
-    if args.get("days") is not None:
+    if days is not None:
         raise ToolRejected(f"{WATCH}'s 'days' needs an 'at' time to run at")
     minutes = args.get("every_minutes")
     if isinstance(minutes, bool) or not isinstance(minutes, (int, float)):
@@ -617,13 +630,13 @@ def _classify_remind(box: "ToolBox", args: dict[str, Any]) -> Decision:
     if not what:
         raise ToolRejected(f"{REMIND} needs something to remind them about")
     at = args.get("at")
-    if at is not None:
-        if args.get("in_minutes") is not None:
-            raise ToolRejected(
-                f"{REMIND} takes 'at' (a time of day) or 'in_minutes', not both"
-            )
+    date = args.get("date") if _given(args.get("date")) else None
+    if _given(at):
+        # A clock time wins over any 'in_minutes' sent beside it: the time is
+        # what they said, minutes are the model's arithmetic, and the receipt
+        # states the clock time, so a misreading shows.
         now = _now()
-        due = _remind_due(at, args.get("date"), now)
+        due = _remind_due(at, date, now)
         if (due - now) > timedelta(minutes=MAX_REMIND_MINUTES):
             raise ToolRejected(f"{REMIND} reaches at most {MAX_REMIND_MINUTES} minutes ahead")
         return Decision(
@@ -632,7 +645,7 @@ def _classify_remind(box: "ToolBox", args: dict[str, Any]) -> Decision:
             why=f"remind them about {what!r} at {_due_phrase(due, now)}",
             args={"what": what, "due": due.isoformat()},
         )
-    if args.get("date") is not None:
+    if date is not None:
         raise ToolRejected(f"{REMIND}'s 'date' needs an 'at' time")
     minutes = args.get("in_minutes")
     if isinstance(minutes, bool) or not isinstance(minutes, (int, float)):

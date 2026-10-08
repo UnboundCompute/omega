@@ -294,7 +294,6 @@ def test_a_watch_on_some_days_keeps_only_those_days(q: EventQueue, tmp_path: Pat
         {"what": "x", "at": "25:00"},
         {"what": "x", "at": 10},
         {"what": "x", "at": "10:00", "days": ["someday"]},
-        {"what": "x", "at": "10:00", "days": []},
         {"what": "x", "every_minutes": 60, "days": ["mon"]},
         {"what": "x"},
     ],
@@ -684,7 +683,6 @@ def test_an_in_minutes_reminder_also_states_its_clock_time(
 @pytest.mark.parametrize(
     "args",
     [
-        {"at": "13:00", "in_minutes": 5},
         {"at": "1pm"},
         {"at": "25:00"},
         {"at": "13:60"},
@@ -735,3 +733,34 @@ def test_the_clock_heads_the_turn_every_role_is_given(q: EventQueue, ist) -> Non
     text = turn._event_turn(ctx, images=False)["content"]
     assert text.startswith("It is now Thursday 08 October 2026, 11:43, IST (UTC+05:30).\n")
     assert "New event:\n" in text
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        # Verbatim from the live log, 2026-10-08: every one was refused.
+        {"date": "2026-10-08", "in_minutes": 0},
+        {"date": "2026-10-08", "in_minutes": 1},
+        {"date": "", "in_minutes": 0},
+        {"in_minutes": None, "date": None},
+    ],
+)
+def test_blank_fields_beside_a_clock_time_do_not_refuse_it(
+    q: EventQueue, tmp_path: Path, ist, monkeypatch: pytest.MonkeyPatch, extra
+) -> None:
+    _at(monkeypatch, 16, 6)
+    box = _box(q, tmp_path)
+    out = box.dispatch(box.classify("remind", {"what": "Play COD", "at": "20:00", **extra}))
+    assert "20:00 today, IST (UTC+05:30) - in 234 minutes" in out
+    [created] = [p for p in _payloads(q) if p["kind"] == episodes.SCHEDULE_CREATED]
+    assert created["every"] == 234 * 60
+
+
+def test_blank_fields_beside_a_watch_time_do_not_refuse_it(
+    q: EventQueue, tmp_path: Path, ist
+) -> None:
+    box = _box(q, tmp_path)
+    d = box.classify("watch", {"what": "news", "at": "10:00", "every_minutes": 0, "days": []})
+    assert d.args["cron"] == "0 10 *"
+    with pytest.raises(ToolRejected, match="leave 'every_minutes' out"):
+        box.classify("watch", {"what": "news", "at": "10:00", "every_minutes": 60})
