@@ -243,6 +243,120 @@ def test_unwatch_receipt_names_what_stopped_not_the_id(q: EventQueue, tmp_path: 
     assert [p["id"] for p in cancelled] == ["w1"], "only the named one is cancelled"
 
 
+# --- a watch at a time of day, in their zone (DL-078) ------------------------
+#
+# The live failure: "at 10am give me all the latest tech news daily" was filed
+# as every 1440 minutes from 22:33 IST, on a host left on UTC, and the reply
+# said "every day at 10:00 AM". Nothing fired at ten.
+
+
+@pytest.fixture
+def ist(monkeypatch: pytest.MonkeyPatch):
+    import time
+
+    monkeypatch.setenv("TZ", "Asia/Kolkata")
+    time.tzset()
+    yield
+    monkeypatch.undo()
+    time.tzset()
+
+
+def test_a_watch_at_a_time_of_day_files_a_cron_not_an_interval(
+    q: EventQueue, tmp_path: Path, ist
+) -> None:
+    box = _box(q, tmp_path)
+    decision = box.classify("watch", {"what": "latest tech news", "at": "10:00"})
+    out = box.dispatch(decision)
+
+    [created] = [p for p in _payloads(q) if p["kind"] == episodes.SCHEDULE_CREATED]
+    assert created["cron"] == "0 10 *"
+    assert created["every"] is None
+    assert "once" not in created
+    assert "at 10:00 every day" in out
+    assert "IST (UTC+05:30)" in out, "the receipt names the zone the clock runs in"
+    assert "next " in out and "10:00" in out.split("next ", 1)[1]
+
+
+def test_a_watch_on_some_days_keeps_only_those_days(q: EventQueue, tmp_path: Path) -> None:
+    box = _box(q, tmp_path)
+    assert box.classify(
+        "watch", {"what": "x", "at": "09:05", "days": ["Mon", "friday"]}
+    ).args["cron"] == "5 9 1,5"
+    every = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"]
+    assert box.classify("watch", {"what": "x", "at": "7:30", "days": every}).args["cron"] == "30 7 *"
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        {"what": "x", "at": "10:00", "every_minutes": 60},
+        {"what": "x", "at": "10am"},
+        {"what": "x", "at": "25:00"},
+        {"what": "x", "at": 10},
+        {"what": "x", "at": "10:00", "days": ["someday"]},
+        {"what": "x", "at": "10:00", "days": []},
+        {"what": "x", "every_minutes": 60, "days": ["mon"]},
+        {"what": "x"},
+    ],
+)
+def test_a_watch_time_is_refused_rather_than_guessed(
+    q: EventQueue, tmp_path: Path, args: dict
+) -> None:
+    with pytest.raises(ToolRejected):
+        _box(q, tmp_path).classify("watch", args)
+    assert q.head() == 0
+
+
+def test_an_interval_watch_says_it_is_not_a_time_of_day(q: EventQueue, tmp_path: Path) -> None:
+    box = _box(q, tmp_path)
+    out = box.dispatch(box.classify("watch", {"what": "x", "every_minutes": 1440}))
+    assert "every 1440 minutes" in out and "not at any time of day" in out
+
+
+def test_the_watch_schema_steers_a_time_of_day_to_at() -> None:
+    [schema] = [s for s in tools.schemas() if s["function"]["name"] == "watch"]
+    params = schema["function"]["parameters"]
+    assert params["required"] == ["what"]
+    assert {"at", "days", "every_minutes"} <= set(params["properties"])
+    assert "at 10am daily" in schema["function"]["description"]
+
+
+def test_a_ten_oclock_watch_fires_at_ten_in_their_zone_not_utc(q: EventQueue, ist) -> None:
+    q.append(episodes.schedule_created(
+        id="w1", instruction=tools.watch_instruction("tech news"), cron="0 10 *",
+        at="2026-10-07T17:03:49+00:00",
+    ))
+    sched = Scheduler(q)
+    sched.refresh()
+    utc = timezone.utc
+    # 04:29 UTC is 09:59 IST: not yet. On a UTC host the next slot was 10:00
+    # UTC, five and a half hours late, which is what the person saw.
+    assert sched.due(datetime(2026, 10, 8, 4, 29, tzinfo=utc).astimezone()) == []
+    [due] = sched.due(datetime(2026, 10, 8, 4, 30, tzinfo=utc).astimezone())
+    assert (due.slot.hour, due.slot.minute) == (10, 0)
+    assert due.slot.utcoffset() == timedelta(hours=5, minutes=30)
+
+
+def test_zone_label_reads_the_process_zone(ist) -> None:
+    from omega.schedule import zone_label
+
+    assert zone_label() == "IST (UTC+05:30)"
+
+
+def test_startup_names_the_zone_schedules_run_on(ist) -> None:
+    from types import SimpleNamespace
+
+    from omega.__main__ import _startup_lines
+
+    rt = SimpleNamespace(
+        store_path="s", queue=SimpleNamespace(head=lambda: 0), address=None,
+        report=SimpleNamespace(lines=lambda: [], clean=True),
+    )
+    assert "local time zone IST (UTC+05:30): clock-time schedules run on it" in _startup_lines(
+        rt, interactive=False
+    )
+
+
 # --- the silence sentinel ----------------------------------------------------
 
 

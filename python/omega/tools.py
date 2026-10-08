@@ -81,7 +81,7 @@ from typing import Any, Callable, Optional, Sequence
 from urllib.parse import urlsplit
 
 from omega import episodes, readable
-from omega.schedule import describe_cron
+from omega.schedule import CronError, describe_cron, next_match, validate_cron, zone_label
 
 __all__ = [
     "EXPLORATION",
@@ -487,10 +487,67 @@ def _classify_recall(box: "ToolBox", args: dict[str, Any]) -> Decision:
     )
 
 
+#: Day names a watch's ``days`` accepts, in crontab's numbering (0=Sunday).
+_WATCH_DAYS = {
+    name: number
+    for number, names in enumerate(
+        (("sun", "sunday"), ("mon", "monday"), ("tue", "tuesday"),
+         ("wed", "wednesday"), ("thu", "thursday"), ("fri", "friday"),
+         ("sat", "saturday"))
+    )
+    for name in names
+}
+
+
+def _watch_cron(at: Any, days: Any) -> str:
+    """``at`` ("HH:MM", their clock) and optional ``days`` as the cron the
+    scheduler already runs (DL-078). Refused rather than guessed: a time read
+    wrong is a schedule that fires at the wrong hour and says nothing."""
+    if not isinstance(at, str):
+        raise ToolRejected(f"{WATCH}'s 'at' must be a time like \"10:00\"")
+    parts = at.strip().split(":")
+    if len(parts) != 2 or not all(p.isdigit() for p in parts):
+        raise ToolRejected(f"{WATCH}'s 'at' must be 24-hour HH:MM, not {at!r}")
+    hour, minute = int(parts[0]), int(parts[1])
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        raise ToolRejected(f"{WATCH}'s 'at' is not a time of day: {at!r}")
+    if days is None:
+        dow = "*"
+    else:
+        if not isinstance(days, list) or not days or not all(isinstance(d, str) for d in days):
+            raise ToolRejected(f"{WATCH}'s 'days' must be a list of weekday names")
+        try:
+            numbers = sorted({_WATCH_DAYS[d.strip().lower()] for d in days})
+        except KeyError as exc:
+            raise ToolRejected(f"{WATCH} does not know the day {exc.args[0]!r}") from None
+        dow = "*" if len(numbers) == 7 else ",".join(str(n) for n in numbers)
+    cron = f"{minute} {hour} {dow}"
+    try:
+        validate_cron(cron)
+    except CronError as exc:  # pragma: no cover - built above from checked parts
+        raise ToolRejected(f"{WATCH} built a bad time {cron!r}: {exc}") from None
+    return cron
+
+
 def _classify_watch(box: "ToolBox", args: dict[str, Any]) -> Decision:
     what = _text(WATCH, args, "what").strip()
     if not what:
         raise ToolRejected(f"{WATCH} needs something to keep an eye on")
+    at = args.get("at")
+    if at is not None:
+        if args.get("every_minutes") is not None:
+            raise ToolRejected(
+                f"{WATCH} takes 'at' (a time of day) or 'every_minutes', not both"
+            )
+        cron = _watch_cron(at, args.get("days"))
+        return Decision(
+            tool=WATCH,
+            tier=LOCAL,
+            why=f"keep an eye on {what!r} {describe_cron(cron)}",
+            args={"what": what, "cron": cron},
+        )
+    if args.get("days") is not None:
+        raise ToolRejected(f"{WATCH}'s 'days' needs an 'at' time to run at")
     minutes = args.get("every_minutes")
     if isinstance(minutes, bool) or not isinstance(minutes, (int, float)):
         raise ToolRejected(f"{WATCH}'s 'every_minutes' must be a number")
@@ -550,12 +607,29 @@ def _watch(box: "ToolBox", args: dict[str, Any]) -> str:
     # so two watches from one turn cannot collide and a replayed turn names the
     # same one.
     sid = f"w{box.for_seq}-{zlib.crc32(what.encode()) & 0xFFFF:04x}"
+    cron = args.get("cron")
+    if cron is not None:
+        box.append(
+            episodes.schedule_created(id=sid, instruction=watch_instruction(what), cron=cron)
+        )
+        # The receipt names the zone and the next run, read off the stored
+        # expression, so "10:00" on a host left on UTC says so here (DL-078).
+        now = datetime.now().astimezone()
+        upcoming = next_match(cron, now)
+        nxt = upcoming.strftime("%a %d %b %H:%M") if upcoming else "not within a week"
+        return (
+            f"watching {what!r} {describe_cron(cron)}, {zone_label(now)} time; "
+            f"next {nxt} (id {sid})"
+        )
     box.append(
         episodes.schedule_created(
             id=sid, instruction=watch_instruction(what), every=args["every_minutes"] * 60
         )
     )
-    return f"watching {what!r} every {args['every_minutes']} minutes (id {sid})"
+    return (
+        f"watching {what!r} every {args['every_minutes']} minutes, counted from now "
+        f"- not at any time of day (id {sid})"
+    )
 
 
 def _remind(box: "ToolBox", args: dict[str, Any]) -> str:
@@ -602,7 +676,7 @@ def describe_schedule(s: Any, *, now: Optional[datetime] = None) -> str:
     else:
         kind, what = "schedule", first
     if s.cron:
-        when = describe_cron(s.cron)
+        when = f"{describe_cron(s.cron)} {zone_label(now)} time"
     elif s.once and s.every:
         left = s.created_at + timedelta(seconds=s.every) - (now or datetime.now(timezone.utc))
         minutes = max(0, round(left.total_seconds() / 60))
@@ -1346,20 +1420,33 @@ _TOOLS: dict[str, _Tool] = {
         schema=_schema(
             WATCH,
             "Keep an eye on something for them in the background: you will be "
-            "woken every so often to check it, and you tell them only when "
-            "there is something new. Use it whenever they ask you to keep "
-            "checking, monitor, or let them know about something.",
+            "woken to check it, and you tell them only when there is something "
+            "new. Use it whenever they ask you to keep checking, monitor, or let "
+            "them know about something. Give exactly one of 'at' or "
+            "'every_minutes': if they name a time of day (\"at 10am daily\", "
+            "\"every Monday at 9\"), use 'at' - 'every_minutes' counts from now "
+            "and never lands on a clock time. Tell them the timing exactly as "
+            "the result states it.",
             {
                 "what": {
                     "type": "string",
                     "description": "What to check and what counts as worth telling them.",
                 },
+                "at": {
+                    "type": "string",
+                    "description": "Time of day to check, 24-hour HH:MM in their local time, e.g. \"10:00\".",
+                },
+                "days": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "With 'at': weekdays to run on, e.g. [\"mon\", \"fri\"]. Omit for every day.",
+                },
                 "every_minutes": {
                     "type": "integer",
-                    "description": f"How often to check, at least {MIN_WATCH_MINUTES}.",
+                    "description": f"Instead of 'at': how often to check, at least {MIN_WATCH_MINUTES}.",
                 },
             },
-            ["what", "every_minutes"],
+            ["what"],
         ),
     ),
     UNWATCH: _Tool(

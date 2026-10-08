@@ -5,6 +5,9 @@
 #   sudo mkdir -p /var/lib/omega /var/lib/omega-discord /etc/omega
 #   sudo chown 10001 /var/lib/omega /var/lib/omega-discord   # the image's `omega` user
 #   echo 'OPENAI_API_KEY=sk-...' | sudo tee /etc/omega/env && sudo chmod 600 /etc/omega/env
+#   # The person's zone: clock-time schedules ("10:00 daily") run on it, and
+#   # a VM left on UTC turns 10am IST into 15:30 (DL-078). Startup logs it.
+#   echo 'TZ=Asia/Kolkata' | sudo tee -a /etc/omega/env
 #   # The adapter's own file, so it never holds the model key (and the core
 #   # never holds the bot token); without these it logs why and exits:
 #   echo 'DISCORD_TOKEN=...' | sudo tee /etc/omega/discord.env

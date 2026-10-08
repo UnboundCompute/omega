@@ -46,6 +46,8 @@ __all__ = [
     "CronError",
     "cron_matches",
     "previous_match",
+    "next_match",
+    "zone_label",
     "validate_cron",
     "describe_cron",
     "LATE_AFTER_SECONDS",
@@ -167,6 +169,35 @@ def previous_match(
             return cursor
         cursor -= timedelta(minutes=1)
     return None
+
+
+def next_match(
+    cron: str, now: datetime, *, horizon_minutes: int = 8 * 24 * 60
+) -> Optional[datetime]:
+    """The first minute after ``now`` that ``cron`` matches, for a receipt.
+
+    :func:`previous_match`'s mirror, and only ever used to *say* when a
+    schedule runs next (DL-078): firing still walks backwards. Eight days
+    reaches any weekly expression.
+    """
+    _parse_cron(cron)
+    cursor = now.replace(second=0, microsecond=0) + timedelta(minutes=1)
+    for _ in range(horizon_minutes):
+        if cron_matches(cron, cursor):
+            return cursor
+        cursor += timedelta(minutes=1)
+    return None
+
+
+def zone_label(when: Optional[datetime] = None) -> str:
+    """The zone clock-time schedules run in, as a person would check it:
+    ``IST (UTC+05:30)``. A host left on UTC says ``UTC (UTC+00:00)``, which is
+    the line that would have caught DL-078's 10am-that-meant-15:30."""
+    moment = (when or datetime.now()).astimezone()
+    offset = moment.utcoffset() or timedelta(0)
+    sign = "-" if offset < timedelta(0) else "+"
+    minutes = abs(int(offset.total_seconds())) // 60
+    return f"{moment.tzname()} (UTC{sign}{minutes // 60:02d}:{minutes % 60:02d})"
 
 
 def validate_cron(cron: str) -> None:

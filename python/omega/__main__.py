@@ -287,6 +287,9 @@ def _startup_lines(rt: runtime.Runtime, *, interactive: bool = True) -> list[str
         out.append(f"listening on {host}:{port}")
     else:
         out.append("socket listener disabled")
+    # Clock-time schedules fire on this zone; a host left on UTC turns "10am"
+    # into 15:30 IST without a word, which is DL-078's failure.
+    out.append(f"local time zone {scheduling.zone_label()}: clock-time schedules run on it")
     out.extend(f"omega: {line}" for line in rt.report.lines())
     if rt.report.clean:
         out.append("(nothing was left in flight last time)")
