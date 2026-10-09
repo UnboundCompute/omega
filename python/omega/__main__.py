@@ -37,9 +37,11 @@ from typing import Callable, Optional
 
 from omega import (
     blobs,
+    calendar,
     derive,
     episodes,
     habits,
+    inbox,
     learn,
     listen,
     machine,
@@ -275,6 +277,25 @@ def heard(
     return 0
 
 
+def _account_lines(environ=os.environ) -> list[str]:
+    """Which outside accounts omega can read, without their secrets (DL-080).
+
+    The feed address is itself the calendar's password, so only the count is
+    printed; the inbox line names the account and never the app password.
+    Said at startup because a sense that silently is not configured looks,
+    from the person's side, exactly like a quiet day.
+    """
+    feeds = calendar.feeds(environ)
+    found = inbox.settings(environ)
+    return [
+        f"calendar: {len(feeds)} feed{'s' if len(feeds) != 1 else ''} "
+        f"(read-only)" if feeds else f"calendar: not connected ({calendar.ENV} unset)",
+        f"inbox: reading {found.user} at {found.host} (read-only)"
+        if found is not None
+        else f"inbox: not connected ({inbox.ENV_USER}/{inbox.ENV_PASSWORD} unset)",
+    ]
+
+
 def _startup_lines(rt: runtime.Runtime, *, interactive: bool = True) -> list[str]:
     """What omega says when it opens.
 
@@ -291,6 +312,7 @@ def _startup_lines(rt: runtime.Runtime, *, interactive: bool = True) -> list[str
     # Clock-time schedules fire on this zone; a host left on UTC turns "10am"
     # into 15:30 IST without a word, which is DL-078's failure.
     out.append(f"local time zone {scheduling.zone_label()}: clock-time schedules run on it")
+    out.extend(_account_lines())
     out.extend(f"omega: {line}" for line in rt.report.lines())
     if rt.report.clean:
         out.append("(nothing was left in flight last time)")
@@ -598,6 +620,10 @@ def main(argv: Optional[list[str]] = None) -> int:
         # no network rather than spending it on a turn that fails.
         online=machine.online,
         machine=lambda: machine.describe(machine.read()),
+        # DL-080: their day and their mail for the same look, both read-only
+        # and both off unless the host's environment names an account.
+        calendar=lambda now: calendar.look_lines(now),
+        inbox=lambda now: inbox.look_lines(now),
     )
     try:
         rt.start()

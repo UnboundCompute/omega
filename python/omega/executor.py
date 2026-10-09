@@ -173,6 +173,26 @@ class StartupReport:
         return out
 
 
+def _sense(
+    read: Optional[Callable[[datetime], Sequence[str]]],
+    now: datetime,
+    name: str,
+) -> Sequence[str]:
+    """One outside sense's lines for a look, never raising (DL-080).
+
+    The readers already turn their own failures into a "couldn't read" line;
+    this catches what they did not expect, and still says so in words rather
+    than dropping the block, because an absent block reads as "not connected"
+    and a broken one must not look like that.
+    """
+    if read is None:
+        return ()
+    try:
+        return tuple(read(now))
+    except Exception as exc:  # noqa: BLE001 - a sense never kills the look
+        return (f"couldn't read the {name}: {type(exc).__name__}",)
+
+
 class Executor:
     """The one consumer. Claims, runs, records, releases — in that order."""
 
@@ -187,6 +207,8 @@ class Executor:
         "_standing",
         "_online",
         "_machine",
+        "_calendar",
+        "_inbox",
         "_readings",
     )
 
@@ -198,6 +220,8 @@ class Executor:
         act: Callable[[TurnContext], ActResult] = no_act_loop_yet,
         online: Optional[Callable[[], bool]] = None,
         machine: Optional[Callable[[], Sequence[str]]] = None,
+        calendar: Optional[Callable[[datetime], Sequence[str]]] = None,
+        inbox: Optional[Callable[[datetime], Sequence[str]]] = None,
     ) -> None:
         self._queue = queue
         self._complete = complete
@@ -207,6 +231,11 @@ class Executor:
         # and "no machine line" — the behaviour before DL-068.
         self._online = online
         self._machine = machine
+        # DL-080's two outside senses, injected for the same reason: a test
+        # never reaches a calendar feed or an IMAP server. Each takes the
+        # look's clock and returns already-worded lines.
+        self._calendar = calendar
+        self._inbox = inbox
         self._recovered = False
         self._open = OpenWork()
         self._learned = Learned()
@@ -1108,6 +1137,8 @@ class Executor:
                 except Exception:  # noqa: BLE001 - a sense never kills the look
                     machine_lines = ()
             machine_lines = self._machines(machine_lines, now=moment)
+            calendar_lines = _sense(self._calendar, moment, "calendar")
+            inbox_lines = _sense(self._inbox, moment, "inbox")
             self._open.advance(store)
             self._learned.advance(store)
             self._moments.advance(store)
@@ -1126,6 +1157,8 @@ class Executor:
                 said=st.said,
                 flagged_since=st.flagged_since,
                 machine_known=st.machine_known,
+                calendar=calendar_lines,
+                inbox=inbox_lines,
             )
             # Stamped with ``moment``, not left to default to wall-clock now.
             # ``notice.standing`` charges a spoken nudge to the day of the *look*

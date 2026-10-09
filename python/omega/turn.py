@@ -34,7 +34,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Optional, Sequence
 
 from omega import blobs, derive, episodes, learn, notice, provider, schedule
-from omega.tools import NOTHING_NEW, is_reminder
+from omega.tools import NOTHING_NEW, is_brief, is_reminder, must_speak
 from omega.queue import EVENT_KINDS, EventQueue, Pending
 
 __all__ = [
@@ -273,8 +273,9 @@ def _judged(verdict: Optional["Verdict"]) -> Optional[str]:
 
 def quiet_allowed(ctx: "TurnContext", text: str) -> bool:
     """May this reply end the turn in silence? Only an unprompted check that
-    found nothing, and never a reminder coming due (DL-075)."""
-    return unprompted(ctx) and not is_reminder(ctx.event) and nothing_new(text)
+    found nothing, and never a reminder or a brief coming due (DL-075,
+    DL-080)."""
+    return unprompted(ctx) and not must_speak(ctx.event) and nothing_new(text)
 
 
 def nothing_new(text: str) -> bool:
@@ -642,6 +643,11 @@ def run_turn(
             # the prompt only asked for; SPEAK, because a judge that saw nothing
             # to do saw nothing to look up. ``raw`` keeps what it said.
             verdict = Verdict(choice=SPEAK, raw=verdict.raw)
+        elif verdict.choice != ACT_THEN_SPEAK and is_brief(ctx.event):
+            # A brief is the same promise with looking built in (DL-080): a
+            # brief that only spoke would brief them from nothing, so any
+            # verdict but ACT becomes ACT.
+            verdict = Verdict(choice=ACT_THEN_SPEAK, raw=verdict.raw)
         if verdict.choice == ACT_THEN_SPEAK:
             acted = act(ctx)
             if acted.blocked_on:
@@ -821,8 +827,11 @@ _JUDGE_SYSTEM = (
     "want to act on soon and would be sorry not to have heard: something due "
     "or overdue, something waiting on them or on you, their machine needing "
     "attention (a reading flagged LOW, above all one that is new since your "
-    "last look or worse than when it was first flagged), or a real change in "
+    "last look or worse than when it was first flagged), an event on their "
+    "calendar starting within about half an hour, unread mail from a person "
+    "that needs their answer or attention, or a real change in "
     "something they asked you to track. Trivia, news they did not ask for, "
+    "newsletters and notifications, events hours away, "
     "and anything you already told them that has not got worse or more "
     "urgent are not nudges. If a nudge may be due but you would have to "
     "check something first, check. A look is answered in the form its end "
@@ -831,6 +840,8 @@ _JUDGE_SYSTEM = (
     "reminder firing is a promise coming due: never SILENT. If keeping it "
     "means looking something up or doing something first (the weather, a "
     "score, a file), choose ACT; otherwise choose SPEAK and remind them.\n"
+    "A daily brief firing is a promise too: choose ACT, look at their "
+    "calendar, mail and what is open, then brief them.\n"
     "Judge this event on its own. That you stayed silent before is not a "
     "reason to stay silent now."
 )
@@ -857,15 +868,16 @@ _REPLY_SYSTEM = (
     "somewhere; that is false. If you were told something and it is not in "
     "front of you now, say you don't have it - not that you cannot keep it.\n"
     "You have a body: you can read and write files, run read-only shell "
-    "commands, search the web, read a page, and look at the notes you have "
+    "commands, search the web, read a page, read their calendar and their "
+    "inbox (read-only, when connected), and look at the notes you have "
     "written about this "
     "person. Never tell the person you cannot reach their filesystem or the "
     "network - that is false - and never hand them a shell command to run "
     "themselves in place of doing it.\n"
     "You also run in the background: you look at their machine and what is "
     "open on your own, you can keep a standing watch on something and "
-    "tell them when there is news, and you can remind them of something "
-    "later. Never tell them you cannot check in the "
+    "tell them when there is news, you can remind them of something "
+    "later, and you can brief them on their day at a set time. Never tell them you cannot check in the "
     "background or message them on your own - that is false.\n"
     "Only a few of your notes are ever in front of you: the ones that matched "
     "this message. There are many more. So 'I don't have any details about "

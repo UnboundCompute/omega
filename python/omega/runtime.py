@@ -53,6 +53,7 @@ import os
 import threading
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Optional, Sequence
 
@@ -273,6 +274,11 @@ class Runtime:
         # and the OS part of every test. `__main__` passes `omega.machine`'s.
         online: Optional[Callable[[], bool]] = None,
         machine: Optional[Callable[[], Sequence[str]]] = None,
+        # DL-080's calendar and inbox senses, ``None`` for the same reason: a
+        # default that fetched a feed or logged into IMAP would put the
+        # person's accounts inside every test. Each takes the look's clock.
+        calendar: Optional[Callable[[datetime], Sequence[str]]] = None,
+        inbox: Optional[Callable[[datetime], Sequence[str]]] = None,
         # On by default because DL-035's whole point is that omega acts on time
         # without being asked, and a proactivity that has to be switched on is
         # one that is off in every deployment nobody remembered to configure.
@@ -301,6 +307,8 @@ class Runtime:
         self._recordings = None if recordings is None else Path(os.fspath(recordings))
         self._online = online
         self._machine = machine
+        self._calendar = calendar
+        self._inbox = inbox
         self._clock = clock
         self._host = host
         self._port = port
@@ -369,6 +377,8 @@ class Runtime:
                 act=self._act,
                 online=self._online,
                 machine=self._machine,
+                calendar=self._calendar,
+                inbox=self._inbox,
             )
             self._report = self._executor.recover()
             self._thread = threading.Thread(

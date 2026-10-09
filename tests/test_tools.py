@@ -57,7 +57,8 @@ def test_ring_one_is_closed_and_the_registry_agrees() -> None:
     # omega acts on time from an ordinary message. They write only omega's own
     # schedule records, which DL-035 already allowed a teach drop to write.
     # DL-077 added `schedules`: the read half of those, so omega can see the
-    # ids `unwatch` needs.
+    # ids `unwatch` needs. DL-080 added `calendar` and `inbox` (read-only
+    # senses of their day and mail) and `brief` (a watch with a fixed job).
     assert tools.TOOL_NAMES == {
         "read_file",
         "write_file",
@@ -68,6 +69,9 @@ def test_ring_one_is_closed_and_the_registry_agrees() -> None:
         "unwatch",
         "remind",
         "schedules",
+        "calendar",
+        "inbox",
+        "brief",
     }
     assert {s["function"]["name"] for s in tools.schemas()} == tools.TOOL_NAMES
 
