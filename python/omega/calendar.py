@@ -47,7 +47,7 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 from datetime import date, datetime, time as dtime, timedelta, timezone, tzinfo
-from typing import Callable, Iterator, Mapping, Optional
+from typing import Callable, Iterator, Mapping, Optional, Sequence
 from zoneinfo import ZoneInfo
 
 __all__ = [
@@ -60,6 +60,7 @@ __all__ = [
     "Window",
     "Calendar",
     "feeds",
+    "connected",
     "get",
     "parse",
     "occurrences",
@@ -96,7 +97,9 @@ MAX_LOCATION = 60
 NOT_CONFIGURED = (
     "no calendar is connected: set OMEGA_CALENDAR_ICS on the host "
     "(Google Calendar → Settings → your calendar → Integrate calendar → "
-    "Secret address in iCal format)"
+    "Secret address in iCal format), or, where that address is switched off, "
+    "sign in with `python -m omega calendar-auth` and set the OMEGA_GCAL_* "
+    "lines it prints"
 )
 
 
@@ -817,6 +820,13 @@ def feeds(environ: Mapping[str, str] = os.environ) -> list[str]:
     return out
 
 
+def connected(environ: Mapping[str, str] = os.environ) -> bool:
+    """Whether any calendar is set up: an iCal feed or a Google sign-in (DL-081)."""
+    from omega import gcal
+
+    return bool(feeds(environ)) or gcal.credentials(environ) is not None
+
+
 class _HttpsOnlyRedirects(urllib.request.HTTPRedirectHandler):
     """Follow a redirect only to another https address: a downgrade would send
     the secret path in the clear."""
@@ -898,16 +908,28 @@ def read_window(
     *,
     environ: Mapping[str, str] = os.environ,
     get: Callable[[str], str] = get,
+    google: Optional[Callable[[datetime, datetime], Sequence[Occurrence]]] = None,
 ) -> Window:
-    """Read every feed and merge what overlaps ``[start, end)``.
+    """Read every feed — and the Google sign-in, when there is one (DL-081) —
+    and merge what overlaps ``[start, end)``.
 
-    A feed that fails is recorded in ``errors`` by position; if *every* feed
-    fails there is nothing to show, so that raises.
+    A source that fails is recorded in ``errors`` by position or name; if
+    *every* source fails there is nothing to show, so that raises.
     """
+    from omega import gcal
+
     urls = feeds(environ)
+    if google is None and gcal.credentials(environ) is not None:
+        google = lambda a, b: gcal.read(a, b, environ=environ)  # noqa: E731
+    sources = len(urls) + (google is not None)
     found: dict[tuple, Occurrence] = {}
     unreadable: set[str] = set()
     errors: list[str] = []
+
+    def keep(items: Sequence[Occurrence]) -> None:
+        for o in items:  # the same invite on two calendars shows once
+            found.setdefault((o.start, o.end, o.all_day, o.summary), o)
+
     for i, url in enumerate(urls, 1):
         label = f"feed {i} of {len(urls)}"
         try:
@@ -918,11 +940,17 @@ def read_window(
         except Exception:  # a parser bug must not take the look down with it
             errors.append(f"{label}: couldn't be parsed")
             continue
-        for o in window.occurrences:  # the same invite on two calendars shows once
-            found.setdefault((o.start, o.end, o.all_day, o.summary), o)
+        keep(window.occurrences)
         unreadable.update(window.unreadable)
-    if urls and len(errors) == len(urls):
-        if len(urls) == 1:
+    if google is not None:
+        try:
+            keep(google(start, end))
+        except CalendarUnavailable as exc:
+            errors.append(f"Google calendar: {exc}")
+        except Exception:  # never let a surprise in Google's answer take the look down
+            errors.append("Google calendar: couldn't be read")
+    if sources and len(errors) == sources:
+        if sources == 1:
             raise CalendarUnavailable(errors[0].split(": ", 1)[1])
         raise CalendarUnavailable("; ".join(errors))
     ordered = sorted(found.values(), key=lambda o: (o.start, o.summary))
@@ -992,7 +1020,7 @@ def look_lines(
 ) -> list[str]:
     """The look's calendar block. ``[]`` means *not configured* and nothing
     else; a failure and an empty calendar each say so in words."""
-    if not feeds(environ):
+    if not connected(environ):
         return []
     now = (now or datetime.now()).astimezone()
     try:
@@ -1015,7 +1043,7 @@ def tool_text(
     Raises :class:`CalendarUnavailable` when every feed fails, so the tool
     layer reports a failure as a failure.
     """
-    if not feeds(environ):
+    if not connected(environ):
         return NOT_CONFIGURED
     now = (now or datetime.now()).astimezone()
     first = now.date()

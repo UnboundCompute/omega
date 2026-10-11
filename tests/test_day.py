@@ -289,6 +289,6 @@ def test_startup_names_the_accounts_and_never_their_secrets() -> None:
 def test_startup_says_when_nothing_is_connected() -> None:
     lines = _account_lines({})
     assert lines == [
-        "calendar: not connected (OMEGA_CALENDAR_ICS unset)",
+        "calendar: not connected (OMEGA_CALENDAR_ICS or OMEGA_GCAL_* unset)",
         "inbox: not connected (OMEGA_IMAP_USER/OMEGA_IMAP_PASSWORD unset)",
     ]

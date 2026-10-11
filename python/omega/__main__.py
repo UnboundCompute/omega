@@ -40,6 +40,7 @@ from omega import (
     calendar,
     derive,
     episodes,
+    gcal,
     habits,
     inbox,
     learn,
@@ -286,10 +287,14 @@ def _account_lines(environ=os.environ) -> list[str]:
     from the person's side, exactly like a quiet day.
     """
     feeds = calendar.feeds(environ)
+    sources = [f"{len(feeds)} feed{'s' if len(feeds) != 1 else ''}"] if feeds else []
+    if gcal.credentials(environ) is not None:  # DL-081: the work calendar's way in
+        sources.append("Google sign-in")
     found = inbox.settings(environ)
     return [
-        f"calendar: {len(feeds)} feed{'s' if len(feeds) != 1 else ''} "
-        f"(read-only)" if feeds else f"calendar: not connected ({calendar.ENV} unset)",
+        f"calendar: {' + '.join(sources)} (read-only)"
+        if sources
+        else f"calendar: not connected ({calendar.ENV} or OMEGA_GCAL_* unset)",
         f"inbox: reading {found.user} at {found.host} (read-only)"
         if found is not None
         else f"inbox: not connected ({inbox.ENV_USER}/{inbox.ENV_PASSWORD} unset)",
@@ -526,8 +531,57 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def calendar_auth(
+    argv: list[str],
+    *,
+    environ=os.environ,
+    ask: Callable[[str], str] = input,
+    ask_secret: Optional[Callable[[str], str]] = None,
+    open_browser: Optional[Callable[[str], object]] = None,
+    say: Callable[[str], object] = print,
+    authorize: Callable[..., str] = gcal.authorize,
+) -> int:
+    """``python -m omega calendar-auth``: the one-time Google sign-in for a
+    calendar whose iCal address is switched off (DL-081).
+
+    Run where a browser is. The client id and secret come from the env when
+    set there, otherwise are asked for (the secret without echo). What it
+    prints is for the host's env file and nowhere else.
+    """
+    import argparse as _argparse
+    import getpass
+    import webbrowser
+
+    _argparse.ArgumentParser(
+        prog="python -m omega calendar-auth",
+        description="Sign in to Google once so omega can read your calendar (read-only).",
+    ).parse_args(argv)
+    client_id = environ.get(gcal.ENV_CLIENT_ID, "").strip() or ask("OAuth client ID: ").strip()
+    client_secret = environ.get(gcal.ENV_CLIENT_SECRET, "").strip() or (ask_secret or getpass.getpass)(
+        "OAuth client secret (not shown): "
+    ).strip()
+    if not client_id or not client_secret:
+        say("calendar-auth: a client ID and secret are both needed (Google Cloud → APIs & Services → Credentials)")
+        return 2
+    try:
+        token = authorize(client_id, client_secret, open_browser=open_browser or webbrowser.open, say=say)
+    except calendar.CalendarUnavailable as exc:
+        say(f"calendar-auth: {exc}")
+        return 1
+    say("")
+    say("Signed in. Put these three lines in the host's env file (/etc/omega/env),")
+    say("then recreate the container. Keep them private: they read your calendar.")
+    say("")
+    for line in gcal.env_lines(client_id, client_secret, token):
+        say(line)
+    return 0
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     """Open one omega, talk to it, close it. Ctrl-C and EOF both leave cleanly."""
+    argv = sys.argv[1:] if argv is None else argv
+    if argv[:1] == ["calendar-auth"]:
+        return calendar_auth(argv[1:])
     parser = build_parser()
     args = parser.parse_args(argv)
     if args.serve and not args.listen:
