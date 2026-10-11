@@ -119,7 +119,10 @@ def test_all_day_and_untitled_and_hostile_titles() -> None:
             _event("\x1b[31mred‮ title " + "x" * 300),
         ]
     )
-    allday, timed = sorted(_read(google, NOW.replace(hour=0)), key=lambda o: not o.all_day)
+    # an all-day date is the host's own day (as in DL-080), and the timed one is
+    # fixed in IST, so look from the host's 11 Oct through its 12 Oct
+    day = datetime(2026, 10, 11).astimezone()
+    allday, timed = sorted(_read(google, day, hours=48), key=lambda o: not o.all_day)
     assert allday.all_day and allday.summary == "(no title)"
     assert "\x1b" not in timed.summary and "‮" not in timed.summary
     assert len(timed.summary) <= cal.MAX_SUMMARY
@@ -129,7 +132,8 @@ def test_the_window_is_honoured_after_rounding() -> None:
     google = Google([_event("Before", "2026-10-12T07:00:00+05:30", "2026-10-12T07:59:00+05:30"), _event()])
     assert [o.summary for o in _read(google, NOW + timedelta(minutes=2))] == ["Standup"]
     (query,) = google.queries()
-    assert query["timeMin"] == ["2026-10-12T08:00:00+05:30"]  # floored to the 5-minute grain
+    # floored to the 5-minute grain; compared as an instant, since the host zone renders it
+    assert datetime.fromisoformat(query["timeMin"][0]) == NOW
 
 
 def test_pages_are_followed() -> None:
