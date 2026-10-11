@@ -78,6 +78,12 @@ def test_ring_one_is_closed_and_the_registry_agrees() -> None:
         "finance",  # DL-083
         "brief",
         "projects",  # DL-087 #7
+        # DL-085: standing grants and what the two of them cover.
+        "grant",
+        "tidy",
+        "follow_up",
+        "report",
+        "undo",
     }
     assert {s["function"]["name"] for s in tools.schemas()} == tools.TOOL_NAMES
 

@@ -223,6 +223,10 @@ NOT_PROJECTED = frozenset(
         # DL-087 #7. Where a project was left is read back by the `projects`
         # tool and the brief, never pushed as an update of its own.
         episodes.PROJECT_STATE,
+        # DL-085. Standing grants are records; what they lead to reaches the
+        # person as the turn's own reply (a proposal is the turn's question,
+        # an action its answer), so a second update for each would say it twice.
+        *episodes.GRANT_KINDS,
     }
 )
 

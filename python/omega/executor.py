@@ -46,6 +46,7 @@ from omega import (
     transcripts,
 )
 from omega.derive import Learned, Moments, OpenWork, Readings
+from omega.grants import Grants
 from omega.memory import WriteKeyConflict
 from omega.queue import EVENT_KINDS, EventQueue, Pending
 from omega.schedule import Schedule, Scheduler
@@ -206,6 +207,7 @@ class Executor:
         "_recovered",
         "_open",
         "_learned",
+        "_grants",
         "_moments",
         "_standing",
         "_online",
@@ -242,6 +244,8 @@ class Executor:
         self._recovered = False
         self._open = OpenWork()
         self._learned = Learned()
+        # Standing grants (DL-085), folded like the views beside it.
+        self._grants = Grants()
         # A third view rather than a field on `_learned` (DL-062): what is
         # true and what happened have different lifetimes, and keeping them
         # in one fold is what would let events leak into the claim set.
@@ -1325,6 +1329,9 @@ class Executor:
         # wrong; an over-eager *habit* looks like omega simply behaving that
         # way, which is the failure DL-042 pairs its violation metric against.
         self._learned.advance(self._queue.store, upto=pending.seq)
+        # Through this event, as `_open` is: a brief must see what was done
+        # before it, and an answer the proposal it answers.
+        self._grants.advance(self._queue.store, upto=pending.seq)
         result = run_turn(
             self._queue,
             pending,
@@ -1350,6 +1357,7 @@ class Executor:
             # #4). The turn decides whether it may carry one; this only says
             # which are waiting, as of this episode.
             ask=self._learned.unasked(),
+            grants=self._grants.state(),
         )
         self._queue.finish(pending.seq)
         return result

@@ -168,6 +168,26 @@ def test_every_kind_round_trips():
             stopped_at="Parser streams.", next_step="Write the changelog.", blocked="",
             at="2026-10-11T12:00:00+05:30",
         ),
+        # DL-085: standing grants.
+        ep.grant_given(for_seq=41, scope="tidy", at="2026-10-11T12:00:00+00:00"),
+        ep.grant_revoked(for_seq=42, scope="tidy", at="2026-10-11T12:00:00+00:00"),
+        ep.grant_restored(for_seq=43, scope="research", at="2026-10-11T12:00:00+00:00"),
+        ep.grant_proposed(
+            for_seq=44, scope="tidy", proposes="action",
+            actions=[{"tool": "tidy", "why": "retire w1", "args": {"id": "w1"}}],
+            at="2026-10-11T12:00:00+00:00",
+        ),
+        ep.grant_answered(
+            for_seq=46, scope="tidy", proposal=45, proposed_for=44, yes=True,
+            at="2026-10-11T12:00:00+00:00",
+        ),
+        ep.grant_acted(
+            for_seq=46, scope="tidy", tool="tidy", why="retire w1", args={"id": "w1"},
+            undo={"restore": {"id": "w1", "instruction": "x", "every": 900,
+                              "cron": None, "once": False,
+                              "created_at": "2026-10-11T12:00:00+00:00"}},
+            proposal=45, at="2026-10-11T12:00:00+00:00",
+        ),
     ]
     assert {p["kind"] for p in built} == ep.KINDS, "a kind has no round-trip test"
     for payload in built:

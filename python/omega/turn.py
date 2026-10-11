@@ -33,11 +33,14 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable, Optional, Sequence
 
-from omega import blobs, derive, episodes, learn, notice, provider, schedule
+from omega import blobs, derive, episodes, grants as granted, learn, notice, provider, schedule
 from omega.tools import (
     NOTHING_NEW,
+    FOLLOW_UP,
+    REPORT,
     is_brief,
     is_reminder,
+    is_research,
     is_tell,
     is_watch,
     must_speak,
@@ -110,6 +113,9 @@ NOT_RECALLED = frozenset({
     # Where a coding project was left (DL-087 #7): derived from a digest, and
     # read through the `projects` tool, not replayed as conversation.
     episodes.PROJECT_STATE,
+    # Standing grants (DL-085) reach the prompt through their own section,
+    # read off the fold, rather than as a line each in the conversation.
+    *episodes.GRANT_KINDS,
 })
 
 #: **A count is not a budget** (DL-039). ``RECALL_N`` bounds how many episodes
@@ -268,6 +274,11 @@ class TurnContext:
     #: from the same snapshot (DL-077).
     running: Sequence[schedule.Schedule] = ()
 
+    #: The standing grants as of this turn (DL-085), a frozen
+    #: :class:`omega.grants.State`. ``None`` is none at all, and renders as
+    #: nothing: a turn with no grants reads exactly as it did before them.
+    grants: Any = None
+
 
 #: Channels whose events nobody typed: omega's own look (DL-061) and the clock
 #: (DL-035). Only on these may a turn that checked end in silence (DL-068 #2).
@@ -275,6 +286,12 @@ UNPROMPTED_CHANNELS = notice.UNPROMPTED_CHANNELS
 
 
 def unprompted(ctx: "TurnContext") -> bool:
+    """Did nobody type this? True on the unprompted channels, and for any
+    event that is not an inbound at all: work that finished (DL-085's
+    research report) is omega's own, and a turn it causes must never pass
+    for the person's message — that is what lets ``grant`` refuse it."""
+    if ctx.event.get("kind", episodes.MESSAGE_INBOUND) != episodes.MESSAGE_INBOUND:
+        return True
     return str(ctx.event.get("channel", "")) in UNPROMPTED_CHANNELS
 
 
@@ -315,8 +332,14 @@ def quiet_allowed(ctx: "TurnContext", text: str, acted: "ActResult") -> bool:
     An unprompted turn that answers the sentinel without having looked is not
     an all-clear, and it is not silence either: it raises, so the turn is
     recorded as failed with :data:`UNLOOKED` in its error.
+
+    A research follow-up may be quiet only once it has set the next one or
+    reported (DL-085): otherwise silence would end their task with nobody
+    told, so it speaks instead.
     """
     if not (unprompted(ctx) and not must_speak(ctx.event) and nothing_new(text)):
+        return False
+    if is_research(ctx.event) and not ({FOLLOW_UP, REPORT} & set(acted.tools)):
         return False
     if not acted.tools:
         raise RuntimeError(UNLOOKED)
@@ -445,6 +468,10 @@ def reply(ctx: TurnContext, verdict: Verdict, acted: ActResult) -> Optional[str]
     refuses.
     """
     if not verdict.speaks:
+        return None
+    if unprompted(ctx) and REPORT in acted.tools:
+        # The report is its own event, and the turn it causes tells them
+        # (DL-085): saying it here too would tell them twice.
         return None
     if acted.text is not None and acted.text.strip():
         if quiet_allowed(ctx, acted.text, acted):
@@ -619,6 +646,7 @@ def run_turn(
     known: Sequence[derive.Claim] = (),
     running: Sequence[schedule.Schedule] = (),
     ask: Sequence[tuple[int, str]] = (),
+    grants: Any = None,
     at: Optional[str] = None,
 ) -> TurnResult:
     """Run one turn over an already-claimed episode and record how it ended.
@@ -689,13 +717,33 @@ def run_turn(
         learned=tuple(learned),
         known=tuple(known),
         running=tuple(running),
+        grants=grants,
     )
 
     verdict: Optional[Verdict] = None
     acted = ActResult()
     try:
         verdict = judge(ctx)
-        if verdict.choice == STAY_SILENT and is_reminder(ctx.event):
+        if verdict.choice != ACT_THEN_SPEAK and not unprompted(ctx) and granted.reading(
+            ctx.grants, ctx.event, ctx.open_work
+        ):
+            # Their yes or no to a proposal (DL-085 #3). The act step is where
+            # an answer is settled, so it must run whatever the judge saw.
+            verdict = Verdict(choice=ACT_THEN_SPEAK, raw=verdict.raw)
+        elif verdict.choice != ACT_THEN_SPEAK and is_research(ctx.event):
+            # A research follow-up carries their task on: like a brief, it
+            # has looking to do, and a judge that let it lapse would drop the
+            # task with nobody told (DL-085 #5).
+            verdict = Verdict(choice=ACT_THEN_SPEAK, raw=verdict.raw)
+        elif (
+            verdict.choice == STAY_SILENT
+            and ctx.event.get("kind") == episodes.WORK_FINISHED
+        ):
+            # Work that finished was asked for, so it is told. It used to read
+            # as their message, which had the same effect; now that it does
+            # not (see `unprompted`), it says so here.
+            verdict = Verdict(choice=SPEAK, raw=verdict.raw)
+        elif verdict.choice == STAY_SILENT and is_reminder(ctx.event):
             # A reminder coming due is a promise, and the prompt saying "never
             # SILENT" was not enough: live, the judge chose silence on a 6pm
             # walk reminder and nobody heard it (DL-075). Code keeps the promise
@@ -1041,6 +1089,7 @@ def _event_turn(
         f"{_learned_section(ctx.learned, at=str(ctx.event.get('at', '')))}"
         f"Recent history:\n{_transcript(ctx.recalled)}\n\n"
         f"{_open_section(ctx.open_work)}"
+        f"{_grants_section(ctx)}"
         f"New event:\n{event}{suffix}"
     )
     parts = _image_parts(ctx) if images else []
@@ -1184,6 +1233,36 @@ def _hygiene(claim: derive.Claim, at: str) -> str:
     noted nothing — which is what keeps an untouched set byte-identical."""
     note = claim.note(at or None)
     return f" [{note}]" if note else ""
+
+
+def _grants_section(ctx: TurnContext) -> str:
+    """The standing grants (DL-085), when there are any.
+
+    Absent when nothing is granted or pending, as the open section is, so a
+    turn with no grants renders exactly as it did before they existed.
+    """
+    state = ctx.grants
+    if not state:
+        return ""
+    lines = []
+    for scope in sorted(state.grants):
+        g = state.grants[scope]
+        gate = (
+            f"you ask before each action ({g.streak} yes in a row)"
+            if g.gated else "they agreed you need not ask first; each action goes in the next brief"
+        )
+        lines.append(f"- {scope} (given in message {g.for_seq}): {gate}")
+    for p in state.pending:
+        lines.append(f"- waiting on their yes or no to {p.pid}: {p.words()}")
+    for task, what in sorted(state.tasks.items()):
+        lines.append(f"- research task {task} under way: {what}")
+    if is_brief(ctx.event):
+        done = state.done_for_brief(ctx.seq)
+        if done:
+            lines.append("Done without asking since the last brief; tell them each, and how to undo it:")
+            lines.extend(f"  - {a.why} ({a.undo_words()})" for a in done)
+    body = "\n".join(lines)
+    return f"Standing grants they gave you:\n{body}\n\n"
 
 
 def _open_section(open_work: Sequence[derive.OpenBlock]) -> str:

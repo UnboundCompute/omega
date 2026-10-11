@@ -36,7 +36,7 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
-from omega import episodes, finance, mcp, projects, provider
+from omega import episodes, finance, grants, mcp, projects, provider
 from omega.tools import (
     EXTERNAL,
     LOCAL,
@@ -46,7 +46,9 @@ from omega.tools import (
     ToolError,
     ToolRejected,
     ToolText,
+    hidden,
     hosted,
+    research_task,
 )
 
 # `act` imports `turn`, never the other way round. `turn` names the *slot*
@@ -124,7 +126,9 @@ _REMOTE_RULES = (
 )
 
 
-def _act_messages(ctx: TurnContext, box: ToolBox) -> list[provider.Message]:
+def _act_messages(
+    ctx: TurnContext, box: ToolBox, suffix: str = ""
+) -> list[provider.Message]:
     """The act prompt, with the store's **absolute path** in it.
 
     Naming the path is not a convenience. ``tools.resolved`` expands a path
@@ -149,7 +153,7 @@ def _act_messages(ctx: TurnContext, box: ToolBox) -> list[provider.Message]:
             f"a relative one is read against whatever directory omega happens "
             f"to be running in, which is not your store."
         ),
-        _event_turn(ctx, images=True),
+        _event_turn(ctx, images=True, suffix=suffix),
     ]
 
 
@@ -205,13 +209,28 @@ def act_loop(
             # Other people's MCP servers, when configured (DL-088); None leaves
             # the offer exactly as it was.
             remote=mcp.remote(),
+            # Standing grants (DL-085), as of this turn, and the words that
+            # may give one: only their own message's.
+            grants=ctx.grants,
+            said=str(ctx.event.get("text", "")) if not unprompted(ctx) else "",
+            task=research_task(ctx.event),
         )
+
+    # Their answer to a proposal is settled before the model is asked anything
+    # (DL-085 #3): a yes runs exactly what was proposed, and nothing the model
+    # thinks of now can stand in for it.
+    note = ""
+    answer = grants.reading(ctx.grants, ctx.event, ctx.open_work) if box.prompted else None
+    if answer is not None:
+        resolved, note, ran = _resolve(ctx, box, *answer)
+        if resolved is not None:
+            return resolved
 
     # Ring 1 plus whatever the provider runs itself (DL-067). The second half
     # never reaches `box.classify`; its tier was decided where it is declared.
-    offered = box.schemas() + hosted()
-    messages = _act_messages(ctx, box)
-    used: list[str] = []
+    offered = box.schemas(hidden(box)) + hosted()
+    messages = _act_messages(ctx, box, note)
+    used: list[str] = list(ran) if answer is not None else []
     seen: set[tuple[str, str]] = set()
 
     for _ in range(max_passes):
@@ -285,6 +304,22 @@ def act_loop(
                 stop_reason="waiting on a person",
             )
 
+        # Under a grant, with its gate on, an action is asked about first
+        # (DL-085 #3) — the whole pass, as above: nothing runs while any of it
+        # waits on them. Written down as a proposal with an id, so their yes
+        # can come from anywhere and still name it.
+        gated = [
+            d for d in cleared
+            if d.tool in grants.GATED_TOOLS and box.grants is not None
+            and box.grants.gated(grants.GATED_TOOLS[d.tool])
+        ]
+        if gated:
+            return ActResult(
+                tools=tuple(used),
+                blocked_on=_propose(ctx, gated),
+                stop_reason="waiting on a person",
+            )
+
         messages.append(provider.assistant_tool_calls(calls, response.text))
         for call, decision, rejection in decisions:
             if decision is None:
@@ -313,6 +348,11 @@ def act_loop(
             )
             if ok:
                 used.append(decision.tool)
+                if decision.tool in grants.GATED_TOOLS:
+                    # Only reachable with the gate dropped: done without
+                    # asking, so written down to be told in the next brief
+                    # (DL-085 #4), with how to take it back.
+                    _acted(ctx, decision, proposal=None)
                 if decision.tier == LOCAL:
                     # **A successful state change makes every earlier
                     # observation stale**, so re-reading after one is
@@ -340,6 +380,115 @@ def act_loop(
         tools=tuple(used),
         stop_reason=f"{EXHAUSTED}: stopped after {max_passes} tool passes",
     )
+
+
+def _propose(ctx: TurnContext, gated: list[Decision]) -> str:
+    """Ask before acting under a grant: one proposal per scope, and the
+    question that ends the turn."""
+    asks = []
+    for scope in sorted({grants.GATED_TOOLS[d.tool] for d in gated}):
+        mine = [d for d in gated if grants.GATED_TOOLS[d.tool] == scope]
+        seq = ctx.queue.append(episodes.grant_proposed(
+            for_seq=ctx.seq,
+            scope=scope,
+            proposes="action",
+            actions=[{"tool": d.tool, "why": d.why, "args": d.args} for d in mine],
+        ))
+        words = "; ".join(d.why for d in mine)
+        asks.append(f"Should I {words}? Reply yes or no ({grants.pid(seq)}).")
+    return "\n".join(asks)
+
+
+def _acted(ctx: TurnContext, decision: Decision, *, proposal: Optional[int]) -> None:
+    ctx.queue.append(episodes.grant_acted(
+        for_seq=ctx.seq,
+        scope=grants.GATED_TOOLS[decision.tool],
+        tool=decision.tool,
+        why=decision.why,
+        args=decision.args,
+        undo=grants.undo_for(decision.tool, decision.args),
+        proposal=proposal,
+    ))
+
+
+def _resolve(
+    ctx: TurnContext, box: ToolBox, proposal: "grants.Proposal", yes: bool
+) -> tuple[Optional[ActResult], str, list[str]]:
+    """Settle their answer to one proposal (DL-085 #3, #7).
+
+    Returns an :class:`ActResult` when the turn ends here (the answer leads
+    straight to the next question), else a note for the act prompt saying
+    what the answer did, and the tools that ran.
+
+    This and :func:`omega.grants.reading` are the seam for an approval queue
+    (DL-087 #8): it only has to deliver the answer as their message.
+    """
+    ctx.queue.append(episodes.grant_answered(
+        for_seq=ctx.seq,
+        scope=proposal.scope,
+        proposal=proposal.seq,
+        proposed_for=proposal.for_seq,
+        yes=yes,
+    ))
+    state = ctx.grants
+    live = state.live(proposal.scope) if state is not None else None
+    if proposal.proposes == "drop_gate":
+        if yes:
+            return None, (
+                f"\n\n(They said yes to {proposal.pid}: you no longer ask before "
+                f"{proposal.scope} actions; each one is listed in their next brief "
+                "with how to undo it. Tell them so, and that saying \"ask me first "
+                f"again about {proposal.scope}\" puts the question back.)"
+            ), []
+        return None, (
+            f"\n\n(They said no to {proposal.pid}: you keep asking first before "
+            f"{proposal.scope} actions. Acknowledge it in a few words.)"
+        ), []
+    if not yes:
+        return None, (
+            f"\n\n(They said no to {proposal.pid} ({proposal.words()}); nothing "
+            "was done, and nothing should be. Acknowledge it in a few words.)"
+        ), []
+    ran: list[str] = []
+    results: list[str] = []
+    for action in proposal.actions:
+        tool = str(action["tool"])
+        if live is None or tool not in grants.GATED_TOOLS or grants.is_money(tool):
+            results.append(f"{tool}: not run, the grant it was proposed under is gone")
+            continue
+        decision = Decision(tool=tool, tier=LOCAL, why=str(action["why"]), args=dict(action["args"]))
+        _called(ctx, decision.tool, decision.args)
+        text, logged, ok = _dispatch(box, decision)
+        _returned(ctx, decision.tool, ok=ok, result=logged if ok else None, error=None if ok else text)
+        if ok:
+            ran.append(tool)
+            _acted(ctx, decision, proposal=proposal.seq)
+        results.append(f"{decision.why}: {text}")
+    done = "; ".join(results)
+    streak = (live.streak + 1) if live is not None else 0
+    asked = any(
+        p.scope == proposal.scope and p.proposes == "drop_gate"
+        for p in (state.pending if state is not None else ())
+    )
+    if live is not None and live.gated and streak >= grants.GATE_DROP_AFTER and not asked:
+        # Ten yeses in a row: ask whether to stop asking. Asked, never
+        # assumed — the gate drops only on their yes to this (DL-085 #3).
+        seq = ctx.queue.append(episodes.grant_proposed(
+            for_seq=ctx.seq, scope=proposal.scope, proposes="drop_gate", actions=[],
+        ))
+        return ActResult(
+            tools=tuple(ran),
+            blocked_on=(
+                f"Done: {done}. That is {streak} approvals in a row for "
+                f"{proposal.scope}; shall I stop asking first and just tell you "
+                f"in the daily brief? Reply yes or no ({grants.pid(seq)})."
+            ),
+            stop_reason="waiting on a person",
+        ), "", ran
+    return None, (
+        f"\n\n(They said yes to {proposal.pid}, and it ran: {done}. Tell them "
+        "what was done in a sentence.)"
+    ), ran
 
 
 def _dispatch(box: ToolBox, decision: Decision) -> tuple[str, str, bool]:

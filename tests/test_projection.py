@@ -347,6 +347,20 @@ def test_every_m1_kind_is_accounted_for() -> None:
         episodes.PROJECT_STATE: episodes.project_state(
             project="omega", session="s", ended_at=AT, reason="answer was not JSON", at=AT
         ),
+        # DL-085: standing grants, every one a record withheld from the wire.
+        episodes.GRANT_GIVEN: episodes.grant_given(for_seq=1, scope="tidy", at=AT),
+        episodes.GRANT_REVOKED: episodes.grant_revoked(for_seq=1, scope="tidy", at=AT),
+        episodes.GRANT_RESTORED: episodes.grant_restored(for_seq=1, scope="tidy", at=AT),
+        episodes.GRANT_PROPOSED: episodes.grant_proposed(
+            for_seq=1, scope="tidy", proposes="drop_gate", actions=[], at=AT,
+        ),
+        episodes.GRANT_ANSWERED: episodes.grant_answered(
+            for_seq=3, scope="tidy", proposal=2, proposed_for=1, yes=False, at=AT,
+        ),
+        episodes.GRANT_ACTED: episodes.grant_acted(
+            for_seq=1, scope="research", tool="follow_up", why="look again",
+            args={"id": "f1-0001"}, undo={"cancel": "f1-0001"}, at=AT,
+        ),
     }
     assert set(made) == set(episodes.KINDS)
     for kind, payload in made.items():

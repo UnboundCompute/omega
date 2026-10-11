@@ -479,7 +479,9 @@ def test_without_configuration_the_act_loop_offers_what_it_always_did(
     fp = provider.FakeProvider({provider.ACT: [""]})
     act_loop(ctx_for(q, fp))
     offered = fp.offers_for(provider.ACT)[0]
-    from omega.tools import hosted, schemas
+    from omega.tools import ToolBox, hidden, hosted, schemas
 
-    assert offered == schemas() + hosted()
+    # Ring 1 as a prompted turn with no grants is offered it: the DL-085
+    # tools that need a grant, a research task or a past action stay hidden.
+    assert offered == schemas(hidden(ToolBox(store_root=q.store.root, prompted=True))) + hosted()
     assert _REMOTE_RULES not in fp.calls_for(provider.ACT)[0][0]["content"]

@@ -170,6 +170,13 @@ class OpenWork:
                 resumed = int(payload["resumes_seq"])
                 self._blocks.pop(resumed, None)
                 self._block_lane.pop(resumed, None)
+        elif kind == episodes.GRANT_ANSWERED:
+            # DL-085: their answer to a proposal settles the question the
+            # proposing turn left open, whichever channel it came from — a
+            # proposal from a research fire answered on Discord shares no lane.
+            asked = int(payload["proposed_for"])
+            self._blocks.pop(asked, None)
+            self._block_lane.pop(asked, None)
         self._through = seq
 
     def _settle(self, lane: Optional[str], *, before: int) -> None:

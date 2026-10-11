@@ -59,6 +59,15 @@ __all__ = [
     "MEMORY_TIDIED",
     "PROJECT_STATE",
     "STALE_CATEGORIES",
+    "GRANT_GIVEN",
+    "GRANT_REVOKED",
+    "GRANT_RESTORED",
+    "GRANT_PROPOSED",
+    "GRANT_ANSWERED",
+    "GRANT_ACTED",
+    "GRANT_KINDS",
+    "GRANT_SCOPES",
+    "GRANT_PROPOSES",
     "REPORT_TRANSCRIPT",
     "REPORT_USAGE",
     "REPORT_RECORDING",
@@ -102,6 +111,12 @@ __all__ = [
     "finance_started",
     "finance_recorded",
     "finance_skipped",
+    "grant_given",
+    "grant_revoked",
+    "grant_restored",
+    "grant_proposed",
+    "grant_answered",
+    "grant_acted",
     "report_write_key",
     "now",
 ]
@@ -171,6 +186,29 @@ STALE_CATEGORIES = frozenset({"job", "location", "plans"})
 #: and nothing is ever edited.
 PROJECT_STATE = "project.state"
 
+#: Standing grants (DL-085). Authority the person handed over, in their own
+#: message, for one closed scope; and the gate that authority sits behind.
+#: ``grant.given`` / ``grant.revoked`` are the grant itself, ``grant.restored``
+#: puts a dropped gate back. ``grant.proposed`` is omega asking before it acts
+#: under a grant (or asking to stop asking), ``grant.answered`` is their yes or
+#: no, and ``grant.acted`` is what was done under a grant, with its undo. All
+#: records: writing one down never runs a turn. The live set is a fold over
+#: these (:mod:`omega.grants`), never a table beside the log.
+GRANT_GIVEN = "grant.given"
+GRANT_REVOKED = "grant.revoked"
+GRANT_RESTORED = "grant.restored"
+GRANT_PROPOSED = "grant.proposed"
+GRANT_ANSWERED = "grant.answered"
+GRANT_ACTED = "grant.acted"
+GRANT_KINDS = frozenset(
+    {GRANT_GIVEN, GRANT_REVOKED, GRANT_RESTORED, GRANT_PROPOSED, GRANT_ANSWERED, GRANT_ACTED}
+)
+#: The only two grants there are (DL-085 #5): carry its own research tasks to
+#: the end, and tidy their reminders and watches. Closed, like the tool set.
+GRANT_SCOPES = frozenset({"research", "tidy"})
+#: What a proposal asks: to do the actions it lists, or to stop asking first.
+GRANT_PROPOSES = frozenset({"action", "drop_gate"})
+
 #: The senses a relay may report for, by the name of the sense rather than of
 #: the file it read. Three of them end in a learning receipt; the machine sense
 #: ends in nothing, because a reading is a condition to show the look and not a
@@ -230,6 +268,12 @@ KINDS = frozenset(
         CLAIM_RESOLVED,
         MEMORY_TIDIED,
         PROJECT_STATE,
+        GRANT_GIVEN,
+        GRANT_REVOKED,
+        GRANT_RESTORED,
+        GRANT_PROPOSED,
+        GRANT_ANSWERED,
+        GRANT_ACTED,
     }
 )
 
@@ -1400,6 +1444,125 @@ def finance_skipped(
     return payload
 
 
+def grant_given(*, for_seq: int, scope: str, at: Optional[str] = None) -> dict[str, Any]:
+    """They gave omega a standing grant (DL-085), in message ``for_seq``."""
+    payload = {"v": VERSION, "kind": GRANT_GIVEN, "for_seq": for_seq, "scope": scope,
+               "at": at or now()}
+    _validate(payload)
+    return payload
+
+
+def grant_revoked(*, for_seq: int, scope: str, at: Optional[str] = None) -> dict[str, Any]:
+    """They took a standing grant back, in message ``for_seq``."""
+    payload = {"v": VERSION, "kind": GRANT_REVOKED, "for_seq": for_seq, "scope": scope,
+               "at": at or now()}
+    _validate(payload)
+    return payload
+
+
+def grant_restored(*, for_seq: int, scope: str, at: Optional[str] = None) -> dict[str, Any]:
+    """They put a dropped gate back, in message ``for_seq``: omega asks first
+    again, and the count of approvals starts from nothing."""
+    payload = {"v": VERSION, "kind": GRANT_RESTORED, "for_seq": for_seq, "scope": scope,
+               "at": at or now()}
+    _validate(payload)
+    return payload
+
+
+def grant_proposed(
+    *,
+    for_seq: int,
+    scope: str,
+    proposes: str,
+    actions: list[dict[str, Any]],
+    at: Optional[str] = None,
+) -> dict[str, Any]:
+    """Omega asking before it acts under a grant. Its own seq is its id.
+
+    ``actions`` are the calls exactly as classified (tool, why, args), so a
+    yes runs the thing they were shown and not a re-reading of it.
+    ``proposes`` is ``"drop_gate"`` for the one other question: may omega
+    stop asking first.
+    """
+    payload = {
+        "v": VERSION,
+        "kind": GRANT_PROPOSED,
+        "for_seq": for_seq,
+        "scope": scope,
+        "proposes": proposes,
+        "actions": [
+            {"tool": a.get("tool"), "why": a.get("why"), "args": dict(a.get("args") or {})}
+            if isinstance(a, dict) else a
+            for a in actions
+        ],
+        "at": at or now(),
+    }
+    _validate(payload)
+    return payload
+
+
+def grant_answered(
+    *,
+    for_seq: int,
+    scope: str,
+    proposal: int,
+    proposed_for: int,
+    yes: bool,
+    at: Optional[str] = None,
+) -> dict[str, Any]:
+    """Their yes or no to proposal ``proposal``, in message ``for_seq``.
+
+    ``proposed_for`` is the turn that asked, so the question it left open is
+    settled by the answer wherever the answer came from.
+    """
+    payload = {
+        "v": VERSION,
+        "kind": GRANT_ANSWERED,
+        "for_seq": for_seq,
+        "scope": scope,
+        "proposal": proposal,
+        "proposed_for": proposed_for,
+        "yes": yes,
+        "at": at or now(),
+    }
+    _validate(payload)
+    return payload
+
+
+def grant_acted(
+    *,
+    for_seq: int,
+    scope: str,
+    tool: str,
+    why: str,
+    args: dict[str, Any],
+    undo: dict[str, Any],
+    proposal: Optional[int] = None,
+    at: Optional[str] = None,
+) -> dict[str, Any]:
+    """Something omega did under a grant, and how to take it back.
+
+    ``gated`` is derived, not passed: an action done on a yes to a proposal
+    names that proposal, and one done with the gate dropped names none. The
+    second kind is what the next brief lists (DL-085 #4).
+    """
+    payload = {
+        "v": VERSION,
+        "kind": GRANT_ACTED,
+        "for_seq": for_seq,
+        "scope": scope,
+        "tool": tool,
+        "why": why,
+        "args": dict(args),
+        "undo": dict(undo),
+        "gated": proposal is not None,
+        "proposal": proposal,
+        "at": at or now(),
+    }
+    _validate(payload)
+    return payload
+
+
 #: The fields a learning report's ``meta`` must carry — the receipt's identity
 #: fields other than the unit, which the core copies across unchanged.
 _REPORT_META: dict[str, tuple[str, ...]] = {
@@ -1572,6 +1735,14 @@ _REQUIRED: dict[str, tuple[str, ...]] = {
         "resolved",
         "reason",
         "at",
+    ),
+    GRANT_GIVEN: ("for_seq", "scope", "at"),
+    GRANT_REVOKED: ("for_seq", "scope", "at"),
+    GRANT_RESTORED: ("for_seq", "scope", "at"),
+    GRANT_PROPOSED: ("for_seq", "scope", "proposes", "actions", "at"),
+    GRANT_ANSWERED: ("for_seq", "scope", "proposal", "proposed_for", "yes", "at"),
+    GRANT_ACTED: (
+        "for_seq", "scope", "tool", "why", "args", "undo", "gated", "proposal", "at"
     ),
 }
 
@@ -1786,6 +1957,11 @@ def _validate(payload: dict[str, Any]) -> None:
     elif kind == PROJECT_STATE:
         # No `for_seq`: identified by the session it read, as its receipt is.
         _validate_project_state(payload)
+    elif kind in GRANT_KINDS:
+        # Attached: ``for_seq`` is the turn that wrote it, which for a grant
+        # given, revoked or restored is the person's own message (DL-085 #6).
+        _require_seq(payload, "for_seq")
+        _validate_grant(payload)
     elif kind == REFLECTION_DONE:
         # No `for_seq` and no `id`: a reflection belongs to no turn and names no
         # standing thing. It is identified by the stretch of log it covered.
@@ -1911,6 +2087,66 @@ def _validate(payload: dict[str, Any]) -> None:
             raise BadPayload("claim_seq must name a claim, not the turn")
 
     _require_str(payload, "at", non_empty=True)
+
+
+def _validate_grant(payload: dict[str, Any]) -> None:
+    kind = payload["kind"]
+    if payload["scope"] not in GRANT_SCOPES:
+        raise BadPayload(f"scope {payload['scope']!r} not in {sorted(GRANT_SCOPES)}")
+    if kind == GRANT_PROPOSED:
+        if payload["proposes"] not in GRANT_PROPOSES:
+            raise BadPayload(
+                f"proposes {payload['proposes']!r} not in {sorted(GRANT_PROPOSES)}"
+            )
+        actions = payload["actions"]
+        if not isinstance(actions, list):
+            raise BadPayload("actions must be a list")
+        if (payload["proposes"] == "action") != bool(actions):
+            # An action proposal with nothing in it would be a yes to nothing,
+            # and a gate proposal carrying actions would run them on a yes that
+            # was only about the gate.
+            raise BadPayload("an action proposal lists its actions; a gate one lists none")
+        for i, action in enumerate(actions):
+            if not isinstance(action, dict):
+                raise BadPayload(f"actions[{i}] must be an object")
+            for field in ("tool", "why"):
+                if not isinstance(action.get(field), str) or not action[field]:
+                    raise BadPayload(f"actions[{i}].{field} must be a non-empty string")
+            if not isinstance(action.get("args"), dict):
+                raise BadPayload(f"actions[{i}].args must be an object")
+    elif kind == GRANT_ANSWERED:
+        _require_seq(payload, "proposal")
+        _require_seq(payload, "proposed_for")
+        if not isinstance(payload["yes"], bool):
+            raise BadPayload("yes must be a bool")
+    elif kind == GRANT_ACTED:
+        _require_str(payload, "tool", non_empty=True)
+        _require_str(payload, "why", non_empty=True)
+        if not isinstance(payload["args"], dict):
+            raise BadPayload("args must be an object")
+        if not isinstance(payload["gated"], bool):
+            raise BadPayload("gated must be a bool")
+        if payload["proposal"] is not None:
+            _require_seq(payload, "proposal")
+        if payload["gated"] != (payload["proposal"] is not None):
+            # Behind the gate means on a yes to a proposal, and only then: a
+            # gated action with no proposal is one nobody approved.
+            raise BadPayload("a gated action names its proposal, and only a gated one")
+        undo = payload["undo"]
+        if not isinstance(undo, dict) or len(undo) != 1:
+            raise BadPayload("undo must be one of {restore: definition} or {cancel: id}")
+        if "cancel" in undo:
+            if not isinstance(undo["cancel"], str) or not undo["cancel"]:
+                raise BadPayload("undo.cancel must be a schedule id")
+        elif "restore" in undo:
+            was = undo["restore"]
+            if not isinstance(was, dict) or not all(
+                isinstance(was.get(f), str) and was[f]
+                for f in ("id", "instruction", "created_at")
+            ):
+                raise BadPayload("undo.restore must be a schedule definition")
+        else:
+            raise BadPayload("undo must be one of {restore: definition} or {cancel: id}")
 
 
 def _validate_finance(payload: dict[str, Any]) -> None:

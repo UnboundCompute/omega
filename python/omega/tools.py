@@ -80,7 +80,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional, Sequence
 from urllib.parse import urlsplit
 
-from omega import calendar as calendars, episodes, finance as finances, inbox as inboxes, readable
+from omega import calendar as calendars, episodes, finance as finances, grants, inbox as inboxes, readable
 from omega import projects as worklog
 from omega.schedule import CronError, describe_cron, next_match, validate_cron, zone_label
 
@@ -114,6 +114,15 @@ __all__ = [
     "missed_text",
     "outage_text",
     "TOOL_NAMES",
+    "GRANT",
+    "TIDY",
+    "FOLLOW_UP",
+    "REPORT",
+    "UNDO",
+    "RESEARCH_LEAD",
+    "research_instruction",
+    "is_research",
+    "research_task",
     "MAX_RECALLED",
     "READ_ONLY_ARGV0",
     "MAX_RESULT_CHARS",
@@ -172,6 +181,11 @@ MAIL = "mail"
 FINANCE = "finance"
 BRIEF = "brief"
 PROJECTS = "projects"
+GRANT = "grant"
+TIDY = "tidy"
+FOLLOW_UP = "follow_up"
+REPORT = "report"
+UNDO = "undo"
 
 #: Ring 1's remainder, and it is closed (DL-014). Spelled as a frozenset so
 #: that "the set does not grow" is a fact about an object and not a promise in
@@ -209,10 +223,18 @@ PROJECTS = "projects"
 #: ``projects`` is DL-087 #7: where each coding project was left, read from
 #: the ``project.state`` records finished sessions leave in the log. It reads
 #: the log only and never touches a repository.
+#:
+#: ``grant``, ``tidy``, ``follow_up``, ``report`` and ``undo`` are DL-085:
+#: standing grants. ``grant`` gives, revokes or re-gates one, and only on the
+#: person's own message; the next three are what the two grants cover (tidy
+#: their watches and reminders; carry a research task to its report); ``undo``
+#: takes back what was done under one. All five write only omega's own log, and
+#: none of them is offered where it could not run (:func:`schemas`).
 TOOL_NAMES = frozenset(
     {
         READ_FILE, WRITE_FILE, RUN_CODE, FETCH, RECALL, WATCH, UNWATCH, REMIND,
         SCHEDULES, CALENDAR, INBOX, MAIL, FINANCE, BRIEF, PROJECTS,
+        GRANT, TIDY, FOLLOW_UP, REPORT, UNDO,
     }
 )
 
@@ -300,7 +322,9 @@ def brief_instruction() -> str:
         "times, mail that needs them, anything due or waiting, one line per "
         "project on where it was left. A few lines, the most "
         "pressing first. If a source could not be read, say so in a few words "
-        "rather than leaving it out; if a day really is empty, say that."
+        "rather than leaving it out; if a day really is empty, say that. If "
+        "you did anything for them under a standing grant without asking "
+        "first, list it, each with how to undo it."
     )
 
 
@@ -361,10 +385,52 @@ def outage_text(failed: int, error: str) -> str:
     )
 
 
+#: How every research follow-up's fire text begins (DL-085).
+RESEARCH_LEAD = "Research you are carrying for them: "
+
+
+def research_instruction(task: int, what: str) -> str:
+    """The text a research follow-up fires with. It names the task, so the
+    fire can carry it on and, when it is done, report it."""
+    return (
+        f"{RESEARCH_LEAD}{what} (task {task})\n"
+        "They gave you a standing research grant. Carry this on: search and "
+        f"read what you need, then either set the next {FOLLOW_UP} if it is "
+        f"not finished, or give your findings with {REPORT} if it is."
+    )
+
+
+def is_research(event: dict[str, Any]) -> bool:
+    """Is this event a research follow-up firing? Read as a reminder is."""
+    return event.get("channel") == "schedule" and str(
+        event.get("text", "")
+    ).startswith(RESEARCH_LEAD)
+
+
+def research_task(event: dict[str, Any]) -> Optional[int]:
+    """The task a research fire carries, or ``None`` for any other event."""
+    if not is_research(event):
+        return None
+    first = str(event.get("text", "")).splitlines()[0]
+    marker = first.rfind("(task ")
+    if marker < 0 or not first.endswith(")"):
+        return None
+    try:
+        task = int(first[marker + 6:-1])
+    except ValueError:
+        return None
+    return task if task > 0 else None
+
+
 def must_speak(event: dict[str, Any]) -> bool:
     """A fire that was promised to reach them, so silence is never right:
-    a reminder (DL-075) or a brief (DL-080)."""
-    return is_reminder(event) or is_brief(event)
+    a reminder (DL-075) or a brief (DL-080). Work that finished (DL-085's
+    research report) is the same: it was asked for, and it has arrived."""
+    return (
+        is_reminder(event)
+        or is_brief(event)
+        or event.get("kind") == episodes.WORK_FINISHED
+    )
 
 
 #: How many claims one ``recall`` answers with.
@@ -1096,6 +1162,273 @@ def _unwatch(box: "ToolBox", args: dict[str, Any]) -> str:
     # can check (DL-044 #6, DL-077).
     [stopped] = [s for s in box.running if s.id == sid]
     return f"stopped {describe_schedule(stopped)}"
+
+
+# --- standing grants (DL-085) --------------------------------------------------
+
+#: Words their message must contain for ``grant`` to *give* a scope: the grant
+#: is theirs to give, so the message that gives it has to be about it.
+_GRANT_WORDS = {
+    grants.RESEARCH: ("research", "look into", "dig into", "investigate", "find out"),
+    grants.TIDY: ("tidy", "clean up", "clean", "watches", "reminders"),
+}
+_GRANT_CHANGES = ("give", "revoke", "restore_gate")
+
+
+def _scope(tool: str, args: dict[str, Any]) -> str:
+    scope = _text(tool, args, "scope").strip().lower()
+    if scope not in grants.SCOPES:
+        raise ToolRejected(
+            f"{tool}: there are two grants, {sorted(grants.SCOPES)}; {scope!r} is not one. "
+            "Calendar, mail and money can never be granted."
+        )
+    return scope
+
+
+def _live(box: "ToolBox", scope: str) -> Optional[Any]:
+    return box.grants.live(scope) if box.grants is not None else None
+
+
+def _classify_grant(box: "ToolBox", args: dict[str, Any]) -> Decision:
+    if not box.prompted:
+        # The one rule DL-085 #6 is about: authority comes only from their own
+        # message. A look, a watch, a reminder, a research fire or work that
+        # finished cannot give itself, or take, a grant.
+        raise ToolRejected(
+            f"{GRANT} runs only on their own message; nobody asked in this turn"
+        )
+    scope = _scope(GRANT, args)
+    change = _text(GRANT, args, "change").strip().lower()
+    if change not in _GRANT_CHANGES:
+        raise ToolRejected(f"{GRANT}'s 'change' is one of {list(_GRANT_CHANGES)}")
+    live = _live(box, scope)
+    if change == "give":
+        said = box.said.lower()
+        if not any(w in said for w in _GRANT_WORDS[scope]):
+            raise ToolRejected(
+                f"their message does not ask for the {scope} grant; give it only "
+                "when they say so in their own words"
+            )
+        if live is not None:
+            raise ToolRejected(f"the {scope} grant is already given")
+    elif live is None:
+        raise ToolRejected(f"there is no {scope} grant to {change.replace('_', ' ')}")
+    elif change == "restore_gate" and live.gated:
+        raise ToolRejected(f"the {scope} gate is already on: you ask before each action")
+    why = {
+        "give": f"take the standing {scope} grant they gave",
+        "revoke": f"give back the standing {scope} grant",
+        "restore_gate": f"ask them first again before each {scope} action",
+    }[change]
+    return Decision(tool=GRANT, tier=LOCAL, why=why, args={"scope": scope, "change": change})
+
+
+def _grant(box: "ToolBox", args: dict[str, Any]) -> str:
+    if box.append is None:
+        raise ToolError("grants cannot change from here: this box has no log")
+    scope, change = args["scope"], args["change"]
+    if change == "give":
+        box.append(episodes.grant_given(for_seq=box.for_seq, scope=scope))
+        return (
+            f"{scope} grant given (message {box.for_seq}). You still ask before each "
+            f"{scope} action until they say otherwise; they can take it back any time."
+        )
+    if change == "revoke":
+        box.append(episodes.grant_revoked(for_seq=box.for_seq, scope=scope))
+        stopped = []
+        if scope == grants.RESEARCH:
+            # The follow-ups were set under the grant, so they end with it.
+            for s in box.running:
+                if s.instruction.startswith(RESEARCH_LEAD):
+                    box.append(episodes.schedule_cancelled(id=s.id))
+                    stopped.append(s.id)
+        tail = f"; stopped follow-ups {', '.join(stopped)}" if stopped else ""
+        return f"{scope} grant taken back{tail}"
+    box.append(episodes.grant_restored(for_seq=box.for_seq, scope=scope))
+    return f"{scope} gate back on: you ask before each {scope} action again"
+
+
+def _definition(s: Any) -> dict[str, Any]:
+    """A running schedule as a restorable record."""
+    return {
+        "id": s.id,
+        "instruction": s.instruction,
+        "every": s.every,
+        "cron": s.cron,
+        "once": bool(s.once),
+        "created_at": s.created_at.astimezone(timezone.utc).isoformat(timespec="seconds"),
+    }
+
+
+_TIDY_CHANGES = ("retire", "every", "reword")
+
+
+def _classify_tidy(box: "ToolBox", args: dict[str, Any]) -> Decision:
+    if _live(box, grants.TIDY) is None:
+        raise ToolRejected(f"{TIDY} needs the tidy grant, and they have not given it")
+    sid = _text(TIDY, args, "id").strip()
+    change = _text(TIDY, args, "change").strip().lower()
+    why = _text(TIDY, args, "why").strip()
+    if change not in _TIDY_CHANGES:
+        raise ToolRejected(f"{TIDY}'s 'change' is one of {list(_TIDY_CHANGES)}")
+    found = [s for s in box.running if s.id == sid]
+    if not found:
+        raise ToolRejected(f"there is no running schedule {sid!r}")
+    [s] = found
+    first = s.instruction.splitlines()[0] if s.instruction else ""
+    if not (first.startswith(WATCH_LEAD) or first.startswith(REMINDER_LEAD)):
+        # Briefs and research follow-ups are not theirs to tidy by grant:
+        # a brief is a promise, and a follow-up belongs to its task.
+        raise ToolRejected(f"{TIDY} covers watches and reminders only; {sid} is neither")
+    out: dict[str, Any] = {"id": sid, "change": change, "was": _definition(s)}
+    if change == "every":
+        if not first.startswith(WATCH_LEAD) or s.cron:
+            raise ToolRejected(f"only a watch that runs every N minutes can be widened")
+        minutes = args.get("every_minutes")
+        if isinstance(minutes, bool) or not isinstance(minutes, int) or minutes < MIN_WATCH_MINUTES:
+            raise ToolRejected(f"'every_minutes' must be a whole number, at least {MIN_WATCH_MINUTES}")
+        out["every_minutes"] = minutes
+        what = f"make {sid} run every {minutes} minutes instead of every {(s.every or 0) // 60}"
+    elif change == "reword":
+        if not first.startswith(WATCH_LEAD):
+            raise ToolRejected("only a watch can be reworded")
+        out["what"] = _text(TIDY, args, "what").strip()
+        what = f"reword {sid} to watch {out['what']!r}"
+    else:
+        what = f"retire {describe_schedule(s)} ({sid})"
+    return Decision(tool=TIDY, tier=LOCAL, why=f"{what}, because {why}", args=out)
+
+
+def _tidy(box: "ToolBox", args: dict[str, Any]) -> str:
+    if box.append is None:
+        raise ToolError("watches cannot be tidied from here: this box has no log")
+    was = args["was"]
+    now = [s for s in box.running if s.id == args["id"]]
+    if not now or _definition(now[0]) != was:
+        # Proposed against one definition, so it runs against that one or not
+        # at all: a yes to "retire the 15-minute watch" is not a yes to
+        # retiring whatever has that id by now.
+        raise ToolError(f"{args['id']} changed since this was proposed; nothing was done")
+    if args["change"] == "retire":
+        box.append(episodes.schedule_cancelled(id=args["id"]))
+        return f"retired {args['id']}"
+    if args["change"] == "every":
+        box.append(episodes.schedule_created(
+            id=args["id"], instruction=was["instruction"], every=args["every_minutes"] * 60,
+        ))
+        return f"{args['id']} now runs every {args['every_minutes']} minutes"
+    box.append(episodes.schedule_created(
+        id=args["id"], instruction=watch_instruction(args["what"]),
+        every=was["every"], cron=was["cron"],
+    ))
+    return f"{args['id']} now watches {args['what']!r}"
+
+
+def _classify_follow_up(box: "ToolBox", args: dict[str, Any]) -> Decision:
+    if _live(box, grants.RESEARCH) is None:
+        raise ToolRejected(f"{FOLLOW_UP} needs the research grant, and they have not given it")
+    task = box.task if box.task is not None else (box.for_seq if box.prompted else None)
+    if not task:
+        raise ToolRejected(
+            f"{FOLLOW_UP} carries a research task they asked for; this turn has none"
+        )
+    what = _text(FOLLOW_UP, args, "what").strip()
+    minutes = args.get("in_minutes")
+    if (
+        isinstance(minutes, bool) or not isinstance(minutes, int)
+        or not MIN_WATCH_MINUTES <= minutes <= MAX_REMIND_MINUTES
+    ):
+        raise ToolRejected(
+            f"'in_minutes' must be a whole number from {MIN_WATCH_MINUTES} to {MAX_REMIND_MINUTES}"
+        )
+    sid = f"f{task}-{zlib.crc32(what.encode()) & 0xFFFF:04x}"
+    return Decision(
+        tool=FOLLOW_UP,
+        tier=LOCAL,
+        why=f"look again at {what!r} in {minutes} minutes, for research task {task}",
+        args={"id": sid, "task": task, "what": what, "in_minutes": minutes},
+    )
+
+
+def _follow_up(box: "ToolBox", args: dict[str, Any]) -> str:
+    if box.append is None:
+        raise ToolError("follow-ups cannot be set from here: this box has no log")
+    box.append(episodes.schedule_created(
+        id=args["id"],
+        instruction=research_instruction(args["task"], args["what"]),
+        every=args["in_minutes"] * 60,
+        once=True,
+    ))
+    return f"follow-up set in {args['in_minutes']} minutes (id {args['id']})"
+
+
+def _classify_report(box: "ToolBox", args: dict[str, Any]) -> Decision:
+    if box.task is None:
+        raise ToolRejected(
+            f"{REPORT} ends a research task from its own follow-up; in a turn "
+            "they started, just answer them"
+        )
+    if _live(box, grants.RESEARCH) is None:
+        raise ToolRejected(f"{REPORT} needs the research grant, and it was taken back")
+    summary = _text(REPORT, args, "summary").strip()
+    if not summary:
+        raise ToolRejected(f"{REPORT} needs a 'summary'")
+    ok = args.get("ok", True)
+    if not isinstance(ok, bool):
+        raise ToolRejected(f"{REPORT}'s 'ok' must be true or false")
+    return Decision(
+        tool=REPORT,
+        tier=LOCAL,
+        why=f"report research task {box.task} as finished",
+        args={"task": box.task, "summary": summary[:4000], "ok": ok},
+    )
+
+
+def _report(box: "ToolBox", args: dict[str, Any]) -> str:
+    if box.append is None:
+        raise ToolError("a report cannot be filed from here: this box has no log")
+    # `work.finished` is an event: the turn it causes is the one that tells
+    # them, so the report reaches them once, as its own message (DL-085 #5).
+    box.append(episodes.work_finished(for_seq=args["task"], summary=args["summary"], ok=args["ok"]))
+    for s in box.running:
+        if s.instruction.startswith(f"{RESEARCH_LEAD}") and s.id.startswith(f"f{args['task']}-"):
+            box.append(episodes.schedule_cancelled(id=s.id))
+    return f"research task {args['task']} reported; they will be told"
+
+
+def _classify_undo(box: "ToolBox", args: dict[str, Any]) -> Decision:
+    if not box.prompted:
+        raise ToolRejected(f"{UNDO} runs only when they ask for it")
+    seq = args.get("action")
+    if isinstance(seq, bool) or not isinstance(seq, int):
+        raise ToolRejected(f"{UNDO} needs 'action', the number of the thing to take back")
+    acted = box.grants.acted.get(seq) if box.grants is not None else None
+    if acted is None:
+        raise ToolRejected(f"there is no action {seq} done under a grant")
+    return Decision(
+        tool=UNDO, tier=LOCAL, why=f"undo: {acted.why}",
+        args={"action": seq, "undo": dict(acted.undo)},
+    )
+
+
+def _undo(box: "ToolBox", args: dict[str, Any]) -> str:
+    if box.append is None:
+        raise ToolError("nothing can be undone from here: this box has no log")
+    undo = args["undo"]
+    if "cancel" in undo:
+        sid = undo["cancel"]
+        if sid not in {s.id for s in box.running}:
+            return f"{sid} is not running any more; nothing to undo"
+        box.append(episodes.schedule_cancelled(id=sid))
+        return f"stopped {sid}"
+    was = undo["restore"]
+    if any(_definition(s) == was for s in box.running):
+        return f"{was['id']} is already as it was; nothing to undo"
+    box.append(episodes.schedule_created(
+        id=was["id"], instruction=was["instruction"], every=was["every"],
+        cron=was["cron"], once=was["once"], at=was["created_at"],
+    ))
+    return f"{was['id']} is back as it was"
 
 
 def describe_schedule(s: Any, *, now: Optional[datetime] = None) -> str:
@@ -2089,20 +2422,124 @@ _TOOLS: dict[str, _Tool] = {
             [],
         ),
     ),
+    GRANT: _Tool(
+        classify=_classify_grant,
+        dispatch=_grant,
+        schema=_schema(
+            GRANT,
+            "Take, give back or re-gate a standing grant, only when they ask in "
+            "their own message. There are two: 'research' (carry the research "
+            "they ask for through to a report, without them asking each step) "
+            "and 'tidy' (tidy their watches and reminders). You still ask "
+            "before each action until they agree to stop being asked. "
+            "'restore_gate' is for when they want to be asked first again.",
+            {
+                "scope": {"type": "string", "enum": sorted(grants.SCOPES)},
+                "change": {"type": "string", "enum": list(_GRANT_CHANGES)},
+            },
+            ["scope", "change"],
+        ),
+    ),
+    TIDY: _Tool(
+        classify=_classify_tidy,
+        dispatch=_tidy,
+        schema=_schema(
+            TIDY,
+            "Under the tidy grant: retire a stale or duplicate watch or "
+            "reminder, widen a watch that runs too often (one that repeats "
+            "what you already notice in your own looks, like a 15-minute "
+            "calendar watch), or reword a watch that keeps failing. Name why.",
+            {
+                "id": {"type": "string", "description": "The schedule's id."},
+                "change": {"type": "string", "enum": list(_TIDY_CHANGES)},
+                "every_minutes": {"type": "integer", "description": f"For 'every': the new gap, at least {MIN_WATCH_MINUTES}."},
+                "what": {"type": "string", "description": "For 'reword': what the watch should look at."},
+                "why": {"type": "string", "description": "Why, in a few words they would recognise."},
+            },
+            ["id", "change", "why"],
+        ),
+    ),
+    FOLLOW_UP: _Tool(
+        classify=_classify_follow_up,
+        dispatch=_follow_up,
+        schema=_schema(
+            FOLLOW_UP,
+            "Under the research grant: come back to research they asked for "
+            "after a while (a source not out yet, a page to re-check), so the "
+            "task is carried to the end without them asking again.",
+            {
+                "what": {"type": "string", "description": "What to look at again."},
+                "in_minutes": {"type": "integer", "description": f"Minutes from now, {MIN_WATCH_MINUTES} to {MAX_REMIND_MINUTES}."},
+            },
+            ["what", "in_minutes"],
+        ),
+    ),
+    REPORT: _Tool(
+        classify=_classify_report,
+        dispatch=_report,
+        schema=_schema(
+            REPORT,
+            "Under the research grant, in a research follow-up: the task is "
+            "done; give them your findings. This is how they hear about it.",
+            {
+                "summary": {"type": "string", "description": "Your findings, as you would tell them."},
+                "ok": {"type": "boolean", "description": "False if it could not be finished."},
+            },
+            ["summary"],
+        ),
+    ),
+    UNDO: _Tool(
+        classify=_classify_undo,
+        dispatch=_undo,
+        schema=_schema(
+            UNDO,
+            "Take back something you did for them under a standing grant, when "
+            "they ask: a retired watch comes back, a follow-up stops.",
+            {"action": {"type": "integer", "description": "The action's number, as the brief listed it."}},
+            ["action"],
+        ),
+    ),
 }
 
 assert set(_TOOLS) == TOOL_NAMES, "the tool set and its registry disagree"
 
 
-def schemas() -> list[dict[str, Any]]:
-    """What is offered to the model, in the order the tools are declared."""
+def schemas(hide: "frozenset[str] | set[str]" = frozenset()) -> list[dict[str, Any]]:
+    """What is offered to the model, in the order the tools are declared.
+
+    ``hide`` leaves out tools that could only refuse in this turn (DL-085's
+    grant tools, where no grant is live): offering a tool that cannot run
+    invites the model to try it, and a turn spent on a refusal is a turn not
+    spent on the work.
+    """
     return [
         _TOOLS[name].schema
         for name in (
             READ_FILE, WRITE_FILE, RUN_CODE, FETCH, RECALL, WATCH, UNWATCH, REMIND,
             SCHEDULES, CALENDAR, INBOX, MAIL, FINANCE, BRIEF, PROJECTS,
+            GRANT, TIDY, FOLLOW_UP, REPORT, UNDO,
         )
+        if name not in hide
     ]
+
+
+def hidden(box: "ToolBox") -> frozenset[str]:
+    """The grant tools that would only refuse in ``box``'s turn (DL-085)."""
+    state = box.grants
+    out = set()
+    if not box.prompted:
+        out |= {GRANT, UNDO}
+    if state is None or state.live(grants.TIDY) is None:
+        out.add(TIDY)
+    if state is None or state.live(grants.RESEARCH) is None:
+        out |= {FOLLOW_UP, REPORT}
+    elif box.task is None:
+        out.add(REPORT)
+        if not box.prompted:
+            out.add(FOLLOW_UP)
+    if state is None or not state.acted:
+        out.add(UNDO)
+    return frozenset(out)
 
 
 #: The provider's own search, offered beside Ring 1 and **not in it** (DL-067).
@@ -2191,6 +2628,18 @@ class ToolBox:
     #: Typed loosely because Ring 1 must not import the adapter that imports it.
     remote: Any = None
 
+    #: The standing grants as of this turn (DL-085): a frozen
+    #: :class:`omega.grants.State`. ``None`` is no grants at all, so a box
+    #: nobody told fails closed: every grant tool refuses.
+    grants: Any = None
+
+    #: Their own words, when their message started the turn: ``grant`` gives
+    #: a scope only if the message asks for it. Empty otherwise.
+    said: str = ""
+
+    #: The research task a follow-up fire carries, or ``None``.
+    task: Optional[int] = None
+
     def __post_init__(self) -> None:
         object.__setattr__(self, "store_root", Path(self.store_root).resolve())
         object.__setattr__(self, "remembered", tuple(self.remembered))
@@ -2208,9 +2657,15 @@ class ToolBox:
         if tool is None and self.remote is not None and isinstance(arguments, dict):
             # An MCP tool, refused or cleared by the adapter: money, writes and
             # the allowlist are decided there, in code, from the name (DL-088).
+            # Its money refusal comes first and is the one logged; the check
+            # below still stands behind anything it clears.
             decided = self.remote.classify(name, arguments)
-            if decided is not None:
+            if decided is not None and not grants.is_money(name):
                 return decided
+        if grants.is_money(name):
+            # Before whether the tool exists: no tool that moves money runs,
+            # under any grant or approval, ever (DL-088, DL-085).
+            raise ToolRejected(grants.money_refusal(name))
         if tool is None:
             raise ToolRejected(
                 f"there is no tool called {name!r}; omega has "
@@ -2239,6 +2694,12 @@ class ToolBox:
             return self.remote.dispatch(decision)
         return _TOOLS[decision.tool].dispatch(self, decision.args)
 
-    def schemas(self) -> list[dict[str, Any]]:
-        """Ring 1, then this box's MCP tools (DL-088), in that order."""
-        return schemas() + (self.remote.schemas() if self.remote is not None else [])
+    def schemas(self, hide: "frozenset[str] | set[str]" = frozenset()) -> list[dict[str, Any]]:
+        """Ring 1 less what this turn may not use (DL-085), then this box's
+        MCP tools (DL-088), in that order."""
+        return schemas(hide) + (self.remote.schemas() if self.remote is not None else [])
+
+
+assert TOOL_NAMES | {WEB_SEARCH} <= set(grants.REVERSIBILITY), (
+    "every tool omega can take has a reversibility tier (DL-085)"
+)
