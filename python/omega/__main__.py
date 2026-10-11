@@ -47,6 +47,7 @@ from omega import (
     learn,
     listen,
     machine,
+    mcp,
     memory,
     provider,
     relay as relaying,
@@ -299,7 +300,7 @@ def _account_lines(environ=os.environ) -> list[str]:
         f"inbox: reading {found.user} at {found.host} (read-only)"
         if found is not None
         else f"inbox: not connected ({inbox.ENV_USER}/{inbox.ENV_PASSWORD} unset)",
-    ]
+    ] + [line for line in (mcp.account_line(environ),) if line]
 
 
 def _startup_lines(rt: runtime.Runtime, *, interactive: bool = True) -> list[str]:

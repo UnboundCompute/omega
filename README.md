@@ -102,6 +102,40 @@ repo root — and deliberately not in whatever directory you happened to run it 
 "it works from the repo and nowhere else" is a rule nobody can see. Without a key it prints
 one sentence naming the exact file to put it in, and exits.
 
+### Other MCP servers as tools (opt-in)
+
+omega can call tools on remote MCP servers (Streamable HTTP, `https://` only). Nothing is
+on by default and no server is built in: with `OMEGA_MCP_SERVERS` unset, omega offers
+exactly the tools it always did. Each server you name is configured from the environment:
+
+```sh
+OMEGA_MCP_SERVERS=github,exa           # short lowercase names, comma separated
+OMEGA_MCP_GITHUB_URL=https://...       # required, https only
+OMEGA_MCP_GITHUB_TOOLS=a,b             # the allowlist: only these are offered
+OMEGA_MCP_GITHUB_TOKEN=...             # optional; sent as "Authorization: Bearer ..."
+OMEGA_MCP_GITHUB_HEADER=...            # optional; send the token raw in this header instead
+OMEGA_MCP_GITHUB_WRITE_TOOLS=c         # tools that change things (see below)
+```
+
+The model sees them as `<server>__<tool>`. Tools are read-only: a tool listed under
+`_WRITE_TOOLS`, or one the server marks as not read-only, is refused until the approval
+gate exists. **Money never goes through omega.** A tool whose name pays, checks out,
+orders, books, buys, sells or trades is refused even when you allowlist it, and no setting
+lifts that. What a server returns is capped and handed to the model as outside data,
+never as instructions.
+
+Some servers it has been shaped around (check each one's own docs for its tool names):
+
+- **GitHub remote MCP**: `https://api.githubcopilot.com/mcp/` with a fine-grained PAT as
+  `_TOKEN`. Allowlist read tools only (listing and reading issues, PRs and files).
+- **Firecrawl**: `https://mcp.firecrawl.dev/v2/mcp`. Keyless, and rate-limited.
+- **Exa**: `https://mcp.exa.ai/mcp`. Keyless.
+- **Google Maps Grounding Lite**: `https://mapstools.googleapis.com/mcp`, with the API key
+  as `_TOKEN` and `_HEADER=X-Goog-Api-Key`. Set a daily quota cap on the key in the Cloud
+  console, so a looping model cannot run up a bill.
+- **Expedia**: `https://www.expedia.com/mcp`. No login. Search only: booking is refused
+  by the money rule, so omega hands you the link.
+
 ## Boundary rule
 
 `apps/mac-tray` is a channel, not the agent. It may render conversation, collect context,

@@ -2123,6 +2123,12 @@ class ToolBox:
     #: (DL-087 #4). Empty means unknown, and the age is then left out.
     at: str = ""
 
+    #: Other people's MCP servers (DL-088): an :class:`omega.mcp.Remote`, or
+    #: ``None`` for none. Outside :data:`TOOL_NAMES` as ``web_search`` is: Ring
+    #: 1 is closed, and these are the person's configuration, not omega's body.
+    #: Typed loosely because Ring 1 must not import the adapter that imports it.
+    remote: Any = None
+
     def __post_init__(self) -> None:
         object.__setattr__(self, "store_root", Path(self.store_root).resolve())
         object.__setattr__(self, "remembered", tuple(self.remembered))
@@ -2137,6 +2143,12 @@ class ToolBox:
         and from nothing else.
         """
         tool = _TOOLS.get(name)
+        if tool is None and self.remote is not None and isinstance(arguments, dict):
+            # An MCP tool, refused or cleared by the adapter: money, writes and
+            # the allowlist are decided there, in code, from the name (DL-088).
+            decided = self.remote.classify(name, arguments)
+            if decided is not None:
+                return decided
         if tool is None:
             raise ToolRejected(
                 f"there is no tool called {name!r}; omega has "
@@ -2161,4 +2173,10 @@ class ToolBox:
                 f"{decision.tool} was classified {decision.tier}; it must be "
                 f"asked about, not dispatched"
             )
+        if decision.tool not in _TOOLS and self.remote is not None and self.remote.knows(decision.tool):
+            return self.remote.dispatch(decision)
         return _TOOLS[decision.tool].dispatch(self, decision.args)
+
+    def schemas(self) -> list[dict[str, Any]]:
+        """Ring 1, then this box's MCP tools (DL-088), in that order."""
+        return schemas() + (self.remote.schemas() if self.remote is not None else [])
