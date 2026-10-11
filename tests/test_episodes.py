@@ -163,6 +163,11 @@ def test_every_kind_round_trips():
             contradictions=1, resolved=1, reason="contradiction: no answer",
             at="2026-10-11T12:00:00+05:30",
         ),
+        ep.project_state(
+            project="omega", session="sess-1", ended_at="2026-10-11T11:00:00+05:30",
+            stopped_at="Parser streams.", next_step="Write the changelog.", blocked="",
+            at="2026-10-11T12:00:00+05:30",
+        ),
     ]
     assert {p["kind"] for p in built} == ep.KINDS, "a kind has no round-trip test"
     for payload in built:

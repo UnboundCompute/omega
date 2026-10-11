@@ -107,6 +107,9 @@ NOT_RECALLED = frozenset({
     episodes.CLAIM_ASKED,
     episodes.CLAIM_RESOLVED,
     episodes.MEMORY_TIDIED,
+    # Where a coding project was left (DL-087 #7): derived from a digest, and
+    # read through the `projects` tool, not replayed as conversation.
+    episodes.PROJECT_STATE,
 })
 
 #: **A count is not a budget** (DL-039). ``RECALL_N`` bounds how many episodes

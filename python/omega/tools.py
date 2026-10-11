@@ -81,6 +81,7 @@ from typing import Any, Callable, Optional, Sequence
 from urllib.parse import urlsplit
 
 from omega import calendar as calendars, episodes, finance as finances, inbox as inboxes, readable
+from omega import projects as worklog
 from omega.schedule import CronError, describe_cron, next_match, validate_cron, zone_label
 
 __all__ = [
@@ -170,6 +171,7 @@ INBOX = "inbox"
 MAIL = "mail"
 FINANCE = "finance"
 BRIEF = "brief"
+PROJECTS = "projects"
 
 #: Ring 1's remainder, and it is closed (DL-014). Spelled as a frozenset so
 #: that "the set does not grow" is a fact about an object and not a promise in
@@ -203,10 +205,14 @@ BRIEF = "brief"
 #: ``finance`` is DL-083: what they spent and received, read from the ledger
 #: the look's sweep of transaction mail writes into the log. It reads the log
 #: only — never IMAP, and never anything that moves money.
+#:
+#: ``projects`` is DL-087 #7: where each coding project was left, read from
+#: the ``project.state`` records finished sessions leave in the log. It reads
+#: the log only and never touches a repository.
 TOOL_NAMES = frozenset(
     {
         READ_FILE, WRITE_FILE, RUN_CODE, FETCH, RECALL, WATCH, UNWATCH, REMIND,
-        SCHEDULES, CALENDAR, INBOX, MAIL, FINANCE, BRIEF,
+        SCHEDULES, CALENDAR, INBOX, MAIL, FINANCE, BRIEF, PROJECTS,
     }
 )
 
@@ -288,9 +294,11 @@ def brief_instruction() -> str:
     return (
         f"{BRIEF_LEAD}their day, at the time they asked for it.\n"
         f"Look first: {CALENDAR} for today, {INBOX} for recent mail from people, "
-        f"{SCHEDULES} for what you are keeping for them, and what is still open "
-        "with them. Then give them a short brief: today's events with times, "
-        "mail that needs them, anything due or waiting. A few lines, the most "
+        f"{SCHEDULES} for what you are keeping for them, {PROJECTS} with days 1 "
+        "for coding projects they touched in the last day, and what is still "
+        "open with them. Then give them a short brief: today's events with "
+        "times, mail that needs them, anything due or waiting, one line per "
+        "project on where it was left. A few lines, the most "
         "pressing first. If a source could not be read, say so in a few words "
         "rather than leaving it out; if a day really is empty, say that."
     )
@@ -909,6 +917,30 @@ def _finance(box: "ToolBox", args: dict[str, Any]) -> str:
         raise ToolError("the finance ledger cannot be read from this turn")
     return _cap(finances.tool_text(
         box.ledger(), days=args["days"], now=datetime.now(timezone.utc)
+    ))
+
+
+def _classify_projects(box: "ToolBox", args: dict[str, Any]) -> Decision:
+    # Exploration: it reads the `project.state` records already in the log
+    # (DL-087 #7) and nothing else — never a repository.
+    name = args.get("project")
+    if _given(name) and not isinstance(name, str):
+        raise ToolRejected(f"{PROJECTS}'s 'project' must be a name")
+    name = name.strip() if isinstance(name, str) else ""
+    days = _days(PROJECTS, args, default=worklog.DEFAULT_DAYS, low=1, high=worklog.MAX_DAYS)
+    why = (
+        f"read where {name!r} was left" if name
+        else f"read where each coding project touched in the last {days} days was left"
+    )
+    return Decision(tool=PROJECTS, tier=EXPLORATION, why=why, args={"project": name, "days": days})
+
+
+def _projects(box: "ToolBox", args: dict[str, Any]) -> str:
+    if box.project_states is None:
+        raise ToolError("project states cannot be read from this turn")
+    return _cap(worklog.tool_text(
+        box.project_states(), project=args["project"], days=args["days"],
+        now=_now(),
     ))
 
 
@@ -2032,6 +2064,31 @@ _TOOLS: dict[str, _Tool] = {
             ["at"],
         ),
     ),
+    PROJECTS: _Tool(
+        classify=_classify_projects,
+        dispatch=_projects,
+        schema=_schema(
+            PROJECTS,
+            "Where they left off in their coding work, read from their "
+            "finished coding sessions (read-only; nothing is done to any "
+            "repository). With no project: each project touched recently and "
+            "where it was left. With a project name: that project's latest "
+            "state - where it stopped, the next step, anything blocked. Use it "
+            "when they ask where they were on something or what they were "
+            "working on.",
+            {
+                "project": {
+                    "type": "string",
+                    "description": "A project (repository) name. Omit to list recent ones.",
+                },
+                "days": {
+                    "type": "integer",
+                    "description": f"Without 'project': how many days back, 1 to {worklog.MAX_DAYS}; default {worklog.DEFAULT_DAYS}.",
+                },
+            },
+            [],
+        ),
+    ),
 }
 
 assert set(_TOOLS) == TOOL_NAMES, "the tool set and its registry disagree"
@@ -2043,7 +2100,7 @@ def schemas() -> list[dict[str, Any]]:
         _TOOLS[name].schema
         for name in (
             READ_FILE, WRITE_FILE, RUN_CODE, FETCH, RECALL, WATCH, UNWATCH, REMIND,
-            SCHEDULES, CALENDAR, INBOX, MAIL, FINANCE, BRIEF,
+            SCHEDULES, CALENDAR, INBOX, MAIL, FINANCE, BRIEF, PROJECTS,
         )
     ]
 
@@ -2118,6 +2175,11 @@ class ToolBox:
     #: second open of it. ``None`` makes the tool refuse rather than say
     #: nothing was recorded.
     ledger: Optional[Callable[[], Sequence[dict[str, Any]]]] = None
+
+    #: How ``projects`` reads (DL-087 #7): the ``project.state`` episodes in
+    #: the turn's own log, through the store the turn holds, as ``ledger``.
+    #: ``None`` makes the tool refuse rather than say nothing was worked on.
+    project_states: Optional[Callable[[], Sequence[dict[str, Any]]]] = None
 
     #: The turn's clock, so `recall` can say how old a stale claim is now
     #: (DL-087 #4). Empty means unknown, and the age is then left out.

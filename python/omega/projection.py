@@ -220,6 +220,9 @@ NOT_PROJECTED = frozenset(
         episodes.CLAIM_ASKED,
         episodes.CLAIM_RESOLVED,
         episodes.MEMORY_TIDIED,
+        # DL-087 #7. Where a project was left is read back by the `projects`
+        # tool and the brief, never pushed as an update of its own.
+        episodes.PROJECT_STATE,
     }
 )
 

@@ -335,8 +335,12 @@ def test_a_session_read_once_is_not_read_twice(store, tmp_path: Path) -> None:
     q, ex, fp = _ready(store)
 
     assert ex.ingest(root=tmp_path, now=NOW) == 1
+    # One reflection and one project-state call (DL-087 #7) on the first read;
+    # the second read must cost nothing more.
+    spent = len(fp.calls_for(provider.LEARN))
+    assert spent == 2
     assert ex.ingest(root=tmp_path, now=NOW) == 0
-    assert len(fp.calls_for(provider.LEARN)) == 1
+    assert len(fp.calls_for(provider.LEARN)) == spent
 
 
 def test_a_short_session_costs_a_receipt_and_no_model_call(

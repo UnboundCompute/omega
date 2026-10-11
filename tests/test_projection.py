@@ -344,6 +344,9 @@ def test_every_m1_kind_is_accounted_for() -> None:
         episodes.MEMORY_TIDIED: episodes.memory_tidied(
             checked_through=5, heard_through=0, at=AT
         ),
+        episodes.PROJECT_STATE: episodes.project_state(
+            project="omega", session="s", ended_at=AT, reason="answer was not JSON", at=AT
+        ),
     }
     assert set(made) == set(episodes.KINDS)
     for kind, payload in made.items():

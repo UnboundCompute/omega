@@ -57,6 +57,7 @@ __all__ = [
     "CLAIM_ASKED",
     "CLAIM_RESOLVED",
     "MEMORY_TIDIED",
+    "PROJECT_STATE",
     "STALE_CATEGORIES",
     "REPORT_TRANSCRIPT",
     "REPORT_USAGE",
@@ -92,6 +93,7 @@ __all__ = [
     "claim_asked",
     "claim_resolved",
     "memory_tidied",
+    "project_state",
     "reflection_done",
     "transcript_ingested",
     "usage_digested",
@@ -164,6 +166,10 @@ MEMORY_TIDIED = "memory.tidied"
 #: category and a category with no threshold would be a stale mark nobody can
 #: explain.
 STALE_CATEGORIES = frozenset({"job", "location", "plans"})
+#: Where a coding project was left, read from one finished session's digest
+#: (DL-087 #7). Derived like a claim: the newest per project is the live view,
+#: and nothing is ever edited.
+PROJECT_STATE = "project.state"
 
 #: The senses a relay may report for, by the name of the sense rather than of
 #: the file it read. Three of them end in a learning receipt; the machine sense
@@ -223,6 +229,7 @@ KINDS = frozenset(
         CLAIM_ASKED,
         CLAIM_RESOLVED,
         MEMORY_TIDIED,
+        PROJECT_STATE,
     }
 )
 
@@ -1278,6 +1285,47 @@ def memory_tidied(
     return payload
 
 
+def project_state(
+    *,
+    project: str,
+    session: str,
+    ended_at: str,
+    stopped_at: Optional[str] = None,
+    next_step: Optional[str] = None,
+    blocked: Optional[str] = None,
+    reason: Optional[str] = None,
+    usage: Optional[list[dict[str, Any]]] = None,
+    at: Optional[str] = None,
+) -> dict[str, Any]:
+    """Where one coding project was left at the end of one session (DL-087 #7).
+
+    ``project`` is the session's working directory's last component, read
+    mechanically from the digest; ``session`` the transcript it came from (the
+    same id its ``transcript.ingested`` receipt carries); ``ended_at`` when the
+    session finished. ``stopped_at`` / ``next_step`` / ``blocked`` are what
+    one LEARN call read off the digest — ``blocked`` may be ``""``.
+
+    **All or nothing.** ``reason`` set means the extraction failed and the
+    three state fields are ``None``: a record never carries half a state. Not
+    the transcript's words either — a sentence each, no more (DL-057).
+    """
+    payload = {
+        "v": VERSION,
+        "kind": PROJECT_STATE,
+        "project": project,
+        "session": session,
+        "ended_at": ended_at,
+        "stopped_at": stopped_at,
+        "next_step": next_step,
+        "blocked": blocked,
+        "reason": reason,
+        "at": at or now(),
+    }
+    _with_usage(payload, usage)
+    _validate(payload)
+    return payload
+
+
 def finance_started(*, at: Optional[str] = None) -> dict[str, Any]:
     """Finance tracking begins here (DL-083 #1). Mail dated before ``at`` is
     never recorded: no backfill, by the person's own word."""
@@ -1505,6 +1553,16 @@ _REQUIRED: dict[str, tuple[str, ...]] = {
     CLAIM_CONTRADICTION: ("claims", "question", "at"),
     CLAIM_ASKED: ("for_seq", "contradiction_seq", "at"),
     CLAIM_RESOLVED: ("contradiction_seq", "kept", "dropped", "answer_seq", "at"),
+    PROJECT_STATE: (
+        "project",
+        "session",
+        "ended_at",
+        "stopped_at",
+        "next_step",
+        "blocked",
+        "reason",
+        "at",
+    ),
     MEMORY_TIDIED: (
         "checked_through",
         "heard_through",
@@ -1538,6 +1596,7 @@ METERED_KINDS = frozenset(
         USAGE_DIGESTED,
         AUDIO_CAPTURED,
         MEMORY_TIDIED,
+        PROJECT_STATE,
     }
 )
 
@@ -1724,6 +1783,9 @@ def _validate(payload: dict[str, Any]) -> None:
         _validate_hygiene(payload)
     elif kind == MEMORY_TIDIED:
         _validate_tidied(payload)
+    elif kind == PROJECT_STATE:
+        # No `for_seq`: identified by the session it read, as its receipt is.
+        _validate_project_state(payload)
     elif kind == REFLECTION_DONE:
         # No `for_seq` and no `id`: a reflection belongs to no turn and names no
         # standing thing. It is identified by the stretch of log it covered.
@@ -2057,6 +2119,38 @@ def _validate_tidied(payload: dict[str, Any]) -> None:
     reason = payload["reason"]
     if reason is not None and not (isinstance(reason, str) and reason.strip()):
         raise BadPayload("reason must be null or a non-empty string")
+
+
+#: Ceiling on each state field, a little above what extraction clips to, so a
+#: hand-built record cannot smuggle a transcript in as a "sentence".
+MAX_STATE_CHARS = 400
+
+
+def _validate_project_state(payload: dict[str, Any]) -> None:
+    for field in ("project", "session", "ended_at"):
+        _require_str(payload, field, non_empty=True)
+    try:
+        datetime.fromisoformat(payload["ended_at"])
+    except ValueError as exc:
+        raise BadPayload(f"ended_at must be an ISO timestamp: {exc}") from exc
+    reason = payload["reason"]
+    fields = ("stopped_at", "next_step", "blocked")
+    if reason is not None:
+        if not (isinstance(reason, str) and reason.strip()):
+            raise BadPayload("reason must be null or a non-empty string")
+        if any(payload[f] is not None for f in fields):
+            # All or nothing: a failed extraction carries no half-state.
+            raise BadPayload("a failed project.state cannot carry state fields")
+        return
+    for field in fields:
+        value = payload[field]
+        if not isinstance(value, str):
+            raise BadPayload(f"{field} must be a string")
+        if len(value) > MAX_STATE_CHARS:
+            raise BadPayload(f"{field} is longer than {MAX_STATE_CHARS} characters")
+    for field in ("stopped_at", "next_step"):
+        if not payload[field].strip():
+            raise BadPayload(f"{field} must not be empty")
 
 
 def _require_str(payload: dict[str, Any], field: str, *, non_empty: bool = False) -> None:

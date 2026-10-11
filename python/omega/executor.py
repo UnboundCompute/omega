@@ -39,6 +39,7 @@ from omega import (
     listen,
     machine,
     notice,
+    projects,
     provider,
     tidy,
     tools,
@@ -701,6 +702,56 @@ class Executor:
             digest, make=episodes.transcript_ingested, receipt=receipt,
             lens=learn.WORK, cause=head,
         )
+        self._note_project(
+            digest, session=session.id, fallback=session.project,
+            ended_at=session.modified.isoformat(),
+        )
+
+    def _note_project(
+        self,
+        digest: Optional[str],
+        *,
+        session: str,
+        fallback: str,
+        ended_at: str,
+    ) -> None:
+        """Where this session left its project, as one ``project.state`` (DL-087 #7).
+
+        After the receipt, and only for a session that had a digest: a session
+        too short to digest, or one whose digest could not be made, has
+        nothing to read a state from, and its receipt already says so. One
+        LEARN call, failing closed — an answer that is not the exact shape is
+        a ``project.state`` with a ``reason`` and no state, never a guess.
+        Separate from the reflection on purpose: the claims and the receipt
+        are byte-for-byte what they were before this existed.
+
+        **Never raises**, for :meth:`ingest`'s reason. Nothing is done to the
+        repository the session was about; this only reads its digest.
+        """
+        if not digest:
+            return
+        try:
+            name = projects.project_of(digest, fallback)
+            meter = provider.Meter(self._completer())
+            try:
+                state = projects.extract(meter, digest)
+            except Exception as exc:  # noqa: BLE001 - recorded, not raised
+                self._queue.append(
+                    episodes.project_state(
+                        project=name, session=session, ended_at=ended_at,
+                        reason=str(exc) or type(exc).__name__,
+                        usage=meter.usage(),
+                    )
+                )
+                return
+            self._queue.append(
+                episodes.project_state(
+                    project=name, session=session, ended_at=ended_at,
+                    usage=meter.usage(), **state,
+                )
+            )
+        except Exception:  # noqa: BLE001 - see the docstring
+            return
 
     def _learn_from_digest(
         self,
@@ -1094,6 +1145,14 @@ class Executor:
                 receipt={"session": unit, **meta}, lens=learn.WORK,
                 reason=reason, cause=seq,
             )
+            if reason is None:
+                # The report's arrival stands in for the session's end: the
+                # relay sends a session once it has sat idle, and the digest
+                # carries only its date.
+                self._note_project(
+                    body, session=unit, fallback=str(meta.get("project", "")),
+                    ended_at=str(report.get("at", "")),
+                )
         elif source == episodes.REPORT_USAGE:
             self._learn_from_digest(
                 body, make=episodes.usage_digested,

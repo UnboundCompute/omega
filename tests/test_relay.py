@@ -235,12 +235,15 @@ def test_a_second_identical_report_is_a_no_op(store: MemoryStore, q: EventQueue)
     seq = _report(q, source="transcript", unit="sess-1", body=DIGEST, meta=SESSION_META, at=AT)
     assert ex.work_reports() == 1
     head = q.head()
+    # One reflection and one project-state call (DL-087 #7); the repeat adds none.
+    spent = len(fp.calls_for(provider.LEARN))
+    assert spent == 2
 
     # Byte-identical under the same key: the log hands back the first seq.
     assert _report(q, source="transcript", unit="sess-1", body=DIGEST, meta=SESSION_META, at=AT) == seq
     assert ex.work_reports() == 0
     assert q.head() == head
-    assert len(fp.calls_for(provider.LEARN)) == 1
+    assert len(fp.calls_for(provider.LEARN)) == spent
     assert len(_written(store, episodes.TRANSCRIPT_INGESTED)) == 1
 
 
