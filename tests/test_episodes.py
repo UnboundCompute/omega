@@ -188,6 +188,11 @@ def test_every_kind_round_trips():
                               "created_at": "2026-10-11T12:00:00+00:00"}},
             proposal=45, at="2026-10-11T12:00:00+00:00",
         ),
+        # DL-087 #8: a proposal that no longer applies.
+        ep.grant_withdrawn(
+            proposal=45, reason="you took back the tidy grant",
+            at="2026-10-11T12:00:00+00:00",
+        ),
         # DL-087 #2: following up on its own failures.
         ep.failure_told(
             subject="w1", kind="schedule", count=3,

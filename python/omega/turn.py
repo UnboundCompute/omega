@@ -29,7 +29,7 @@ restart test depends on.
 from __future__ import annotations
 
 import base64
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Any, Callable, Optional, Sequence
 
@@ -38,6 +38,8 @@ from omega.tools import (
     NOTHING_NEW,
     FOLLOW_UP,
     REPORT,
+    FOLLOWUP_ASK,
+    PROMISE_ASK,
     asks,
     is_brief,
     is_reminder,
@@ -117,6 +119,9 @@ NOT_RECALLED = frozenset({
     # Standing grants (DL-085) reach the prompt through their own section,
     # read off the fold, rather than as a line each in the conversation.
     *episodes.GRANT_KINDS,
+    # A withdrawn proposal (DL-087 #8) reaches them as one line of the next
+    # brief, read off the fold, not as a line of conversation.
+    episodes.GRANT_WITHDRAWN,
     # Follow-ups on omega's own failures (DL-087 #2): the tell is already in
     # the conversation as its own inbound; the record is bookkeeping.
     *episodes.FAILURE_KINDS,
@@ -237,6 +242,10 @@ class ActResult:
     error: Optional[str] = None
     stop_reason: str = ""
     text: Optional[str] = None
+    #: What code says after the reply, whatever the model wrote (DL-087 #8):
+    #: the question a proposal asks, with its id and how to answer it, and
+    #: "that one's closed" for an answer that came too late. Never blocks.
+    told: str = ""
 
 
 @dataclass(frozen=True)
@@ -486,21 +495,30 @@ def reply(ctx: TurnContext, verdict: Verdict, acted: ActResult) -> Optional[str]
     """
     if not verdict.speaks:
         return None
+    told_ = acted.told or None
     if unprompted(ctx) and REPORT in acted.tools:
         # The report is its own event, and the turn it causes tells them
         # (DL-085): saying it here too would tell them twice.
-        return None
+        return told_
     if acted.text is not None and acted.text.strip():
         if quiet_allowed(ctx, acted.text, acted):
             # Checked, and found nothing worth interrupting them for. On a
             # channel nobody typed on that is a decision, not an empty answer.
-            return None
+            # A proposal it filed is still asked: that is not news, it is a
+            # question (DL-087 #8).
+            return told_
+        if told_:
+            return f"{acted.text}\n\n{told_}"
         # The sub-loop already answered, holding every tool result. Composing
         # again here would ask a model that cannot see any of them to describe
         # work it did not watch — which is exactly how omega came to write a
         # file and then say it could not (see :class:`ActResult`). The cheapest
         # correct reply is the one already written.
         return acted.text
+    if told_:
+        # Code already has the words (a proposal's question, a closed
+        # answer); a model asked to restate them could only lose the id.
+        return told_
     response = ctx.complete(
         provider.ACT, _reply_messages(ctx, acted, look_reason(ctx, verdict))
     )
@@ -720,15 +738,17 @@ def run_turn(
         # what it reports is often that the model could not be reached.
         words = told(event)
         if asks(event):
-            # DL-087 #2: a follow-up that proposes pausing a watch is a
-            # question, so it waits on them like any other, and a plain "yes"
-            # is read against it (grants.reading's newest open question).
-            record = write_memory(
-                queue, seq=pending.seq, outcome="blocked", needs=words, at=at
-            )
-            return TurnResult(
-                seq=pending.seq, outcome="blocked", record_seq=record, needs=words
-            )
+            # DL-087 #2, #1: a follow-up that proposes pausing a watch, or a
+            # promise's reminder, is a question. Filed, not blocked (DL-087
+            # #8): it is said with its id and how to answer in place of the
+            # bare "Reply yes or no.", and a plain "yes" is still read against
+            # it while it is the newest thing omega asked.
+            asked = _proposal_for(queue, pending.seq)
+            if asked is not None and words.endswith(_REPLY_YES_NO):
+                words = (
+                    words[: -len(_REPLY_YES_NO)]
+                    + f" {granted.how_to_answer(asked)}"
+                )
         record = write_memory(
             queue, seq=pending.seq, outcome="spoke", reply_text=words, at=at
         )
@@ -755,7 +775,7 @@ def run_turn(
     acted = ActResult()
     try:
         verdict = judge(ctx)
-        if verdict.choice != ACT_THEN_SPEAK and not unprompted(ctx) and granted.reading(
+        if verdict.choice != ACT_THEN_SPEAK and not unprompted(ctx) and granted.answers(
             ctx.grants, ctx.event, ctx.open_work
         ):
             # Their yes or no to a proposal (DL-085 #3). The act step is where
@@ -802,6 +822,10 @@ def run_turn(
         if verdict.choice == ACT_THEN_SPEAK:
             acted = act(ctx)
             if acted.blocked_on:
+                waiting = _waiting(ctx)
+                if waiting:
+                    # A brief that stops on a "May I?" still lists them.
+                    acted = replace(acted, blocked_on=f"{acted.blocked_on}\n\n{waiting}")
                 record = write_memory(
                     queue,
                     seq=pending.seq,
@@ -848,6 +872,12 @@ def run_turn(
     # projected (DL-042), so the receipt has nowhere to ride but the one reply
     # this turn is about to record.
     receipt = _teach(ctx, pending, known=known, running=running, at=at)
+
+    brief = _waiting(ctx)
+    if brief:
+        # DL-087 #8: every proposal still waiting on them, and each withdrawn
+        # since the last brief, listed by code so none is ever dropped.
+        text = brief if text is None else f"{text}\n\n{brief}"
 
     if text is None and receipt is None:
         # Silence. A success, recorded as one, with `reply` null rather than
@@ -909,6 +939,36 @@ def run_turn(
         tools=tuple(acted.tools),
         verdict=verdict,
     )
+
+
+def _waiting(ctx: "TurnContext") -> str:
+    """A brief's list of proposals waiting on them and of withdrawals (DL-087
+    #8); empty for any other turn, and for a brief with none of either."""
+    if not is_brief(ctx.event):
+        return ""
+    now = str(ctx.event.get("at", "")) or episodes.now()
+    return granted.briefing(ctx.grants, ctx.seq, now=now)
+
+
+#: How every asking tell ends (:data:`omega.tools.FOLLOWUP_ASK`,
+#: :data:`omega.tools.PROMISE_ASK`); swapped for the proposal's own answer
+#: form once it is filed.
+_REPLY_YES_NO = " Reply yes or no."
+assert FOLLOWUP_ASK.endswith(_REPLY_YES_NO) and PROMISE_ASK.endswith(_REPLY_YES_NO)
+
+
+def _proposal_for(queue: EventQueue, seq: int) -> Optional[str]:
+    """The id of the proposal a follow-up tell at ``seq`` carries, or
+    ``None``. The executor writes it straight after the tell, so it is among
+    the next few records; a turn's grants fold stops at its own event and
+    cannot see it."""
+    for n, episode in enumerate(queue.store.episodes_since(seq)):
+        if n >= 8:
+            break
+        payload = episodes.decode(episode.payload)
+        if payload.get("kind") == episodes.GRANT_PROPOSED and payload.get("for_seq") == seq:
+            return granted.pid(episode.seq)
+    return None
 
 
 def _question_for(
@@ -1287,6 +1347,11 @@ def _grants_section(ctx: TurnContext) -> str:
         lines.append(f"- {scope} (given in message {g.for_seq}): {gate}")
     for p in state.pending:
         lines.append(f"- waiting on their yes or no to {p.pid}: {p.words()}")
+    if is_brief(ctx.event) and (state.pending or state.withdrawn_for_brief(ctx.seq)):
+        lines.append(
+            "The list of what waits on their answer, and of what you stopped "
+            "asking, is added after your brief in code; do not repeat it."
+        )
     for task, what in sorted(state.tasks.items()):
         lines.append(f"- research task {task} under way: {what}")
     if is_brief(ctx.event):

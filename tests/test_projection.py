@@ -361,6 +361,10 @@ def test_every_m1_kind_is_accounted_for() -> None:
             for_seq=1, scope="research", tool="follow_up", why="look again",
             args={"id": "f1-0001"}, undo={"cancel": "f1-0001"}, at=AT,
         ),
+        # DL-087 #8: a withdrawn proposal reaches them in the brief, never pushed.
+        episodes.GRANT_WITHDRAWN: episodes.grant_withdrawn(
+            proposal=2, reason="you took back the tidy grant", at=AT,
+        ),
         # DL-087 #2: what omega said about its own failures, never pushed.
         episodes.FAILURE_TOLD: episodes.failure_told(
             subject="w1", kind="schedule", count=3, last_error="boom", at=AT,

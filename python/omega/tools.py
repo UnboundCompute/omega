@@ -124,6 +124,7 @@ __all__ = [
     "PROMISE_ASK",
     "promise_text",
     "asks",
+    "PENDING",
     "RESEARCH_LEAD",
     "research_instruction",
     "is_research",
@@ -197,6 +198,7 @@ UNDO = "undo"
 #: an open promise to close — so Ring 1, and every turn without that grant,
 #: is exactly what it was.
 PROMISE = "promise"
+PENDING = "pending"
 
 #: Ring 1's remainder, and it is closed (DL-014). Spelled as a frozenset so
 #: that "the set does not grow" is a fact about an object and not a promise in
@@ -241,11 +243,15 @@ PROMISE = "promise"
 #: their watches and reminders; carry a research task to its report); ``undo``
 #: takes back what was done under one. All five write only omega's own log, and
 #: none of them is offered where it could not run (:func:`schemas`).
+#:
+#: ``pending`` is DL-087 #8: the proposals waiting on their yes or no, each
+#: with its id and how to answer it, read off the grants fold. Read-only, and
+#: offered only while there is something to list.
 TOOL_NAMES = frozenset(
     {
         READ_FILE, WRITE_FILE, RUN_CODE, FETCH, RECALL, WATCH, UNWATCH, REMIND,
         SCHEDULES, CALENDAR, INBOX, MAIL, FINANCE, BRIEF, PROJECTS,
-        GRANT, TIDY, FOLLOW_UP, REPORT, UNDO,
+        GRANT, TIDY, FOLLOW_UP, REPORT, UNDO, PENDING,
     }
 )
 
@@ -450,8 +456,9 @@ def promise_text(found: Sequence[Any]) -> str:
 
 def asks(event: dict[str, Any]) -> bool:
     """Is this tell a question waiting on their yes or no (a follow-up that
-    proposes pausing a watch, or a promise's reminder)? Its turn then ends
-    blocked, so a plain "yes" answers it."""
+    proposes pausing a watch, or a promise's reminder)? Its turn is spoken
+    with the proposal's id and how to answer (DL-087 #8), and a plain "yes"
+    answers it while it is the newest thing omega asked."""
     return is_tell(event) and told(event).endswith((FOLLOWUP_ASK, PROMISE_ASK))
 
 
@@ -1576,6 +1583,29 @@ def _promise(box: "ToolBox", args: dict[str, Any]) -> str:
     return f"promise {args['promise']} marked {args['how']}"
 
 
+def _classify_pending(box: "ToolBox", args: dict[str, Any]) -> Decision:
+    # Exploration: it reads the grants fold this turn already holds (DL-087
+    # #8), and nothing else.
+    return Decision(
+        tool=PENDING, tier=EXPLORATION,
+        why="list the proposals waiting on their answer", args={},
+    )
+
+
+def _pending(box: "ToolBox", args: dict[str, Any]) -> str:
+    waiting = box.grants.pending if box.grants is not None else ()
+    if not waiting:
+        return "nothing is waiting on their answer"
+    lines = []
+    for p in waiting:
+        old = " (old)" if grants.is_old(p, box.at) else ""
+        lines.append(
+            f"{p.pid}: {p.words()}, since {grants.since_words(p.at)}{old}. "
+            f"{grants.how_to_answer(p.pid)}"
+        )
+    return "\n".join(lines)
+
+
 def describe_schedule(s: Any, *, now: Optional[datetime] = None) -> str:
     """One running schedule as the person would recognise it: what kind it
     is, when it runs, and what it is about, read off the stored definition."""
@@ -2645,6 +2675,18 @@ _TOOLS: dict[str, _Tool] = {
             ["action"],
         ),
     ),
+    PENDING: _Tool(
+        classify=_classify_pending,
+        dispatch=_pending,
+        schema=_schema(
+            PENDING,
+            "List what you asked them and are still waiting on their yes or no "
+            "for, each with its id (p12) and since when. Use it when they ask "
+            "what is waiting on them, or which id to answer.",
+            {},
+            [],
+        ),
+    ),
 }
 
 assert set(_TOOLS) == TOOL_NAMES, "the tool set and its registry disagree"
@@ -2682,7 +2724,7 @@ def schemas(hide: "frozenset[str] | set[str]" = frozenset()) -> list[dict[str, A
         for name in (
             READ_FILE, WRITE_FILE, RUN_CODE, FETCH, RECALL, WATCH, UNWATCH, REMIND,
             SCHEDULES, CALENDAR, INBOX, MAIL, FINANCE, BRIEF, PROJECTS,
-            GRANT, TIDY, FOLLOW_UP, REPORT, UNDO,
+            GRANT, TIDY, FOLLOW_UP, REPORT, UNDO, PENDING,
         )
         if name not in hide
     ]
@@ -2704,6 +2746,9 @@ def hidden(box: "ToolBox") -> frozenset[str]:
             out.add(FOLLOW_UP)
     if state is None or not state.acted:
         out.add(UNDO)
+    if state is None or not state.pending:
+        # Nothing to list (DL-087 #8): offered only while a proposal waits.
+        out.add(PENDING)
     return frozenset(out)
 
 

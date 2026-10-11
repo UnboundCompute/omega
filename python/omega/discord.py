@@ -55,6 +55,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import os
+import re
 import sys
 import tempfile
 import threading
@@ -69,6 +70,8 @@ from omega.channel import DEFAULT_HOST, DEFAULT_PORT, PROTOCOL, ChannelClient, C
 
 __all__ = [
     "CHANNEL",
+    "REACTION_WORDS",
+    "reaction_answer",
     "LIMIT",
     "ENV_TOKEN",
     "ENV_OWNER",
@@ -145,6 +148,41 @@ def accepts(
     if self_id is not None and author_id == self_id:
         return False
     return author_id == owner_id
+
+
+#: A reaction on omega's own proposal message that answers it (DL-087 #8).
+REACTION_WORDS = {"\u2705": "yes", "\u274c": "no"}
+#: How a proposal message names the id it asks about, and how to answer it.
+_ASKS = re.compile(r'"yes (p\d+)"')
+
+
+def reaction_answer(
+    *,
+    emoji: str,
+    user_id: int,
+    owner_id: int,
+    author_id: Optional[int],
+    self_id: Optional[int],
+    in_guild: bool,
+    content: str,
+) -> Optional[str]:
+    """What a reaction says, as the words of an answer, or ``None``.
+
+    Only the owner's, only in their DM, only a check or a cross, and only on
+    omega's own message that asks exactly one proposal ("yes p12"): a check on
+    a message asking two would be a guess about which, so it says nothing and
+    they answer in words. The words are what they would have typed, so the
+    core reads them exactly as it reads a typed answer.
+    """
+    word = REACTION_WORDS.get(emoji)
+    if word is None or in_guild or user_id != owner_id:
+        return None
+    if self_id is None or author_id != self_id:
+        return None
+    ids = set(_ASKS.findall(content or ""))
+    if len(ids) != 1:
+        return None
+    return f"{word} {ids.pop()}"
 
 
 def is_audio(filename: str, content_type: Optional[str]) -> bool:
@@ -331,6 +369,17 @@ class Dm:
             await self._say(message, text)
         for attachment in audio:
             await self._recording(message, attachment)
+
+    async def react(self, message_id: Any, text: str) -> None:
+        """A reaction already read as an answer (:func:`reaction_answer`).
+        Keyed by the message and the word, so a reaction taken off and put
+        back lands on the duplicate path rather than as a second answer."""
+        key = f"react:{message_id}:{text.split()[0]}"
+        ack = await asyncio.to_thread(self._inbound.say, key, text)
+        if ack is None or ack.get("op") != "ack":
+            self._note("a reaction did not reach the core")
+            return
+        self._note(f"reaction filed as seq {ack['seq']}{' (duplicate)' if ack.get('duplicate') else ''}")
 
     async def _say(self, message: Any, text: str) -> None:
         ack = await asyncio.to_thread(self._inbound.say, message.id, text)
@@ -778,6 +827,33 @@ def _run(
         ):
             return
         await dms.handle(message)
+
+    @client.event
+    async def on_raw_reaction_add(payload: Any) -> None:
+        # DL-087 #8. DM reactions arrive under the default intents already
+        # (``dm_reactions``); nothing new is asked of the gateway. Cheap checks
+        # first, so a reaction that cannot answer fetches nothing.
+        if payload.guild_id is not None or payload.user_id != owner_id:
+            return
+        if str(payload.emoji) not in REACTION_WORDS:
+            return
+        try:
+            channel = client.get_channel(payload.channel_id) or await client.fetch_channel(payload.channel_id)
+            message = await channel.fetch_message(payload.message_id)
+        except Exception:  # noqa: BLE001 - an unreadable message answers nothing
+            log("could not read the message a reaction was on")
+            return
+        words = reaction_answer(
+            emoji=str(payload.emoji),
+            user_id=payload.user_id,
+            owner_id=owner_id,
+            author_id=message.author.id,
+            self_id=client.user.id if client.user else None,
+            in_guild=False,
+            content=message.content,
+        )
+        if words is not None:
+            await dms.react(payload.message_id, words)
 
     async def runner() -> None:
         loop = asyncio.get_running_loop()

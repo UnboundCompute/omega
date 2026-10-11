@@ -211,6 +211,7 @@ class Executor:
         "_open",
         "_learned",
         "_grants",
+        "_head_grants",
         "_followups",
         "_promises",
         "_promises_now",
@@ -253,6 +254,10 @@ class Executor:
         self._learned = Learned()
         # Standing grants (DL-085), folded like the views beside it.
         self._grants = Grants()
+        # The same fold kept at the log's head (DL-087 #8), for one question
+        # only: which proposals no longer apply, to be written down as
+        # withdrawn. `_grants` cannot answer it: it stops at the turn.
+        self._head_grants = Grants()
         # Omega's own failures (DL-087 #2), folded the same way: a count that
         # survives a restart because the failures are in the log.
         self._followups = Followups()
@@ -1458,6 +1463,7 @@ class Executor:
         self._queue.finish(pending.seq)
         # After the reply is durable, and never able to fail or hold it.
         self._hold_promises(pending)
+        self._withdraw()
         return result
 
     def _hold_promises(self, pending: Pending) -> None:
@@ -1584,6 +1590,15 @@ class Executor:
                     why=decision.why, args=decision.args,
                     undo=grants.undo_for(decision.tool, decision.args), proposal=None,
                 ))
+
+    def _withdraw(self) -> None:
+        """Write down every proposal that stopped applying (DL-087 #8): its
+        grant taken back, its gate put back, its schedule stopped or changed,
+        its research finished. After the turn, because the turn is what most
+        often makes one lapse (a revoke, a cancel). Writes nothing while no
+        proposal is pending, so a log without them gains no records."""
+        self._head_grants.advance(self._queue.store)
+        grants.withdraw_lapsed(self._queue.append, self._head_grants.state())
 
     def _standing_schedules(self) -> list[Schedule]:
         self._standing.refresh()

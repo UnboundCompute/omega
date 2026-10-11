@@ -347,9 +347,10 @@ def test_under_tidy_a_failing_watch_is_proposed_paused_and_a_yes_pauses_it(q: Ev
     assert action["args"]["was"]["id"] == "w1-abcd"
 
     # The tell is a question: delivered with no model call, and waiting.
+    # DL-087 #8: it speaks (the proposal is filed, not blocking), with its id.
     result, fp = deliver(q)
-    assert result.outcome == "blocked" and fp.calls == []
-    assert "Should I pause it" in (result.needs or "")
+    assert result.outcome == "spoke" and fp.calls == []
+    assert "Should I pause it" in (result.reply or "")
     assert "w1-abcd" in {s.id for s in _running(q)}, "nothing ran on its own"
 
     # Their plain yes is read against it, through the gate, and pauses it.
@@ -447,8 +448,9 @@ def test_the_brief_says_why_a_task_could_not_finish_and_may_carry_it_on(q: Event
     assert f"follow_up (task {task})" in prompt
     offered = {t["function"]["name"] for t in fp.offers_for(provider.ACT)[0] if "function" in t}
     assert "follow_up" in offered
-    # Through the DL-085 gate, as ever: proposed, not set.
-    assert result.outcome == "blocked"
+    # Through the DL-085 gate, as ever: proposed, not set. Filed, and the
+    # brief speaks rather than blocks (DL-087 #8).
+    assert result.outcome == "spoke"
     [proposal] = kinds(q, episodes.GRANT_PROPOSED)
     assert proposal["scope"] == "research" and proposal["actions"][0]["args"]["task"] == task
     assert not any(s.id.startswith(f"f{task}-") for s in _running(q))

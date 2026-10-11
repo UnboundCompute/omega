@@ -87,10 +87,11 @@ def propose_tidy(q: EventQueue, sid: str = "w1-abcd") -> tuple[int, int]:
     """A prompted turn asks to retire ``sid``; returns (turn seq, proposal seq)."""
     seq = say(q, "please tidy up")
     result, _ = turn(q, seq, act=[call("tidy", id=sid, change="retire", why="it is stale")])
-    assert result.outcome == "blocked", result
+    # DL-087 #8: a proposal is filed and the turn speaks; it no longer blocks.
+    assert result.outcome == "spoke", result
     [proposal] = [p for p in kinds(q, episodes.GRANT_PROPOSED) if p["for_seq"] == seq]
     pseq = next(x.seq for x in q.recent(500) if x.payload is not None and x.payload == proposal)
-    assert f"p{pseq}" in result.needs
+    assert f"p{pseq}" in result.reply
     return seq, pseq
 
 
@@ -287,8 +288,9 @@ def test_ten_approvals_propose_dropping_the_gate_and_do_not_drop_it(q: EventQueu
         result, _ = turn(q, say(q, "yes"), act=["Done."])
         if i < grants.GATE_DROP_AFTER - 1:
             assert result.outcome == "spoke"
-    assert result.outcome == "blocked"
-    assert "10 approvals in a row" in result.needs
+    # DL-087 #8: asked as part of the reply, not by blocking the turn.
+    assert result.outcome == "spoke"
+    assert "10 approvals in a row" in result.reply
     drops = [p for p in kinds(q, episodes.GRANT_PROPOSED) if p["proposes"] == "drop_gate"]
     assert len(drops) == 1
     s = state(q)
@@ -453,7 +455,8 @@ def test_research_is_carried_to_a_report(q: EventQueue) -> None:
     give(q, "research")
     ask = say(q, "research the best e-reader for me, the new ones come out tomorrow")
     result, _ = turn(q, ask, act=[call("follow_up", what="new e-readers", in_minutes=60)])
-    assert result.outcome == "blocked" and "Should I" in result.needs
+    # DL-087 #8: filed and asked; the turn speaks rather than blocks.
+    assert result.outcome == "spoke" and "Should I" in result.reply
     turn(q, say(q, "yes"), act=["I'll look again in an hour."])
     [sched] = [s for s in kinds(q, episodes.SCHEDULE_CREATED) if s["id"].startswith("f")]
     assert tools.research_task({"channel": "schedule", "text": sched["instruction"]}) == ask

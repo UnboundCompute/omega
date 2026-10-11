@@ -66,6 +66,8 @@ __all__ = [
     "GRANT_ANSWERED",
     "GRANT_ACTED",
     "GRANT_KINDS",
+    "GRANT_WITHDRAWN",
+    "MAX_WITHDRAWN_REASON",
     "GRANT_SCOPES",
     "GRANT_PROPOSES",
     "FAILURE_TOLD",
@@ -215,6 +217,14 @@ GRANT_ACTED = "grant.acted"
 GRANT_KINDS = frozenset(
     {GRANT_GIVEN, GRANT_REVOKED, GRANT_RESTORED, GRANT_PROPOSED, GRANT_ANSWERED, GRANT_ACTED}
 )
+#: A proposal that no longer applies, written down rather than dropped
+#: (DL-087 #8): its grant was taken back, its gate put back, its schedule
+#: stopped or changed, or its research finished. Names the proposal and why.
+#: Outside :data:`GRANT_KINDS` because it belongs to no turn and no scope:
+#: the executor writes it when it sees the proposal has lapsed. A record.
+GRANT_WITHDRAWN = "grant.withdrawn"
+#: Ceiling on why a proposal was withdrawn. One clause, read in a brief.
+MAX_WITHDRAWN_REASON = 200
 #: The only grants there are (DL-085 #5, DL-087 #1): carry its own research
 #: tasks to the end, tidy their reminders and watches, and hold them to the
 #: promises they make in their own messages. Closed, like the tool set.
@@ -317,6 +327,7 @@ KINDS = frozenset(
         GRANT_PROPOSED,
         GRANT_ANSWERED,
         GRANT_ACTED,
+        GRANT_WITHDRAWN,
         FAILURE_TOLD,
         FAILURE_RECOVERED,
         PROMISE_NOTED,
@@ -1791,6 +1802,7 @@ _REQUIRED: dict[str, tuple[str, ...]] = {
     GRANT_REVOKED: ("for_seq", "scope", "at"),
     GRANT_RESTORED: ("for_seq", "scope", "at"),
     GRANT_PROPOSED: ("for_seq", "scope", "proposes", "actions", "at"),
+    GRANT_WITHDRAWN: ("proposal", "reason", "at"),
     GRANT_ANSWERED: ("for_seq", "scope", "proposal", "proposed_for", "yes", "at"),
     GRANT_ACTED: (
         "for_seq", "scope", "tool", "why", "args", "undo", "gated", "proposal", "at"
@@ -1803,6 +1815,18 @@ _REQUIRED: dict[str, tuple[str, ...]] = {
 _UNATTACHED_KINDS = frozenset(
     {MESSAGE_INBOUND, SCHEDULE_CREATED, SCHEDULE_CANCELLED, AUDIO_CAPTURED}
 )
+
+
+def grant_withdrawn(*, proposal: int, reason: str, at: Optional[str] = None) -> dict[str, Any]:
+    """A proposal withdrawn because it no longer applies (DL-087 #8).
+
+    ``proposal`` is the ``grant.proposed`` seq (its id); ``reason`` says why,
+    in words the next brief can show them as they are.
+    """
+    payload = {"v": VERSION, "kind": GRANT_WITHDRAWN, "proposal": proposal,
+               "reason": reason, "at": at or now()}
+    _validate(payload)
+    return payload
 
 
 def failure_told(
@@ -2068,6 +2092,13 @@ def _validate(payload: dict[str, Any]) -> None:
         # No `for_seq`: written after the turn's reply, by code, and named by
         # the message it came from (or the promise it ends) instead.
         _validate_promise(payload)
+    elif kind == GRANT_WITHDRAWN:
+        # No `for_seq`: written by the executor, not by a turn. It names the
+        # proposal it closes instead.
+        _require_seq(payload, "proposal")
+        _require_str(payload, "reason", non_empty=True)
+        if len(payload["reason"]) > MAX_WITHDRAWN_REASON:
+            raise BadPayload(f"reason must be at most {MAX_WITHDRAWN_REASON} characters")
     elif kind in GRANT_KINDS:
         # Attached: ``for_seq`` is the turn that wrote it, which for a grant
         # given, revoked or restored is the person's own message (DL-085 #6).

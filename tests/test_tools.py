@@ -84,6 +84,7 @@ def test_ring_one_is_closed_and_the_registry_agrees() -> None:
         "follow_up",
         "report",
         "undo",
+        "pending",  # DL-087 #8: proposals waiting on their answer, read-only
     }
     assert {s["function"]["name"] for s in tools.schemas()} == tools.TOOL_NAMES
 

@@ -417,10 +417,11 @@ def test_a_due_promise_is_one_tell_and_a_yes_sets_its_reminder(q: EventQueue) ->
     assert "send the deck to Priya" in tell["text"] and "call mum" not in tell["text"]
     assert running(q) == {}, "nothing set before their yes"
 
-    # The tell is a question: delivered blocked, with no model call.
+    # The tell is a question: delivered with no model call. Spoken, not
+    # blocked, since DL-087 #8 files a proposal as pending.
     calls = len(script.fp.calls)
     result = turn(ex, q)
-    assert result is not None and result.outcome == "blocked"
+    assert result is not None and result.outcome == "spoke"
     assert len(script.fp.calls) == calls
 
     say(q, "yes")
@@ -444,7 +445,7 @@ def test_a_no_sets_nothing(q: EventQueue) -> None:
     say(q, "I'll send the deck Tuesday")
     ex = executor(q, script)
     turn(ex, q)
-    assert turn(ex, q).outcome == "blocked"
+    assert turn(ex, q).outcome == "spoke"
     say(q, "no")
     turn(ex, q)
     assert running(q) == {} and kinds(q, episodes.GRANT_ACTED) == []
