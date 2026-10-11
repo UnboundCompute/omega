@@ -59,6 +59,7 @@ def test_ring_one_is_closed_and_the_registry_agrees() -> None:
     # DL-077 added `schedules`: the read half of those, so omega can see the
     # ids `unwatch` needs. DL-080 added `calendar` and `inbox` (read-only
     # senses of their day and mail) and `brief` (a watch with a fixed job).
+    # DL-082 added `mail`: one listed mail opened in full, read-only.
     assert tools.TOOL_NAMES == {
         "read_file",
         "write_file",
@@ -71,6 +72,7 @@ def test_ring_one_is_closed_and_the_registry_agrees() -> None:
         "schedules",
         "calendar",
         "inbox",
+        "mail",  # DL-082
         "brief",
     }
     assert {s["function"]["name"] for s in tools.schemas()} == tools.TOOL_NAMES

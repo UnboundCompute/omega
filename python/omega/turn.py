@@ -828,7 +828,7 @@ _JUDGE_SYSTEM = (
     "or overdue, something waiting on them or on you, their machine needing "
     "attention (a reading flagged LOW, above all one that is new since your "
     "last look or worse than when it was first flagged), an event on their "
-    "calendar starting within about half an hour, unread mail from a person "
+    "calendar starting within about half an hour, new mail from a person "
     "that needs their answer or attention, or a real change in "
     "something they asked you to track. Trivia, news they did not ask for, "
     "newsletters and notifications, events hours away, "
@@ -1245,9 +1245,31 @@ def _render_payload(payload: dict[str, Any]) -> str:
     if kind == episodes.TOOL_CALLED:
         return f"tool {payload.get('tool')} called"
     if kind == episodes.TOOL_RETURNED:
+        if payload.get("ok") and payload.get("tool") == "mail":
+            return f"tool mail ok: {_mail_digest(str(payload.get('result') or ''))}"
         ok = "ok" if payload.get("ok") else f"failed: {payload.get('error')}"
         return f"tool {payload.get('tool')} {ok}"
     return str(kind)
+
+
+#: How long a recalled ``mail`` result may run (DL-082 #5).
+MAIL_DIGEST_CHARS = 200
+
+
+def _mail_digest(result: str) -> str:
+    """One line saying which mail was opened, so what was read stays in
+    context without its body. A held mail's result is already its redacted
+    digest; an ordinary one is reduced to its From and Subject lines."""
+    head = dict(
+        line.split(": ", 1) for line in result.splitlines()[:3] if ": " in line
+    )
+    if "From" in head:
+        line = f"opened mail from {head['From']}: {head.get('Subject', '(no subject)')}"
+    else:
+        line = " ".join(result.split())
+    if len(line) > MAIL_DIGEST_CHARS:
+        line = line[: MAIL_DIGEST_CHARS - 1].rstrip() + "…"
+    return line
 
 
 #: Caps on what travels as pixels (DL-031). A starting guess, not a

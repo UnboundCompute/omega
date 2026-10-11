@@ -120,6 +120,7 @@ def test_tools_are_offered_to_act_and_to_nobody_else(q: EventQueue, box: ToolBox
         "schedules",
         "calendar",
         "inbox",
+        "mail",  # DL-082
         "brief",
     }
     # Beside Ring 1, not in it (DL-067): the provider's own search.

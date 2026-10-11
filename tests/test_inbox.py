@@ -115,6 +115,8 @@ class FakeIMAP:
         raise AssertionError(f"unexpected UID {command}")
 
     def _fetch(self, uid: int, what: str):
+        if uid not in self.mails:
+            return "OK", [None]  # what a server says for a UID it does not have
         m = self.mails[uid]
         raw = m["raw"]
         if "HEADER.FIELDS" in what:
@@ -390,7 +392,7 @@ def test_server_error_scrubbed_and_logout_always() -> None:
 
 def _mail(date: datetime | None, **kw: Any) -> inbox.Mail:
     base = dict(sender="Kaushik R <k@x.com>", subject="lunch?", date=date,
-                snippet="are we on?", bulk=False, unread=True)
+                snippet="are we on?", bulk=False, unread=True, uid=7, held=False)
     return inbox.Mail(**{**base, **kw})
 
 
@@ -402,11 +404,18 @@ def test_lines_today_yesterday_weekday(ist) -> None:
         _mail(None),
     ], NOW)
     assert out == [
-        "14:05 from Kaushik R <k@x.com>: lunch? — are we on?",
-        "yesterday 18:20 from Kaushik R <k@x.com>: lunch?",
-        "Tue 06 Oct from Kaushik R <k@x.com>: lunch? — are we on? (read)",
-        "undated from Kaushik R <k@x.com>: lunch? — are we on?",
+        "14:05 from Kaushik R <k@x.com>: lunch? — are we on? #7",
+        "yesterday 18:20 from Kaushik R <k@x.com>: lunch? #7",
+        "Tue 06 Oct from Kaushik R <k@x.com>: lunch? — are we on? (read) #7",
+        "undated from Kaushik R <k@x.com>: lunch? — are we on? #7",
     ]
+
+
+def test_held_line_shows_subject_never_snippet(ist) -> None:
+    out = inbox.lines([_mail(datetime(2026, 10, 9, 14, 5, tzinfo=IST), held=True,
+                             snippet="code 482913", uid=31, unread=False)], NOW)
+    assert out == ["14:05 from Kaushik R <k@x.com>: lunch? "
+                   "[held: opens only when they ask] (read) #31"]
 
 
 def test_look_lines_not_configured() -> None:
@@ -426,22 +435,26 @@ def test_look_lines_people_then_bulk_count(ist) -> None:
         1: {"msg": {"sender": "News <n@x.com>", "extra": "List-Id: <n.x.com>\r\n"}},
         2: {"msg": {"sender": "Bot <b@x.com>", "extra": "Auto-Submitted: auto-replied\r\n"}},
         3: {},
+        4: {"flags": ["\\Seen"], "msg": {"subject": "seen it"}},
     })
     out = inbox.look_lines(NOW, environ=ENV, connect=connect)
     assert out == [
-        "14:05 from Kaushik R <k@x.com>: lunch? — Are we on for lunch tomorrow?",
-        "(and 2 unread newsletters/notifications, not listed)",
+        "14:05 from Kaushik R <k@x.com>: seen it — Are we on for lunch tomorrow? (read) #4",
+        "14:05 from Kaushik R <k@x.com>: lunch? — Are we on for lunch tomorrow? #3",
+        "(and 2 newsletters/notifications, not listed)",
     ]
+    # Read mail too (DL-082 #6): no UNSEEN in the look's search.
+    assert "UNSEEN" not in _search(connect)
 
 
 def test_look_lines_none_from_people(ist) -> None:
     connect = server()
     assert inbox.look_lines(NOW, environ=ENV, connect=connect) == [
-        "no unread mail from people in the last 2 days"]
+        "no mail from people in the last 2 days"]
     connect = server({1: {"msg": {"extra": "Precedence: bulk\r\n"}}})
     assert inbox.look_lines(NOW, environ=ENV, connect=connect) == [
-        "no unread mail from people in the last 2 days",
-        "(and 1 unread newsletters/notifications, not listed)",
+        "no mail from people in the last 2 days",
+        "(and 1 newsletters/notifications, not listed)",
     ]
 
 
@@ -464,8 +477,8 @@ def test_tool_text_tags_bulk_and_raises_on_failure(ist) -> None:
                       2: {"flags": ["\\Seen"], "msg": {"body": b""}}})
     text = inbox.tool_text(unread_only=False, now=NOW, environ=ENV, connect=connect)
     assert text.splitlines() == [
-        "14:05 from Kaushik R <k@x.com>: lunch? (read)",  # same Date: higher UID first
-        "14:05 from Kaushik R <k@x.com>: lunch? [bulk]",
+        "14:05 from Kaushik R <k@x.com>: lunch? (read) #2",  # same Date: higher UID first
+        "14:05 from Kaushik R <k@x.com>: lunch? [bulk] #1",
     ]
     bad = server(fail={"login": imaplib.IMAP4.error(PASSWORD)})
     with pytest.raises(inbox.InboxUnavailable) as caught:
