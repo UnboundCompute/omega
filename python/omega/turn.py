@@ -34,7 +34,15 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Optional, Sequence
 
 from omega import blobs, derive, episodes, learn, notice, provider, schedule
-from omega.tools import NOTHING_NEW, is_brief, is_reminder, is_tell, must_speak, told
+from omega.tools import (
+    NOTHING_NEW,
+    is_brief,
+    is_reminder,
+    is_tell,
+    is_watch,
+    must_speak,
+    told,
+)
 from omega.queue import EVENT_KINDS, EventQueue, Pending
 
 __all__ = [
@@ -50,6 +58,7 @@ __all__ = [
     "MAX_OPEN_CHARS",
     "MAX_LEARNED_CHARS",
     "MAX_ACT_PASSES",
+    "UNLOOKED",
     "JudgeUndecided",
     "NotAnEvent",
     "Verdict",
@@ -278,11 +287,28 @@ def _judged(verdict: Optional["Verdict"]) -> Optional[str]:
     return " ".join(verdict.raw.split())[:300]
 
 
-def quiet_allowed(ctx: "TurnContext", text: str) -> bool:
+#: The error a turn fails with when it said "nothing new" having looked at
+#: nothing (DL-089 #2).
+UNLOOKED = "answered nothing new without looking"
+
+
+def quiet_allowed(ctx: "TurnContext", text: str, acted: "ActResult") -> bool:
     """May this reply end the turn in silence? Only an unprompted check that
-    found nothing, and never a reminder or a brief coming due (DL-075,
-    DL-080)."""
-    return unprompted(ctx) and not must_speak(ctx.event) and nothing_new(text)
+    found nothing, never a reminder or a brief coming due (DL-075, DL-080),
+    and only after a real look: at least one tool call that came back
+    (DL-089). ``acted.tools`` lists exactly those, the calls whose
+    ``tool.returned`` was ok, hosted searches included; a refused or failed
+    call is not a look.
+
+    An unprompted turn that answers the sentinel without having looked is not
+    an all-clear, and it is not silence either: it raises, so the turn is
+    recorded as failed with :data:`UNLOOKED` in its error.
+    """
+    if not (unprompted(ctx) and not must_speak(ctx.event) and nothing_new(text)):
+        return False
+    if not acted.tools:
+        raise RuntimeError(UNLOOKED)
+    return True
 
 
 def nothing_new(text: str) -> bool:
@@ -409,7 +435,7 @@ def reply(ctx: TurnContext, verdict: Verdict, acted: ActResult) -> Optional[str]
     if not verdict.speaks:
         return None
     if acted.text is not None and acted.text.strip():
-        if quiet_allowed(ctx, acted.text):
+        if quiet_allowed(ctx, acted.text, acted):
             # Checked, and found nothing worth interrupting them for. On a
             # channel nobody typed on that is a decision, not an empty answer.
             return None
@@ -422,7 +448,7 @@ def reply(ctx: TurnContext, verdict: Verdict, acted: ActResult) -> Optional[str]
     response = ctx.complete(
         provider.ACT, _reply_messages(ctx, acted, look_reason(ctx, verdict))
     )
-    if quiet_allowed(ctx, response.text):
+    if quiet_allowed(ctx, response.text, acted):
         return None
     if not response.text.strip():
         # DL-011, stated as sharply as it deserves: a model that **returns no
@@ -673,6 +699,13 @@ def run_turn(
             # A brief is the same promise with looking built in (DL-080): a
             # brief that only spoke would brief them from nothing, so any
             # verdict but ACT becomes ACT.
+            verdict = Verdict(choice=ACT_THEN_SPEAK, raw=verdict.raw)
+        elif verdict.choice != ACT_THEN_SPEAK and is_watch(ctx.event):
+            # A watch is a promise to look (DL-089). Live, calendar and inbox
+            # watches were judged a bare SILENT in 1-2s with no tool call, so
+            # they never opened what they were watching. Any verdict but ACT
+            # becomes ACT, as for a brief; the watch may still end quiet, but
+            # only after it has looked. ``raw`` keeps what the judge said.
             verdict = Verdict(choice=ACT_THEN_SPEAK, raw=verdict.raw)
         if verdict.choice == ACT_THEN_SPEAK:
             acted = act(ctx)

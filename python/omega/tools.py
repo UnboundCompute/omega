@@ -105,6 +105,7 @@ __all__ = [
     "remind_instruction",
     "REMINDER_LEAD",
     "is_reminder",
+    "is_watch",
     "TELL_LEAD",
     "tell_instruction",
     "is_tell",
@@ -238,6 +239,14 @@ def watch_instruction(what: str) -> str:
         "them only what is new since you last told them about it. If nothing "
         f"is worth interrupting them for, answer exactly {NOTHING_NEW}"
     )
+
+
+def is_watch(event: dict[str, Any]) -> bool:
+    """Is this event a watch firing (DL-089)? Read as a reminder is: the
+    ``schedule`` channel carrying :func:`watch_instruction`'s text."""
+    return event.get("channel") == "schedule" and str(
+        event.get("text", "")
+    ).startswith(WATCH_LEAD)
 
 
 #: How every reminder's fire text begins, and so how a turn knows it is one.
