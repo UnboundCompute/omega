@@ -1,9 +1,11 @@
 """Standing grants, and the gate they sit behind (DL-085).
 
 A grant is authority the person handed over in their own message, for one of
-two closed scopes: **research** (carry its own research tasks to the end) and
-**tidy** (tidy their reminders and watches). Nothing else can be granted, and
-calendar, mail and anything that moves money are outside both.
+three closed scopes: **research** (carry its own research tasks to the end),
+**tidy** (tidy their reminders and watches) and **promises** (DL-087 #1: hold
+them to what they say they will do, with a reminder). Nothing else can be
+granted, and calendar, mail and anything that moves money are outside all
+three.
 
 Everything here is a fold over the log, like :class:`omega.derive.OpenWork`.
 The grant set is never stored beside the log and never mutated; a turn is
@@ -47,9 +49,11 @@ if TYPE_CHECKING:  # pragma: no cover
 __all__ = [
     "RESEARCH",
     "TIDY",
+    "PROMISES",
     "SCOPES",
     "GATE_DROP_AFTER",
     "GATED_TOOLS",
+    "PROPOSED_TOOLS",
     "READ",
     "OWN",
     "OUTWARD",
@@ -71,7 +75,9 @@ __all__ = [
 
 RESEARCH = "research"
 TIDY = "tidy"
+PROMISES = "promises"
 SCOPES = episodes.GRANT_SCOPES
+assert {RESEARCH, TIDY, PROMISES} == SCOPES
 
 #: Yeses in a row, for one scope, before omega asks whether it may stop
 #: asking. Asks, never drops.
@@ -80,6 +86,13 @@ GATE_DROP_AFTER = 10
 #: The tools a grant covers, and so the only ones a gate sits in front of.
 #: Every other tool is either a read (no gate needed) or outside every grant.
 GATED_TOOLS = {"tidy": TIDY, "follow_up": RESEARCH}
+
+#: Tools a grant covers only when *code* proposes them under it, never when
+#: the model asks (DL-087 #1): a reminder for a promise they made is proposed
+#: under ``promises``, while a ``remind`` they ask for in so many words runs as
+#: it always has. Kept apart from :data:`GATED_TOOLS` for exactly that reason:
+#: listing ``remind`` there would put a gate in front of every reminder.
+PROPOSED_TOOLS = {"remind": PROMISES}
 
 # --- reversibility ----------------------------------------------------------
 
@@ -118,6 +131,7 @@ REVERSIBILITY: dict[str, str] = {
     "tidy": OWN,
     "follow_up": OWN,
     "report": OWN,
+    "promise": OWN,  # closes one of their noted promises (DL-087 #1)
     "write_file": OWN,  # inside the store; outside it is irreversible
     "run_code": READ,  # read-only argv; anything else is irreversible
 }
@@ -502,5 +516,9 @@ def undo_for(tool: str, args: dict[str, Any]) -> dict[str, Any]:
     if tool == "tidy":
         return {"restore": dict(args["was"])}
     if tool == "follow_up":
+        return {"cancel": str(args["id"])}
+    if tool == "remind" and args.get("id"):
+        # A promise's reminder (DL-087 #1): set under a known id, so taking it
+        # back is cancelling that schedule.
         return {"cancel": str(args["id"])}
     raise ValueError(f"{tool} is not an action a grant covers")

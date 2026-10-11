@@ -82,6 +82,7 @@ from urllib.parse import urlsplit
 
 from omega import calendar as calendars, episodes, finance as finances, grants, inbox as inboxes, readable
 from omega import projects as worklog
+from omega import promises as pledges
 from omega.schedule import CronError, describe_cron, next_match, validate_cron, zone_label
 
 __all__ = [
@@ -119,6 +120,10 @@ __all__ = [
     "FOLLOW_UP",
     "REPORT",
     "UNDO",
+    "PROMISE",
+    "PROMISE_ASK",
+    "promise_text",
+    "asks",
     "RESEARCH_LEAD",
     "research_instruction",
     "is_research",
@@ -186,6 +191,12 @@ TIDY = "tidy"
 FOLLOW_UP = "follow_up"
 REPORT = "report"
 UNDO = "undo"
+#: Closes one of their noted promises (DL-087 #1). **Not in** :data:`TOOL_NAMES`
+#: and not in :func:`schemas`: like an MCP server's tools it exists only where
+#: something put it there — a live ``promises`` grant, their own message, and
+#: an open promise to close — so Ring 1, and every turn without that grant,
+#: is exactly what it was.
+PROMISE = "promise"
 
 #: Ring 1's remainder, and it is closed (DL-014). Spelled as a frozenset so
 #: that "the set does not grow" is a fact about an object and not a promise in
@@ -421,11 +432,27 @@ def followup_text(entry: Any, *, propose: bool = False) -> str:
     return tell_instruction(f"{head} {tail}")
 
 
+#: What a promise tell ends with (DL-087 #1): it carries a ``promises``
+#: proposal to set the reminders it names, so it is a question too.
+PROMISE_ASK = "Should I remind you then? Reply yes or no."
+
+
+def promise_text(found: Sequence[Any]) -> str:
+    """The tell that asks before setting a reminder for each promise in
+    ``found`` (DL-087 #1): their words back, with when it is due."""
+    if len(found) == 1:
+        head = f"You said you'd {found[0].words()}."
+    else:
+        listed = "; ".join(p.words() for p in found)
+        head = f"You said you'd: {listed}."
+    return tell_instruction(f"{head} {PROMISE_ASK}")
+
+
 def asks(event: dict[str, Any]) -> bool:
     """Is this tell a question waiting on their yes or no (a follow-up that
-    proposes pausing a watch)? Its turn then ends blocked, so a plain "yes"
-    answers it."""
-    return is_tell(event) and told(event).endswith(FOLLOWUP_ASK)
+    proposes pausing a watch, or a promise's reminder)? Its turn then ends
+    blocked, so a plain "yes" answers it."""
+    return is_tell(event) and told(event).endswith((FOLLOWUP_ASK, PROMISE_ASK))
 
 
 #: How every research follow-up's fire text begins (DL-085).
@@ -1159,7 +1186,9 @@ def _remind(box: "ToolBox", args: dict[str, Any]) -> str:
     if box.append is None:
         raise ToolError("reminders cannot be set from here: this box has no log")
     what = args["what"]
-    sid = f"r{box.for_seq}-{zlib.crc32(what.encode()) & 0xFFFF:04x}"
+    # A promise's reminder (DL-087 #1) comes with its id, so the schedule is
+    # named by the promise; one the model sets is named as it always was.
+    sid = args.get("id") or f"r{box.for_seq}-{zlib.crc32(what.encode()) & 0xFFFF:04x}"
     # Whole seconds, because that is how the stamp below is written: the
     # delay is counted from it, so the fire lands on the named minute.
     now = _now().replace(microsecond=0)
@@ -1214,6 +1243,10 @@ def _unwatch(box: "ToolBox", args: dict[str, Any]) -> str:
 _GRANT_WORDS = {
     grants.RESEARCH: ("research", "look into", "dig into", "investigate", "find out"),
     grants.TIDY: ("tidy", "clean up", "clean", "watches", "reminders"),
+    grants.PROMISES: (
+        "promise", "commit", "hold me to", "keep me to", "my word",
+        "what i say i'll", "what i said i'd", "remind me of what i",
+    ),
 }
 _GRANT_CHANGES = ("give", "revoke", "restore_gate")
 
@@ -1222,7 +1255,7 @@ def _scope(tool: str, args: dict[str, Any]) -> str:
     scope = _text(tool, args, "scope").strip().lower()
     if scope not in grants.SCOPES:
         raise ToolRejected(
-            f"{tool}: there are two grants, {sorted(grants.SCOPES)}; {scope!r} is not one. "
+            f"{tool}: the grants are {sorted(grants.SCOPES)}; {scope!r} is not one. "
             "Calendar, mail and money can never be granted."
         )
     return scope
@@ -1485,6 +1518,62 @@ def _undo(box: "ToolBox", args: dict[str, Any]) -> str:
         cron=was["cron"], once=was["once"], at=was["created_at"],
     ))
     return f"{was['id']} is back as it was"
+
+
+# --- promises they made (DL-087 #1) ---------------------------------------------
+
+_PROMISE_CLOSES = ("done", "dropped")
+
+
+def _promising(box: "ToolBox") -> bool:
+    """Is ``promise`` there to be called in this box's turn?"""
+    state = box.promises
+    return bool(box.prompted and state and state.open)
+
+
+def _classify_promise(box: "ToolBox", args: dict[str, Any]) -> Decision:
+    if not box.prompted:
+        raise ToolRejected(f"{PROMISE} runs only on their own message")
+    state = box.promises
+    how = _text(PROMISE, args, "how").strip().lower()
+    if how not in _PROMISE_CLOSES:
+        raise ToolRejected(f"{PROMISE}'s 'how' is one of {list(_PROMISE_CLOSES)}")
+    which = args.get("which")
+    found = state.oldest() if state else []
+    if isinstance(which, int) and not isinstance(which, bool):
+        hits = [p for p in found if p.seq == which]
+    elif isinstance(which, str) and which.strip():
+        key = pledges.normalized(which.strip().lstrip("#"))
+        hits = [p for p in found if key.isdigit() and p.seq == int(key)]
+        if not hits:
+            hits = [p for p in found if key and key in pledges.normalized(p.text)]
+    else:
+        raise ToolRejected(f"{PROMISE} needs 'which': the promise's number or its words")
+    if len(hits) != 1:
+        listing = "; ".join(f"{p.seq}: {p.words()}" for p in found) or "none"
+        raise ToolRejected(
+            f"{'more than one' if hits else 'no'} open promise matches {which!r}; "
+            f"open: {listing}"
+        )
+    [p] = hits
+    sid = state.reminder_of(p.seq)
+    return Decision(
+        tool=PROMISE, tier=LOCAL,
+        why=f"mark their promise {p.words()} {how}",
+        args={"promise": p.seq, "how": how, "reminder": sid},
+    )
+
+
+def _promise(box: "ToolBox", args: dict[str, Any]) -> str:
+    if box.append is None:
+        raise ToolError("promises cannot be closed from here: this box has no log")
+    box.append(episodes.promise_closed(promise=args["promise"], how=args["how"]))
+    sid = args.get("reminder")
+    if sid and sid in {s.id for s in box.running}:
+        # Kept or let go, the reminder for it has nothing left to remind of.
+        box.append(episodes.schedule_cancelled(id=sid))
+        return f"promise {args['promise']} marked {args['how']}; its reminder {sid} stopped"
+    return f"promise {args['promise']} marked {args['how']}"
 
 
 def describe_schedule(s: Any, *, now: Optional[datetime] = None) -> str:
@@ -2484,9 +2573,10 @@ _TOOLS: dict[str, _Tool] = {
         schema=_schema(
             GRANT,
             "Take, give back or re-gate a standing grant, only when they ask in "
-            "their own message. There are two: 'research' (carry the research "
-            "they ask for through to a report, without them asking each step) "
-            "and 'tidy' (tidy their watches and reminders). You still ask "
+            "their own message. There are three: 'research' (carry the research "
+            "they ask for through to a report, without them asking each step), "
+            "'tidy' (tidy their watches and reminders) and 'promises' (notice "
+            "what they say they will do and offer to remind them). You still ask "
             "before each action until they agree to stop being asked. "
             "'restore_gate' is for when they want to be asked first again.",
             {
@@ -2558,6 +2648,25 @@ _TOOLS: dict[str, _Tool] = {
 }
 
 assert set(_TOOLS) == TOOL_NAMES, "the tool set and its registry disagree"
+
+#: ``promise`` (DL-087 #1), registered beside Ring 1 and not in it: see
+#: :data:`PROMISE`. :meth:`ToolBox.classify` reaches it only where
+#: :func:`_promising` holds.
+_PROMISE_TOOL = _Tool(
+    classify=_classify_promise,
+    dispatch=_promise,
+    schema=_schema(
+        PROMISE,
+        "Close one of the promises they made, when they tell you it is done "
+        "or that they are dropping it. Their open promises are listed in the "
+        "brief; name one by its number or its words.",
+        {
+            "which": {"type": "string", "description": "The promise's number, or words from it."},
+            "how": {"type": "string", "enum": list(_PROMISE_CLOSES)},
+        },
+        ["which", "how"],
+    ),
+)
 
 
 def schemas(hide: "frozenset[str] | set[str]" = frozenset()) -> list[dict[str, Any]]:
@@ -2701,6 +2810,12 @@ class ToolBox:
     #: everywhere else, so the offer and the gate are as they were.
     retry: tuple[int, ...] = ()
 
+    #: The promises they made, as of this turn (DL-087 #1): a frozen
+    #: :class:`omega.promises.State`, or ``None``. Only a live ``promises``
+    #: grant with an open promise, on their own message, puts ``promise`` in
+    #: this box; everywhere else the box is what it was.
+    promises: Any = None
+
     def __post_init__(self) -> None:
         object.__setattr__(self, "store_root", Path(self.store_root).resolve())
         object.__setattr__(self, "remembered", tuple(self.remembered))
@@ -2715,6 +2830,8 @@ class ToolBox:
         and from nothing else.
         """
         tool = _TOOLS.get(name)
+        if tool is None and name == PROMISE and _promising(self):
+            tool = _PROMISE_TOOL
         if tool is None and self.remote is not None and isinstance(arguments, dict):
             # An MCP tool, refused or cleared by the adapter: money, writes and
             # the allowlist are decided there, in code, from the name (DL-088).
@@ -2753,12 +2870,17 @@ class ToolBox:
             )
         if decision.tool not in _TOOLS and self.remote is not None and self.remote.knows(decision.tool):
             return self.remote.dispatch(decision)
+        if decision.tool == PROMISE and decision.tool not in _TOOLS:
+            return _PROMISE_TOOL.dispatch(self, decision.args)
         return _TOOLS[decision.tool].dispatch(self, decision.args)
 
     def schemas(self, hide: "frozenset[str] | set[str]" = frozenset()) -> list[dict[str, Any]]:
         """Ring 1 less what this turn may not use (DL-085), then this box's
         MCP tools (DL-088), in that order."""
-        return schemas(hide) + (self.remote.schemas() if self.remote is not None else [])
+        mine = schemas(hide)
+        if _promising(self) and PROMISE not in hide:
+            mine.append(_PROMISE_TOOL.schema)
+        return mine + (self.remote.schemas() if self.remote is not None else [])
 
 
 assert TOOL_NAMES | {WEB_SEARCH} <= set(grants.REVERSIBILITY), (

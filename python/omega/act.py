@@ -218,6 +218,7 @@ def act_loop(
             # Research tasks this brief says could not be finished (DL-087
             # #2): the brief may carry them on, through the gate as ever.
             retry=_retry(ctx),
+            promises=ctx.promises,
         )
 
     # Their answer to a proposal is settled before the model is asked anything
@@ -417,10 +418,15 @@ def _propose(ctx: TurnContext, gated: list[Decision]) -> str:
     return "\n".join(asks)
 
 
-def _acted(ctx: TurnContext, decision: Decision, *, proposal: Optional[int]) -> None:
+def _acted(
+    ctx: TurnContext, decision: Decision, *, proposal: Optional[int],
+    scope: Optional[str] = None,
+) -> None:
     ctx.queue.append(episodes.grant_acted(
         for_seq=ctx.seq,
-        scope=grants.GATED_TOOLS[decision.tool],
+        # The proposal's scope when it names one: a promise's reminder is
+        # proposed under ``promises`` without ``remind`` being a gated tool.
+        scope=scope or grants.GATED_TOOLS[decision.tool],
         tool=decision.tool,
         why=decision.why,
         args=decision.args,
@@ -471,7 +477,11 @@ def _resolve(
     results: list[str] = []
     for action in proposal.actions:
         tool = str(action["tool"])
-        if live is None or tool not in grants.GATED_TOOLS or grants.is_money(tool):
+        proposable = (
+            tool in grants.GATED_TOOLS
+            or grants.PROPOSED_TOOLS.get(tool) == proposal.scope
+        )
+        if live is None or not proposable or grants.is_money(tool):
             results.append(f"{tool}: not run, the grant it was proposed under is gone")
             continue
         decision = Decision(tool=tool, tier=LOCAL, why=str(action["why"]), args=dict(action["args"]))
@@ -480,7 +490,7 @@ def _resolve(
         _returned(ctx, decision.tool, ok=ok, result=logged if ok else None, error=None if ok else text)
         if ok:
             ran.append(tool)
-            _acted(ctx, decision, proposal=proposal.seq)
+            _acted(ctx, decision, proposal=proposal.seq, scope=proposal.scope)
         results.append(f"{decision.why}: {text}")
     done = "; ".join(results)
     streak = (live.streak + 1) if live is not None else 0

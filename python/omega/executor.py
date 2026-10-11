@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import tempfile
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional, Sequence
 
@@ -41,6 +41,7 @@ from omega import (
     machine,
     notice,
     projects,
+    promises,
     provider,
     tidy,
     tools,
@@ -211,6 +212,9 @@ class Executor:
         "_learned",
         "_grants",
         "_followups",
+        "_promises",
+        "_promises_now",
+        "_grants_now",
         "_moments",
         "_standing",
         "_online",
@@ -252,6 +256,13 @@ class Executor:
         # Omega's own failures (DL-087 #2), folded the same way: a count that
         # survives a restart because the failures are in the log.
         self._followups = Followups()
+        # Promises they made (DL-087 #1): one fold kept at the turn being
+        # handled, as the views above are, and one at the log's head with a
+        # head-kept grants fold beside it, for the pass after each turn's
+        # reply, which must see what that turn (and its grant) just wrote.
+        self._promises = promises.Promises()
+        self._promises_now = promises.Promises()
+        self._grants_now = Grants()
         # A third view rather than a field on `_learned` (DL-062): what is
         # true and what happened have different lifetimes, and keeping them
         # in one fold is what would let events leak into the claim set.
@@ -1414,6 +1425,7 @@ class Executor:
         # before it, and an answer the proposal it answers.
         self._grants.advance(self._queue.store, upto=pending.seq)
         self._followups.advance(self._queue.store, upto=pending.seq)
+        self._promises.advance(self._queue.store, upto=pending.seq)
         result = run_turn(
             self._queue,
             pending,
@@ -1441,9 +1453,137 @@ class Executor:
             ask=self._learned.unasked(),
             grants=self._grants.state(),
             followups=self._followups.state(),
+            promises=self._promises.state(),
         )
         self._queue.finish(pending.seq)
+        # After the reply is durable, and never able to fail or hold it.
+        self._hold_promises(pending)
         return result
+
+    def _hold_promises(self, pending: Pending) -> None:
+        """DL-087 #1: note the promises in their own message, and offer (or,
+        with the gate dropped, set) a reminder for each that has a due date.
+
+        Runs after the turn's terminal record, so the reply never waits on it
+        and nothing here can change it. **Without a live ``promises`` grant it
+        calls nothing and writes nothing** — the one exception is a reminder
+        set under the grant earlier firing now, which closes its promise.
+
+        The source is the inbound text of a prompted message and nothing else
+        (:func:`omega.promises.theirs`); a code pre-filter gates the one LEARN
+        call, which fails closed and is never retried. A promise already open
+        in the same words is not noted twice. A due one becomes one tell and
+        one ``promises`` proposal (the DL-085 gate: their yes is what sets
+        it), or, with that gate dropped, the reminder itself, recorded as an
+        action with its undo and listed in the next brief. A reminder further
+        out than ``remind`` reaches is not offered: the promise stays open and
+        the brief names it. Money is never acted on here: the only action is
+        ``remind``.
+
+        **Never raises.**
+        """
+        try:
+            store = self._queue.store
+            view = self._promises_now.advance(store).state()
+            event = pending.payload
+            fired = event.get("schedule_id")
+            if fired and event.get("kind") == episodes.MESSAGE_INBOUND:
+                kept = view.reminding(str(fired))
+                if kept is not None:
+                    self._queue.append(
+                        episodes.promise_closed(promise=kept.seq, how="reminded")
+                    )
+            if not view.granted or not promises.theirs(event):
+                return
+            text = str(event["text"])
+            if not promises.worth_reading(text):
+                return
+            at = str(event.get("at") or episodes.now())
+            try:
+                found = promises.extract(self._completer(), text, at)
+            except Exception:  # noqa: BLE001 - fails closed: nothing is noted
+                return
+            noted: list[promises.Promise] = []
+            seen: set[str] = set()
+            for item in found:
+                key = promises.normalized(item["text"])
+                if not key or key in seen or view.same(item["text"]) is not None:
+                    continue
+                seen.add(key)
+                payload = episodes.promise_noted(
+                    text=item["text"], due=item["due"], source_seq=pending.seq
+                )
+                seq = self._queue.append(payload)
+                noted.append(promises.Promise(
+                    seq=seq, text=payload["text"], due=payload["due"],
+                    source_seq=pending.seq, at=payload["at"],
+                ))
+            self._remind_of(pending.seq, noted)
+        except Exception:  # noqa: BLE001 - see the docstring
+            return
+
+    def _remind_of(self, for_seq: int, noted: Sequence[promises.Promise]) -> None:
+        """The reminders for the promises just noted from message ``for_seq``."""
+        now = tools._now().replace(microsecond=0)
+        reach = now + timedelta(minutes=tools.MAX_REMIND_MINUTES)
+        due = [
+            p for p in noted
+            if p.due is not None and now < datetime.fromisoformat(p.due) <= reach
+        ]
+        if not due:
+            return
+        state = self._grants_now.advance(self._queue.store).state()
+        if state.live(grants.PROMISES) is None:
+            return
+        actions = []
+        for p in due:
+            when = datetime.fromisoformat(p.due).astimezone()
+            actions.append({
+                "tool": tools.REMIND,
+                "why": f"remind them about {p.text!r} at {tools._due_phrase(when, now)}",
+                "args": {
+                    "what": p.text, "due": p.due,
+                    "id": promises.reminder_id(p.seq), "promise": p.seq,
+                },
+            })
+        if state.gated(grants.PROMISES):
+            # Asked, as every action under a grant is until they say stop:
+            # one tell naming them all, and one proposal their yes runs.
+            tell = self._queue.append(
+                episodes.inbound(tools.promise_text(due), channel="schedule")
+            )
+            self._queue.append(episodes.grant_proposed(
+                for_seq=tell, scope=grants.PROMISES, proposes="action", actions=actions,
+            ))
+            return
+        box = tools.ToolBox(
+            store_root=self._queue.store.root,
+            append=self._queue.append,
+            for_seq=for_seq,
+            running=tuple(self._standing_schedules()),
+            grants=state,
+        )
+        for action in actions:
+            decision = tools.Decision(
+                tool=tools.REMIND, tier=tools.LOCAL, why=action["why"], args=action["args"]
+            )
+            self._queue.append(episodes.tool_called(
+                for_seq=for_seq, tool=decision.tool, args=decision.args
+            ))
+            try:
+                result, ok = box.dispatch(decision), True
+            except Exception as exc:  # noqa: BLE001 - recorded, as act records it
+                result, ok = f"{decision.tool} raised {type(exc).__name__}: {exc}", False
+            self._queue.append(episodes.tool_returned(
+                for_seq=for_seq, tool=decision.tool, ok=ok,
+                result=str(result) if ok else None, error=None if ok else str(result),
+            ))
+            if ok:
+                self._queue.append(episodes.grant_acted(
+                    for_seq=for_seq, scope=grants.PROMISES, tool=decision.tool,
+                    why=decision.why, args=decision.args,
+                    undo=grants.undo_for(decision.tool, decision.args), proposal=None,
+                ))
 
     def _standing_schedules(self) -> list[Schedule]:
         self._standing.refresh()

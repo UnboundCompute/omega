@@ -368,6 +368,11 @@ def test_every_m1_kind_is_accounted_for() -> None:
         episodes.FAILURE_RECOVERED: episodes.failure_recovered(
             subject="w1", kind="schedule", count=3, last_error="boom", at=AT,
         ),
+        # DL-087 #1: promises they made, never pushed on their own.
+        episodes.PROMISE_NOTED: episodes.promise_noted(
+            text="call mum", due=None, source_seq=1, at=AT,
+        ),
+        episodes.PROMISE_CLOSED: episodes.promise_closed(promise=2, how="dropped", at=AT),
     }
     assert set(made) == set(episodes.KINDS)
     for kind, payload in made.items():

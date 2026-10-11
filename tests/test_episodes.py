@@ -197,6 +197,12 @@ def test_every_kind_round_trips():
             subject="mcp:github", kind="mcp", count=3,
             last_error="the github MCP server timed out", at="2026-10-11T12:00:00+00:00",
         ),
+        # DL-087 #1: promises they made in their own words.
+        ep.promise_noted(
+            text="send the deck to Priya", due="2026-10-16T09:00:00+05:30",
+            source_seq=47, at="2026-10-11T12:00:00+00:00",
+        ),
+        ep.promise_closed(promise=48, how="done", at="2026-10-11T12:00:00+00:00"),
     ]
     assert {p["kind"] for p in built} == ep.KINDS, "a kind has no round-trip test"
     for payload in built:

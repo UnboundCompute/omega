@@ -73,6 +73,11 @@ __all__ = [
     "FAILURE_KINDS",
     "FAILURE_SUBJECTS",
     "MAX_FAILURE_ERROR",
+    "PROMISE_NOTED",
+    "PROMISE_CLOSED",
+    "PROMISE_KINDS",
+    "PROMISE_CLOSES",
+    "MAX_PROMISE_TEXT",
     "REPORT_TRANSCRIPT",
     "REPORT_USAGE",
     "REPORT_RECORDING",
@@ -116,6 +121,8 @@ __all__ = [
     "finance_started",
     "finance_recorded",
     "finance_skipped",
+    "promise_noted",
+    "promise_closed",
     "grant_given",
     "grant_revoked",
     "grant_restored",
@@ -208,9 +215,10 @@ GRANT_ACTED = "grant.acted"
 GRANT_KINDS = frozenset(
     {GRANT_GIVEN, GRANT_REVOKED, GRANT_RESTORED, GRANT_PROPOSED, GRANT_ANSWERED, GRANT_ACTED}
 )
-#: The only two grants there are (DL-085 #5): carry its own research tasks to
-#: the end, and tidy their reminders and watches. Closed, like the tool set.
-GRANT_SCOPES = frozenset({"research", "tidy"})
+#: The only grants there are (DL-085 #5, DL-087 #1): carry its own research
+#: tasks to the end, tidy their reminders and watches, and hold them to the
+#: promises they make in their own messages. Closed, like the tool set.
+GRANT_SCOPES = frozenset({"research", "tidy", "promises"})
 #: What a proposal asks: to do the actions it lists, or to stop asking first.
 GRANT_PROPOSES = frozenset({"action", "drop_gate"})
 
@@ -229,6 +237,20 @@ FAILURE_KINDS = frozenset({FAILURE_TOLD, FAILURE_RECOVERED})
 FAILURE_SUBJECTS = frozenset({"schedule", "mcp", "research"})
 #: Ceiling on the error a failure record carries. A sentence, not a traceback.
 MAX_FAILURE_ERROR = 200
+
+#: Promises the person made in their own words (DL-087 #1). ``promise.noted``
+#: is one commitment read off one of their prompted messages, with the due
+#: instant code resolved (or none); ``promise.closed`` is it ending, because its
+#: reminder fired, they said it was done, or they dropped it. Records, never
+#: events, and neither recalled nor projected: the open set is a fold over them
+#: (:mod:`omega.promises`), and the words are theirs, already in the log.
+PROMISE_NOTED = "promise.noted"
+PROMISE_CLOSED = "promise.closed"
+PROMISE_KINDS = frozenset({PROMISE_NOTED, PROMISE_CLOSED})
+#: How a promise ends. Closed, like the failure subjects.
+PROMISE_CLOSES = frozenset({"reminded", "done", "dropped"})
+#: Ceiling on a promise's text: a sentence, not their message.
+MAX_PROMISE_TEXT = 200
 
 #: The senses a relay may report for, by the name of the sense rather than of
 #: the file it read. Three of them end in a learning receipt; the machine sense
@@ -297,6 +319,8 @@ KINDS = frozenset(
         GRANT_ACTED,
         FAILURE_TOLD,
         FAILURE_RECOVERED,
+        PROMISE_NOTED,
+        PROMISE_CLOSED,
     }
 )
 
@@ -1761,6 +1785,8 @@ _REQUIRED: dict[str, tuple[str, ...]] = {
     ),
     FAILURE_TOLD: ("subject", "failure", "count", "last_error", "at"),
     FAILURE_RECOVERED: ("subject", "failure", "count", "last_error", "at"),
+    PROMISE_NOTED: ("text", "due", "source_seq", "at"),
+    PROMISE_CLOSED: ("promise", "how", "at"),
     GRANT_GIVEN: ("for_seq", "scope", "at"),
     GRANT_REVOKED: ("for_seq", "scope", "at"),
     GRANT_RESTORED: ("for_seq", "scope", "at"),
@@ -1803,6 +1829,30 @@ def failure_recovered(
     payload = {"v": VERSION, "kind": FAILURE_RECOVERED, "subject": subject,
                "failure": kind, "count": count, "last_error": last_error,
                "at": at or now()}
+    _validate(payload)
+    return payload
+
+
+def promise_noted(
+    *, text: str, due: Optional[str], source_seq: int, at: Optional[str] = None
+) -> dict[str, Any]:
+    """A promise read off their own message ``source_seq`` (DL-087 #1).
+
+    ``due`` is the instant code resolved from what the model read, as an ISO
+    datetime in their zone, or ``None`` when the message gave none (or gave one
+    already past).
+    """
+    payload = {"v": VERSION, "kind": PROMISE_NOTED, "text": text, "due": due,
+               "source_seq": source_seq, "at": at or now()}
+    _validate(payload)
+    return payload
+
+
+def promise_closed(*, promise: int, how: str, at: Optional[str] = None) -> dict[str, Any]:
+    """The promise noted at seq ``promise`` ended, ``how`` one of
+    :data:`PROMISE_CLOSES` (DL-087 #1)."""
+    payload = {"v": VERSION, "kind": PROMISE_CLOSED, "promise": promise,
+               "how": how, "at": at or now()}
     _validate(payload)
     return payload
 
@@ -2014,6 +2064,10 @@ def _validate(payload: dict[str, Any]) -> None:
         # No `for_seq`: a follow-up belongs to no one turn. It is about a run
         # of failures, named by its subject.
         _validate_failure(payload)
+    elif kind in PROMISE_KINDS:
+        # No `for_seq`: written after the turn's reply, by code, and named by
+        # the message it came from (or the promise it ends) instead.
+        _validate_promise(payload)
     elif kind in GRANT_KINDS:
         # Attached: ``for_seq`` is the turn that wrote it, which for a grant
         # given, revoked or restored is the person's own message (DL-085 #6).
@@ -2458,6 +2512,33 @@ def _validate_failure(payload: dict[str, Any]) -> None:
     _require_str(payload, "last_error")
     if len(payload["last_error"]) > MAX_FAILURE_ERROR:
         raise BadPayload(f"last_error is longer than {MAX_FAILURE_ERROR} characters")
+    _require_str(payload, "at", non_empty=True)
+
+
+def _validate_promise(payload: dict[str, Any]) -> None:
+    if payload["kind"] == PROMISE_NOTED:
+        text = payload["text"]
+        if not isinstance(text, str) or not text.strip():
+            raise BadPayload("text must be a non-empty string")
+        if len(text) > MAX_PROMISE_TEXT:
+            raise BadPayload(f"text is longer than {MAX_PROMISE_TEXT} characters")
+        due = payload["due"]
+        if due is not None:
+            if not isinstance(due, str):
+                raise BadPayload("due must be null or an ISO datetime")
+            try:
+                when = datetime.fromisoformat(due)
+            except ValueError as exc:
+                raise BadPayload(f"due must be an ISO datetime: {exc}") from exc
+            if when.tzinfo is None:
+                # A due instant without a zone is a reminder that fires at a
+                # different hour depending on where the log is read.
+                raise BadPayload("due must carry its zone")
+        _require_seq(payload, "source_seq")
+    else:
+        _require_seq(payload, "promise")
+        if payload["how"] not in PROMISE_CLOSES:
+            raise BadPayload(f"how {payload['how']!r} not in {sorted(PROMISE_CLOSES)}")
     _require_str(payload, "at", non_empty=True)
 
 

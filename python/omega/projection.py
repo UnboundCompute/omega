@@ -230,6 +230,9 @@ NOT_PROJECTED = frozenset(
         # DL-087 #2. A follow-up's words reach the person as the tell inbound
         # (or the brief line) they stand for; the record only remembers it.
         *episodes.FAILURE_KINDS,
+        # DL-087 #1. A promise reaches the person as its reminder or the brief
+        # line naming it; the record only remembers it.
+        *episodes.PROMISE_KINDS,
     }
 )
 

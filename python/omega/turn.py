@@ -120,6 +120,9 @@ NOT_RECALLED = frozenset({
     # Follow-ups on omega's own failures (DL-087 #2): the tell is already in
     # the conversation as its own inbound; the record is bookkeeping.
     *episodes.FAILURE_KINDS,
+    # Promises they made (DL-087 #1): their words are already in the
+    # conversation as their own message; the brief names the open ones.
+    *episodes.PROMISE_KINDS,
 })
 
 #: **A count is not a budget** (DL-039). ``RECALL_N`` bounds how many episodes
@@ -287,6 +290,11 @@ class TurnContext:
     #: :class:`omega.followups.State`. ``None`` or empty renders as nothing,
     #: so a turn over a log with no failures reads exactly as before.
     followups: Any = None
+
+    #: The promises they made, as of this turn (DL-087 #1), a frozen
+    #: :class:`omega.promises.State`. ``None``, or one with no live grant,
+    #: renders as nothing: a turn without the grant reads exactly as before.
+    promises: Any = None
 
 
 #: Channels whose events nobody typed: omega's own look (DL-061) and the clock
@@ -658,6 +666,7 @@ def run_turn(
     grants: Any = None,
     followups: Any = None,
     at: Optional[str] = None,
+    promises: Any = None,
 ) -> TurnResult:
     """Run one turn over an already-claimed episode and record how it ended.
 
@@ -739,6 +748,7 @@ def run_turn(
         running=tuple(running),
         grants=grants,
         followups=followups,
+        promises=promises,
     )
 
     verdict: Optional[Verdict] = None
@@ -1112,6 +1122,7 @@ def _event_turn(
         f"{_open_section(ctx.open_work)}"
         f"{_grants_section(ctx)}"
         f"{_followups_section(ctx)}"
+        f"{_promises_section(ctx)}"
         f"New event:\n{event}{suffix}"
     )
     parts = _image_parts(ctx) if images else []
@@ -1319,6 +1330,32 @@ def _followups_section(ctx: TurnContext) -> str:
         )
     body = "\n".join(lines)
     return f"Your own follow-ups, for this brief:\n{body}\n\n"
+
+
+def _promises_section(ctx: TurnContext) -> str:
+    """The open promises a brief names (DL-087 #1).
+
+    Only in a brief, only under a live ``promises`` grant, and only for
+    promises no earlier brief named: each is named once, up to
+    :data:`omega.promises.BRIEF_NAMES` oldest first, then "+N more" (which the
+    next brief names). Absent otherwise, so a turn without the grant renders
+    exactly as it did.
+    """
+    state = ctx.promises
+    if not state or not is_brief(ctx.event):
+        return ""
+    owed = state.briefing(ctx.seq)
+    if not owed:
+        return ""
+    lines = [f"- {p.words()}, said in message {p.source_seq} (promise {p.seq})" for p in owed.named]
+    if owed.more:
+        lines.append(f"+{owed.more} more")
+    body = "\n".join(lines)
+    return (
+        "Open promises they made, for this brief (name each, oldest first, "
+        "with \"+N more\" as written; they are theirs to keep, never yours to "
+        f"act on):\n{body}\n\n"
+    )
 
 
 def _open_section(open_work: Sequence[derive.OpenBlock]) -> str:
