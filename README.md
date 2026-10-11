@@ -111,3 +111,7 @@ judgement, or agent orchestration. Those belong to the Python/Rust core.
 The same rule cuts the other way inside the core: nothing outside `python/omega/memory/`
 touches the store, and the seam speaks episodes — never frames, offsets or CRCs. That one
 is enforced by a test, not by discipline.
+
+## License
+
+omega is licensed under the GNU Affero General Public License v3.0 or later. See LICENSE.
