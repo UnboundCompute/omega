@@ -80,7 +80,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional, Sequence
 from urllib.parse import urlsplit
 
-from omega import calendar as calendars, episodes, inbox as inboxes, readable
+from omega import calendar as calendars, episodes, finance as finances, inbox as inboxes, readable
 from omega.schedule import CronError, describe_cron, next_match, validate_cron, zone_label
 
 __all__ = [
@@ -97,6 +97,7 @@ __all__ = [
     "UNWATCH",
     "REMIND",
     "MAIL",
+    "FINANCE",
     "MIN_WATCH_MINUTES",
     "MAX_REMIND_MINUTES",
     "NOTHING_NEW",
@@ -160,6 +161,7 @@ SCHEDULES = "schedules"
 CALENDAR = "calendar"
 INBOX = "inbox"
 MAIL = "mail"
+FINANCE = "finance"
 BRIEF = "brief"
 
 #: Ring 1's remainder, and it is closed (DL-014). Spelled as a frozenset so
@@ -190,10 +192,14 @@ BRIEF = "brief"
 #:
 #: ``mail`` is DL-082: the inbox could list a mail but never show the whole of
 #: one, even asked. It reads the same mailbox the same read-only way.
+#:
+#: ``finance`` is DL-083: what they spent and received, read from the ledger
+#: the look's sweep of transaction mail writes into the log. It reads the log
+#: only — never IMAP, and never anything that moves money.
 TOOL_NAMES = frozenset(
     {
         READ_FILE, WRITE_FILE, RUN_CODE, FETCH, RECALL, WATCH, UNWATCH, REMIND,
-        SCHEDULES, CALENDAR, INBOX, MAIL, BRIEF,
+        SCHEDULES, CALENDAR, INBOX, MAIL, FINANCE, BRIEF,
     }
 )
 
@@ -740,7 +746,9 @@ def _classify_schedules(box: "ToolBox", args: dict[str, Any]) -> Decision:
 MAX_LOOK_DAYS = 14
 
 
-def _days(tool: str, args: dict[str, Any], default: int, low: int) -> int:
+def _days(
+    tool: str, args: dict[str, Any], default: int, low: int, high: int = MAX_LOOK_DAYS
+) -> int:
     """An optional whole number of days, blank meaning the default."""
     value = args.get("days")
     if not _given(value):
@@ -748,8 +756,8 @@ def _days(tool: str, args: dict[str, Any], default: int, low: int) -> int:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ToolRejected(f"{tool}'s 'days' must be a number")
     days = int(value)
-    if not (low <= days <= MAX_LOOK_DAYS):
-        raise ToolRejected(f"{tool}'s 'days' must be {low} to {MAX_LOOK_DAYS}, not {days}")
+    if not (low <= days <= high):
+        raise ToolRejected(f"{tool}'s 'days' must be {low} to {high}, not {days}")
     return days
 
 
@@ -817,6 +825,26 @@ def _classify_mail(box: "ToolBox", args: dict[str, Any]) -> Decision:
     if isinstance(uid, bool) or not isinstance(uid, int) or uid < 1:
         raise ToolRejected(f"{MAIL} needs 'id', the whole number after '#' in an inbox line")
     return Decision(tool=MAIL, tier=EXPLORATION, why=f"open mail #{uid}", args={"id": uid})
+
+
+def _classify_finance(box: "ToolBox", args: dict[str, Any]) -> Decision:
+    # Exploration: it reads the finance records already in the log (DL-083)
+    # and writes nothing, here or in the mailbox.
+    days = _days(FINANCE, args, default=finances.DEFAULT_DAYS, low=1, high=finances.MAX_DAYS)
+    return Decision(
+        tool=FINANCE,
+        tier=EXPLORATION,
+        why=f"read what they spent and received in the last {days} days",
+        args={"days": days},
+    )
+
+
+def _finance(box: "ToolBox", args: dict[str, Any]) -> str:
+    if box.ledger is None:
+        raise ToolError("the finance ledger cannot be read from this turn")
+    return _cap(finances.tool_text(
+        box.ledger(), days=args["days"], now=datetime.now(timezone.utc)
+    ))
 
 
 #: Says what an opened mail's body is before the model reads it (DL-082 #3).
@@ -1874,6 +1902,25 @@ _TOOLS: dict[str, _Tool] = {
             ["id"],
         ),
     ),
+    FINANCE: _Tool(
+        classify=_classify_finance,
+        dispatch=_finance,
+        schema=_schema(
+            FINANCE,
+            "What they spent and received, read from their bank and card "
+            "alert mail since tracking began (no earlier history): totals per "
+            "currency, who they spent most with, and each transaction. Use it "
+            "when they ask about spending, money or a payment. It only reads; "
+            "it never pays or moves anything.",
+            {
+                "days": {
+                    "type": "integer",
+                    "description": f"How many days back, 1 to {finances.MAX_DAYS}; default {finances.DEFAULT_DAYS}.",
+                },
+            },
+            [],
+        ),
+    ),
     BRIEF: _Tool(
         classify=_classify_brief,
         dispatch=_brief,
@@ -1909,7 +1956,7 @@ def schemas() -> list[dict[str, Any]]:
         _TOOLS[name].schema
         for name in (
             READ_FILE, WRITE_FILE, RUN_CODE, FETCH, RECALL, WATCH, UNWATCH, REMIND,
-            SCHEDULES, CALENDAR, INBOX, MAIL, BRIEF,
+            SCHEDULES, CALENDAR, INBOX, MAIL, FINANCE, BRIEF,
         )
     ]
 
@@ -1978,6 +2025,12 @@ class ToolBox:
     #: may a held mail open. Defaulted to ``False``, so a box nobody told
     #: fails closed: ordinary mail still opens, held mail does not.
     prompted: bool = False
+
+    #: How ``finance`` reads the ledger (DL-083): the finance episodes in the
+    #: turn's own log, read through the store the turn already holds — not a
+    #: second open of it. ``None`` makes the tool refuse rather than say
+    #: nothing was recorded.
+    ledger: Optional[Callable[[], Sequence[dict[str, Any]]]] = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "store_root", Path(self.store_root).resolve())

@@ -82,7 +82,14 @@ RECALL_N = 40
 #: something said (DL-072); presence alone arrives every five minutes while the
 #: person works, so counting reports would push the conversation out of
 #: ``RECALL_N`` within hours. What the reports taught arrives as claims instead.
-NOT_RECALLED = frozenset({episodes.SENSE_REPORTED})
+#: The finance ledger (DL-083) is out for the same reason: one record per bank
+#: alert would crowd the conversation out, and the `finance` tool reads it.
+NOT_RECALLED = frozenset({
+    episodes.SENSE_REPORTED,
+    episodes.FINANCE_STARTED,
+    episodes.FINANCE_RECORDED,
+    episodes.FINANCE_SKIPPED,
+})
 
 #: **A count is not a budget** (DL-039). ``RECALL_N`` bounds how many episodes
 #: come back, which was mistaken for bounding how much *context* they cost.

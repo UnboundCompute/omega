@@ -319,6 +319,17 @@ def test_every_m1_kind_is_accounted_for() -> None:
             meta={"source": "knowledgec"},
             at=AT,
         ),
+        episodes.FINANCE_STARTED: episodes.finance_started(at=AT),
+        episodes.FINANCE_RECORDED: episodes.finance_recorded(
+            key="<m@bank>", amount="500.00", currency="INR", direction="debit",
+            counterparty="abc@ybl", account="1234", when="2026-09-23",
+            sender="Bank <a@bank.in>", subject="UPI debit", message_id="<m@bank>",
+            at=AT,
+        ),
+        episodes.FINANCE_SKIPPED: episodes.finance_skipped(
+            key="<n@bank>", sender="Bank <a@bank.in>", subject="alert",
+            when="2026-09-23", message_id="<n@bank>", at=AT,
+        ),
     }
     assert set(made) == set(episodes.KINDS)
     for kind, payload in made.items():

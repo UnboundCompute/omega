@@ -40,6 +40,7 @@ from omega import (
     calendar,
     derive,
     episodes,
+    finance,
     gcal,
     habits,
     inbox,
@@ -677,7 +678,12 @@ def main(argv: Optional[list[str]] = None) -> int:
         # DL-080: their day and their mail for the same look, both read-only
         # and both off unless the host's environment names an account.
         calendar=lambda now: calendar.look_lines(now),
-        inbox=lambda now: inbox.look_lines(now),
+        # DL-083: the finance sweep rides the look's one reading of the inbox
+        # and appends to the log through the runtime's own queue. `rt` is
+        # bound before any look can run: looks start after `rt.start()`.
+        inbox=lambda now: inbox.look_lines(
+            now, on_mails=lambda mails: finance.record(rt.queue, mails, now)
+        ),
     )
     try:
         rt.start()

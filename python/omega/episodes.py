@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 from datetime import date, datetime, timezone
+from decimal import Decimal, InvalidOperation
 from typing import Any, Optional
 
 from omega.blobs import is_digest
@@ -46,6 +47,10 @@ __all__ = [
     "USAGE_DIGESTED",
     "AUDIO_CAPTURED",
     "SENSE_REPORTED",
+    "FINANCE_STARTED",
+    "FINANCE_RECORDED",
+    "FINANCE_SKIPPED",
+    "FINANCE_DIRECTIONS",
     "REPORT_TRANSCRIPT",
     "REPORT_USAGE",
     "REPORT_RECORDING",
@@ -79,6 +84,9 @@ __all__ = [
     "usage_digested",
     "audio_captured",
     "sense_reported",
+    "finance_started",
+    "finance_recorded",
+    "finance_skipped",
     "report_write_key",
     "now",
 ]
@@ -114,6 +122,16 @@ AUDIO_CAPTURED = "audio.captured"
 #: (DL-069) they found nothing; the Mac now does the mechanical half and sends
 #: the result, and this is the record of it arriving.
 SENSE_REPORTED = "sense.reported"
+#: The finance ledger (DL-083). Tracking begins at a ``finance.started`` and
+#: only mail dated at or after it is ever recorded; each transaction mail read
+#: is one ``finance.recorded``, and one that looked like a transaction but whose
+#: amount or direction could not be read is one ``finance.skipped``, so the
+#: count of what was dropped survives for the tool to say. The log is the
+#: ledger: nothing is written beside it.
+FINANCE_STARTED = "finance.started"
+FINANCE_RECORDED = "finance.recorded"
+FINANCE_SKIPPED = "finance.skipped"
+FINANCE_DIRECTIONS = frozenset({"debit", "credit"})
 
 #: The senses a relay may report for, by the name of the sense rather than of
 #: the file it read. Three of them end in a learning receipt; the machine sense
@@ -164,6 +182,9 @@ KINDS = frozenset(
         USAGE_DIGESTED,
         AUDIO_CAPTURED,
         SENSE_REPORTED,
+        FINANCE_STARTED,
+        FINANCE_RECORDED,
+        FINANCE_SKIPPED,
     }
 )
 
@@ -1065,6 +1086,80 @@ def sense_reported(
     return payload
 
 
+def finance_started(*, at: Optional[str] = None) -> dict[str, Any]:
+    """Finance tracking begins here (DL-083 #1). Mail dated before ``at`` is
+    never recorded: no backfill, by the person's own word."""
+    payload = {"v": VERSION, "kind": FINANCE_STARTED, "at": at or now()}
+    _validate(payload)
+    return payload
+
+
+def finance_recorded(
+    *,
+    key: str,
+    amount: str,
+    currency: str,
+    direction: str,
+    counterparty: str,
+    account: Optional[str],
+    when: str,
+    sender: str,
+    subject: str,
+    message_id: str,
+    at: Optional[str] = None,
+) -> dict[str, Any]:
+    """One transaction read from one mail (DL-083 #2-#3).
+
+    ``key`` is what dedupes it — the Message-ID, else a digest of sender, Date
+    and subject — so a mail seen by ten looks is one record. ``amount`` is a
+    Decimal as text, never a float; ``account`` is at most the last four
+    digits, never a full number; ``when`` is an ISO date.
+    """
+    payload = {
+        "v": VERSION,
+        "kind": FINANCE_RECORDED,
+        "key": key,
+        "amount": amount,
+        "currency": currency,
+        "direction": direction,
+        "counterparty": counterparty,
+        "account": account,
+        "when": when,
+        "sender": sender,
+        "subject": subject,
+        "message_id": message_id,
+        "at": at or now(),
+    }
+    _validate(payload)
+    return payload
+
+
+def finance_skipped(
+    *,
+    key: str,
+    sender: str,
+    subject: str,
+    when: str,
+    message_id: str,
+    at: Optional[str] = None,
+) -> dict[str, Any]:
+    """A mail that looked like a transaction but whose amount or direction
+    could not be read (DL-083 #5). Failing closed is not failing silently: the
+    finance tool counts these, so no total is ever built on dropped mail."""
+    payload = {
+        "v": VERSION,
+        "kind": FINANCE_SKIPPED,
+        "key": key,
+        "sender": sender,
+        "subject": subject,
+        "when": when,
+        "message_id": message_id,
+        "at": at or now(),
+    }
+    _validate(payload)
+    return payload
+
+
 #: The fields a learning report's ``meta`` must carry — the receipt's identity
 #: fields other than the unit, which the core copies across unchanged.
 _REPORT_META: dict[str, tuple[str, ...]] = {
@@ -1198,6 +1293,21 @@ _REQUIRED: dict[str, tuple[str, ...]] = {
         "at",
     ),
     SENSE_REPORTED: ("source", "unit", "device", "body", "meta", "reason", "at"),
+    FINANCE_STARTED: ("at",),
+    FINANCE_RECORDED: (
+        "key",
+        "amount",
+        "currency",
+        "direction",
+        "counterparty",
+        "account",
+        "when",
+        "sender",
+        "subject",
+        "message_id",
+        "at",
+    ),
+    FINANCE_SKIPPED: ("key", "sender", "subject", "when", "message_id", "at"),
 }
 
 #: The kinds that are *not* about one turn. Everything else names the inbound
@@ -1393,6 +1503,13 @@ def _validate(payload: dict[str, Any]) -> None:
         # identified by the sense and the unit it read, which the write key
         # carries.
         _validate_report(payload)
+    elif kind == FINANCE_STARTED:
+        # No `for_seq` and no `id`: tracking belongs to no turn, and its
+        # instant is the whole of it.
+        pass
+    elif kind in (FINANCE_RECORDED, FINANCE_SKIPPED):
+        # Identified by the mail it read (DL-083 #4), not by a turn.
+        _validate_finance(payload)
     elif kind == REFLECTION_DONE:
         # No `for_seq` and no `id`: a reflection belongs to no turn and names no
         # standing thing. It is identified by the stretch of log it covered.
@@ -1518,6 +1635,38 @@ def _validate(payload: dict[str, Any]) -> None:
             raise BadPayload("claim_seq must name a claim, not the turn")
 
     _require_str(payload, "at", non_empty=True)
+
+
+def _validate_finance(payload: dict[str, Any]) -> None:
+    for field in ("key", "when"):
+        _require_str(payload, field, non_empty=True)
+    for field in ("sender", "subject", "message_id"):
+        _require_str(payload, field)
+    try:
+        date.fromisoformat(payload["when"])
+    except ValueError as exc:
+        raise BadPayload(f"when must be an ISO date: {exc}") from exc
+    if payload["kind"] != FINANCE_RECORDED:
+        return
+    _require_str(payload, "amount", non_empty=True)
+    try:
+        amount = Decimal(payload["amount"])
+    except InvalidOperation as exc:
+        raise BadPayload(f"amount must be a decimal: {payload['amount']!r}") from exc
+    if not amount.is_finite() or amount <= 0:
+        raise BadPayload("amount must be a positive decimal")
+    _require_str(payload, "currency", non_empty=True)
+    _require_str(payload, "counterparty")
+    if payload["direction"] not in FINANCE_DIRECTIONS:
+        raise BadPayload(
+            f"direction {payload['direction']!r} not in {sorted(FINANCE_DIRECTIONS)}"
+        )
+    account = payload["account"]
+    if account is not None and not (
+        isinstance(account, str) and account.isdigit() and 1 <= len(account) <= 4
+    ):
+        # Never a full number: the ledger keeps at most the last four digits.
+        raise BadPayload("account must be null or at most the last four digits")
 
 
 def _validate_trigger(trigger: Any) -> None:

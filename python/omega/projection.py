@@ -206,6 +206,11 @@ NOT_PROJECTED = frozenset(
         # meeting's words — so projecting it would push exactly the firehose
         # the two receipts above were withheld to prevent, verbatim.
         episodes.SENSE_REPORTED,
+        # DL-083. The finance ledger is records with no turn behind them;
+        # it reaches the person only when they ask the `finance` tool.
+        episodes.FINANCE_STARTED,
+        episodes.FINANCE_RECORDED,
+        episodes.FINANCE_SKIPPED,
     }
 )
 

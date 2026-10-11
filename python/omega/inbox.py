@@ -43,6 +43,7 @@ import email
 import email.policy
 import html
 import imaplib
+import sys
 import os
 import re
 import socket
@@ -66,6 +67,7 @@ __all__ = [
     "MAX_OPEN_BYTES",
     "OPEN_CHARS",
     "HELD_MARK",
+    "TEXT_CHARS",
     "InboxUnavailable",
     "Settings",
     "Mail",
@@ -116,11 +118,19 @@ SENDER_CHARS = 80
 SUBJECT_CHARS = 140
 SNIPPET_CHARS = 200
 
+#: How much of a listed mail's text body :class:`Mail` keeps beside the
+#: snippet, for the finance sweep (DL-083): a bank alert's amount is often
+#: past the first 200 characters, rarely past the first 4000.
+TEXT_CHARS = 4_000
+MESSAGE_ID_CHARS = 200
+
 #: A ``FROM`` search term longer than this is not a name or an address.
 MAX_SENDER_QUERY = 100
 
 #: The only header fields fetched for the listing.
-_HEADER_FIELDS = "FROM SUBJECT DATE LIST-UNSUBSCRIBE LIST-ID PRECEDENCE AUTO-SUBMITTED"
+_HEADER_FIELDS = (
+    "FROM SUBJECT DATE MESSAGE-ID LIST-UNSUBSCRIBE LIST-ID PRECEDENCE AUTO-SUBMITTED"
+)
 _META_FETCH = f"(FLAGS RFC822.SIZE BODY.PEEK[HEADER.FIELDS ({_HEADER_FIELDS})])"
 _BODY_FETCH = "(BODY.PEEK[])"
 
@@ -152,6 +162,9 @@ class Mail:
     unread: bool
     uid: int                  # the IMAP UID, shown as "#uid" and what `mail` opens
     held: bool                # recovery or Apple/Microsoft account mail (DL-082)
+    # DL-083, both defaulted so a Mail built by hand still reads as before.
+    message_id: str = ""      # the Message-ID header, sanitized; "" when absent
+    text: str = ""            # the text body's start, one line, TEXT_CHARS; "" when held
 
 
 @dataclass(frozen=True)
@@ -306,6 +319,8 @@ def _fetch(imap: Any, uid: bytes) -> Optional[Mail]:
         unread=flags is None or b"\\Seen" not in flags.group(1).split(),
         uid=int(uid),
         held=held,
+        message_id=_clean(_header(headers, "Message-ID"), MESSAGE_ID_CHARS),
+        text="" if held else _clean(body, TEXT_CHARS),
     )
 
 
@@ -612,11 +627,17 @@ def look_lines(
     *,
     environ: Mapping[str, str] = os.environ,
     connect: Callable[..., Any] = imaplib.IMAP4_SSL,
+    on_mails: Optional[Callable[[Sequence[Mail]], None]] = None,
 ) -> list[str]:
     """What the look says about the inbox: nothing, a failure, or what is there.
 
     Recent mail read or not (DL-082 #6): mail they opened on their phone first
     is still part of their day, and is marked " (read)".
+
+    ``on_mails`` is handed every mail this reading found, bulk included, and
+    only when the reading succeeded — the finance sweep (DL-083) rides the
+    look's one IMAP read rather than making its own. It never costs the look
+    its lines: whatever it raises is dropped here.
     """
     s = settings(environ)
     if s is None:
@@ -626,6 +647,13 @@ def look_lines(
         mails = read(s, days=LOOK_DAYS, unread_only=False, connect=connect, now=now)
     except InboxUnavailable as exc:
         return [f"couldn't read the inbox: {exc}"]
+    if on_mails is not None:
+        try:
+            on_mails(mails)
+        except Exception as exc:  # noqa: BLE001 - a sweep never kills the look
+            # ...but it is never silent either: a sweep that broke records
+            # nothing, and only this line says so (DL-084 #4).
+            print(f"omega: mail sweep failed: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
     people = [m for m in mails if not m.bulk]
     bulk = len(mails) - len(people)
     out = lines(people, now) if people else [

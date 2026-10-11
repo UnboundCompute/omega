@@ -120,6 +120,28 @@ def test_every_kind_round_trips():
             meta={"source": "claude-code", "project": "-Users-me-project"},
             at="2026-09-23T10:00:00+00:00",
         ),
+        ep.finance_started(at="2026-10-11T12:00:00+05:30"),
+        ep.finance_recorded(
+            key="<a1@bank>",
+            amount="500.00",
+            currency="INR",
+            direction="debit",
+            counterparty="abc@ybl",
+            account="1234",
+            when="2026-10-11",
+            sender="Bank <alerts@bank.in>",
+            subject="UPI debit",
+            message_id="<a1@bank>",
+            at="2026-10-11T12:00:00+05:30",
+        ),
+        ep.finance_skipped(
+            key="<a2@bank>",
+            sender="Bank <alerts@bank.in>",
+            subject="Transaction alert",
+            when="2026-10-11",
+            message_id="<a2@bank>",
+            at="2026-10-11T12:00:00+05:30",
+        ),
     ]
     assert {p["kind"] for p in built} == ep.KINDS, "a kind has no round-trip test"
     for payload in built:
