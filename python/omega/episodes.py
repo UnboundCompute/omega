@@ -602,6 +602,7 @@ def inbound(
     schedule_id: Optional[str] = None,
     schedule_slot: Optional[str] = None,
     machine: Optional[list[str]] = None,
+    mail_at: Optional[str] = None,
     at: Optional[str] = None,
 ) -> dict[str, Any]:
     """Something arrived that omega may need to respond to.
@@ -667,6 +668,10 @@ def inbound(
         # A look's machine readings, as the lines it showed (DL-076), so the
         # next look can tell a flag that is new from one that has stood all day.
         payload["machine"] = list(machine)
+    if mail_at is not None:
+        # A look that read the inbox and got an answer (DL-090): when it
+        # began reading, which is where the look's next mail read starts.
+        payload["mail_at"] = mail_at
     _validate(payload)
     return payload
 
@@ -2096,6 +2101,8 @@ def _validate(payload: dict[str, Any]) -> None:
                 isinstance(line, str) for line in lines
             ):
                 raise BadPayload("machine must be a list of lines")
+        if "mail_at" in payload:
+            _require_str(payload, "mail_at", non_empty=True)
         if "schedule_slot" in payload:
             _require_str(payload, "schedule_slot", non_empty=True)
             if not payload.get("schedule_id"):

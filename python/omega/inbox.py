@@ -35,6 +35,14 @@ one mail whole by its UID — the ``#id`` every listed line ends with — on the
 same read-only select with the same peek. Whether a held mail may be opened is
 the tool's gate, not this module's; :func:`redact` is what lets the log keep
 that it was opened without keeping the code or the link in it.
+
+**Only what arrived after a moment (DL-090).** An unprompted read passes
+``after``: the server's INTERNALDATE — when the mail reached the mailbox, which
+a sender cannot forge the way they can a Date header — is fetched beside the
+listing headers, and a mail that arrived before ``after`` is dropped before its
+body is fetched. The search itself stays a coarse ``SINCE`` date. Which moment
+that is, is :mod:`omega.mailcursor`'s business, not this module's. A read with
+no ``after`` sends exactly the commands it always did.
 """
 
 from __future__ import annotations
@@ -68,6 +76,8 @@ __all__ = [
     "OPEN_CHARS",
     "HELD_MARK",
     "TEXT_CHARS",
+    "MAX_HOURS",
+    "FAILED",
     "InboxUnavailable",
     "Settings",
     "Mail",
@@ -78,6 +88,7 @@ __all__ = [
     "open_mail",
     "redact",
     "lines",
+    "arrived_since",
     "look_lines",
     "tool_text",
 ]
@@ -92,6 +103,14 @@ DEFAULT_PORT = 993
 #: How far back the look reads. Two days covers "since yesterday morning"
 #: without dredging up a week of mail the person has already decided to ignore.
 LOOK_DAYS = 2
+
+#: The narrowest window ``hours`` may ask for is one hour, the widest two days
+#: (DL-090); past that, ``days`` is the window.
+MAX_HOURS = 48
+
+#: How a reading that failed begins, wherever it is worded: three-valued means
+#: a failure is said in words, and this is the words.
+FAILED = "couldn't read the inbox"
 
 #: At most this many mails are fetched per reading, newest first.
 MAX_MAILS = 20
@@ -133,6 +152,10 @@ _HEADER_FIELDS = (
 )
 _META_FETCH = f"(FLAGS RFC822.SIZE BODY.PEEK[HEADER.FIELDS ({_HEADER_FIELDS})])"
 _BODY_FETCH = "(BODY.PEEK[])"
+#: The listing fetch plus when the server received each mail (DL-090).
+_ARRIVAL_FETCH = (
+    f"(FLAGS RFC822.SIZE INTERNALDATE BODY.PEEK[HEADER.FIELDS ({_HEADER_FIELDS})])"
+)
 
 _AUTH_REASON = f"login refused (check {ENV_USER} and the app password)"
 
@@ -165,6 +188,9 @@ class Mail:
     # DL-083, both defaulted so a Mail built by hand still reads as before.
     message_id: str = ""      # the Message-ID header, sanitized; "" when absent
     text: str = ""            # the text body's start, one line, TEXT_CHARS; "" when held
+    # DL-090: when the server received it (INTERNALDATE), tz-aware. Only
+    # fetched for a read that asked for it; None otherwise or when unreadable.
+    arrived: Optional[datetime] = None
 
 
 @dataclass(frozen=True)
@@ -208,18 +234,30 @@ def read(
     limit: int = MAX_MAILS,
     connect: Callable[..., Any] = imaplib.IMAP4_SSL,
     now: Optional[datetime] = None,
+    after: Optional[datetime] = None,
+    arrival: bool = False,
+    hours: Optional[int] = None,
 ) -> list[Mail]:
     """Up to ``limit`` mails from the last ``days`` days, newest first.
+
+    ``after`` (DL-090) keeps only mail the server received at or after that
+    moment, to the whole second its INTERNALDATE has; ``arrival`` fetches the
+    INTERNALDATE without filtering on it. ``hours`` narrows the search's date
+    to that many hours back instead of ``days``; the hour itself is the
+    caller's ``after``. A mail whose INTERNALDATE cannot be read is kept:
+    showing a mail twice is a smaller harm than never showing it.
 
     Raises :class:`ValueError` for a sender that cannot be searched safely and
     :class:`InboxUnavailable` for anything the server or the network did.
     """
-    criteria = _criteria(days, unread_only, sender, now)
+    criteria = _criteria(days, unread_only, sender, now, hours=hours)
+    floor = after.replace(microsecond=0) if after is not None else None
+    stamped = arrival or after is not None
     with _session(s, connect) as imap:
         typ, data = imap.uid("SEARCH", None, *criteria)
         _ok((typ, data), "search")
         uids = _uids(data)[-limit:] if limit > 0 else []
-        mails = [_fetch(imap, uid) for uid in reversed(uids)]
+        mails = [_fetch(imap, uid, stamped=stamped, floor=floor) for uid in reversed(uids)]
     return _newest_first([m for m in mails if m is not None])
 
 
@@ -247,10 +285,11 @@ def _session(s: Settings, connect: Callable[..., Any]) -> Iterator[Any]:
 
 
 def _criteria(days: int, unread_only: bool, sender: Optional[str],
-              now: Optional[datetime]) -> list[str]:
+              now: Optional[datetime], *, hours: Optional[int] = None) -> list[str]:
     """The SEARCH terms. ``SINCE`` is a date in IMAP, so local midnight counts."""
     local = (now or datetime.now(timezone.utc)).astimezone()
-    since = (local - timedelta(days=days)).date()
+    back = timedelta(hours=hours) if hours is not None else timedelta(days=days)
+    since = (local - back).date()
     terms = ["SINCE", f"{since.day:02d}-{_MONTHS[since.month - 1]}-{since.year}"]
     if unread_only:
         terms.append("UNSEEN")
@@ -287,13 +326,21 @@ def _uids(data: Sequence[Any]) -> list[bytes]:
     return sorted(found, key=int)  # ascending UID = oldest first
 
 
-def _fetch(imap: Any, uid: bytes) -> Optional[Mail]:
-    """One mail: flags, size and the listing headers, then the body if small."""
-    typ, data = imap.uid("FETCH", uid, _META_FETCH)
+def _fetch(imap: Any, uid: bytes, *, stamped: bool = False,
+           floor: Optional[datetime] = None) -> Optional[Mail]:
+    """One mail: flags, size and the listing headers, then the body if small.
+
+    ``stamped`` also fetches INTERNALDATE; a mail that arrived before
+    ``floor`` is ``None``, its body never fetched.
+    """
+    typ, data = imap.uid("FETCH", uid, _ARRIVAL_FETCH if stamped else _META_FETCH)
     _ok((typ, data), "fetch")
     meta, header = _parts(data, b"HEADER.FIELDS")
     if header is None:
         return None  # expunged between search and fetch
+    arrived = _internaldate(meta) if stamped else None
+    if floor is not None and arrived is not None and arrived < floor:
+        return None  # arrived before the cursor: already read from here
     flags = re.search(rb"FLAGS \(([^)]*)\)", meta)
     size = re.search(rb"RFC822\.SIZE (\d+)", meta)
     headers = email.message_from_bytes(header, policy=email.policy.default)
@@ -321,7 +368,30 @@ def _fetch(imap: Any, uid: bytes) -> Optional[Mail]:
         held=held,
         message_id=_clean(_header(headers, "Message-ID"), MESSAGE_ID_CHARS),
         text="" if held else _clean(body, TEXT_CHARS),
+        arrived=arrived,
     )
+
+
+_INTERNALDATE = re.compile(
+    rb'INTERNALDATE "\s?(\d{1,2})-([A-Za-z]{3})-(\d{4}) '
+    rb'(\d{2}):(\d{2}):(\d{2}) ([+-])(\d{2})(\d{2})"'
+)
+
+
+def _internaldate(meta: bytes) -> Optional[datetime]:
+    """The server's ``INTERNALDATE "09-Oct-2026 14:05:00 +0530"``, tz-aware,
+    or ``None`` when absent or unreadable. Parsed by hand: ``%b`` is locale's."""
+    found = _INTERNALDATE.search(meta)
+    if found is None:
+        return None
+    day, mon, year, hh, mm, ss, sign, oh, om = found.groups()
+    try:
+        month = _MONTHS.index(mon.decode().title()) + 1
+        offset = timedelta(hours=int(oh), minutes=int(om))
+        zone = timezone(-offset if sign == b"-" else offset)
+        return datetime(int(year), month, int(day), int(hh), int(mm), int(ss), tzinfo=zone)
+    except ValueError:
+        return None
 
 
 def _parts(data: Sequence[Any], marker: bytes) -> tuple[bytes, Optional[bytes]]:
@@ -628,8 +698,13 @@ def look_lines(
     environ: Mapping[str, str] = os.environ,
     connect: Callable[..., Any] = imaplib.IMAP4_SSL,
     on_mails: Optional[Callable[[Sequence[Mail]], None]] = None,
+    after: Optional[datetime] = None,
 ) -> list[str]:
     """What the look says about the inbox: nothing, a failure, or what is there.
+
+    ``after`` (DL-090) lists only mail that arrived since then, and an empty
+    listing says so as "no new mail ... since": the look's own cursor, kept
+    by :mod:`omega.mailcursor`. ``on_mails`` still gets the whole reading.
 
     Recent mail read or not (DL-082 #6): mail they opened on their phone first
     is still part of their day, and is marked " (read)".
@@ -644,9 +719,10 @@ def look_lines(
         return []
     now = now or datetime.now(timezone.utc)
     try:
-        mails = read(s, days=LOOK_DAYS, unread_only=False, connect=connect, now=now)
+        mails = read(s, days=LOOK_DAYS, unread_only=False, connect=connect, now=now,
+                     arrival=after is not None)
     except InboxUnavailable as exc:
-        return [f"couldn't read the inbox: {exc}"]
+        return [f"{FAILED}: {exc}"]
     if on_mails is not None:
         try:
             on_mails(mails)
@@ -654,10 +730,13 @@ def look_lines(
             # ...but it is never silent either: a sweep that broke records
             # nothing, and only this line says so (DL-084 #4).
             print(f"omega: mail sweep failed: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
+    if after is not None:
+        mails = arrived_since(mails, after)
     people = [m for m in mails if not m.bulk]
     bulk = len(mails) - len(people)
     out = lines(people, now) if people else [
-        f"no mail from people in the last {LOOK_DAYS} days"
+        f"no new mail from people since {_when(after, now)}" if after is not None
+        else f"no mail from people in the last {LOOK_DAYS} days"
     ]
     if bulk:
         out.append(f"(and {bulk} newsletters/notifications, not listed)")
@@ -671,6 +750,13 @@ NOT_CONNECTED = (
 )
 
 
+def arrived_since(mails: Sequence[Mail], after: datetime) -> list[Mail]:
+    """The mails that arrived at or after ``after``, to the whole second
+    INTERNALDATE has. One whose arrival is unknown is kept, as in :func:`read`."""
+    floor = after.replace(microsecond=0)
+    return [m for m in mails if m.arrived is None or m.arrived >= floor]
+
+
 def tool_text(
     *,
     sender: Optional[str] = None,
@@ -679,17 +765,36 @@ def tool_text(
     now: Optional[datetime] = None,
     environ: Mapping[str, str] = os.environ,
     connect: Callable[..., Any] = imaplib.IMAP4_SSL,
+    hours: Optional[int] = None,
+    after: Optional[datetime] = None,
 ) -> str:
-    """The inbox as a tool answer. Raises :class:`InboxUnavailable` on failure."""
+    """The inbox as a tool answer. Raises :class:`InboxUnavailable` on failure.
+
+    ``hours`` narrows the window below a day, by arrival. ``after`` is an
+    unprompted read's cursor (DL-090): only mail that arrived since, said as
+    "new since", and an empty answer as "no new mail since". Neither given,
+    the answer is what it always was.
+    """
     s = settings(environ)
     if s is None:
         return NOT_CONNECTED
     now = now or datetime.now(timezone.utc)
+    bound = after
+    if hours is not None:
+        start = now - timedelta(hours=hours)
+        bound = start if bound is None or start > bound else bound
     mails = read(s, days=days, unread_only=unread_only, sender=sender,
-                 connect=connect, now=now)
+                 connect=connect, now=now, after=bound, hours=hours)
+    cursor = after is not None and bound == after
     if not mails:
         kind = "unread mail" if unread_only else "mail"
         who = f" from {_clean(sender, SENDER_CHARS)}" if sender else ""
-        span = "day" if days == 1 else f"{days} days"
+        if cursor:
+            return f"no new {kind}{who} since {_when(after, now)}"
+        if hours is not None:
+            span = "hour" if hours == 1 else f"{hours} hours"
+        else:
+            span = "day" if days == 1 else f"{days} days"
         return f"no {kind}{who} in the last {span}"
-    return "\n".join(_line(m, now, tag_bulk=True) for m in mails)
+    listing = "\n".join(_line(m, now, tag_bulk=True) for m in mails)
+    return f"new since {_when(after, now)}:\n{listing}" if cursor else listing

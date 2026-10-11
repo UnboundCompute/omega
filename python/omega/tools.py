@@ -1019,22 +1019,49 @@ def _classify_inbox(box: "ToolBox", args: dict[str, Any]) -> Decision:
     days = _days(INBOX, args, default=inboxes.LOOK_DAYS, low=1)
     unread = args.get("unread_only")
     unread_only = unread if isinstance(unread, bool) else True
+    # DL-090: an hour window below a day. Absent, the decision is what it was,
+    # down to its arguments, so a call without it logs and reads as before.
+    hours = _hours(args)
+    span = f"{hours} hours" if hours is not None else f"{days} days"
+    decided = {"from": sender, "days": days, "unread_only": unread_only}
+    if hours is not None:
+        decided["hours"] = hours
     return Decision(
         tool=INBOX,
         tier=EXPLORATION,
         why=(
             f"read their {'unread ' if unread_only else ''}mail"
-            f"{f' from {sender!r}' if sender else ''} of the last {days} days"
+            f"{f' from {sender!r}' if sender else ''} of the last {span}"
         ),
-        args={"from": sender, "days": days, "unread_only": unread_only},
+        args=decided,
     )
 
 
+def _hours(args: dict[str, Any]) -> Optional[int]:
+    """``inbox``'s optional ``hours``, 1 to :data:`omega.inbox.MAX_HOURS`."""
+    value = args.get("hours")
+    if not _given(value):
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ToolRejected(f"{INBOX}'s 'hours' must be a number")
+    hours = int(value)
+    if not (1 <= hours <= inboxes.MAX_HOURS):
+        raise ToolRejected(f"{INBOX}'s 'hours' must be 1 to {inboxes.MAX_HOURS}, not {hours}")
+    return hours
+
+
 def _inbox(box: "ToolBox", args: dict[str, Any]) -> str:
+    kw: dict[str, Any] = {
+        "sender": args["from"], "days": args["days"], "unread_only": args["unread_only"],
+    }
+    if args.get("hours") is not None:
+        kw["hours"] = args["hours"]
+    if not box.prompted and box.mail_since is not None:
+        # DL-090: nobody asked, so only what arrived since this origin last
+        # read the same mail. Their own question never takes this branch.
+        kw["after"] = box.mail_since(args["from"], args["unread_only"])
     try:
-        return _cap(inboxes.tool_text(
-            sender=args["from"], days=args["days"], unread_only=args["unread_only"]
-        ))
+        return _cap(inboxes.tool_text(**kw))
     except inboxes.InboxUnavailable as exc:
         raise ToolError(f"could not read the inbox: {exc}") from None
 
@@ -2562,6 +2589,10 @@ _TOOLS: dict[str, _Tool] = {
                     "type": "integer",
                     "description": f"How many days back, 1 to {MAX_LOOK_DAYS}; default {inboxes.LOOK_DAYS}.",
                 },
+                "hours": {
+                    "type": "integer",
+                    "description": f"Only the last this many hours, 1 to {inboxes.MAX_HOURS}, in place of days. Omit for days.",
+                },
                 "unread_only": {
                     "type": "boolean",
                     "description": "Only unread mail (the default). False to include mail they already read.",
@@ -2945,6 +2976,12 @@ class ToolBox:
     #: :class:`omega.lessons.State`, or ``None``. Only their own message,
     #: with one standing, puts ``forget`` in this box.
     lessons: Any = None
+    #: Where an unprompted turn's mail reads begin (DL-090): given the read's
+    #: ``from`` and ``unread_only``, the moment after which mail is new to
+    #: this turn's origin, folded from the log by :mod:`omega.mailcursor`.
+    #: Consulted only when ``prompted`` is false; ``None`` is a box with no
+    #: log to fold, which reads mail as it always did.
+    mail_since: Optional[Callable[[Optional[str], bool], datetime]] = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "store_root", Path(self.store_root).resolve())

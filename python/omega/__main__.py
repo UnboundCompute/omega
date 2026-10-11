@@ -684,8 +684,11 @@ def main(argv: Optional[list[str]] = None) -> int:
         # DL-083: the finance sweep rides the look's one reading of the inbox
         # and appends to the log through the runtime's own queue. `rt` is
         # bound before any look can run: looks start after `rt.start()`.
-        inbox=lambda now: inbox.look_lines(
-            now, on_mails=lambda mails: finance.record(rt.queue, mails, now)
+        # DL-090: `after` is the look's mail cursor; taking it is what makes
+        # the executor read mail hourly and only what arrived since.
+        inbox=lambda now, after=None: inbox.look_lines(
+            now, after=after,
+            on_mails=lambda mails: finance.record(rt.queue, mails, now),
         ),
     )
     try:

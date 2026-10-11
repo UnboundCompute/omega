@@ -25,6 +25,7 @@ append and never a second path into the loop.
 
 from __future__ import annotations
 
+import inspect
 import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -36,10 +37,12 @@ from omega import (
     episodes,
     grants,
     habits,
+    inbox as inboxes,
     learn,
     lessons,
     listen,
     machine,
+    mailcursor,
     notice,
     projects,
     promises,
@@ -181,6 +184,16 @@ class StartupReport:
         return out
 
 
+def _takes_after(read: Optional[Callable[..., Sequence[str]]]) -> bool:
+    """Does this sense accept the mail cursor as ``after=`` (DL-090)?"""
+    if read is None:
+        return False
+    try:
+        return "after" in inspect.signature(read).parameters
+    except (TypeError, ValueError):
+        return False
+
+
 def _sense(
     read: Optional[Callable[[datetime], Sequence[str]]],
     now: datetime,
@@ -224,6 +237,7 @@ class Executor:
         "_machine",
         "_calendar",
         "_inbox",
+        "_inbox_after",
         "_readings",
     )
 
@@ -251,6 +265,10 @@ class Executor:
         # look's clock and returns already-worded lines.
         self._calendar = calendar
         self._inbox = inbox
+        # DL-090: an inbox sense that takes ``after`` reads from the look's
+        # mail cursor, once an hour; one that takes only the clock is read at
+        # every look, as before, and nothing is recorded of it.
+        self._inbox_after = _takes_after(inbox)
         self._recovered = False
         self._open = OpenWork()
         self._learned = Learned()
@@ -1276,7 +1294,7 @@ class Executor:
                     machine_lines = ()
             machine_lines = self._machines(machine_lines, now=moment)
             calendar_lines = _sense(self._calendar, moment, "calendar")
-            inbox_lines = _sense(self._inbox, moment, "inbox")
+            inbox_lines, mail_at = self._look_mail(moment)
             self._open.advance(store)
             self._learned.advance(store)
             self._moments.advance(store)
@@ -1308,12 +1326,40 @@ class Executor:
                     text,
                     channel=notice.CHANNEL,
                     machine=list(machine_lines),
+                    mail_at=mail_at,
                     at=moment.isoformat(),
                 )
             )
         except Exception:  # noqa: BLE001 - see the docstring
             return False
         return True
+
+    def _look_mail(self, moment: datetime) -> tuple[Sequence[str], Optional[str]]:
+        """The look's mail lines, and the stamp to record if it read (DL-090).
+
+        At most once an hour (:data:`omega.notice.MAIL_EVERY_SECONDS`), and
+        then only mail that arrived since the look last read, or the last hour
+        when it never has. A look between reads says so in one line instead
+        of a missing block, which would read as "not connected". The stamp is
+        returned only for a reading that came back, so a failed read leaves
+        the cursor where it was and the next look reads again.
+        """
+        if not self._inbox_after:
+            return _sense(self._inbox, moment, "inbox"), None
+        last = mailcursor.last_read(self._queue.store, mailcursor.LOOK)
+        gap = timedelta(seconds=notice.MAIL_EVERY_SECONDS)
+        if last is not None and moment - last < gap:
+            when = last.astimezone().strftime("%H:%M")
+            return (
+                f"mail is read once an hour; last read at {when}, and nothing "
+                f"that arrived since is lost",
+            ), None
+        after = last if last is not None else moment - timedelta(
+            seconds=mailcursor.FIRST_WINDOW_SECONDS
+        )
+        lines = _sense(lambda now: self._inbox(now, after=after), moment, "inbox")
+        read = bool(lines) and not str(lines[0]).startswith(inboxes.FAILED)
+        return lines, (moment.isoformat() if read else None)
 
     def _follow_up(self, moment: datetime) -> bool:
         """DL-087 #2: tell them, once, about one thing that kept failing.

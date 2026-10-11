@@ -51,6 +51,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 __all__ = [
     "CHANNEL",
     "LOOK_EVERY_SECONDS",
+    "MAIL_EVERY_SECONDS",
     "MAX_PER_DAY",
     "MAX_L1_CHARS",
     "SAID_KEPT",
@@ -77,6 +78,11 @@ UNPROMPTED_CHANNELS = frozenset({CHANNEL, "schedule"})
 #: How often omega may *look*. Not how often it may speak. Halved from an hour
 #: by DL-068, which also gave the look a machine sense that can change in it.
 LOOK_EVERY_SECONDS = 30 * 60
+
+#: How often the look reads their *mail* (DL-090): the person asked for the
+#: Gmail sweep to run once an hour, and the look runs every half hour. The rest
+#: of the look — calendar, machine — keeps the look's own pace.
+MAIL_EVERY_SECONDS = 60 * 60
 
 #: No cap on unprompted speech per day (DL-068). ``None`` rather than a large
 #: number, so that "unlimited" cannot be mistaken for a tuned value.

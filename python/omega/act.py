@@ -34,9 +34,10 @@ asking about the other half produces side effects for a plan nobody approved.
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Any, Optional
 
-from omega import episodes, finance, grants, lessons, mcp, projects, provider
+from omega import episodes, finance, grants, lessons, mailcursor, mcp, projects, provider
 from omega.tools import (
     EXTERNAL,
     LOCAL,
@@ -158,6 +159,20 @@ def _act_messages(
     ]
 
 
+def _mail_since(ctx: TurnContext) -> Any:
+    """The cursor an unprompted turn's ``inbox`` reads from (DL-090), folded
+    from the log at the moment of the read, never counting this turn's own."""
+    where = mailcursor.origin(ctx.event) or "unknown"
+
+    def since(sender: Optional[str], unread_only: bool) -> Any:
+        return mailcursor.since(
+            ctx.queue.store, where, now=datetime.now(timezone.utc),
+            sender=sender, unread_only=unread_only, exclude=ctx.seq,
+        )
+
+    return since
+
+
 def _signature(call: provider.ToolCall) -> tuple[str, str]:
     """A call's identity for stall detection: name plus arguments, spelled
     canonically so that key order cannot disguise a repeat."""
@@ -222,6 +237,9 @@ def act_loop(
             # omega's own lessons and skills (DL-086): `forget`, on their
             # own message, when one stands; nothing at all otherwise.
             lessons=ctx.lessons,
+            # DL-090: an unprompted turn's mail is only what arrived since
+            # its origin last read it; their own turn gets no cursor at all.
+            mail_since=_mail_since(ctx) if unprompted(ctx) else None,
         )
 
     # Their answer to a proposal is settled before the model is asked anything
