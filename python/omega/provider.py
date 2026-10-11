@@ -24,6 +24,14 @@ shape nearly became the contract by default. Errors surface as
 :class:`ProviderError`. The loop decides what to do about them, once we have
 decided what the loop should do.
 
+DL-084 #3 decided one thing: a transport blip (a timeout, a connection that
+never opened) on a judge or act call is tried once more, after a jittered
+pause. That is :func:`retry_blips`, a wrapper a turn puts around this seam,
+not a setting of the HTTP client below it — so the retry is in our code, said
+on stderr and counted on the turn's record, and the client still runs
+``max_retries=0``. A reply the server sent (any status, a 4xx above all) is an
+answer, and asking again would only repeat it.
+
 **The seam carries tool calls, and it was widened additively** (M1 step 7,
 DL-028). ``complete(role, messages)`` had no field in which a model could say
 *call this tool with these arguments*, so it grew an optional ``tools``
@@ -68,6 +76,9 @@ from __future__ import annotations
 
 import json
 import os
+import random
+import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional, Protocol, Sequence
@@ -83,6 +94,10 @@ __all__ = [
     "HostedCall",
     "Response",
     "Meter",
+    "RETRIED_ROLES",
+    "BLIP_PAUSE_SECONDS",
+    "is_blip",
+    "retry_blips",
     "Provider",
     "ProviderError",
     "ProviderNotConfigured",
@@ -360,13 +375,17 @@ class Meter:
     response to read, and the error is already on the record.
     """
 
-    __slots__ = ("_complete", "_rows")
+    __slots__ = ("_complete", "_rows", "_retried")
 
     _FIELDS = ("input", "cached", "output", "reasoning")
 
     def __init__(self, complete: Callable[..., "Response"]) -> None:
         self._complete = complete
         self._rows: dict[tuple[str, str], dict[str, int]] = {}
+        # Blips retried per role (DL-084 #3), added to that role's next row as
+        # ``retried`` — present only when there was one, so a turn that never
+        # retried writes the bytes it always did.
+        self._retried: dict[str, int] = {}
 
     def __call__(self, role: str, messages: Any, *args: Any, **kwargs: Any) -> "Response":
         response = self._complete(role, messages, *args, **kwargs)
@@ -379,6 +398,9 @@ class Meter:
             {"calls": 0, **{f: 0 for f in self._FIELDS}, "unmetered": 0},
         )
         row["calls"] += 1
+        retried = self._retried.pop(role, 0)
+        if retried:
+            row["retried"] = row.get("retried", 0) + retried
         if response.prompt_tokens is None or response.completion_tokens is None:
             row["unmetered"] += 1
             return
@@ -386,6 +408,10 @@ class Meter:
         row["output"] += response.completion_tokens
         row["cached"] += response.cached_tokens or 0
         row["reasoning"] += response.reasoning_tokens or 0
+
+    def retried(self, role: str) -> None:
+        """Count one retried blip against ``role`` (DL-084 #3)."""
+        self._retried[role] = self._retried.get(role, 0) + 1
 
     def usage(self) -> Optional[list[dict[str, Any]]]:
         """The tally, or ``None`` when nothing was called — so a pass that
@@ -397,6 +423,76 @@ class Meter:
             {"role": role, "model": model, **row}
             for (role, model), row in sorted(self._rows.items())
         ]
+
+
+#: The roles whose calls get one retry on a blip (DL-084 #3): the judge, and
+#: act — which composes every reply. Not learn: an extraction that misses a
+#: beat costs a receipt, not a turn.
+RETRIED_ROLES = frozenset({JUDGE, ACT})
+
+#: The jittered pause before that one retry, in seconds. Short, because a
+#: blip is short and the person may be waiting; jittered, so two calls that
+#: blipped together do not retry together.
+BLIP_PAUSE_SECONDS = (0.5, 2.0)
+
+#: What the client library calls a request that timed out or never connected.
+#: Matched by name so this module still never imports it (see OpenAIProvider).
+_BLIP_NAMES = frozenset({"APIConnectionError", "APITimeoutError"})
+
+
+def is_blip(exc: BaseException) -> bool:
+    """Did this call fail in transport — timed out, or never connected?
+
+    Walks the ``__cause__`` chain, since :class:`ProviderError` wraps what the
+    client raised. Anything carrying a status code is a reply the server sent,
+    never a blip, whatever else it is.
+    """
+    seen: Optional[BaseException] = exc
+    while seen is not None:
+        if isinstance(getattr(seen, "status_code", None), int):
+            return False
+        if isinstance(seen, (TimeoutError, ConnectionError)) or _BLIP_NAMES & {
+            cls.__name__ for cls in type(seen).__mro__
+        }:
+            return True
+        seen = seen.__cause__
+    return False
+
+
+def retry_blips(
+    complete: Callable[..., "Response"],
+    *,
+    on_retry: Optional[Callable[[str], None]] = None,
+    sleep: Optional[Callable[[float], None]] = None,
+) -> Callable[..., "Response"]:
+    """``complete``, with one retry for a judge or act call that blipped.
+
+    DL-084 #3, in our code where it can be seen: the retry is said on stderr,
+    ``on_retry`` counts it (a turn hands :meth:`Meter.retried`), and a second
+    failure says it was the second. Only model calls pass through here — a
+    tool call is dispatched by the tool box and is never retried.
+    """
+
+    def call(role: str, messages: Any, *args: Any, **kwargs: Any) -> "Response":
+        try:
+            return complete(role, messages, *args, **kwargs)
+        except Exception as exc:  # noqa: BLE001 - re-raised unless a blip
+            if role not in RETRIED_ROLES or not is_blip(exc):
+                raise
+            print(
+                f"omega: {role} call blipped ({exc}); retrying once",
+                file=sys.stderr,
+                flush=True,
+            )
+        if on_retry is not None:
+            on_retry(role)
+        (sleep or time.sleep)(random.uniform(*BLIP_PAUSE_SECONDS))
+        try:
+            return complete(role, messages, *args, **kwargs)
+        except ProviderError as exc:
+            raise ProviderError(f"{exc} (after one retry)") from exc
+
+    return call
 
 
 class Provider(Protocol):
@@ -733,9 +829,9 @@ class OpenAIProvider:
             if not api_key:
                 raise ProviderNotConfigured("api_key must not be empty")
 
-            # max_retries=0 on purpose: retry policy is deferred in CLAUDE.md,
-            # and a client retrying under the seam would settle that deferred
-            # question invisibly, which is how a default becomes a decision.
+            # max_retries=0 on purpose: a client retrying under the seam
+            # retries invisibly. DL-084's one retry is `retry_blips`, above
+            # it, where stderr and the turn's record can see it.
             client = OpenAI(api_key=api_key, timeout=timeout, max_retries=0)
 
         self._client = client

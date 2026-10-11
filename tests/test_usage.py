@@ -49,8 +49,8 @@ def _priced(answers: dict[str, list[str]], tokens=(100, 20, 40, 5)):
     return complete
 
 
-def _turn(q: EventQueue, complete) -> dict:
-    seq = q.append(episodes.inbound("hello", channel="tray", at=AT))
+def _turn(q: EventQueue, complete, channel: str = "tray") -> dict:
+    seq = q.append(episodes.inbound("hello", channel=channel, at=AT))
     q.claim(seq)
     run_turn(q, q.at(seq), complete=complete, at=AT)
     [record] = [p for _, p in _log(q) if p["kind"] in episodes.TERMINAL_KINDS]
@@ -123,7 +123,8 @@ def test_a_spoken_turn_records_what_every_call_in_it_spent(q: EventQueue) -> Non
 
 
 def test_a_silent_turn_still_paid_for_its_judge(q: EventQueue) -> None:
-    record = _turn(q, _priced({"judge": ["SILENT"]}))
+    # A fire: their own message never ends silent (DL-084 #2).
+    record = _turn(q, _priced({"judge": ["SILENT"]}), channel="schedule")
 
     assert record["outcome"] == "silent"
     [row] = record["usage"]

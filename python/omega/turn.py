@@ -34,7 +34,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Optional, Sequence
 
 from omega import blobs, derive, episodes, learn, notice, provider, schedule
-from omega.tools import NOTHING_NEW, is_brief, is_reminder, must_speak
+from omega.tools import NOTHING_NEW, is_brief, is_reminder, is_tell, must_speak, told
 from omega.queue import EVENT_KINDS, EventQueue, Pending
 
 __all__ = [
@@ -624,8 +624,21 @@ def run_turn(
     # on the one terminal record the turn writes, whichever path ends it
     # (DL-070).
     meter = provider.Meter(complete or provider.complete)
-    complete = meter
+    # DL-084 #3: one retry for a judge or act call that blipped in transport,
+    # counted on the meter so the record says it happened.
+    complete = provider.retry_blips(meter, on_retry=meter.retried)
     event = perceive(pending)
+    if is_tell(event):
+        # DL-084 #1, #4: omega telling them about itself — a promise it could
+        # not keep, or an outage. Delivered as written, with no model call:
+        # what it reports is often that the model could not be reached.
+        words = told(event)
+        record = write_memory(
+            queue, seq=pending.seq, outcome="spoke", reply_text=words, at=at
+        )
+        return TurnResult(
+            seq=pending.seq, outcome="spoke", record_seq=record, reply=words
+        )
     recalled = recall(queue, before=pending.seq, n=recall_n)
     ctx = TurnContext(
         seq=pending.seq,
@@ -649,6 +662,12 @@ def run_turn(
             # walk reminder and nobody heard it (DL-075). Code keeps the promise
             # the prompt only asked for; SPEAK, because a judge that saw nothing
             # to do saw nothing to look up. ``raw`` keeps what it said.
+            verdict = Verdict(choice=SPEAK, raw=verdict.raw)
+        elif verdict.choice == STAY_SILENT and not unprompted(ctx):
+            # Their own message never ends silent (DL-084 #2). The prompt says
+            # so; live, "keep checking ... and let me know" was still answered
+            # with nothing, twice. SPEAK, as for a reminder; ``raw`` keeps
+            # what the judge said.
             verdict = Verdict(choice=SPEAK, raw=verdict.raw)
         elif verdict.choice != ACT_THEN_SPEAK and is_brief(ctx.event):
             # A brief is the same promise with looking built in (DL-080): a

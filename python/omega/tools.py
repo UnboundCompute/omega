@@ -105,6 +105,12 @@ __all__ = [
     "remind_instruction",
     "REMINDER_LEAD",
     "is_reminder",
+    "TELL_LEAD",
+    "tell_instruction",
+    "is_tell",
+    "told",
+    "missed_text",
+    "outage_text",
     "TOOL_NAMES",
     "MAX_RECALLED",
     "READ_ONLY_ARGV0",
@@ -286,6 +292,56 @@ def is_brief(event: dict[str, Any]) -> bool:
     return event.get("channel") == "schedule" and str(
         event.get("text", "")
     ).startswith(BRIEF_LEAD)
+
+
+#: How every message omega sends about itself begins (DL-084 #1, #4): a promise
+#: it could not keep, or an outage. What follows the lead is the message, word
+#: for word, and the turn delivers it without a model call — the thing being
+#: reported is often that the model could not be reached.
+TELL_LEAD = "omega, telling them about itself: "
+
+
+def tell_instruction(words: str) -> str:
+    """The inbound text of a message omega sends about itself."""
+    return f"{TELL_LEAD}{words}"
+
+
+def is_tell(event: dict[str, Any]) -> bool:
+    """Is this event one of those messages (DL-084)? Read as a reminder is."""
+    return event.get("channel") == "schedule" and str(
+        event.get("text", "")
+    ).startswith(TELL_LEAD)
+
+
+def told(event: dict[str, Any]) -> str:
+    """What a tell event says to them."""
+    return str(event.get("text", ""))[len(TELL_LEAD):].strip()
+
+
+def missed_text(instruction: str, slot: datetime, error: str) -> str:
+    """The tell for a kept promise that could not be delivered in a day
+    (DL-084 #1), naming what it was, when it was due, and the cause (#4)."""
+    first = instruction.splitlines()[0] if instruction else ""
+    if first.startswith(REMINDER_LEAD):
+        what = f"your reminder ({first[len(REMINDER_LEAD):][:120]})"
+    elif first.startswith(BRIEF_LEAD):
+        what = "your daily brief"
+    else:
+        what = f"something you asked for ({first[:120]})"
+    due = slot.astimezone().strftime("%a %d %b %H:%M")
+    return tell_instruction(
+        f"I couldn't deliver {what}, due {due}: every try for a day failed, "
+        f"the last with {error[:200]}. I've stopped trying, so it is missed."
+    )
+
+
+def outage_text(failed: int, error: str) -> str:
+    """The tell for a run of failed looks (DL-084 #4), naming the cause."""
+    return tell_instruction(
+        f"Something is wrong on my side: my last {failed} looks failed, the "
+        f"last with {error[:200]}. I'll keep trying; until it works, reminders "
+        "and watches may be late."
+    )
 
 
 def must_speak(event: dict[str, Any]) -> bool:
@@ -982,6 +1038,13 @@ def _unwatch(box: "ToolBox", args: dict[str, Any]) -> str:
         raise ToolError("watches cannot be stopped from here: this box has no log")
     sid = args["id"]
     known = {getattr(s, "id", None) for s in box.running}
+    if sid not in known and sid:
+        # DL-084 #5: "stop the flight prices watch" names a title, not an id.
+        # Resolved only when exactly one running schedule's words contain it;
+        # two or none is the refusal below, which lists the ids to choose by.
+        named = [s for s in box.running if sid.lower() in s.instruction.lower()]
+        if len(named) == 1:
+            sid = named[0].id
     if sid not in known:
         listing = ", ".join(
             f"{s.id}: {s.instruction.splitlines()[0][:80]}" for s in box.running
@@ -1785,9 +1848,10 @@ _TOOLS: dict[str, _Tool] = {
         dispatch=_unwatch,
         schema=_schema(
             UNWATCH,
-            "Stop a watch, reminder, brief or schedule you are running, by its id. "
+            "Stop a watch, reminder, brief or schedule you are running, by its id "
+            "or by words from what it is about, when only one matches. "
             f"Call {SCHEDULES} first if you do not know the id.",
-            {"id": {"type": "string", "description": "The schedule's id."}},
+            {"id": {"type": "string", "description": "The schedule's id, or words from its title."}},
             ["id"],
         ),
     ),

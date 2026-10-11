@@ -142,7 +142,8 @@ def test_step_handles_one_episode_at_a_time(q: EventQueue) -> None:
 def test_silence_drains_exactly_like_speech(q: EventQueue) -> None:
     """DL-011 — a silent turn advances DONE like a speaking one. If it did not,
     one quiet event would stall the queue forever."""
-    send(q, "fyi")
+    # A fire: their own message never ends silent (DL-084 #2).
+    q.append(episodes.inbound("fyi", channel="schedule", at=AT))
     ex = Executor(q, complete=silent().complete)
     ex.recover()
 

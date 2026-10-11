@@ -37,9 +37,9 @@ def q(store: MemoryStore) -> EventQueue:
     return EventQueue(store)
 
 
-def put(q: EventQueue, text: str = "what's on my plate?"):
+def put(q: EventQueue, text: str = "what's on my plate?", channel: str = "tray"):
     """Enqueue an inbound event and claim it, exactly as the drain would."""
-    seq = q.append(episodes.inbound(text, channel="tray", at=AT))
+    seq = q.append(episodes.inbound(text, channel=channel, at=AT))
     q.claim(seq)
     return q.at(seq)
 
@@ -76,8 +76,9 @@ def test_a_speaking_turn_records_what_it_said(q: EventQueue) -> None:
 def test_a_silent_turn_is_a_success_and_costs_no_reply_call(q: EventQueue) -> None:
     """DL-011's load-bearing property. Silence is an outcome, not an absence:
     the record exists, ``reply`` is null rather than empty, and the expensive
-    role is never called."""
-    p = put(q, "fyi, moved the meeting")
+    role is never called. On a fire: their own message never ends silent
+    (DL-084 #2, pinned below)."""
+    p = put(q, "fyi, moved the meeting", channel="schedule")
     fp = fake(judge="SILENT", act=["should never be used"])
 
     result = run_turn(q, p, complete=fp.complete, at=AT)
@@ -435,7 +436,8 @@ def test_silence_failure_and_speech_are_three_distinguishable_records(
         ("silent", "SILENT", None),
         ("failed", "nonsense", None),
     ]:
-        p = put(q, text)
+        # A fire: their own message never ends silent (DL-084 #2).
+        p = put(q, text, channel="schedule")
         fp = provider.FakeProvider(
             {provider.JUDGE: judge_says, provider.ACT: act_says or "unused"}
         )
@@ -469,7 +471,7 @@ def test_a_turn_runs_with_nothing_in_recall(q: EventQueue) -> None:
 def test_recall_carries_earlier_silence_into_the_prompt(q: EventQueue) -> None:
     """A silent turn is part of the history. Hiding it would make the judge
     re-decide an event it has already answered."""
-    first = put(q, "moved the meeting")
+    first = put(q, "moved the meeting", channel="schedule")
     run_turn(q, first, complete=fake(judge="SILENT").complete, at=AT)
     q.finish(first.seq)
 

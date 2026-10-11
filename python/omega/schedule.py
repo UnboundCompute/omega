@@ -33,7 +33,7 @@ property of the algorithm rather than a special case someone has to remember.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Iterator, Optional
 
 from omega import episodes
@@ -42,6 +42,7 @@ from omega.queue import EventQueue
 __all__ = [
     "Schedule",
     "Due",
+    "Owed",
     "Scheduler",
     "CronError",
     "cron_matches",
@@ -53,6 +54,8 @@ __all__ = [
     "LATE_AFTER_SECONDS",
     "CATCH_UP_HORIZON_MINUTES",
     "TICK_SECONDS",
+    "RETRY_AFTER_MINUTES",
+    "OWED_FOR",
 ]
 
 #: How often the heartbeat asks "is anything due?". Not how often anything
@@ -71,6 +74,17 @@ LATE_AFTER_SECONDS = 120
 #: cheap iterations. A daily schedule missed by longer than this is not "late",
 #: it is a machine that was off, and firing it on wake would be noise.
 CATCH_UP_HORIZON_MINUTES = 25 * 60
+
+#: How long after a failed fire a kept promise is tried again (DL-084 #1): 1,
+#: 5, then 15 minutes after the first, second and third failure, and on every
+#: tick after that. The runtime holds the clock while offline (DL-068 #5), so
+#: "every tick" is every tick that could reach the model.
+RETRY_AFTER_MINUTES = (1, 5, 15)
+
+#: How long past its slot a failed fire is kept trying before they are told it
+#: was missed. A day: a reminder delivered later than that is not the reminder
+#: they asked for, and tomorrow's brief replaces today's.
+OWED_FOR = timedelta(hours=24)
 
 #: ``minute hour day-of-week``. A subset, not a dialect: ``*``, ``N``, ``A-B``,
 #: ``A,B``, ``*/N``. Day-of-week is 0=Sunday, as every crontab has it.
@@ -281,9 +295,19 @@ class Schedule:
     every: Optional[int] = None
     cron: Optional[str] = None
     #: A reminder (DL-068): fires once, ``every`` seconds after creation, and
-    #: the fire itself retires it — read back from the log, so a restart
-    #: between fire and turn does not fire it twice.
+    #: is retired when that fire is *delivered* (DL-084 #1) — read back from
+    #: the log, so a restart between fire and turn does not fire it twice.
     once: bool = False
+
+    @property
+    def kept(self) -> bool:
+        """A promise whose fire must land, not merely be written (DL-084 #1):
+        a reminder, or a brief. A watch that fails waits for its next slot,
+        as before; these are tried again until delivered or a day has gone."""
+        # Imported here: `tools` imports this module for its cron helpers.
+        from omega.tools import BRIEF_LEAD
+
+        return self.once or self.instruction.startswith(BRIEF_LEAD)
 
 
 @dataclass(frozen=True)
@@ -297,13 +321,43 @@ class Due:
     slot: datetime
     late_by: timedelta
 
+    #: Set when this is not a fire at all but the end of trying (DL-084 #1):
+    #: the promise could not be delivered within :data:`OWED_FOR`, and what is
+    #: appended instead is the message telling them so.
+    missed: Optional["Owed"] = None
+
     @property
     def late(self) -> bool:
         return self.late_by.total_seconds() > LATE_AFTER_SECONDS
 
 
+@dataclass(frozen=True)
+class Owed:
+    """A kept promise whose last fire failed, so it is still owed (DL-084 #1).
+
+    Folded from the log — the fire's inbound and the ``turn.completed`` with
+    ``outcome: "failed"`` that answered it — so a restart rebuilds it exactly.
+    """
+
+    slot: datetime
+    failures: int
+    failed_at: datetime
+    error: str
+
+    def retry_at(self) -> datetime:
+        steps = RETRY_AFTER_MINUTES
+        wait = steps[self.failures - 1] if self.failures <= len(steps) else 0
+        return self.failed_at + timedelta(minutes=wait)
+
+
 def _parse_at(raw: str) -> datetime:
     return datetime.fromisoformat(raw)
+
+
+def _parse_utc(raw: str) -> datetime:
+    """A log stamp; a naive one is UTC, which is what `episodes.now` writes."""
+    parsed = datetime.fromisoformat(raw)
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
 
 class Scheduler:
@@ -325,6 +379,11 @@ class Scheduler:
         # guard, and in memory on purpose: a fire in flight dies with the
         # process, so persisting this would be persisting a lie.
         self._in_flight: dict[str, int] = {}
+        # DL-084 #1, both folded from the log. A kept promise's fire waits in
+        # `_awaiting` (fire seq -> schedule id, slot) until its turn ends;
+        # ending `failed` makes it `_owed`, anything else discharges it.
+        self._awaiting: dict[int, tuple[str, datetime]] = {}
+        self._owed: dict[str, Owed] = {}
 
     def refresh(self) -> None:
         """Fold every episode written since the last look into the table."""
@@ -333,10 +392,10 @@ class Scheduler:
             return
         for episode in self._queue.store.episodes_since(self._cursor):
             payload = episodes.decode(episode.payload)
-            self._observe(payload)
+            self._observe(payload, episode.seq)
             self._cursor = episode.seq
 
-    def _observe(self, payload: dict) -> None:
+    def _observe(self, payload: dict, seq: int = 0) -> None:
         kind = payload.get("kind")
         if kind == episodes.SCHEDULE_CREATED:
             sid, cron = payload["id"], payload.get("cron")
@@ -367,6 +426,7 @@ class Scheduler:
         elif kind == episodes.SCHEDULE_CANCELLED:
             self._defs.pop(payload["id"], None)
             self._broken.pop(payload["id"], None)
+            self._owed.pop(payload["id"], None)
         elif kind == episodes.MESSAGE_INBOUND:
             sid = payload.get("schedule_id")
             if sid:
@@ -375,12 +435,49 @@ class Scheduler:
                 # slot that says which obligations are discharged. Falling back
                 # to `at` keeps fires written before the field existed readable
                 # — additive schema, per `VERSION`.
-                self._last_fire[sid] = _parse_at(
-                    payload.get("schedule_slot") or payload["at"]
+                slot = _parse_at(payload.get("schedule_slot") or payload["at"])
+                self._last_fire[sid] = slot
+                kept = self._defs.get(sid)
+                if kept is None or not kept.kept:
+                    return
+                from omega.tools import TELL_LEAD  # see `Schedule.kept`
+
+                if str(payload.get("text", "")).startswith(TELL_LEAD):
+                    # They have been told it was missed: trying is over, and
+                    # telling is the last thing this promise owes.
+                    self._discharge(kept)
+                else:
+                    self._awaiting[seq] = (sid, slot)
+        elif kind in episodes.TERMINAL_KINDS:
+            found = self._awaiting.pop(payload.get("for_seq"), None)
+            if found is None:
+                return
+            sid, slot = found
+            kept = self._defs.get(sid)
+            if kept is None:
+                return  # cancelled while its fire ran
+            if kind == episodes.TURN_COMPLETED and payload.get("outcome") == "failed":
+                # DL-084 #1: a fire that failed is still owed. Counted per
+                # slot, so tomorrow's brief starts its backoff afresh.
+                before = self._owed.get(sid)
+                failures = before.failures + 1 if before and before.slot == slot else 1
+                self._owed[sid] = Owed(
+                    slot=slot,
+                    failures=failures,
+                    failed_at=_parse_utc(payload["at"]),
+                    error=str(payload.get("error") or "unknown error"),
                 )
-                done = self._defs.get(sid)
-                if done is not None and done.once:
-                    self._defs.pop(sid, None)
+            else:
+                # Spoke or blocked — delivered, or waiting on them, which is
+                # delivered too. (A kept fire cannot end silent: DL-075 and
+                # DL-080 force it to speak, and were it to, re-firing a turn
+                # that chose quiet would only buy the same quiet again.)
+                self._discharge(kept)
+
+    def _discharge(self, schedule: Schedule) -> None:
+        self._owed.pop(schedule.id, None)
+        if schedule.once:
+            self._defs.pop(schedule.id, None)
 
     @property
     def schedules(self) -> list[Schedule]:
@@ -401,12 +498,31 @@ class Scheduler:
     def last_fire(self, schedule_id: str) -> Optional[datetime]:
         return self._last_fire.get(schedule_id)
 
+    def owed(self, schedule_id: str) -> Optional[Owed]:
+        """The failed fire still owed for this schedule, if any (DL-084 #1)."""
+        return self._owed.get(schedule_id)
+
     def due(self, now: datetime) -> list[Due]:
         """Which schedules should fire at ``now``, newest slot first."""
         out: list[Due] = []
+        awaiting = {sid for sid, _ in self._awaiting.values()}
         for schedule in self.schedules:
             if self._blocked_by_previous_fire(schedule.id):
                 continue
+            if schedule.id in awaiting:
+                # A kept fire with no ending in the log yet. The in-memory
+                # guard above says the same within one process; this is what
+                # says it after a restart.
+                continue
+            owed = self._owed.get(schedule.id)
+            if owed is not None:
+                if now - owed.slot >= OWED_FOR:
+                    out.append(Due(schedule, owed.slot, now - owed.slot, missed=owed))
+                elif now >= owed.retry_at():
+                    out.append(Due(schedule=schedule, slot=owed.slot, late_by=now - owed.slot))
+                continue
+            if schedule.once and schedule.id in self._last_fire:
+                continue  # fired and not failed: delivered, or still landing
             found = self._slot_for(schedule, now)
             if found is not None:
                 out.append(Due(schedule=schedule, slot=found, late_by=now - found))
@@ -458,7 +574,11 @@ class Scheduler:
         """
         del now  # the slot, not the observation, is what the fire is for
         text = due.schedule.instruction
-        if due.late:
+        if due.missed is not None:
+            from omega.tools import missed_text  # see `Schedule.kept`
+
+            text = missed_text(text, due.slot, due.missed.error)
+        elif due.late:
             minutes = int(due.late_by.total_seconds() // 60)
             text = (
                 f"{text}\n\n(Scheduled for {due.slot.isoformat()}, running "

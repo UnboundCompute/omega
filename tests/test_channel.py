@@ -182,7 +182,9 @@ def test_a_silent_turn_reaches_the_client_as_a_success(
     """DL-011 end to end. The tray must be able to show "I read it and had
     nothing to add" — not an error, and not an empty message bubble."""
     client.subscribe(0)
-    client.say("fyi, the meeting moved")
+    # Unprompted: their own message never ends silent (DL-084 #2), so
+    # silence is exercised on a fire, the one place it still lives.
+    client.say("fyi, the meeting moved", channel="schedule")
     ex = Executor(
         q,
         complete=provider.FakeProvider(
@@ -192,7 +194,8 @@ def test_a_silent_turn_reaches_the_client_as_a_success(
     ex.recover()
     ex.drain()
 
-    assert client.read()["state"] == UNDERSTOOD
+    # A fire is not acknowledged as understood (nobody sent it), so the
+    # first update the client sees is the ending.
     completed = client.read()
     assert completed["state"] == COMPLETE
     assert completed["outcome"] == "silent"

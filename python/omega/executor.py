@@ -40,6 +40,7 @@ from omega import (
     machine,
     notice,
     provider,
+    tools,
     transcripts,
 )
 from omega.derive import Learned, Moments, OpenWork, Readings
@@ -1121,6 +1122,18 @@ class Executor:
         store = self._queue.store
         try:
             st = notice.standing(store)
+            if notice.owes_outage(st):
+                # DL-084 #4: three failed looks in a row are an outage, told
+                # once, naming the cause, before looking again. Not held while
+                # offline: the tell needs no model, only the outbound path.
+                self._queue.append(
+                    episodes.inbound(
+                        tools.outage_text(st.failed_looks, st.look_error or ""),
+                        channel="schedule",
+                        at=moment.isoformat(),
+                    )
+                )
+                return True
             if not notice.may_look(
                 st, now=moment, look_every_seconds=look_every_seconds
             ):

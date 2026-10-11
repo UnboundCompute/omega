@@ -172,7 +172,8 @@ def test_a_silent_verdict_is_a_success_and_not_a_failure(store_dir: Path) -> Non
     """DL-011 — silence is a first-class successful outcome. The two must be
     separately observable, or every later metric counts one as the other."""
     with runtime_at(store_dir, silent()) as rt:
-        said = rt.say("fyi, the parcel arrived")
+        # A fire: their own message never ends silent (DL-084 #2).
+        said = rt.say("fyi, the parcel arrived", channel="schedule")
 
         assert said.silent is True
         assert said.failed is False

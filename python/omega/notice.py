@@ -41,6 +41,7 @@ from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Optional, Sequence
 
 from omega import episodes
+from omega.tools import TELL_LEAD
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from omega.derive import Claim, Moment, OpenBlock
@@ -59,6 +60,8 @@ __all__ = [
     "local_date",
     "standing",
     "may_look",
+    "LOOKS_BEFORE_TELLING",
+    "owes_outage",
     "situation",
 ]
 
@@ -84,6 +87,11 @@ MAX_PER_DAY: Optional[int] = None
 #: this yesterday" stops being a reason for silence after about that long.
 SAID_KEPT = 5
 SAID_WITHIN_SECONDS = 24 * 60 * 60
+
+#: Failed looks in a row before they are told omega is failing (DL-084 #4).
+#: One is a blip and two a bad minute; three, half an hour apart, is an outage
+#: they would want to know about before they learn it from a missed reminder.
+LOOKS_BEFORE_TELLING = 3
 
 #: The situation text is a prompt, so it is capped like one. Small on purpose:
 #: the turn's own recall already puts recent conversation and the matched claims
@@ -163,6 +171,20 @@ class Standing:
     #: earlier look to compare with, so nothing is called new.
     machine_known: bool = False
 
+    #: Looks in a row whose turn failed, counted since the last look that did
+    #: not (DL-084 #4), and the error the newest of them failed with.
+    failed_looks: int = 0
+    look_error: Optional[str] = None
+
+    #: Whether they have been told about this run of failures already: an
+    #: outage is told once, and a look that works is what ends it.
+    outage_told: bool = False
+
+
+def owes_outage(st: Standing) -> bool:
+    """Should they be told now that omega is failing (DL-084 #4)?"""
+    return st.failed_looks >= LOOKS_BEFORE_TELLING and not st.outage_told
+
 
 def standing(store: "MemoryStore") -> Standing:
     """Fold the log for what the unprompted pass has already done.
@@ -188,6 +210,9 @@ def standing(store: "MemoryStore") -> Standing:
     through = 0
     flagged: dict[str, tuple[str, str]] = {}
     machine_known = False
+    failed_looks = 0
+    look_error: Optional[str] = None
+    outage_told = False
 
     for episode in store.episodes_since(0):
         through = episode.seq
@@ -203,6 +228,12 @@ def standing(store: "MemoryStore") -> Standing:
             at = payload.get("at")
             if payload.get("channel") in UNPROMPTED_CHANNELS:
                 unprompted[episode.seq] = at if isinstance(at, str) else ""
+                if not payload.get("schedule_id") and str(
+                    payload.get("text", "")
+                ).startswith(TELL_LEAD):
+                    # The outage tell itself: a missed promise's tell names
+                    # its schedule, this one names none.
+                    outage_told = True
             if payload.get("channel") == CHANNEL:
                 mine[episode.seq] = at if isinstance(at, str) else ""
                 if isinstance(at, str):
@@ -229,6 +260,11 @@ def standing(store: "MemoryStore") -> Standing:
                 del said[:-SAID_KEPT]
             if for_seq in mine:
                 completed.add(for_seq)
+                if payload.get("outcome") == "failed":
+                    failed_looks += 1
+                    look_error = str(payload.get("error") or "unknown error")
+                else:
+                    failed_looks, outage_told = 0, False
                 if payload.get("outcome") == "spoke":
                     # Read from the *look's* stamp, not the completion's: a turn
                     # raised at 23:59 that finishes at 00:01 spent the day it was
@@ -244,6 +280,7 @@ def standing(store: "MemoryStore") -> Standing:
                 # turn is over and waiting on a person, so it is not an event
                 # still sitting unhandled in the queue.
                 completed.add(for_seq)
+                failed_looks, outage_told = 0, False
 
     return Standing(
         looked_at=looked_at,
@@ -254,6 +291,9 @@ def standing(store: "MemoryStore") -> Standing:
         said=tuple(said),
         flagged_since=tuple((k, a, l) for k, (a, l) in flagged.items()),
         machine_known=machine_known,
+        failed_looks=failed_looks,
+        look_error=look_error,
+        outage_told=outage_told,
     )
 
 

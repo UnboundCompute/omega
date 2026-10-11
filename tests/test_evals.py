@@ -241,7 +241,8 @@ def test_a_silent_turn_is_observed_as_silent_and_not_as_a_failure():
     successful outcome, so a check must be able to see it as one."""
     scenario = Scenario(
         name="quiet",
-        drive=asking("the parcel arrived"),
+        # A fire, not their message: theirs never ends silent (DL-084 #2).
+        drive=lambda rt: [rt.say("the parcel arrived", channel="schedule")],
         capability=lambda o: (
             passed("") if "silent" in o.outcomes() else failed(str(o.outcomes()))
         ),

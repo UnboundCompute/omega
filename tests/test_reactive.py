@@ -144,10 +144,15 @@ def test_a_reminder_fires_exactly_once_even_across_a_restart(q: EventQueue) -> N
     assert clock.tick(now=T0 + timedelta(minutes=1)) == []
     fired = clock.tick(now=T0 + timedelta(minutes=2))
     assert len(fired) == 1
-    # Not drained: the in-flight guard alone would also hold this tick back,
-    # which is why the assertions that matter are `schedules` and the reborn
-    # fold below, where no in-flight state exists.
+    # Not yet delivered: a fire with no terminal is awaited, never re-fired,
+    # and the reminder stays until delivery discharges it (DL-084 #1).
     assert clock.tick(now=T0 + timedelta(minutes=10)) == []
+    assert [s.id for s in clock.schedules] == ["r1"]
+    awaiting = Scheduler(q)
+    assert awaiting.tick(now=T0 + timedelta(hours=5)) == []
+
+    q.append(episodes.completed(for_seq=fired[0], outcome="spoke", reply="ok", at=AT))
+    assert clock.tick(now=T0 + timedelta(minutes=11)) == []
     assert clock.schedules == []
 
     # A fresh fold of the same log — what a restart builds — agrees.
