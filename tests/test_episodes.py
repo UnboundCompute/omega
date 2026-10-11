@@ -142,6 +142,27 @@ def test_every_kind_round_trips():
             message_id="<a2@bank>",
             at="2026-10-11T12:00:00+05:30",
         ),
+        ep.claim_merged(kept=3, folded=[9, 5], at="2026-10-11T12:00:00+05:30"),
+        ep.claim_stale(
+            claim_seq=3,
+            category="location",
+            basis_at="2026-01-01T09:00:00+00:00",
+            age_days=283,
+            at="2026-10-11T12:00:00+05:30",
+        ),
+        ep.claim_contradiction(
+            claims=[7, 3], question="Which is right now?", at="2026-10-11T12:00:00+05:30"
+        ),
+        ep.claim_asked(for_seq=12, contradiction_seq=11, at="2026-10-11T12:00:00+05:30"),
+        ep.claim_resolved(
+            contradiction_seq=11, kept=7, dropped=3, answer_seq=14,
+            at="2026-10-11T12:00:00+05:30",
+        ),
+        ep.memory_tidied(
+            checked_through=10, heard_through=14, merged=1, staled=1,
+            contradictions=1, resolved=1, reason="contradiction: no answer",
+            at="2026-10-11T12:00:00+05:30",
+        ),
     ]
     assert {p["kind"] for p in built} == ep.KINDS, "a kind has no round-trip test"
     for payload in built:

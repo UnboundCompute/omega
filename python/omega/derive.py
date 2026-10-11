@@ -32,7 +32,7 @@ way for what omega believes to drift from what the log says it was told.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Iterable, Optional
 
@@ -285,6 +285,57 @@ def local_hour(at: str) -> Optional[int]:
     return parsed.astimezone().hour
 
 
+def _parse_at(at: Optional[str]) -> Optional[datetime]:
+    if not at:
+        return None
+    try:
+        parsed = datetime.fromisoformat(at)
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def _days_between(earlier: Optional[str], later: Optional[str]) -> Optional[int]:
+    """Whole days from ``earlier`` to ``later``, or ``None`` if either is unreadable.
+
+    ``None`` rather than 0, because "could not tell" and "today" are different
+    answers and a stale mark rendered as "0 days ago" would be a wrong one.
+    """
+    start, end = _parse_at(earlier), _parse_at(later)
+    if start is None or end is None:
+        return None
+    return max(0, (end - start).days)
+
+
+def _later(a: Optional[str], b: Optional[str]) -> bool:
+    """Is instant ``a`` strictly after ``b``? An unreadable ``a`` never is; an
+    unreadable ``b`` is passed by any readable ``a``."""
+    first, second = _parse_at(a), _parse_at(b)
+    if first is None:
+        return False
+    return second is None or first > second
+
+
+def _age_phrase(days: Optional[int]) -> str:
+    if days is None:
+        return ""
+    if days < 60:
+        return f"{days} day" + ("" if days == 1 else "s")
+    if days < 730:
+        return f"{days // 30} months"
+    return f"{days // 365} years"
+
+
+#: How many of the person's own messages after a question are read for its
+#: answer (DL-087 #4). A labelled guess: an answer is usually the next thing
+#: they say, and a question still unanswered three messages later has been
+#: passed over. Past the window the pair stays marked conflicting and is not
+#: asked again.
+ANSWER_WINDOW = 3
+
+
 @dataclass(frozen=True)
 class Claim:
     """One thing omega has been taught, and the condition it applies under.
@@ -309,6 +360,40 @@ class Claim:
     source_seq: int
     explicit: bool
     supersedes: Optional[int] = None
+    #: The three below are what memory hygiene (DL-087 #4) knows about the
+    #: claim, and none of them is part of *what was claimed*: two claims are
+    #: equal if they were taught the same, whatever a tidy pass later noticed.
+    #: ``at`` is when it was last said — a merge that folds in a newer saying of
+    #: the same sentence moves it forward. ``stale`` is ``(category, basis_at)``
+    #: when a ``claim.stale`` marked it old; ``conflicts`` the texts of standing
+    #: claims it contradicts and the person has not yet settled. All default to
+    #: nothing, and :meth:`note` is empty when they are, so a log with no
+    #: hygiene episodes renders byte-identically to one from before they existed.
+    at: Optional[str] = field(default=None, compare=False)
+    stale: Optional[tuple[str, str]] = field(default=None, compare=False)
+    conflicts: tuple[str, ...] = field(default=(), compare=False)
+
+    def note(self, at: Optional[str] = None) -> str:
+        """What hygiene says about this claim, as words, or ``""``.
+
+        The age is measured to ``at`` (the turn's clock) when it can be read,
+        and the stale claim is shown, never hidden: old is a reason to check,
+        not a reason to forget (DL-087 #4).
+        """
+        parts = []
+        if self.stale is not None:
+            basis = self.stale[1]
+            age = _age_phrase(_days_between(basis, at))
+            day = basis[:10]
+            parts.append(
+                f"last said {day}, {age} ago; may be out of date"
+                if age
+                else f"last said {day}; may be out of date"
+            )
+        if self.conflicts:
+            quoted = "; ".join(f'"{text}"' for text in self.conflicts)
+            parts.append(f"conflicts with {quoted}; not settled yet")
+        return "; ".join(parts)
 
     def fires_on(self, *, text: str, channel: str, hour: Optional[int]) -> bool:
         """Does this claim apply to the situation described?
@@ -390,6 +475,15 @@ class Learned:
         "_digested",
         "_heard",
         "_reports",
+        "_stale",
+        "_contradictions",
+        "_questions",
+        "_pairs",
+        "_asked",
+        "_awaiting",
+        "_checked_through",
+        "_heard_through",
+        "_tidied_at",
     )
 
     def __init__(self) -> None:
@@ -408,6 +502,21 @@ class Learned:
         # receipt is the core saying "I have learned from it", and the gap
         # between the two is exactly the work still owed.
         self._reports: dict[tuple[str, str], int] = {}
+        # Memory hygiene (DL-087 #4), all folded from its own records. Stale
+        # marks by claim seq; open contradictions by their record's seq, each
+        # the pair of claim seqs it is about (rewritten when a merge folds one
+        # of them into a survivor); every pair ever recorded, so none is
+        # recorded twice; which were asked, and on which seq; the person's
+        # messages since each ask, up to `ANSWER_WINDOW`; and the pass cursors.
+        self._stale: dict[int, tuple[str, str]] = {}
+        self._contradictions: dict[int, tuple[int, int]] = {}
+        self._questions: dict[int, str] = {}
+        self._pairs: set[frozenset[int]] = set()
+        self._asked: dict[int, int] = {}
+        self._awaiting: dict[int, list[tuple[int, str]]] = {}
+        self._checked_through = 0
+        self._heard_through = 0
+        self._tidied_at = ""
 
     @property
     def through(self) -> int:
@@ -449,6 +558,7 @@ class Learned:
                 source_seq=int(payload["source_seq"]),
                 explicit=bool(payload.get("explicit", False)),
                 supersedes=None if supersedes is None else int(supersedes),
+                at=str(payload.get("at", "")) or None,
             )
             # A claim reached the log, so whatever was failing is not failing
             # now. Counting *since the last success* rather than for all time is
@@ -526,6 +636,51 @@ class Learned:
             # exactly backwards, since the conversation is what there is to
             # reflect *on*.
             self._since_reflection += 1
+            if self._awaiting and payload.get("channel") not in notice.UNPROMPTED_CHANNELS:
+                # A possible answer to a question omega asked (DL-087 #4): only
+                # the person's own messages, never a look or a fire. Read against
+                # the most recently asked question only: a bare "1" answers the
+                # question they just saw, not every one still open.
+                latest = max(self._awaiting, key=lambda c: self._asked[c])
+                heard = self._awaiting[latest]
+                if len(heard) < ANSWER_WINDOW:
+                    heard.append((seq, str(payload.get("text", ""))))
+        elif payload.get("kind") == episodes.CLAIM_MERGED:
+            self._merge(int(payload["kept"]), [int(s) for s in payload["folded"]])
+        elif payload.get("kind") == episodes.CLAIM_STALE:
+            claim_seq = int(payload["claim_seq"])
+            if claim_seq in self._claims:
+                self._stale[claim_seq] = (
+                    str(payload["category"]),
+                    str(payload["basis_at"]),
+                )
+        elif payload.get("kind") == episodes.CLAIM_CONTRADICTION:
+            a, b = (int(v) for v in payload["claims"])
+            self._pairs.add(frozenset((a, b)))
+            self._contradictions[seq] = (a, b)
+            self._questions[seq] = str(payload["question"])
+        elif payload.get("kind") == episodes.CLAIM_ASKED:
+            contradiction = int(payload["contradiction_seq"])
+            if contradiction in self._contradictions and contradiction not in self._asked:
+                self._asked[contradiction] = seq
+                self._awaiting[contradiction] = []
+        elif payload.get("kind") == episodes.CLAIM_RESOLVED:
+            contradiction = int(payload["contradiction_seq"])
+            pair = self._contradictions.get(contradiction)
+            dropped = int(payload["dropped"])
+            kept = int(payload["kept"])
+            # Replayed only when it names the pair it resolves: an answer is
+            # about one question, and a record dropping a claim that was not in
+            # it would be a removal nobody asked for.
+            if pair is not None and {kept, dropped} == set(pair):
+                self._claims.pop(dropped, None)
+                self._stale.pop(dropped, None)
+                del self._contradictions[contradiction]
+                self._awaiting.pop(contradiction, None)
+        elif payload.get("kind") == episodes.MEMORY_TIDIED:
+            self._checked_through = int(payload["checked_through"])
+            self._heard_through = int(payload["heard_through"])
+            self._tidied_at = str(payload["at"])
         elif payload.get("kind") == episodes.CLAIM_RETRACTED:
             # ``pop`` with a default for the same reason supersession uses one:
             # naming a claim that is no longer active is an ordinary race in an
@@ -565,9 +720,120 @@ class Learned:
             if unit not in self.worked(source)
         )
 
+    def _merge(self, kept: int, folded: list[int]) -> None:
+        """Fold ``folded`` into ``kept`` (DL-087 #4).
+
+        Only while the survivor stands: a merge into a claim that has since
+        left the set would remove the duplicates and keep nothing, which is a
+        retraction nobody asked for. The survivor's ``at`` moves to the newest
+        saying folded in, and a stale mark older than that saying is cleared —
+        saying it again is the reaffirmation the mark was waiting for.
+        """
+        survivor = self._claims.get(kept)
+        if survivor is None:
+            return
+        latest = survivor.at
+        for seq in folded:
+            gone = self._claims.pop(seq, None)
+            self._stale.pop(seq, None)
+            if gone is not None and gone.at and _later(gone.at, latest):
+                latest = gone.at
+        if latest != survivor.at:
+            self._claims[kept] = replace(survivor, at=latest)
+        mark = self._stale.get(kept)
+        if mark is not None and _later(latest, mark[1]):
+            del self._stale[kept]
+        for contradiction, pair in list(self._contradictions.items()):
+            moved = tuple(kept if seq in folded else seq for seq in pair)
+            if moved[0] == moved[1]:
+                # Both sides were the same sentence after all.
+                del self._contradictions[contradiction]
+                self._awaiting.pop(contradiction, None)
+            else:
+                self._contradictions[contradiction] = (moved[0], moved[1])
+
+    def _shown(self, claim: Claim) -> Claim:
+        stale = self._stale.get(claim.seq)
+        conflicts = tuple(
+            self._claims[other].text
+            for pair in self._contradictions.values()
+            if claim.seq in pair
+            for other in pair
+            if other != claim.seq and other in self._claims
+        )
+        if stale is None and not conflicts:
+            return claim
+        return replace(claim, stale=stale, conflicts=conflicts)
+
     def claims(self) -> list[Claim]:
-        """Every active claim, oldest first."""
-        return sorted(self._claims.values(), key=lambda c: c.seq)
+        """Every active claim, oldest first, with what hygiene noted on it."""
+        return [
+            self._shown(claim)
+            for claim in sorted(self._claims.values(), key=lambda c: c.seq)
+        ]
+
+    def raw(self, seq: int) -> Optional[Claim]:
+        """One active claim by seq, as taught, or ``None``."""
+        return self._claims.get(seq)
+
+    @property
+    def stale_marks(self) -> dict[int, tuple[str, str]]:
+        """Claims marked old, by seq, as ``(category, basis_at)``."""
+        return dict(self._stale)
+
+    @property
+    def pairs_recorded(self) -> frozenset[frozenset[int]]:
+        """Every pair a ``claim.contradiction`` was ever recorded for."""
+        return frozenset(self._pairs)
+
+    def contradictions(self) -> dict[int, tuple[int, int]]:
+        """Open contradictions whose two claims both still stand."""
+        return {
+            seq: pair
+            for seq, pair in self._contradictions.items()
+            if all(side in self._claims for side in pair)
+        }
+
+    def unasked(self) -> list[tuple[int, str]]:
+        """Open contradictions not yet asked, as ``(seq, question)``, oldest first."""
+        return [
+            (seq, self._questions[seq])
+            for seq in sorted(self.contradictions())
+            if seq not in self._asked
+        ]
+
+    def awaiting(self) -> list[tuple[int, tuple[int, int], str, list[tuple[int, str]]]]:
+        """Asked contradictions and the person's messages since, not yet read.
+
+        ``(seq, pair, question, [(message seq, text), ...])``, holding only the
+        messages past :attr:`heard_through`, so a pass never reads one twice.
+        """
+        open_now = self.contradictions()
+        return [
+            (
+                seq,
+                open_now[seq],
+                self._questions[seq],
+                [m for m in heard if m[0] > self._heard_through],
+            )
+            for seq, heard in sorted(self._awaiting.items())
+            if seq in open_now
+        ]
+
+    @property
+    def checked_through(self) -> int:
+        """The claim seq every candidate pair up to has been judged for."""
+        return self._checked_through
+
+    @property
+    def heard_through(self) -> int:
+        """The message seq every possible answer up to has been read for."""
+        return self._heard_through
+
+    @property
+    def tidied_at(self) -> str:
+        """When the last tidy pass ran, or ``""``."""
+        return self._tidied_at
 
     @property
     def failed(self) -> int:

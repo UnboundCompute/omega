@@ -1241,7 +1241,13 @@ def review(
     if claims:
         lines.append("What I believe about you:")
         for claim in claims:
-            lines.append(f"- [{claim.seq}] {claim.text} ({when_phrase(claim.trigger)})")
+            # What memory hygiene noted (DL-087 #4), only when it noted
+            # something, so a set no pass has touched renders as it always did.
+            note = claim.note(episodes.now()) if hasattr(claim, "note") else ""
+            lines.append(
+                f"- [{claim.seq}] {claim.text} ({when_phrase(claim.trigger)})"
+                + (f" [{note}]" if note else "")
+            )
             if claim.situation:
                 lines.append(f"    learned {claim.situation}")
     if running:

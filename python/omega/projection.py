@@ -211,6 +211,15 @@ NOT_PROJECTED = frozenset(
         episodes.FINANCE_STARTED,
         episodes.FINANCE_RECORDED,
         episodes.FINANCE_SKIPPED,
+        # DL-087 #4. Memory hygiene is omega tidying what it holds, between
+        # turns; a contradiction's question reaches the person only inside the
+        # reply of the brief or look that carried it, never as its own update.
+        episodes.CLAIM_MERGED,
+        episodes.CLAIM_STALE,
+        episodes.CLAIM_CONTRADICTION,
+        episodes.CLAIM_ASKED,
+        episodes.CLAIM_RESOLVED,
+        episodes.MEMORY_TIDIED,
     }
 )
 

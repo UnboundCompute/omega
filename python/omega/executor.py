@@ -40,6 +40,7 @@ from omega import (
     machine,
     notice,
     provider,
+    tidy,
     tools,
     transcripts,
 )
@@ -593,6 +594,37 @@ class Executor:
                 usage=meter.usage(),
             )
         )
+        return True
+
+    def tidy(self, *, now: Optional[str] = None) -> bool:
+        """Keep omega's own memory clean (DL-087 #4). Returns whether a pass ran.
+
+        Merges duplicate claims, marks old changeable-state ones, records
+        contradictions for the person to settle, and reads their answers — all
+        as appends, never edits (:mod:`omega.tidy`). Self-gating: at most daily,
+        or sooner when the person has said something since a question went out.
+
+        **Never raises**, for :meth:`reflect`'s reason. A pass that broke past
+        :func:`tidy.run`'s own handling still leaves a receipt with the reason,
+        and its cursors where they were.
+        """
+        if not self._recovered:
+            return False
+        self._learned.advance(self._queue.store)
+        clock = now or episodes.now()
+        if not tidy.due(self._learned, clock):
+            return False
+        try:
+            tidy.run(self._queue, self._learned, self._completer(), now=clock)
+        except Exception as exc:  # noqa: BLE001 - see the docstring
+            self._queue.append(
+                episodes.memory_tidied(
+                    checked_through=self._learned.checked_through,
+                    heard_through=self._learned.heard_through,
+                    reason=str(exc) or type(exc).__name__,
+                    at=clock,
+                )
+            )
         return True
 
     def ingest(self, *, root: Optional[Any] = None, now: Optional[Any] = None) -> int:
@@ -1255,6 +1287,10 @@ class Executor:
             # and cancelling a schedule created while this turn sat in a
             # backlog is correct — it is still firing.
             running=self._standing_schedules(),
+            # A contradiction the person has not been asked about yet (DL-087
+            # #4). The turn decides whether it may carry one; this only says
+            # which are waiting, as of this episode.
+            ask=self._learned.unasked(),
         )
         self._queue.finish(pending.seq)
         return result

@@ -185,6 +185,7 @@ def act_loop(
             prompted=not unprompted(ctx),
             # The finance ledger is the log (DL-083), read when asked.
             ledger=lambda: finance.ledger(ctx.queue.store),
+            at=str(ctx.event.get("at", "")),
         )
 
     # Ring 1 plus whatever the provider runs itself (DL-067). The second half

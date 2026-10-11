@@ -98,6 +98,15 @@ NOT_RECALLED = frozenset({
     episodes.FINANCE_STARTED,
     episodes.FINANCE_RECORDED,
     episodes.FINANCE_SKIPPED,
+    # Memory hygiene (DL-087 #4): bookkeeping about claims, not conversation.
+    # The question a contradiction asks is already in recall, inside the reply
+    # that carried it.
+    episodes.CLAIM_MERGED,
+    episodes.CLAIM_STALE,
+    episodes.CLAIM_CONTRADICTION,
+    episodes.CLAIM_ASKED,
+    episodes.CLAIM_RESOLVED,
+    episodes.MEMORY_TIDIED,
 })
 
 #: **A count is not a budget** (DL-039). ``RECALL_N`` bounds how many episodes
@@ -606,6 +615,7 @@ def run_turn(
     learned: Sequence[derive.Claim] = (),
     known: Sequence[derive.Claim] = (),
     running: Sequence[schedule.Schedule] = (),
+    ask: Sequence[tuple[int, str]] = (),
     at: Optional[str] = None,
 ) -> TurnResult:
     """Run one turn over an already-claimed episode and record how it ended.
@@ -785,6 +795,20 @@ def run_turn(
         # catch. The judge still governs every other turn.
         text = receipt if text is None else f"{text}\n\n{receipt}"
 
+    question = _question_for(ctx, ask, running) if text is not None else None
+    if question is not None:
+        # DL-087 #4: a contradiction is asked once, folded into a turn that is
+        # already speaking unprompted — never an interrupt of its own. The
+        # record lands before the terminal one, like a teach receipt's claims,
+        # and it is what stops the same pair being asked again.
+        contradiction, words = question
+        queue.append(
+            episodes.claim_asked(
+                for_seq=pending.seq, contradiction_seq=contradiction, at=at
+            )
+        )
+        text = f"{text}\n\n{words}"
+
     record = write_memory(
         queue,
         seq=pending.seq,
@@ -803,6 +827,29 @@ def run_turn(
         tools=tuple(acted.tools),
         verdict=verdict,
     )
+
+
+def _question_for(
+    ctx: "TurnContext",
+    ask: Sequence[tuple[int, str]],
+    running: Sequence[schedule.Schedule],
+) -> Optional[tuple[int, str]]:
+    """The one contradiction question this turn may carry, or ``None``.
+
+    Folded into the brief when there is one (DL-080): a brief is the moment the
+    person expects omega to raise things. With no brief standing, a spoken look
+    carries it instead. Never a reply to their own message — that turn is about
+    what they asked — and at most one per turn, so a backlog of contradictions
+    becomes one question a day rather than a quiz.
+    """
+    if not ask:
+        return None
+    from omega.tools import BRIEF_LEAD
+
+    briefed = any(item.instruction.startswith(BRIEF_LEAD) for item in running)
+    if is_brief(ctx.event) or (is_look(ctx) and not briefed):
+        return ask[0]
+    return None
 
 
 # --- verdict parsing --------------------------------------------------------
@@ -988,7 +1035,7 @@ def _event_turn(
     event = _elide(_render_event(ctx.event), MAX_NEW_EVENT_CHARS)
     text = (
         f"{_clock_line(ctx.event)}"
-        f"{_learned_section(ctx.learned)}"
+        f"{_learned_section(ctx.learned, at=str(ctx.event.get('at', '')))}"
         f"Recent history:\n{_transcript(ctx.recalled)}\n\n"
         f"{_open_section(ctx.open_work)}"
         f"New event:\n{event}{suffix}"
@@ -1090,7 +1137,7 @@ def _reply_messages(
     ]
 
 
-def _learned_section(learned: Sequence[derive.Claim]) -> str:
+def _learned_section(learned: Sequence[derive.Claim], *, at: str = "") -> str:
     """What omega has been taught that applies here, above the history (DL-042).
 
     **Above** it, not below, and that is the placement decision. These are
@@ -1120,10 +1167,20 @@ def _learned_section(learned: Sequence[derive.Claim]) -> str:
     if not learned:
         return ""
     ordered = sorted(learned, key=lambda c: (c.explicit, c.seq))
-    lines = [_elide(f"- {claim.text}", MAX_EVENT_CHARS, at=claim.seq) for claim in ordered]
+    lines = [
+        _elide(f"- {claim.text}{_hygiene(claim, at)}", MAX_EVENT_CHARS, at=claim.seq)
+        for claim in ordered
+    ]
     lines = _within(lines, MAX_LEARNED_CHARS, noun="learned item")
     body = "\n".join(lines)
     return f"What you have learned about working with this person:\n{body}\n\n"
+
+
+def _hygiene(claim: derive.Claim, at: str) -> str:
+    """What memory hygiene noted (DL-087 #4), bracketed, or ``""`` when it
+    noted nothing — which is what keeps an untouched set byte-identical."""
+    note = claim.note(at or None)
+    return f" [{note}]" if note else ""
 
 
 def _open_section(open_work: Sequence[derive.OpenBlock]) -> str:

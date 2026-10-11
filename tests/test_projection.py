@@ -330,6 +330,20 @@ def test_every_m1_kind_is_accounted_for() -> None:
             key="<n@bank>", sender="Bank <a@bank.in>", subject="alert",
             when="2026-09-23", message_id="<n@bank>", at=AT,
         ),
+        episodes.CLAIM_MERGED: episodes.claim_merged(kept=3, folded=[4], at=AT),
+        episodes.CLAIM_STALE: episodes.claim_stale(
+            claim_seq=3, category="job", basis_at=AT, age_days=200, at=AT
+        ),
+        episodes.CLAIM_CONTRADICTION: episodes.claim_contradiction(
+            claims=[3, 5], question="Which is right now? Reply 1 or 2.", at=AT
+        ),
+        episodes.CLAIM_ASKED: episodes.claim_asked(for_seq=7, contradiction_seq=6, at=AT),
+        episodes.CLAIM_RESOLVED: episodes.claim_resolved(
+            contradiction_seq=6, kept=5, dropped=3, answer_seq=8, at=AT
+        ),
+        episodes.MEMORY_TIDIED: episodes.memory_tidied(
+            checked_through=5, heard_through=0, at=AT
+        ),
     }
     assert set(made) == set(episodes.KINDS)
     for kind, payload in made.items():

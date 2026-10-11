@@ -21,7 +21,7 @@ from __future__ import annotations
 import json
 from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation
-from typing import Any, Optional
+from typing import Any, Optional, Sequence
 
 from omega.blobs import is_digest
 from omega.memory import MAX_BODY
@@ -51,6 +51,13 @@ __all__ = [
     "FINANCE_RECORDED",
     "FINANCE_SKIPPED",
     "FINANCE_DIRECTIONS",
+    "CLAIM_MERGED",
+    "CLAIM_STALE",
+    "CLAIM_CONTRADICTION",
+    "CLAIM_ASKED",
+    "CLAIM_RESOLVED",
+    "MEMORY_TIDIED",
+    "STALE_CATEGORIES",
     "REPORT_TRANSCRIPT",
     "REPORT_USAGE",
     "REPORT_RECORDING",
@@ -79,6 +86,12 @@ __all__ = [
     "claim_extracted",
     "claim_retracted",
     "claim_extraction_failed",
+    "claim_merged",
+    "claim_stale",
+    "claim_contradiction",
+    "claim_asked",
+    "claim_resolved",
+    "memory_tidied",
     "reflection_done",
     "transcript_ingested",
     "usage_digested",
@@ -132,6 +145,25 @@ FINANCE_STARTED = "finance.started"
 FINANCE_RECORDED = "finance.recorded"
 FINANCE_SKIPPED = "finance.skipped"
 FINANCE_DIRECTIONS = frozenset({"debit", "credit"})
+#: Omega keeping its own memory clean (DL-087 #4). Every one is an append next
+#: to the claims it is about, never an edit of them: ``claim.merged`` folds
+#: duplicates into one survivor, ``claim.stale`` marks a changeable-state claim
+#: old, ``claim.contradiction`` records that two standing claims cannot both be
+#: true and the question that will settle it, ``claim.asked`` that the question
+#: went out on a turn's reply, ``claim.resolved`` the person's answer, and
+#: ``memory.tidied`` the pass itself with its cursors. ``Learned`` derives the
+#: cleaned view from the originals plus these, so the originals stay readable
+#: and a rebuild reaches every earlier state.
+CLAIM_MERGED = "claim.merged"
+CLAIM_STALE = "claim.stale"
+CLAIM_CONTRADICTION = "claim.contradiction"
+CLAIM_ASKED = "claim.asked"
+CLAIM_RESOLVED = "claim.resolved"
+MEMORY_TIDIED = "memory.tidied"
+#: What a claim can go stale *as*. Closed, because the threshold is per
+#: category and a category with no threshold would be a stale mark nobody can
+#: explain.
+STALE_CATEGORIES = frozenset({"job", "location", "plans"})
 
 #: The senses a relay may report for, by the name of the sense rather than of
 #: the file it read. Three of them end in a learning receipt; the machine sense
@@ -185,6 +217,12 @@ KINDS = frozenset(
         FINANCE_STARTED,
         FINANCE_RECORDED,
         FINANCE_SKIPPED,
+        CLAIM_MERGED,
+        CLAIM_STALE,
+        CLAIM_CONTRADICTION,
+        CLAIM_ASKED,
+        CLAIM_RESOLVED,
+        MEMORY_TIDIED,
     }
 )
 
@@ -1086,6 +1124,160 @@ def sense_reported(
     return payload
 
 
+def claim_merged(
+    *, kept: int, folded: Sequence[int], at: Optional[str] = None
+) -> dict[str, Any]:
+    """Claims that say the same thing, folded into one (DL-087 #4).
+
+    ``kept`` stays in the learned set and every seq in ``folded`` leaves it —
+    the active set only, exactly as a supersession leaves it: the folded
+    ``claim.extracted`` records stay in the log. Not about a turn, so no
+    ``for_seq``: a tidy pass runs between turns.
+    """
+    payload = {
+        "v": VERSION,
+        "kind": CLAIM_MERGED,
+        "kept": kept,
+        "folded": sorted(folded),
+        "at": at or now(),
+    }
+    _validate(payload)
+    return payload
+
+
+def claim_stale(
+    *,
+    claim_seq: int,
+    category: str,
+    basis_at: str,
+    age_days: int,
+    at: Optional[str] = None,
+) -> dict[str, Any]:
+    """A changeable-state claim is old enough to be doubted (DL-087 #4).
+
+    A mark, not a removal: the claim stays in recall and is shown with its age.
+    ``basis_at`` is when it was last said, which is what the age is measured
+    from; ``age_days`` is the age when the mark was made, kept so the record
+    explains itself without the clock that wrote it.
+    """
+    payload = {
+        "v": VERSION,
+        "kind": CLAIM_STALE,
+        "claim_seq": claim_seq,
+        "category": category,
+        "basis_at": basis_at,
+        "age_days": age_days,
+        "at": at or now(),
+    }
+    _validate(payload)
+    return payload
+
+
+def claim_contradiction(
+    *, claims: Sequence[int], question: str, at: Optional[str] = None
+) -> dict[str, Any]:
+    """Two standing claims that cannot both be true, and the question to ask.
+
+    The question is rendered when the contradiction is found and kept here, so
+    what was asked is a fact in the log rather than something re-rendered later
+    from claims that may since have changed. Recorded once per pair; never
+    adjudicated by omega — only the person's answer drops one (DL-087 #4).
+    """
+    payload = {
+        "v": VERSION,
+        "kind": CLAIM_CONTRADICTION,
+        "claims": sorted(claims),
+        "question": question,
+        "at": at or now(),
+    }
+    _validate(payload)
+    return payload
+
+
+def claim_asked(
+    *, for_seq: int, contradiction_seq: int, at: Optional[str] = None
+) -> dict[str, Any]:
+    """The question for a contradiction went out on this turn's reply.
+
+    Attached to the turn whose reply carried it, because that reply is where
+    the person saw it — and its existence is what stops it being asked again.
+    """
+    payload = {
+        "v": VERSION,
+        "kind": CLAIM_ASKED,
+        "for_seq": for_seq,
+        "contradiction_seq": contradiction_seq,
+        "at": at or now(),
+    }
+    _validate(payload)
+    return payload
+
+
+def claim_resolved(
+    *,
+    contradiction_seq: int,
+    kept: int,
+    dropped: int,
+    answer_seq: int,
+    at: Optional[str] = None,
+) -> dict[str, Any]:
+    """The person answered a contradiction: ``dropped`` leaves the active set.
+
+    ``answer_seq`` is the message that answered, so the drop is always
+    traceable to something the person said and never to omega's own guess.
+    """
+    payload = {
+        "v": VERSION,
+        "kind": CLAIM_RESOLVED,
+        "contradiction_seq": contradiction_seq,
+        "kept": kept,
+        "dropped": dropped,
+        "answer_seq": answer_seq,
+        "at": at or now(),
+    }
+    _validate(payload)
+    return payload
+
+
+def memory_tidied(
+    *,
+    checked_through: int,
+    heard_through: int,
+    merged: int = 0,
+    staled: int = 0,
+    contradictions: int = 0,
+    resolved: int = 0,
+    reason: Optional[str] = None,
+    usage: Optional[list[dict[str, Any]]] = None,
+    at: Optional[str] = None,
+) -> dict[str, Any]:
+    """One tidy pass ran (DL-087 #4), and how far its two cursors got.
+
+    ``checked_through`` is the claim seq up to which every candidate pair has
+    been judged for contradiction; ``heard_through`` the message seq up to which
+    replies to an asked question have been read. Both live in the log for
+    DL-054's reason: a cursor kept in memory resets on restart and re-judges —
+    and re-pays for — what was already concluded. ``reason`` is why the model
+    half failed; the code half (merges, stale marks) does not need the model and
+    its counts stand either way.
+    """
+    payload = {
+        "v": VERSION,
+        "kind": MEMORY_TIDIED,
+        "checked_through": checked_through,
+        "heard_through": heard_through,
+        "merged": merged,
+        "staled": staled,
+        "contradictions": contradictions,
+        "resolved": resolved,
+        "reason": reason,
+        "at": at or now(),
+    }
+    _with_usage(payload, usage)
+    _validate(payload)
+    return payload
+
+
 def finance_started(*, at: Optional[str] = None) -> dict[str, Any]:
     """Finance tracking begins here (DL-083 #1). Mail dated before ``at`` is
     never recorded: no backfill, by the person's own word."""
@@ -1308,6 +1500,21 @@ _REQUIRED: dict[str, tuple[str, ...]] = {
         "at",
     ),
     FINANCE_SKIPPED: ("key", "sender", "subject", "when", "message_id", "at"),
+    CLAIM_MERGED: ("kept", "folded", "at"),
+    CLAIM_STALE: ("claim_seq", "category", "basis_at", "age_days", "at"),
+    CLAIM_CONTRADICTION: ("claims", "question", "at"),
+    CLAIM_ASKED: ("for_seq", "contradiction_seq", "at"),
+    CLAIM_RESOLVED: ("contradiction_seq", "kept", "dropped", "answer_seq", "at"),
+    MEMORY_TIDIED: (
+        "checked_through",
+        "heard_through",
+        "merged",
+        "staled",
+        "contradictions",
+        "resolved",
+        "reason",
+        "at",
+    ),
 }
 
 #: The kinds that are *not* about one turn. Everything else names the inbound
@@ -1330,6 +1537,7 @@ METERED_KINDS = frozenset(
         TRANSCRIPT_INGESTED,
         USAGE_DIGESTED,
         AUDIO_CAPTURED,
+        MEMORY_TIDIED,
     }
 )
 
@@ -1510,6 +1718,12 @@ def _validate(payload: dict[str, Any]) -> None:
     elif kind in (FINANCE_RECORDED, FINANCE_SKIPPED):
         # Identified by the mail it read (DL-083 #4), not by a turn.
         _validate_finance(payload)
+    elif kind in (CLAIM_MERGED, CLAIM_STALE, CLAIM_CONTRADICTION, CLAIM_RESOLVED):
+        # No `for_seq`: a tidy pass belongs to no turn (DL-087 #4). Each names
+        # the claims it is about instead.
+        _validate_hygiene(payload)
+    elif kind == MEMORY_TIDIED:
+        _validate_tidied(payload)
     elif kind == REFLECTION_DONE:
         # No `for_seq` and no `id`: a reflection belongs to no turn and names no
         # standing thing. It is identified by the stretch of log it covered.
@@ -1786,6 +2000,63 @@ def _validate_blob_ref(*, context_at: int, item: dict[str, Any]) -> None:
             f"context[{context_at}].bytes must be a non-negative int, "
             f"got {size!r}"
         )
+
+
+def _validate_hygiene(payload: dict[str, Any]) -> None:
+    """The four claim-hygiene records (DL-087 #4), each about named claims."""
+    kind = payload["kind"]
+    if kind == CLAIM_MERGED:
+        _require_seq(payload, "kept")
+        folded = payload["folded"]
+        if not isinstance(folded, list) or not folded:
+            raise BadPayload("folded must be a non-empty list of claim seqs")
+        for value in folded:
+            if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+                raise BadPayload(f"folded holds a non-seq {value!r}")
+        if len(set(folded)) != len(folded) or payload["kept"] in folded:
+            # A survivor folded into itself would remove the one claim the
+            # merge exists to keep.
+            raise BadPayload("folded must be distinct and must not name kept")
+    elif kind == CLAIM_STALE:
+        _require_seq(payload, "claim_seq")
+        if payload["category"] not in STALE_CATEGORIES:
+            raise BadPayload(
+                f"category {payload['category']!r} not in {sorted(STALE_CATEGORIES)}"
+            )
+        _require_str(payload, "basis_at", non_empty=True)
+        age = payload["age_days"]
+        if isinstance(age, bool) or not isinstance(age, int) or age < 0:
+            raise BadPayload("age_days must be a non-negative count")
+    elif kind == CLAIM_CONTRADICTION:
+        pair = payload["claims"]
+        if (
+            not isinstance(pair, list)
+            or len(pair) != 2
+            or any(not isinstance(v, int) or isinstance(v, bool) or v < 1 for v in pair)
+            or pair[0] == pair[1]
+        ):
+            raise BadPayload("claims must be two distinct claim seqs")
+        _require_str(payload, "question", non_empty=True)
+    elif kind == CLAIM_RESOLVED:
+        for field in ("contradiction_seq", "kept", "dropped", "answer_seq"):
+            _require_seq(payload, field)
+        if payload["kept"] == payload["dropped"]:
+            raise BadPayload("a resolution must keep one claim and drop the other")
+
+
+def _validate_tidied(payload: dict[str, Any]) -> None:
+    for field in ("checked_through", "heard_through"):
+        value = payload[field]
+        # 0 is a real cursor here: nothing checked yet.
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise BadPayload(f"{field} must be a non-negative seq")
+    for field in ("merged", "staled", "contradictions", "resolved"):
+        value = payload[field]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise BadPayload(f"{field} must be a non-negative count")
+    reason = payload["reason"]
+    if reason is not None and not (isinstance(reason, str) and reason.strip()):
+        raise BadPayload("reason must be null or a non-empty string")
 
 
 def _require_str(payload: dict[str, Any], field: str, *, non_empty: bool = False) -> None:

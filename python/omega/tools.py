@@ -1656,7 +1656,7 @@ def fetch(
     return _cap(f"{head}\n\n{text}", MAX_FETCH_CHARS)
 
 
-def recall(claims: Sequence[Any], about: str = "") -> str:
+def recall(claims: Sequence[Any], about: str = "", *, at: str = "") -> str:
     """What omega has written down, optionally narrowed to a phrase (DL-060).
 
     ``claims`` is passed in and never fetched. The running process holds an
@@ -1704,7 +1704,11 @@ def recall(claims: Sequence[Any], about: str = "") -> str:
         )
 
     shown = matched[:MAX_RECALLED]
-    lines = [f"- {getattr(c, 'text', '')} ({when_phrase(getattr(c, 'trigger', None))})" for c in shown]
+    lines = [
+        f"- {getattr(c, 'text', '')} ({when_phrase(getattr(c, 'trigger', None))})"
+        + _hygiene(c, at)
+        for c in shown
+    ]
     header = (
         f"You have written down {len(claims)} things about this person."
         if not needle
@@ -1713,6 +1717,14 @@ def recall(claims: Sequence[Any], about: str = "") -> str:
     if len(matched) > len(shown):
         lines.append(f"... and {len(matched) - len(shown)} more; search for something narrower.")
     return _cap("\n".join([header, *lines]))
+
+
+def _hygiene(claim: Any, at: str) -> str:
+    """What memory hygiene noted on a claim (DL-087 #4) — old, or conflicting —
+    or ``""`` when it noted nothing, so an untouched set renders as before."""
+    note_of = getattr(claim, "note", None)
+    note = note_of(at or None) if callable(note_of) else ""
+    return f" [{note}]" if note else ""
 
 
 def _cap(text: str, limit: int = MAX_RESULT_CHARS) -> str:
@@ -1802,7 +1814,9 @@ _TOOLS: dict[str, _Tool] = {
     ),
     RECALL: _Tool(
         classify=_classify_recall,
-        dispatch=lambda box, args: recall(box.remembered, args.get("about") or ""),
+        dispatch=lambda box, args: recall(
+            box.remembered, args.get("about") or "", at=box.at
+        ),
         schema=_schema(
             RECALL,
             "Look at what you have written down about this person. Use it "
@@ -2104,6 +2118,10 @@ class ToolBox:
     #: second open of it. ``None`` makes the tool refuse rather than say
     #: nothing was recorded.
     ledger: Optional[Callable[[], Sequence[dict[str, Any]]]] = None
+
+    #: The turn's clock, so `recall` can say how old a stale claim is now
+    #: (DL-087 #4). Empty means unknown, and the age is then left out.
+    at: str = ""
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "store_root", Path(self.store_root).resolve())

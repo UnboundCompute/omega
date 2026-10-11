@@ -680,6 +680,10 @@ class Runtime:
             # minutes, and the two cheap senses above should not sit behind it
             # waiting for a meeting to finish being heard.
             executor.hear(folder=str(self._recordings))
+        # Memory hygiene (DL-087 #4), after every pass that writes claims and
+        # before the look, so a look reads a memory already tidied. Daily under
+        # its own gate, so on most polls this is a fold and a date compare.
+        executor.tidy()
         # Last, and unconditional. Last because the three passes above *write
         # memory* and this one *reads* it to decide whether to speak — running it
         # first would have it judge a moment it had not yet finished perceiving.
