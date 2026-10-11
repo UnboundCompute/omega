@@ -188,6 +188,15 @@ def test_every_kind_round_trips():
                               "created_at": "2026-10-11T12:00:00+00:00"}},
             proposal=45, at="2026-10-11T12:00:00+00:00",
         ),
+        # DL-087 #2: following up on its own failures.
+        ep.failure_told(
+            subject="w1", kind="schedule", count=3,
+            last_error="RuntimeError: provider down", at="2026-10-11T12:00:00+00:00",
+        ),
+        ep.failure_recovered(
+            subject="mcp:github", kind="mcp", count=3,
+            last_error="the github MCP server timed out", at="2026-10-11T12:00:00+00:00",
+        ),
     ]
     assert {p["kind"] for p in built} == ep.KINDS, "a kind has no round-trip test"
     for payload in built:

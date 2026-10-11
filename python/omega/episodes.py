@@ -68,6 +68,11 @@ __all__ = [
     "GRANT_KINDS",
     "GRANT_SCOPES",
     "GRANT_PROPOSES",
+    "FAILURE_TOLD",
+    "FAILURE_RECOVERED",
+    "FAILURE_KINDS",
+    "FAILURE_SUBJECTS",
+    "MAX_FAILURE_ERROR",
     "REPORT_TRANSCRIPT",
     "REPORT_USAGE",
     "REPORT_RECORDING",
@@ -209,6 +214,22 @@ GRANT_SCOPES = frozenset({"research", "tidy"})
 #: What a proposal asks: to do the actions it lists, or to stop asking first.
 GRANT_PROPOSES = frozenset({"action", "drop_gate"})
 
+#: Omega following up on its own failures (DL-087 #2). ``failure.told`` is the
+#: one tell it gave about a subject that kept failing; ``failure.recovered`` is
+#: that subject working again after the tell. Records, never events: the
+#: failures themselves are already in the log (a failed fire's turn record, a
+#: failed MCP call's ``tool.returned``), and the live view is a fold over them
+#: (:mod:`omega.followups`). These two only remember what omega *said*, so it
+#: never says it twice.
+FAILURE_TOLD = "failure.told"
+FAILURE_RECOVERED = "failure.recovered"
+FAILURE_KINDS = frozenset({FAILURE_TOLD, FAILURE_RECOVERED})
+#: What can go wrong and be followed up on: a schedule (watch, reminder,
+#: brief), an MCP server, or a research task. Closed, like the grant scopes.
+FAILURE_SUBJECTS = frozenset({"schedule", "mcp", "research"})
+#: Ceiling on the error a failure record carries. A sentence, not a traceback.
+MAX_FAILURE_ERROR = 200
+
 #: The senses a relay may report for, by the name of the sense rather than of
 #: the file it read. Three of them end in a learning receipt; the machine sense
 #: ends in nothing, because a reading is a condition to show the look and not a
@@ -274,6 +295,8 @@ KINDS = frozenset(
         GRANT_PROPOSED,
         GRANT_ANSWERED,
         GRANT_ACTED,
+        FAILURE_TOLD,
+        FAILURE_RECOVERED,
     }
 )
 
@@ -1736,6 +1759,8 @@ _REQUIRED: dict[str, tuple[str, ...]] = {
         "reason",
         "at",
     ),
+    FAILURE_TOLD: ("subject", "failure", "count", "last_error", "at"),
+    FAILURE_RECOVERED: ("subject", "failure", "count", "last_error", "at"),
     GRANT_GIVEN: ("for_seq", "scope", "at"),
     GRANT_REVOKED: ("for_seq", "scope", "at"),
     GRANT_RESTORED: ("for_seq", "scope", "at"),
@@ -1752,6 +1777,34 @@ _REQUIRED: dict[str, tuple[str, ...]] = {
 _UNATTACHED_KINDS = frozenset(
     {MESSAGE_INBOUND, SCHEDULE_CREATED, SCHEDULE_CANCELLED, AUDIO_CAPTURED}
 )
+
+
+def failure_told(
+    *, subject: str, kind: str, count: int, last_error: str, at: Optional[str] = None
+) -> dict[str, Any]:
+    """Omega told them, once, that ``subject`` kept failing (DL-087 #2).
+
+    ``kind`` is what the subject is (a schedule id, an MCP server, a research
+    task); ``count`` the consecutive failures when it told; ``last_error`` the
+    newest error, already redacted and capped.
+    """
+    payload = {"v": VERSION, "kind": FAILURE_TOLD, "subject": subject,
+               "failure": kind, "count": count, "last_error": last_error,
+               "at": at or now()}
+    _validate(payload)
+    return payload
+
+
+def failure_recovered(
+    *, subject: str, kind: str, count: int, last_error: str, at: Optional[str] = None
+) -> dict[str, Any]:
+    """A subject omega had told them about worked again (DL-087 #2). ``count``
+    and ``last_error`` are what the run of failures ended on."""
+    payload = {"v": VERSION, "kind": FAILURE_RECOVERED, "subject": subject,
+               "failure": kind, "count": count, "last_error": last_error,
+               "at": at or now()}
+    _validate(payload)
+    return payload
 
 
 #: The kinds a pass ends on, and so the only ones that may carry ``usage``
@@ -1957,6 +2010,10 @@ def _validate(payload: dict[str, Any]) -> None:
     elif kind == PROJECT_STATE:
         # No `for_seq`: identified by the session it read, as its receipt is.
         _validate_project_state(payload)
+    elif kind in FAILURE_KINDS:
+        # No `for_seq`: a follow-up belongs to no one turn. It is about a run
+        # of failures, named by its subject.
+        _validate_failure(payload)
     elif kind in GRANT_KINDS:
         # Attached: ``for_seq`` is the turn that wrote it, which for a grant
         # given, revoked or restored is the person's own message (DL-085 #6).
@@ -2387,6 +2444,21 @@ def _validate_project_state(payload: dict[str, Any]) -> None:
     for field in ("stopped_at", "next_step"):
         if not payload[field].strip():
             raise BadPayload(f"{field} must not be empty")
+
+
+def _validate_failure(payload: dict[str, Any]) -> None:
+    _require_str(payload, "subject", non_empty=True)
+    if payload["failure"] not in FAILURE_SUBJECTS:
+        raise BadPayload(
+            f"failure {payload['failure']!r} not in {sorted(FAILURE_SUBJECTS)}"
+        )
+    count = payload["count"]
+    if isinstance(count, bool) or not isinstance(count, int) or count < 1:
+        raise BadPayload("count must be a positive int")
+    _require_str(payload, "last_error")
+    if len(payload["last_error"]) > MAX_FAILURE_ERROR:
+        raise BadPayload(f"last_error is longer than {MAX_FAILURE_ERROR} characters")
+    _require_str(payload, "at", non_empty=True)
 
 
 def _require_str(payload: dict[str, Any], field: str, *, non_empty: bool = False) -> None:

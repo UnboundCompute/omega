@@ -227,6 +227,9 @@ NOT_PROJECTED = frozenset(
         # person as the turn's own reply (a proposal is the turn's question,
         # an action its answer), so a second update for each would say it twice.
         *episodes.GRANT_KINDS,
+        # DL-087 #2. A follow-up's words reach the person as the tell inbound
+        # (or the brief line) they stand for; the record only remembers it.
+        *episodes.FAILURE_KINDS,
     }
 )
 

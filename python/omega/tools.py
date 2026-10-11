@@ -376,13 +376,56 @@ def missed_text(instruction: str, slot: datetime, error: str) -> str:
     )
 
 
+#: How the outage tell's words begin, so the fold that tells it once can tell
+#: it apart from every other tell (DL-087 #2 added the follow-up's).
+OUTAGE_LEAD = "Something is wrong on my side: "
+
+
 def outage_text(failed: int, error: str) -> str:
     """The tell for a run of failed looks (DL-084 #4), naming the cause."""
     return tell_instruction(
-        f"Something is wrong on my side: my last {failed} looks failed, the "
+        f"{OUTAGE_LEAD}my last {failed} looks failed, the "
         f"last with {error[:200]}. I'll keep trying; until it works, reminders "
         "and watches may be late."
     )
+
+
+#: How a follow-up tell's words begin (DL-087 #2): one thing omega runs kept
+#: failing, and this is the one time it says so.
+FOLLOWUP_LEAD = "Something keeps failing on my side: "
+#: What a follow-up tell ends with when it carries a ``tidy`` proposal. A tell
+#: that ends so is a question, and its turn ends waiting on their answer.
+FOLLOWUP_ASK = "Should I pause it until it's fixed? Reply yes or no."
+
+
+def followup_text(entry: Any, *, propose: bool = False) -> str:
+    """The one tell for a subject that failed three times in a row (DL-087
+    #2), naming it and its last error in plain words. ``propose`` is a watch
+    paused by the ``tidy`` grant on their yes; a watch without one asks them
+    what to do instead."""
+    head = (
+        f"{FOLLOWUP_LEAD}{entry.label} has failed {entry.count} times in a row, "
+        f"the last with {entry.last_error}."
+    )
+    if entry.kind == "mcp":
+        tail = (
+            "I won't retry those calls on my own; ask me again once it is back, "
+            "or check how it is set up."
+        )
+    elif propose:
+        tail = FOLLOWUP_ASK
+    elif entry.watch:
+        tail = "Do you want me to stop it, or leave it running while you look into it?"
+    else:
+        tail = "I'll keep at it; I'll say so here when it works again."
+    return tell_instruction(f"{head} {tail}")
+
+
+def asks(event: dict[str, Any]) -> bool:
+    """Is this tell a question waiting on their yes or no (a follow-up that
+    proposes pausing a watch)? Its turn then ends blocked, so a plain "yes"
+    answers it."""
+    return is_tell(event) and told(event).endswith(FOLLOWUP_ASK)
 
 
 #: How every research follow-up's fire text begins (DL-085).
@@ -1328,6 +1371,19 @@ def _classify_follow_up(box: "ToolBox", args: dict[str, Any]) -> Decision:
     if _live(box, grants.RESEARCH) is None:
         raise ToolRejected(f"{FOLLOW_UP} needs the research grant, and they have not given it")
     task = box.task if box.task is not None else (box.for_seq if box.prompted else None)
+    if not task and box.retry:
+        # A brief carrying on a task it reports as failed (DL-087 #2): only a
+        # task it was handed, named when it was handed more than one.
+        named = args.get("task")
+        if isinstance(named, int) and not isinstance(named, bool) and named in box.retry:
+            task = named
+        elif named is None and len(box.retry) == 1:
+            task = box.retry[0]
+        else:
+            raise ToolRejected(
+                f"{FOLLOW_UP} from a brief carries on one of research tasks "
+                f"{list(box.retry)}; name it as 'task'"
+            )
     if not task:
         raise ToolRejected(
             f"{FOLLOW_UP} carries a research task they asked for; this turn has none"
@@ -2535,7 +2591,7 @@ def hidden(box: "ToolBox") -> frozenset[str]:
         out |= {FOLLOW_UP, REPORT}
     elif box.task is None:
         out.add(REPORT)
-        if not box.prompted:
+        if not box.prompted and not box.retry:
             out.add(FOLLOW_UP)
     if state is None or not state.acted:
         out.add(UNDO)
@@ -2639,6 +2695,11 @@ class ToolBox:
 
     #: The research task a follow-up fire carries, or ``None``.
     task: Optional[int] = None
+
+    #: Research tasks a brief says could not be finished (DL-087 #2), which
+    #: that brief may carry on with ``follow_up`` naming one of them. Empty
+    #: everywhere else, so the offer and the gate are as they were.
+    retry: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "store_root", Path(self.store_root).resolve())

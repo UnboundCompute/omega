@@ -41,7 +41,7 @@ from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Optional, Sequence
 
 from omega import episodes
-from omega.tools import TELL_LEAD
+from omega.tools import OUTAGE_LEAD, tell_instruction
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from omega.derive import Claim, Moment, OpenBlock
@@ -230,9 +230,10 @@ def standing(store: "MemoryStore") -> Standing:
                 unprompted[episode.seq] = at if isinstance(at, str) else ""
                 if not payload.get("schedule_id") and str(
                     payload.get("text", "")
-                ).startswith(TELL_LEAD):
+                ).startswith(tell_instruction(OUTAGE_LEAD)):
                     # The outage tell itself: a missed promise's tell names
-                    # its schedule, this one names none.
+                    # its schedule, this one names none, and a follow-up's
+                    # (DL-087 #2) is about something else and says so.
                     outage_told = True
             if payload.get("channel") == CHANNEL:
                 mine[episode.seq] = at if isinstance(at, str) else ""

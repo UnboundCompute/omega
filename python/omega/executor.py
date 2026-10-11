@@ -34,6 +34,7 @@ from typing import Any, Callable, Optional, Sequence
 from omega import (
     blobs,
     episodes,
+    grants,
     habits,
     learn,
     listen,
@@ -46,6 +47,7 @@ from omega import (
     transcripts,
 )
 from omega.derive import Learned, Moments, OpenWork, Readings
+from omega.followups import Followups
 from omega.grants import Grants
 from omega.memory import WriteKeyConflict
 from omega.queue import EVENT_KINDS, EventQueue, Pending
@@ -208,6 +210,7 @@ class Executor:
         "_open",
         "_learned",
         "_grants",
+        "_followups",
         "_moments",
         "_standing",
         "_online",
@@ -246,6 +249,9 @@ class Executor:
         self._learned = Learned()
         # Standing grants (DL-085), folded like the views beside it.
         self._grants = Grants()
+        # Omega's own failures (DL-087 #2), folded the same way: a count that
+        # survives a restart because the failures are in the log.
+        self._followups = Followups()
         # A third view rather than a field on `_learned` (DL-062): what is
         # true and what happened have different lifetimes, and keeping them
         # in one fold is what would let events leak into the claim set.
@@ -1229,6 +1235,8 @@ class Executor:
                     )
                 )
                 return True
+            if self._follow_up(moment):
+                return True
             if not notice.may_look(
                 st, now=moment, look_every_seconds=look_every_seconds
             ):
@@ -1285,6 +1293,79 @@ class Executor:
             return False
         return True
 
+    def _follow_up(self, moment: datetime) -> bool:
+        """DL-087 #2: tell them, once, about one thing that kept failing.
+
+        Folded from the log, so it is the same answer after a restart. A
+        subject that was told about and works again gets its
+        ``failure.recovered`` here — a record, which the next brief turns
+        into one line; it starts no turn. A subject owed its tell gets one
+        tell inbound (delivered as written, no model call) and its
+        ``failure.told``, one per pass, oldest run first. A watch under the
+        ``tidy`` grant also gets a proposal to pause it, through the gate:
+        the tell asks, and their yes is what runs it. Nothing is retried.
+
+        With no failures in the log, the view is empty and this returns
+        ``False`` having appended nothing.
+        """
+        store = self._queue.store
+        self._followups.advance(store)
+        state = self._followups.state()
+        if not state:
+            return False
+        at = moment.isoformat()
+        for e in state.recovering:
+            self._queue.append(episodes.failure_recovered(
+                subject=e.subject, kind=e.kind, count=e.count,
+                last_error=e.last_error, at=at,
+            ))
+        owed = state.owed()
+        if not owed:
+            return False
+        e = owed[0]
+        proposal = self._pause_proposal(e) if e.watch else None
+        seq = self._queue.append(episodes.inbound(
+            tools.followup_text(e, propose=proposal is not None),
+            channel="schedule",
+            at=at,
+        ))
+        if proposal is not None:
+            self._queue.append(episodes.grant_proposed(
+                for_seq=seq, scope=grants.TIDY, proposes="action",
+                actions=[proposal], at=at,
+            ))
+        self._queue.append(episodes.failure_told(
+            subject=e.subject, kind=e.kind, count=e.count,
+            last_error=e.last_error, at=at,
+        ))
+        return True
+
+    def _pause_proposal(self, entry: Any) -> Optional[dict[str, Any]]:
+        """Pausing a failing watch, as the ``tidy`` tool would propose it, or
+        ``None`` when there is no tidy grant or no such watch running. The
+        tool's own classifier builds it, so it carries the definition a yes
+        must still find (and is refused exactly where a turn's would be)."""
+        # A fresh fold, not `_grants`: that one is kept at the turn being
+        # handled, and folding it ahead here would show a turn what came after
+        # its event. Rare enough (a watch owed its tell) to pay for.
+        state = Grants.rebuild(self._queue.store).state()
+        if state.live(grants.TIDY) is None:
+            return None
+        box = tools.ToolBox(
+            store_root=self._queue.store.root,
+            running=tuple(self._standing_schedules()),
+            grants=state,
+        )
+        try:
+            d = box.classify(tools.TIDY, {
+                "id": entry.ref,
+                "change": "retire",
+                "why": f"it has failed {entry.count} times in a row (last: {entry.last_error})",
+            })
+        except tools.ToolRejected:
+            return None
+        return {"tool": d.tool, "why": d.why, "args": d.args}
+
     def _machines(self, local: Sequence[str], *, now: datetime) -> Sequence[str]:
         """The local machine's lines plus every reported one's, labeled.
 
@@ -1332,6 +1413,7 @@ class Executor:
         # Through this event, as `_open` is: a brief must see what was done
         # before it, and an answer the proposal it answers.
         self._grants.advance(self._queue.store, upto=pending.seq)
+        self._followups.advance(self._queue.store, upto=pending.seq)
         result = run_turn(
             self._queue,
             pending,
@@ -1358,6 +1440,7 @@ class Executor:
             # which are waiting, as of this episode.
             ask=self._learned.unasked(),
             grants=self._grants.state(),
+            followups=self._followups.state(),
         )
         self._queue.finish(pending.seq)
         return result

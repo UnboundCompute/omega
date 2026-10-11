@@ -38,6 +38,7 @@ from omega.tools import (
     NOTHING_NEW,
     FOLLOW_UP,
     REPORT,
+    asks,
     is_brief,
     is_reminder,
     is_research,
@@ -116,6 +117,9 @@ NOT_RECALLED = frozenset({
     # Standing grants (DL-085) reach the prompt through their own section,
     # read off the fold, rather than as a line each in the conversation.
     *episodes.GRANT_KINDS,
+    # Follow-ups on omega's own failures (DL-087 #2): the tell is already in
+    # the conversation as its own inbound; the record is bookkeeping.
+    *episodes.FAILURE_KINDS,
 })
 
 #: **A count is not a budget** (DL-039). ``RECALL_N`` bounds how many episodes
@@ -278,6 +282,11 @@ class TurnContext:
     #: :class:`omega.grants.State`. ``None`` is none at all, and renders as
     #: nothing: a turn with no grants reads exactly as it did before them.
     grants: Any = None
+
+    #: Omega's own failures as of this turn (DL-087 #2), a frozen
+    #: :class:`omega.followups.State`. ``None`` or empty renders as nothing,
+    #: so a turn over a log with no failures reads exactly as before.
+    followups: Any = None
 
 
 #: Channels whose events nobody typed: omega's own look (DL-061) and the clock
@@ -647,6 +656,7 @@ def run_turn(
     running: Sequence[schedule.Schedule] = (),
     ask: Sequence[tuple[int, str]] = (),
     grants: Any = None,
+    followups: Any = None,
     at: Optional[str] = None,
 ) -> TurnResult:
     """Run one turn over an already-claimed episode and record how it ended.
@@ -700,6 +710,16 @@ def run_turn(
         # not keep, or an outage. Delivered as written, with no model call:
         # what it reports is often that the model could not be reached.
         words = told(event)
+        if asks(event):
+            # DL-087 #2: a follow-up that proposes pausing a watch is a
+            # question, so it waits on them like any other, and a plain "yes"
+            # is read against it (grants.reading's newest open question).
+            record = write_memory(
+                queue, seq=pending.seq, outcome="blocked", needs=words, at=at
+            )
+            return TurnResult(
+                seq=pending.seq, outcome="blocked", record_seq=record, needs=words
+            )
         record = write_memory(
             queue, seq=pending.seq, outcome="spoke", reply_text=words, at=at
         )
@@ -718,6 +738,7 @@ def run_turn(
         known=tuple(known),
         running=tuple(running),
         grants=grants,
+        followups=followups,
     )
 
     verdict: Optional[Verdict] = None
@@ -1090,6 +1111,7 @@ def _event_turn(
         f"Recent history:\n{_transcript(ctx.recalled)}\n\n"
         f"{_open_section(ctx.open_work)}"
         f"{_grants_section(ctx)}"
+        f"{_followups_section(ctx)}"
         f"New event:\n{event}{suffix}"
     )
     parts = _image_parts(ctx) if images else []
@@ -1263,6 +1285,40 @@ def _grants_section(ctx: TurnContext) -> str:
             lines.extend(f"  - {a.why} ({a.undo_words()})" for a in done)
     body = "\n".join(lines)
     return f"Standing grants they gave you:\n{body}\n\n"
+
+
+def _followups_section(ctx: TurnContext) -> str:
+    """What a brief owes them about omega's own failures (DL-087 #2).
+
+    Only in a brief, and only when there is something: a subject they were
+    told kept failing that works again (one line, not an interrupt), and a
+    research task whose follow-up failed ("couldn't finish X — here's why").
+    Absent otherwise, so a log with no failures renders as it always did.
+    """
+    state = ctx.followups
+    if not state or not is_brief(ctx.event):
+        return ""
+    owed = state.briefing(ctx.seq)
+    if not owed:
+        return ""
+    lines = []
+    for e in owed.recovered:
+        lines.append(
+            f"- working again: {e.label}, which had failed {e.count} times in a "
+            "row and which you told them about; say so in one line"
+        )
+    research = ctx.grants is not None and ctx.grants.live(granted.RESEARCH) is not None
+    for e in owed.research:
+        carry = (
+            f" You may carry it on with {FOLLOW_UP} (task {e.ref}); otherwise say so."
+            if research else ""
+        )
+        lines.append(
+            f"- you couldn't finish {e.label}: here's why — {e.last_error}. "
+            f"Tell them.{carry}"
+        )
+    body = "\n".join(lines)
+    return f"Your own follow-ups, for this brief:\n{body}\n\n"
 
 
 def _open_section(open_work: Sequence[derive.OpenBlock]) -> str:

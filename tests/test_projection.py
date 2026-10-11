@@ -361,6 +361,13 @@ def test_every_m1_kind_is_accounted_for() -> None:
             for_seq=1, scope="research", tool="follow_up", why="look again",
             args={"id": "f1-0001"}, undo={"cancel": "f1-0001"}, at=AT,
         ),
+        # DL-087 #2: what omega said about its own failures, never pushed.
+        episodes.FAILURE_TOLD: episodes.failure_told(
+            subject="w1", kind="schedule", count=3, last_error="boom", at=AT,
+        ),
+        episodes.FAILURE_RECOVERED: episodes.failure_recovered(
+            subject="w1", kind="schedule", count=3, last_error="boom", at=AT,
+        ),
     }
     assert set(made) == set(episodes.KINDS)
     for kind, payload in made.items():

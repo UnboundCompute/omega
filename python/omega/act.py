@@ -48,6 +48,7 @@ from omega.tools import (
     ToolText,
     hidden,
     hosted,
+    is_brief,
     research_task,
 )
 
@@ -214,6 +215,9 @@ def act_loop(
             grants=ctx.grants,
             said=str(ctx.event.get("text", "")) if not unprompted(ctx) else "",
             task=research_task(ctx.event),
+            # Research tasks this brief says could not be finished (DL-087
+            # #2): the brief may carry them on, through the gate as ever.
+            retry=_retry(ctx),
         )
 
     # Their answer to a proposal is settled before the model is asked anything
@@ -380,6 +384,20 @@ def act_loop(
         tools=tuple(used),
         stop_reason=f"{EXHAUSTED}: stopped after {max_passes} tool passes",
     )
+
+
+def _retry(ctx: TurnContext) -> tuple[int, ...]:
+    """The failed research tasks a brief turn may set a follow-up for."""
+    state = ctx.followups
+    if not state or not is_brief(ctx.event):
+        return ()
+    out = []
+    for e in state.briefing(ctx.seq).research:
+        try:
+            out.append(int(e.ref))
+        except ValueError:
+            continue
+    return tuple(out)
 
 
 def _propose(ctx: TurnContext, gated: list[Decision]) -> str:
