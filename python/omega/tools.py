@@ -122,6 +122,7 @@ __all__ = [
     "UNDO",
     "PROMISE",
     "PROMISE_ASK",
+    "FORGET",
     "promise_text",
     "asks",
     "PENDING",
@@ -198,6 +199,11 @@ UNDO = "undo"
 #: an open promise to close — so Ring 1, and every turn without that grant,
 #: is exactly what it was.
 PROMISE = "promise"
+#: Strikes one of omega's own lessons or skills (DL-086). Outside
+#: :data:`TOOL_NAMES` for :data:`PROMISE`'s reason: it exists only on their
+#: own message, and only when there is a lesson or a skill to strike, so
+#: every other turn, and every turn before the first review, is unchanged.
+FORGET = "forget"
 PENDING = "pending"
 
 #: Ring 1's remainder, and it is closed (DL-014). Spelled as a frozenset so
@@ -1583,6 +1589,61 @@ def _promise(box: "ToolBox", args: dict[str, Any]) -> str:
     return f"promise {args['promise']} marked {args['how']}"
 
 
+# --- omega's own lessons and skills (DL-086) -----------------------------------
+
+
+def _forgetting(box: "ToolBox") -> bool:
+    """Is ``forget`` there to be called in this box's turn?"""
+    return bool(box.prompted and box.lessons)
+
+
+def _classify_forget(box: "ToolBox", args: dict[str, Any]) -> Decision:
+    if not box.prompted:
+        raise ToolRejected(f"{FORGET} runs only on their own message")
+    state = box.lessons
+    found: list[tuple[str, int, str]] = []
+    if state:
+        found += [("lesson", l.seq, l.text) for l in state.lessons]
+        found += [("skill", k.seq, f"{k.name} {k.when}") for k in state.skills]
+    which = args.get("which")
+    if isinstance(which, int) and not isinstance(which, bool):
+        hits = [f for f in found if f[1] == which]
+    elif isinstance(which, str) and which.strip():
+        key = pledges.normalized(which.strip().lstrip("#"))
+        number = key.split()[-1] if key.split() and key.split()[-1].isdigit() else None
+        kind = key.split()[0] if key.split() and key.split()[0] in ("lesson", "skill") else None
+        hits = [
+            f for f in found
+            if number is not None and f[1] == int(number) and kind in (None, f[0])
+        ]
+        if not hits and number is None:
+            hits = [f for f in found if key and key in pledges.normalized(f[2])]
+    else:
+        raise ToolRejected(f"{FORGET} needs 'which': the lesson's or skill's number, or its words")
+    if len(hits) != 1:
+        listing = "; ".join(f"{k} {n}: {t[:60]}" for k, n, t in found) or "none"
+        raise ToolRejected(
+            f"{'more than one' if hits else 'no'} lesson or skill matches {which!r}; "
+            f"standing: {listing}"
+        )
+    [(kind, seq, text)] = hits
+    return Decision(
+        tool=FORGET, tier=LOCAL,
+        why=f"forget your {kind} {seq} ({text[:60]})",
+        args={"kind": kind, "seq": seq},
+    )
+
+
+def _forget(box: "ToolBox", args: dict[str, Any]) -> str:
+    if box.append is None:
+        raise ToolError("nothing can be forgotten from here: this box has no log")
+    if args["kind"] == "lesson":
+        box.append(episodes.lesson_struck(lesson=args["seq"], source_seq=box.for_seq))
+    else:
+        box.append(episodes.skill_retired(skill=args["seq"], reason="they asked you to forget it"))
+    return f"{args['kind']} {args['seq']} forgotten"
+
+
 def _classify_pending(box: "ToolBox", args: dict[str, Any]) -> Decision:
     # Exploration: it reads the grants fold this turn already holds (DL-087
     # #8), and nothing else.
@@ -2711,6 +2772,25 @@ _PROMISE_TOOL = _Tool(
 )
 
 
+#: ``forget`` (DL-086), registered beside Ring 1 and not in it: see
+#: :data:`FORGET`. :meth:`ToolBox.classify` reaches it only where
+#: :func:`_forgetting` holds.
+_FORGET_TOOL = _Tool(
+    classify=_classify_forget,
+    dispatch=_forget,
+    schema=_schema(
+        FORGET,
+        "Strike one of your own lessons or saved skills, when they tell you "
+        "it is wrong or to forget it. Name it by its number (lesson N, skill "
+        "N) or its words.",
+        {
+            "which": {"type": "string", "description": "The lesson's or skill's number, or words from it."},
+        },
+        ["which"],
+    ),
+)
+
+
 def schemas(hide: "frozenset[str] | set[str]" = frozenset()) -> list[dict[str, Any]]:
     """What is offered to the model, in the order the tools are declared.
 
@@ -2861,6 +2941,11 @@ class ToolBox:
     #: this box; everywhere else the box is what it was.
     promises: Any = None
 
+    #: omega's own lessons and skills, as of this turn (DL-086): a frozen
+    #: :class:`omega.lessons.State`, or ``None``. Only their own message,
+    #: with one standing, puts ``forget`` in this box.
+    lessons: Any = None
+
     def __post_init__(self) -> None:
         object.__setattr__(self, "store_root", Path(self.store_root).resolve())
         object.__setattr__(self, "remembered", tuple(self.remembered))
@@ -2877,6 +2962,8 @@ class ToolBox:
         tool = _TOOLS.get(name)
         if tool is None and name == PROMISE and _promising(self):
             tool = _PROMISE_TOOL
+        if tool is None and name == FORGET and _forgetting(self):
+            tool = _FORGET_TOOL
         if tool is None and self.remote is not None and isinstance(arguments, dict):
             # An MCP tool, refused or cleared by the adapter: money, writes and
             # the allowlist are decided there, in code, from the name (DL-088).
@@ -2917,6 +3004,8 @@ class ToolBox:
             return self.remote.dispatch(decision)
         if decision.tool == PROMISE and decision.tool not in _TOOLS:
             return _PROMISE_TOOL.dispatch(self, decision.args)
+        if decision.tool == FORGET and decision.tool not in _TOOLS:
+            return _FORGET_TOOL.dispatch(self, decision.args)
         return _TOOLS[decision.tool].dispatch(self, decision.args)
 
     def schemas(self, hide: "frozenset[str] | set[str]" = frozenset()) -> list[dict[str, Any]]:
@@ -2925,6 +3014,8 @@ class ToolBox:
         mine = schemas(hide)
         if _promising(self) and PROMISE not in hide:
             mine.append(_PROMISE_TOOL.schema)
+        if _forgetting(self) and FORGET not in hide:
+            mine.append(_FORGET_TOOL.schema)
         return mine + (self.remote.schemas() if self.remote is not None else [])
 
 

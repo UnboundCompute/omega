@@ -359,6 +359,7 @@ _WATCH_LEAD = "Standing watch you agreed to keep for them: "
 _REMINDER_LEAD = "Reminder you promised them: "
 _BRIEF_LEAD = "Daily brief you promised them: "
 _RESEARCH_LEAD = "Research you are carrying for them: "
+_REVIEW_LEAD = "Weekly self-review you hold for yourself: "  # omega.lessons
 
 
 def _first(payload: dict[str, Any]) -> str:
@@ -374,6 +375,8 @@ def _schedule_label(payload: dict[str, Any]) -> str:
         return f"your reminder ({first[len(_REMINDER_LEAD):][:80]})"
     if first.startswith(_BRIEF_LEAD):
         return "your daily brief"
+    if first.startswith(_REVIEW_LEAD):
+        return "my weekly self-review"
     return f"the scheduled job {payload.get('schedule_id')}"
 
 

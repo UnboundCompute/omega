@@ -208,6 +208,18 @@ def test_every_kind_round_trips():
             source_seq=47, at="2026-10-11T12:00:00+00:00",
         ),
         ep.promise_closed(promise=48, how="done", at="2026-10-11T12:00:00+00:00"),
+        # DL-086: omega's own lessons and skills, and its review cursor.
+        ep.lesson_learned(text="check the calendar before saying a day is free", cites=[3]),
+        ep.lesson_retracted(lesson=9, cites=[4]),
+        ep.lesson_struck(lesson=9, source_seq=12),
+        ep.skill_saved(
+            name="weekly digest", when="digest, summary of my week",
+            steps=[{"tool": "calendar", "args_that_mattered": "the next 7 days"}],
+            prefs="short", cites=[5],
+        ),
+        ep.skill_corrected(skill=13, cites=[6]),
+        ep.skill_retired(skill=13, reason="corrected 2 times"),
+        ep.review_done(since_seq=0, learned=1, retracted=0, skills=1),
     ]
     assert {p["kind"] for p in built} == ep.KINDS, "a kind has no round-trip test"
     for payload in built:

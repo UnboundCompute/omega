@@ -37,6 +37,7 @@ from omega import (
     grants,
     habits,
     learn,
+    lessons,
     listen,
     machine,
     notice,
@@ -215,6 +216,7 @@ class Executor:
         "_followups",
         "_promises",
         "_promises_now",
+        "_lessons",
         "_grants_now",
         "_moments",
         "_standing",
@@ -268,6 +270,10 @@ class Executor:
         self._promises = promises.Promises()
         self._promises_now = promises.Promises()
         self._grants_now = Grants()
+        # omega's own lessons and skills (DL-086), kept at the turn being
+        # handled like the views above, and apart from `_learned`: what omega
+        # learned about its own working is never a claim about the person.
+        self._lessons = lessons.Lessons()
         # A third view rather than a field on `_learned` (DL-062): what is
         # true and what happened have different lifetimes, and keeping them
         # in one fold is what would let events leak into the claim set.
@@ -1431,6 +1437,7 @@ class Executor:
         self._grants.advance(self._queue.store, upto=pending.seq)
         self._followups.advance(self._queue.store, upto=pending.seq)
         self._promises.advance(self._queue.store, upto=pending.seq)
+        self._lessons.advance(self._queue.store, upto=pending.seq)
         result = run_turn(
             self._queue,
             pending,
@@ -1459,6 +1466,7 @@ class Executor:
             grants=self._grants.state(),
             followups=self._followups.state(),
             promises=self._promises.state(),
+            lessons=self._lessons.state(),
         )
         self._queue.finish(pending.seq)
         # After the reply is durable, and never able to fail or hold it.
@@ -1602,7 +1610,9 @@ class Executor:
 
     def _standing_schedules(self) -> list[Schedule]:
         self._standing.refresh()
-        return self._standing.schedules
+        # The self-review (DL-086) is omega's own, not one of theirs: never
+        # listed, unwatched or tidied, and never in a look or a teach.
+        return [s for s in self._standing.schedules if s.id != lessons.REVIEW_ID]
 
 
     def __repr__(self) -> str:

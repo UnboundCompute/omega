@@ -236,6 +236,10 @@ NOT_PROJECTED = frozenset(
         # DL-087 #1. A promise reaches the person as its reminder or the brief
         # line naming it; the record only remembers it.
         *episodes.PROMISE_KINDS,
+        # DL-086. Omega's lessons and skills are its own working notes; a
+        # review reaches the person as its turn's reply, and a strike as the
+        # reply of the turn that asked for it.
+        *episodes.LESSON_KINDS,
     }
 )
 

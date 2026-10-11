@@ -80,6 +80,17 @@ __all__ = [
     "PROMISE_KINDS",
     "PROMISE_CLOSES",
     "MAX_PROMISE_TEXT",
+    "LESSON_LEARNED",
+    "LESSON_RETRACTED",
+    "LESSON_STRUCK",
+    "SKILL_SAVED",
+    "SKILL_CORRECTED",
+    "SKILL_RETIRED",
+    "REVIEW_DONE",
+    "LESSON_KINDS",
+    "MAX_LESSON_TEXT",
+    "MAX_SKILL_NAME",
+    "MAX_SKILL_STEPS",
     "REPORT_TRANSCRIPT",
     "REPORT_USAGE",
     "REPORT_RECORDING",
@@ -125,6 +136,13 @@ __all__ = [
     "finance_skipped",
     "promise_noted",
     "promise_closed",
+    "lesson_learned",
+    "lesson_retracted",
+    "lesson_struck",
+    "skill_saved",
+    "skill_corrected",
+    "skill_retired",
+    "review_done",
     "grant_given",
     "grant_revoked",
     "grant_restored",
@@ -262,6 +280,36 @@ PROMISE_CLOSES = frozenset({"reminded", "done", "dropped"})
 #: Ceiling on a promise's text: a sentence, not their message.
 MAX_PROMISE_TEXT = 200
 
+#: Omega learning from its own record (DL-086). Written only by the weekly
+#: self-review (and, for a strike, by their own ``forget``), never mid-turn.
+#: ``lesson.learned`` is one lesson with the seqs of the evidence it rests on;
+#: ``lesson.retracted`` the review taking one back on new evidence;
+#: ``lesson.struck`` the person striking one, named by their message.
+#: ``skill.saved`` is a way of doing a kind of task (the tools, in order, and
+#: what mattered about their arguments); ``skill.corrected`` evidence that it
+#: went wrong; ``skill.retired`` it ending. ``review.done`` is the review
+#: itself and its cursor. All records, neither recalled nor projected: the
+#: live set is a fold (:mod:`omega.lessons`), and none of it is ever a fact
+#: about the person.
+LESSON_LEARNED = "lesson.learned"
+LESSON_RETRACTED = "lesson.retracted"
+LESSON_STRUCK = "lesson.struck"
+SKILL_SAVED = "skill.saved"
+SKILL_CORRECTED = "skill.corrected"
+SKILL_RETIRED = "skill.retired"
+REVIEW_DONE = "review.done"
+LESSON_KINDS = frozenset({
+    LESSON_LEARNED, LESSON_RETRACTED, LESSON_STRUCK,
+    SKILL_SAVED, SKILL_CORRECTED, SKILL_RETIRED, REVIEW_DONE,
+})
+#: Ceiling on a lesson's text, and on a skill's ``when``, ``prefs``, a step's
+#: arguments and a retirement's reason: a sentence each.
+MAX_LESSON_TEXT = 200
+#: A skill's name is a label, not a sentence.
+MAX_SKILL_NAME = 60
+#: A skill longer than this is not a habit, it is a script.
+MAX_SKILL_STEPS = 8
+
 #: The senses a relay may report for, by the name of the sense rather than of
 #: the file it read. Three of them end in a learning receipt; the machine sense
 #: ends in nothing, because a reading is a condition to show the look and not a
@@ -332,6 +380,7 @@ KINDS = frozenset(
         FAILURE_RECOVERED,
         PROMISE_NOTED,
         PROMISE_CLOSED,
+        *LESSON_KINDS,
     }
 )
 
@@ -1798,6 +1847,13 @@ _REQUIRED: dict[str, tuple[str, ...]] = {
     FAILURE_RECOVERED: ("subject", "failure", "count", "last_error", "at"),
     PROMISE_NOTED: ("text", "due", "source_seq", "at"),
     PROMISE_CLOSED: ("promise", "how", "at"),
+    LESSON_LEARNED: ("text", "cites", "at"),
+    LESSON_RETRACTED: ("lesson", "cites", "at"),
+    LESSON_STRUCK: ("lesson", "source_seq", "at"),
+    SKILL_SAVED: ("name", "when", "steps", "prefs", "cites", "at"),
+    SKILL_CORRECTED: ("skill", "cites", "at"),
+    SKILL_RETIRED: ("skill", "reason", "at"),
+    REVIEW_DONE: ("since_seq", "learned", "retracted", "skills", "at"),
     GRANT_GIVEN: ("for_seq", "scope", "at"),
     GRANT_REVOKED: ("for_seq", "scope", "at"),
     GRANT_RESTORED: ("for_seq", "scope", "at"),
@@ -1877,6 +1933,73 @@ def promise_closed(*, promise: int, how: str, at: Optional[str] = None) -> dict[
     :data:`PROMISE_CLOSES` (DL-087 #1)."""
     payload = {"v": VERSION, "kind": PROMISE_CLOSED, "promise": promise,
                "how": how, "at": at or now()}
+    _validate(payload)
+    return payload
+
+
+def lesson_learned(*, text: str, cites: Sequence[int], at: Optional[str] = None) -> dict[str, Any]:
+    """One lesson from the self-review, resting on the evidence at ``cites``
+    (DL-086)."""
+    payload = {"v": VERSION, "kind": LESSON_LEARNED, "text": text,
+               "cites": list(cites), "at": at or now()}
+    _validate(payload)
+    return payload
+
+
+def lesson_retracted(*, lesson: int, cites: Sequence[int], at: Optional[str] = None) -> dict[str, Any]:
+    """The review taking back the lesson at seq ``lesson`` (DL-086)."""
+    payload = {"v": VERSION, "kind": LESSON_RETRACTED, "lesson": lesson,
+               "cites": list(cites), "at": at or now()}
+    _validate(payload)
+    return payload
+
+
+def lesson_struck(*, lesson: int, source_seq: int, at: Optional[str] = None) -> dict[str, Any]:
+    """They struck the lesson at seq ``lesson``, in their message ``source_seq``
+    (DL-086)."""
+    payload = {"v": VERSION, "kind": LESSON_STRUCK, "lesson": lesson,
+               "source_seq": source_seq, "at": at or now()}
+    _validate(payload)
+    return payload
+
+
+def skill_saved(
+    *, name: str, when: str, steps: Sequence[dict[str, Any]], prefs: str,
+    cites: Sequence[int], at: Optional[str] = None,
+) -> dict[str, Any]:
+    """A skill the self-review saved (DL-086): ``steps`` are
+    ``{"tool", "args_that_mattered"}`` in order."""
+    payload = {"v": VERSION, "kind": SKILL_SAVED, "name": name, "when": when,
+               "steps": [dict(s) for s in steps], "prefs": prefs,
+               "cites": list(cites), "at": at or now()}
+    _validate(payload)
+    return payload
+
+
+def skill_corrected(*, skill: int, cites: Sequence[int], at: Optional[str] = None) -> dict[str, Any]:
+    """Evidence that the skill at seq ``skill`` went wrong (DL-086)."""
+    payload = {"v": VERSION, "kind": SKILL_CORRECTED, "skill": skill,
+               "cites": list(cites), "at": at or now()}
+    _validate(payload)
+    return payload
+
+
+def skill_retired(*, skill: int, reason: str, at: Optional[str] = None) -> dict[str, Any]:
+    """The skill at seq ``skill`` ends, and why (DL-086)."""
+    payload = {"v": VERSION, "kind": SKILL_RETIRED, "skill": skill,
+               "reason": reason, "at": at or now()}
+    _validate(payload)
+    return payload
+
+
+def review_done(
+    *, since_seq: int, learned: int, retracted: int, skills: int, at: Optional[str] = None
+) -> dict[str, Any]:
+    """One self-review read the log after ``since_seq`` (DL-086). Its own seq
+    is the next review's cursor; the counts are what it wrote."""
+    payload = {"v": VERSION, "kind": REVIEW_DONE, "since_seq": since_seq,
+               "learned": learned, "retracted": retracted, "skills": skills,
+               "at": at or now()}
     _validate(payload)
     return payload
 
@@ -2092,6 +2215,10 @@ def _validate(payload: dict[str, Any]) -> None:
         # No `for_seq`: written after the turn's reply, by code, and named by
         # the message it came from (or the promise it ends) instead.
         _validate_promise(payload)
+    elif kind in LESSON_KINDS:
+        # No `for_seq`: written by the self-review (DL-086), which names its
+        # evidence by seq instead, or by `forget`, which names their message.
+        _validate_lesson(payload)
     elif kind == GRANT_WITHDRAWN:
         # No `for_seq`: written by the executor, not by a turn. It names the
         # proposal it closes instead.
@@ -2570,6 +2697,64 @@ def _validate_promise(payload: dict[str, Any]) -> None:
         _require_seq(payload, "promise")
         if payload["how"] not in PROMISE_CLOSES:
             raise BadPayload(f"how {payload['how']!r} not in {sorted(PROMISE_CLOSES)}")
+    _require_str(payload, "at", non_empty=True)
+
+
+def _require_cites(payload: dict[str, Any]) -> None:
+    cites = payload["cites"]
+    if not isinstance(cites, list) or not cites:
+        raise BadPayload("cites must be a non-empty list of seqs")
+    for cite in cites:
+        if not isinstance(cite, int) or isinstance(cite, bool) or cite < 1:
+            raise BadPayload(f"each cite must be a positive int, got {cite!r}")
+
+
+def _require_sentence(payload: dict[str, Any], field: str, *, cap: int, empty: bool = False) -> None:
+    value = payload[field]
+    if not isinstance(value, str) or (not empty and not value.strip()):
+        raise BadPayload(f"{field} must be a{'' if empty else ' non-empty'} string")
+    if len(value) > cap:
+        raise BadPayload(f"{field} is longer than {cap} characters")
+
+
+def _validate_lesson(payload: dict[str, Any]) -> None:
+    kind = payload["kind"]
+    if kind == LESSON_LEARNED:
+        _require_sentence(payload, "text", cap=MAX_LESSON_TEXT)
+        _require_cites(payload)
+    elif kind == LESSON_RETRACTED:
+        _require_seq(payload, "lesson")
+        _require_cites(payload)
+    elif kind == LESSON_STRUCK:
+        _require_seq(payload, "lesson")
+        _require_seq(payload, "source_seq")
+    elif kind == SKILL_SAVED:
+        _require_sentence(payload, "name", cap=MAX_SKILL_NAME)
+        _require_sentence(payload, "when", cap=MAX_LESSON_TEXT)
+        _require_sentence(payload, "prefs", cap=MAX_LESSON_TEXT, empty=True)
+        steps = payload["steps"]
+        if not isinstance(steps, list) or not 1 <= len(steps) <= MAX_SKILL_STEPS:
+            raise BadPayload(f"steps must be a list of 1 to {MAX_SKILL_STEPS}")
+        for step in steps:
+            if not isinstance(step, dict) or set(step) != {"tool", "args_that_mattered"}:
+                raise BadPayload('each step is exactly {"tool", "args_that_mattered"}')
+            _require_sentence(step, "tool", cap=MAX_SKILL_NAME)
+            _require_sentence(step, "args_that_mattered", cap=MAX_LESSON_TEXT, empty=True)
+        _require_cites(payload)
+    elif kind == SKILL_CORRECTED:
+        _require_seq(payload, "skill")
+        _require_cites(payload)
+    elif kind == SKILL_RETIRED:
+        _require_seq(payload, "skill")
+        _require_sentence(payload, "reason", cap=MAX_LESSON_TEXT)
+    else:  # REVIEW_DONE
+        since = payload["since_seq"]
+        if isinstance(since, bool) or not isinstance(since, int) or since < 0:
+            raise BadPayload("since_seq must be a non-negative int")
+        for field in ("learned", "retracted", "skills"):
+            value = payload[field]
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise BadPayload(f"{field} must be a non-negative count")
     _require_str(payload, "at", non_empty=True)
 
 

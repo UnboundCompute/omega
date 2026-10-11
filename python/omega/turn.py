@@ -33,7 +33,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Any, Callable, Optional, Sequence
 
-from omega import blobs, derive, episodes, grants as granted, learn, notice, provider, schedule
+from omega import blobs, derive, episodes, grants as granted, learn, lessons as self_taught, notice, provider, schedule
 from omega.tools import (
     NOTHING_NEW,
     FOLLOW_UP,
@@ -128,6 +128,9 @@ NOT_RECALLED = frozenset({
     # Promises they made (DL-087 #1): their words are already in the
     # conversation as their own message; the brief names the open ones.
     *episodes.PROMISE_KINDS,
+    # Lessons and skills (DL-086) reach the judge and act prompts through
+    # their own section, read off the fold, never as lines of conversation.
+    *episodes.LESSON_KINDS,
 })
 
 #: **A count is not a budget** (DL-039). ``RECALL_N`` bounds how many episodes
@@ -304,6 +307,12 @@ class TurnContext:
     #: :class:`omega.promises.State`. ``None``, or one with no live grant,
     #: renders as nothing: a turn without the grant reads exactly as before.
     promises: Any = None
+
+    #: omega's own lessons and skills as of this turn (DL-086), a frozen
+    #: :class:`omega.lessons.State`. ``None``, or one with none standing,
+    #: renders as nothing and offers nothing: a turn before the first review
+    #: reads exactly as before.
+    lessons: Any = None
 
 
 #: Channels whose events nobody typed: omega's own look (DL-061) and the clock
@@ -685,6 +694,7 @@ def run_turn(
     followups: Any = None,
     at: Optional[str] = None,
     promises: Any = None,
+    lessons: Any = None,
 ) -> TurnResult:
     """Run one turn over an already-claimed episode and record how it ended.
 
@@ -755,6 +765,8 @@ def run_turn(
         return TurnResult(
             seq=pending.seq, outcome="spoke", record_seq=record, reply=words
         )
+    if self_taught.is_review(event):
+        return _review(queue, pending, complete, meter, lessons=lessons, at=at)
     recalled = recall(queue, before=pending.seq, n=recall_n)
     ctx = TurnContext(
         seq=pending.seq,
@@ -769,6 +781,7 @@ def run_turn(
         grants=grants,
         followups=followups,
         promises=promises,
+        lessons=lessons,
     )
 
     verdict: Optional[Verdict] = None
@@ -1158,7 +1171,7 @@ _REPLY_SYSTEM = (
 
 
 def _event_turn(
-    ctx: TurnContext, *, images: bool, suffix: str = ""
+    ctx: TurnContext, *, images: bool, suffix: str = "", lessons: bool = False
 ) -> provider.Message:
     """The one user turn every role is given: recall, then the new event.
 
@@ -1169,6 +1182,10 @@ def _event_turn(
     because it fires on every event and only needs to know a picture is there
     to route; `act` and `reply` pass true because they are the roles expected
     to answer about it.
+
+    ``lessons`` puts omega's own lessons (DL-086) under the claims: the judge
+    and act steps decide how to work, so they read them; the reply step only
+    words what was done. Empty when none stand, so the turn is unchanged.
     """
     # The new event gets its own, far looser budget (DL-039): it is the thing
     # omega was asked about, so cutting it is cutting the question. It is
@@ -1178,6 +1195,7 @@ def _event_turn(
     text = (
         f"{_clock_line(ctx.event)}"
         f"{_learned_section(ctx.learned, at=str(ctx.event.get('at', '')))}"
+        f"{self_taught.section(ctx.lessons) if lessons else ''}"
         f"Recent history:\n{_transcript(ctx.recalled)}\n\n"
         f"{_open_section(ctx.open_work)}"
         f"{_grants_section(ctx)}"
@@ -1263,11 +1281,56 @@ _LOOK_JUDGE_SUFFIX = (
 )
 
 
+def _review(
+    queue: EventQueue,
+    pending: Pending,
+    complete: Callable[..., provider.Response],
+    meter: provider.Meter,
+    *,
+    lessons: Any,
+    at: Optional[str],
+) -> TurnResult:
+    """omega's weekly self-review (DL-086), in place of judge, act and reply.
+
+    One LEARN call over evidence code built (:mod:`omega.lessons`). It speaks
+    a short report when something changed and is quiet when nothing did,
+    which is a review that read the log and found nothing to learn, not a
+    look that skipped looking: this path never reaches :func:`reply`, where
+    the unlooked rule lives. An answer that was not the shape writes nothing
+    and fails the turn, so the failure follow-up counts it.
+    """
+    try:
+        done = self_taught.review(
+            queue, complete, upto=pending.seq, state=lessons, at=at,
+        )
+    except Exception as exc:  # noqa: BLE001 - every path records, as run_turn's
+        error = f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
+        record = write_memory(
+            queue, seq=pending.seq, outcome="failed", error=error,
+            usage=meter.usage(), at=at,
+        )
+        return TurnResult(
+            seq=pending.seq, outcome="failed", record_seq=record, error=error
+        )
+    if done.report is None:
+        record = write_memory(
+            queue, seq=pending.seq, outcome="silent", usage=meter.usage(), at=at
+        )
+        return TurnResult(seq=pending.seq, outcome="silent", record_seq=record)
+    record = write_memory(
+        queue, seq=pending.seq, outcome="spoke", reply_text=done.report,
+        usage=meter.usage(), at=at,
+    )
+    return TurnResult(
+        seq=pending.seq, outcome="spoke", record_seq=record, reply=done.report
+    )
+
+
 def _judge_messages(ctx: TurnContext) -> list[provider.Message]:
     suffix = _LOOK_JUDGE_SUFFIX if is_look(ctx) else _JUDGE_SUFFIX
     return [
         provider.system(_JUDGE_SYSTEM),
-        _event_turn(ctx, images=False, suffix=suffix),
+        _event_turn(ctx, images=False, suffix=suffix, lessons=True),
     ]
 
 

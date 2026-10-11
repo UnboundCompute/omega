@@ -57,7 +57,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Optional, Sequence
 
-from omega import episodes, notice, projection, provider
+from omega import episodes, lessons, notice, projection, provider
 from omega.blobs import BlobStore
 from omega.channel import DEFAULT_HOST, DEFAULT_PORT, Channel
 from omega.executor import Executor, StartupReport
@@ -284,6 +284,11 @@ class Runtime:
         # one that is off in every deployment nobody remembered to configure.
         # Tests that want a still clock pass `clock=False` rather than racing it.
         clock: bool = True,
+        # DL-086: the weekly self-review omega holds for itself. Off by
+        # default for the same reason as the senses above: a schedule written
+        # into every test's log would change what every test's log says.
+        # `__main__` turns it on; it needs the clock to ever fire.
+        self_review: bool = False,
         host: str = DEFAULT_HOST,
         port: int = DEFAULT_PORT,
         poll: float = DEFAULT_POLL,
@@ -310,6 +315,7 @@ class Runtime:
         self._calendar = calendar
         self._inbox = inbox
         self._clock = clock
+        self._self_review = self_review
         self._host = host
         self._port = port
         self._poll = poll
@@ -391,6 +397,10 @@ class Runtime:
                 # omega does on waking from a sleep is discharge what it already
                 # owed rather than whatever arrives next.
                 self._scheduler = Scheduler(self._queue)
+                if self._self_review:
+                    # Idempotent: a restart finds it standing and writes nothing.
+                    self._scheduler.refresh()
+                    lessons.ensure_schedule(self._queue, self._scheduler.schedules)
                 self._clock_thread = threading.Thread(
                     target=self._clock_loop, name="omega-clock", daemon=True
                 )

@@ -36,7 +36,7 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
-from omega import episodes, finance, grants, mcp, projects, provider
+from omega import episodes, finance, grants, lessons, mcp, projects, provider
 from omega.tools import (
     EXTERNAL,
     LOCAL,
@@ -154,7 +154,7 @@ def _act_messages(
             f"a relative one is read against whatever directory omega happens "
             f"to be running in, which is not your store."
         ),
-        _event_turn(ctx, images=True, suffix=suffix),
+        _event_turn(ctx, images=True, suffix=suffix, lessons=True),
     ]
 
 
@@ -219,6 +219,9 @@ def act_loop(
             # #2): the brief may carry them on, through the gate as ever.
             retry=_retry(ctx),
             promises=ctx.promises,
+            # omega's own lessons and skills (DL-086): `forget`, on their
+            # own message, when one stands; nothing at all otherwise.
+            lessons=ctx.lessons,
         )
 
     # Their answer to a proposal is settled before the model is asked anything
@@ -264,6 +267,9 @@ def act_loop(
     # Ring 1 plus whatever the provider runs itself (DL-067). The second half
     # never reaches `box.classify`; its tier was decided where it is declared.
     offered = box.schemas(hidden(box)) + hosted()
+    # A saved skill that fits (DL-086) is words in the prompt and nothing
+    # else: every call it suggests still goes through `box.classify`.
+    note += lessons.plan_for(ctx.lessons, str(ctx.event.get("text", "")))
     messages = _act_messages(ctx, box, note)
     used: list[str] = list(ran)
     asked = "\n".join(told)

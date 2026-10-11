@@ -377,6 +377,20 @@ def test_every_m1_kind_is_accounted_for() -> None:
             text="call mum", due=None, source_seq=1, at=AT,
         ),
         episodes.PROMISE_CLOSED: episodes.promise_closed(promise=2, how="dropped", at=AT),
+        # DL-086: omega's own lessons and skills, never pushed on their own.
+        episodes.LESSON_LEARNED: episodes.lesson_learned(text="ask less", cites=[1], at=AT),
+        episodes.LESSON_RETRACTED: episodes.lesson_retracted(lesson=2, cites=[1], at=AT),
+        episodes.LESSON_STRUCK: episodes.lesson_struck(lesson=2, source_seq=3, at=AT),
+        episodes.SKILL_SAVED: episodes.skill_saved(
+            name="digest", when="digest",
+            steps=[{"tool": "calendar", "args_that_mattered": ""}],
+            prefs="", cites=[1], at=AT,
+        ),
+        episodes.SKILL_CORRECTED: episodes.skill_corrected(skill=2, cites=[1], at=AT),
+        episodes.SKILL_RETIRED: episodes.skill_retired(skill=2, reason="asked", at=AT),
+        episodes.REVIEW_DONE: episodes.review_done(
+            since_seq=0, learned=0, retracted=0, skills=0, at=AT,
+        ),
     }
     assert set(made) == set(episodes.KINDS)
     for kind, payload in made.items():

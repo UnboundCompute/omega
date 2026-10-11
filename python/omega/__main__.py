@@ -652,6 +652,8 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     rt = runtime.Runtime(
         store_dir,
+        # DL-086: omega's weekly self-review, held for itself.
+        self_review=True,
         listen=args.listen,
         host=args.host,
         port=args.port,
