@@ -19,6 +19,7 @@ hierarchy would buy nothing the closed ``KINDS`` set does not already give.
 from __future__ import annotations
 
 import json
+import math
 import re
 from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation
@@ -100,6 +101,18 @@ __all__ = [
     "MAX_LESSON_TEXT",
     "MAX_SKILL_NAME",
     "MAX_SKILL_STEPS",
+    "LOCATION_SET",
+    "PLACE_SAVED",
+    "PLACE_FORGOTTEN",
+    "LOCATION_KINDS",
+    "LOCATION_SOURCES",
+    "MAX_LOCATION_LABEL",
+    "MAX_LOCATION_CITY",
+    "MAX_PLACE_NAME",
+    "MAX_LOCATION_ACCURACY",
+    "location_set",
+    "place_saved",
+    "place_forgotten",
     "REPORT_TRANSCRIPT",
     "REPORT_USAGE",
     "REPORT_RECORDING",
@@ -335,6 +348,27 @@ MAX_SKILL_NAME = 60
 #: A skill longer than this is not a habit, it is a script.
 MAX_SKILL_STEPS = 8
 
+#: Where the person is (DL-091). ``location.set`` is one fix: what they said
+#: ("I'm at the office"), what their phone's Shortcut posted, or a saved place
+#: they named. History is kept; the current location is simply the latest fix.
+#: ``place.saved`` names a place ("home") and ``place.forgotten`` drops the
+#: name. All records, neither recalled nor projected: location is never a fact
+#: to learn, never sent anywhere by omega, and the current one is a fold
+#: (:mod:`omega.location`).
+LOCATION_SET = "location.set"
+PLACE_SAVED = "place.saved"
+PLACE_FORGOTTEN = "place.forgotten"
+LOCATION_KINDS = frozenset({LOCATION_SET, PLACE_SAVED, PLACE_FORGOTTEN})
+#: Where a fix came from: their words, the phone, or a place they saved.
+LOCATION_SOURCES = frozenset({"said", "shortcut", "saved"})
+#: A label is a place, not a paragraph; a city is a name.
+MAX_LOCATION_LABEL = 200
+MAX_LOCATION_CITY = 100
+#: A saved place's name is a word or two ("home", "the gym").
+MAX_PLACE_NAME = 40
+#: Metres. A fix vaguer than this is not a location.
+MAX_LOCATION_ACCURACY = 100_000
+
 #: The senses a relay may report for, by the name of the sense rather than of
 #: the file it read. Three of them end in a learning receipt; the machine sense
 #: ends in nothing, because a reading is a condition to show the look and not a
@@ -407,6 +441,7 @@ KINDS = frozenset(
         PROMISE_NOTED,
         PROMISE_CLOSED,
         *LESSON_KINDS,
+        *LOCATION_KINDS,
     }
 )
 
@@ -1888,6 +1923,9 @@ _REQUIRED: dict[str, tuple[str, ...]] = {
     SKILL_CORRECTED: ("skill", "cites", "at"),
     SKILL_RETIRED: ("skill", "reason", "at"),
     REVIEW_DONE: ("since_seq", "learned", "retracted", "skills", "at"),
+    LOCATION_SET: ("source", "label", "lat", "lon", "accuracy_m", "city", "place", "at"),
+    PLACE_SAVED: ("name", "label", "lat", "lon", "at"),
+    PLACE_FORGOTTEN: ("name", "at"),
     GRANT_GIVEN: ("for_seq", "scope", "at"),
     GRANT_REVOKED: ("for_seq", "scope", "at"),
     GRANT_RESTORED: ("for_seq", "scope", "at"),
@@ -1993,6 +2031,49 @@ def promise_closed(*, promise: int, how: str, at: Optional[str] = None) -> dict[
     :data:`PROMISE_CLOSES` (DL-087 #1)."""
     payload = {"v": VERSION, "kind": PROMISE_CLOSED, "promise": promise,
                "how": how, "at": at or now()}
+    _validate(payload)
+    return payload
+
+
+def location_set(
+    *,
+    source: str,
+    label: Optional[str] = None,
+    lat: Optional[float] = None,
+    lon: Optional[float] = None,
+    accuracy_m: Optional[float] = None,
+    city: Optional[str] = None,
+    place: Optional[str] = None,
+    at: Optional[str] = None,
+) -> dict[str, Any]:
+    """One fix of where the person is (DL-091), ``source`` one of
+    :data:`LOCATION_SOURCES`. ``place`` is the saved place's name when they
+    named one; ``city`` alone is a rough fix."""
+    payload = {"v": VERSION, "kind": LOCATION_SET, "source": source, "label": label,
+               "lat": lat, "lon": lon, "accuracy_m": accuracy_m, "city": city,
+               "place": place, "at": at or now()}
+    _validate(payload)
+    return payload
+
+
+def place_saved(
+    *,
+    name: str,
+    label: Optional[str] = None,
+    lat: Optional[float] = None,
+    lon: Optional[float] = None,
+    at: Optional[str] = None,
+) -> dict[str, Any]:
+    """The person naming a place ``name`` (DL-091)."""
+    payload = {"v": VERSION, "kind": PLACE_SAVED, "name": name, "label": label,
+               "lat": lat, "lon": lon, "at": at or now()}
+    _validate(payload)
+    return payload
+
+
+def place_forgotten(*, name: str, at: Optional[str] = None) -> dict[str, Any]:
+    """The person dropping the saved place ``name`` (DL-091)."""
+    payload = {"v": VERSION, "kind": PLACE_FORGOTTEN, "name": name, "at": at or now()}
     _validate(payload)
     return payload
 
@@ -2281,6 +2362,10 @@ def _validate(payload: dict[str, Any]) -> None:
         # No `for_seq`: written after the turn's reply, by code, and named by
         # the message it came from (or the promise it ends) instead.
         _validate_promise(payload)
+    elif kind in LOCATION_KINDS:
+        # No `for_seq`: a fix from the phone belongs to no turn, and one they
+        # said is about them, not about the turn that wrote it down.
+        _validate_location(payload)
     elif kind in LESSON_KINDS:
         # No `for_seq`: written by the self-review (DL-086), which names its
         # evidence by seq instead, or by `forget`, which names their message.
@@ -2777,6 +2862,78 @@ def _validate_promise(payload: dict[str, Any]) -> None:
         if payload["how"] not in PROMISE_CLOSES:
             raise BadPayload(f"how {payload['how']!r} not in {sorted(PROMISE_CLOSES)}")
     _require_str(payload, "at", non_empty=True)
+
+
+def _optional_coords(payload: dict[str, Any]) -> bool:
+    """Checks ``lat``/``lon``: both numbers in range, or both null. True when
+    they are present."""
+    lat, lon = payload["lat"], payload["lon"]
+    if lat is None and lon is None:
+        return False
+    for field, value, bound in (("lat", lat, 90), ("lon", lon, 180)):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise BadPayload(f"{field} must be a number, or lat and lon both null")
+        if not math.isfinite(value) or not -bound <= value <= bound:
+            raise BadPayload(f"{field} must be within ±{bound}")
+    return True
+
+
+def _optional_text(payload: dict[str, Any], field: str, cap: int) -> bool:
+    value = payload[field]
+    if value is None:
+        return False
+    if not isinstance(value, str) or not value.strip():
+        raise BadPayload(f"{field} must be null or a non-empty string")
+    if len(value) > cap:
+        raise BadPayload(f"{field} is longer than {cap} characters")
+    return True
+
+
+def _place_name(payload: dict[str, Any], field: str) -> None:
+    name = payload[field]
+    if (not isinstance(name, str) or not name or name != name.strip()
+            or name != name.casefold() or len(name) > MAX_PLACE_NAME):
+        raise BadPayload(
+            f"{field} must be a trimmed, case-folded name of 1 to {MAX_PLACE_NAME} characters"
+        )
+
+
+def _validate_location(payload: dict[str, Any]) -> None:
+    kind = payload["kind"]
+    if kind == LOCATION_SET:
+        if payload["source"] not in LOCATION_SOURCES:
+            raise BadPayload(f"source {payload['source']!r} not in {sorted(LOCATION_SOURCES)}")
+        coords = _optional_coords(payload)
+        labelled = _optional_text(payload, "label", MAX_LOCATION_LABEL)
+        city = _optional_text(payload, "city", MAX_LOCATION_CITY)
+        if not (coords or labelled or city):
+            raise BadPayload("a location needs coordinates, a label or a city")
+        accuracy = payload["accuracy_m"]
+        if accuracy is not None:
+            if (isinstance(accuracy, bool) or not isinstance(accuracy, (int, float))
+                    or not math.isfinite(accuracy)
+                    or not 0 <= accuracy <= MAX_LOCATION_ACCURACY):
+                raise BadPayload(f"accuracy_m must be null or 0 to {MAX_LOCATION_ACCURACY}")
+        if payload["place"] is not None:
+            _place_name(payload, "place")
+        if (payload["source"] == "saved") != (payload["place"] is not None):
+            raise BadPayload("a saved-place fix names its place, and only it does")
+    elif kind == PLACE_SAVED:
+        _place_name(payload, "name")
+        coords = _optional_coords(payload)
+        labelled = _optional_text(payload, "label", MAX_LOCATION_LABEL)
+        if not (coords or labelled):
+            raise BadPayload("a saved place needs coordinates or a label")
+    else:  # PLACE_FORGOTTEN
+        _place_name(payload, "name")
+    at = payload["at"]
+    _require_str(payload, "at", non_empty=True)
+    try:
+        stamp = datetime.fromisoformat(at)
+    except ValueError as exc:
+        raise BadPayload(f"at must be an ISO datetime: {exc}") from exc
+    if stamp.tzinfo is None:
+        raise BadPayload("at must carry its zone")
 
 
 def _require_cites(payload: dict[str, Any]) -> None:

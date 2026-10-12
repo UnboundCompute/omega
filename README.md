@@ -136,6 +136,44 @@ Some servers it has been shaped around (check each one's own docs for its tool n
 - **Expedia**: `https://www.expedia.com/mcp`. No login. Search only: booking is refused
   by the money rule, so omega hands you the link.
 
+### Location from your phone (opt-in)
+
+Tell omega where you are ("I'm at the office", "I'm home") and it notes it; name places
+with "save this as home". On your own messages it then sees one line, *their location*
+as of a time and how it knows, so a maps tool can answer "near me" and route questions.
+After three hours that line becomes your *last known* location and is never presented as
+current. Location never appears in briefs, watches or tells, is never learned as a fact
+about you, and omega sends it nowhere except as an argument the model passes a tool for
+the question you asked. History is kept in the log; ask "where was I yesterday at 6".
+
+Your phone can keep it current. Set a token and omega listens for `POST /location` on
+`127.0.0.1` only; unset, nothing listens:
+
+```sh
+OMEGA_LOCATION_TOKEN=<long random string>   # e.g. openssl rand -hex 32
+OMEGA_LOCATION_PORT=7718                    # optional; the default
+```
+
+On the host, publish that port to your tailnet only (MagicDNS and HTTPS certificates
+enabled), never with `tailscale funnel`:
+
+```sh
+sudo tailscale serve --bg --https=7718 http://127.0.0.1:7718
+```
+
+Then in the Shortcuts app on the phone (with Tailscale connected), make a shortcut:
+
+1. **Get Current Location**.
+2. **Get Contents of URL**: `https://<vm>.<tailnet>.ts.net:7718/location`, Method
+   **POST**, Header `Authorization` = `Bearer <token>`, Request Body **JSON** with `lat`
+   (Number: the location's Latitude) and `lon` (Number: its Longitude). Optional fields:
+   `accuracy` (metres), `label`, `city`. A `city` alone is accepted as a rough location.
+3. Optionally, an Automation to run it (when you arrive or leave somewhere, or at set
+   times).
+
+A wrong token is a 401 and a bad body a 400; nothing is written for either, and requests
+are rate-limited. The listener logs nothing, the token included.
+
 ## Boundary rule
 
 `apps/mac-tray` is a channel, not the agent. It may render conversation, collect context,

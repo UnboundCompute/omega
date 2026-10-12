@@ -18,6 +18,10 @@
 #   echo 'SARVAM_API_KEY=...' | sudo tee -a /etc/omega/discord.env
 #   sudo chmod 600 /etc/omega/discord.env
 #   sudo tailscale serve --bg --tcp 7717 tcp://127.0.0.1:7717
+#   # Optional (DL-091): the phone's location Shortcut. The core itself listens
+#   # (it is the one writer); unset, nothing listens. Tailnet only, never funnel.
+#   echo "OMEGA_LOCATION_TOKEN=$(openssl rand -hex 32)" | sudo tee -a /etc/omega/env
+#   sudo tailscale serve --bg --https=7718 http://127.0.0.1:7718
 #
 #   sudo install -m 755 autodeploy.sh /usr/local/bin/omega-autodeploy
 #   sudo cp omega-autodeploy.service omega-autodeploy.timer /etc/systemd/system/

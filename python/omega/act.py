@@ -37,7 +37,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-from omega import episodes, finance, grants, lessons, mailcursor, mcp, projects, provider
+from omega import episodes, finance, grants, lessons, location, mailcursor, mcp, projects, provider
 from omega.tools import (
     EXTERNAL,
     LOCAL,
@@ -240,6 +240,10 @@ def act_loop(
             # DL-090: an unprompted turn's mail is only what arrived since
             # its origin last read it; their own turn gets no cursor at all.
             mail_since=_mail_since(ctx) if unprompted(ctx) else None,
+            # DL-091: where they are, folded from the log when the tool asks,
+            # and only in a turn their own message started.
+            locations=(lambda: location.fold(ctx.queue.store)) if not unprompted(ctx) else None,
+            located=bool(ctx.location),
         )
 
     # Their answer to a proposal is settled before the model is asked anything

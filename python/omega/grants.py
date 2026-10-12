@@ -154,6 +154,7 @@ REVERSIBILITY: dict[str, str] = {
     "report": OWN,
     "promise": OWN,  # closes one of their noted promises (DL-087 #1)
     "forget": OWN,  # strikes one of omega's own lessons or skills (DL-086)
+    "location": OWN,  # notes or names where they are, in the log (DL-091)
     "write_file": OWN,  # inside the store; outside it is irreversible
     "run_code": READ,  # read-only argv; anything else is irreversible
 }

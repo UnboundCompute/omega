@@ -83,6 +83,7 @@ from urllib.parse import urlsplit
 from omega import calendar as calendars, episodes, finance as finances, grants, inbox as inboxes, readable
 from omega import projects as worklog
 from omega import promises as pledges
+from omega import location as whereabouts
 from omega.schedule import CronError, describe_cron, next_match, validate_cron, zone_label
 
 __all__ = [
@@ -123,6 +124,7 @@ __all__ = [
     "PROMISE",
     "PROMISE_ASK",
     "FORGET",
+    "LOCATION",
     "promise_text",
     "asks",
     "PENDING",
@@ -204,6 +206,11 @@ PROMISE = "promise"
 #: own message, and only when there is a lesson or a skill to strike, so
 #: every other turn, and every turn before the first review, is unchanged.
 FORGET = "forget"
+#: Where they are (DL-091): note it, read it, name places. Outside
+#: :data:`TOOL_NAMES` for :data:`PROMISE`'s reason: it exists only on their
+#: own message, in a box with the log to read and write, so every unprompted
+#: turn (a brief, a watch, a look, a tell) neither sees nor calls it.
+LOCATION = "location"
 PENDING = "pending"
 
 #: Ring 1's remainder, and it is closed (DL-014). Spelled as a frozenset so
@@ -1675,6 +1682,166 @@ def _forget(box: "ToolBox", args: dict[str, Any]) -> str:
     return f"{args['kind']} {args['seq']} forgotten"
 
 
+# --- where they are (DL-091) -----------------------------------------------------
+
+_LOCATION_ACTIONS = ("here", "where", "save", "forget", "places", "history")
+_LOCATION_WRITES = frozenset({"here", "save", "forget"})
+
+
+def _locating(box: "ToolBox") -> bool:
+    """Is ``location`` there to be called in this box's turn?
+
+    Only on their own message, in a box with the log, and only once there is
+    something to read (a fix or a saved place) or their words are about
+    where they are: a turn over a log without either is offered exactly what
+    it always was.
+    """
+    return bool(
+        box.prompted and box.locations is not None and box.append is not None
+        and (box.located or whereabouts.speaks_of_place(box.said))
+    )
+
+
+def _location_now(box: "ToolBox") -> datetime:
+    try:
+        moment = datetime.fromisoformat(box.at) if box.at else None
+    except ValueError:
+        moment = None
+    if moment is None:
+        return _now()
+    return moment if moment.tzinfo else moment.replace(tzinfo=timezone.utc)
+
+
+def _location_words(args: dict[str, Any], key: str) -> str:
+    # Refusals name the field, never what was in it: a refusal can reach the
+    # self-review's digest, and where they are is not a lesson.
+    value = args.get(key)
+    if not _given(value):
+        return ""
+    if not isinstance(value, str):
+        raise ToolRejected(f"{LOCATION}'s {key!r} must be a string")
+    value = " ".join(value.split())
+    if len(value) > episodes.MAX_LOCATION_LABEL:
+        raise ToolRejected(
+            f"{LOCATION}'s {key!r} is longer than {episodes.MAX_LOCATION_LABEL} characters"
+        )
+    return value
+
+
+def _location_name(args: dict[str, Any]) -> str:
+    name = whereabouts.place_name(_location_words(args, "name"))
+    if not name:
+        raise ToolRejected(f"{LOCATION} {args.get('action')} needs 'name': the place's name")
+    if len(name) > episodes.MAX_PLACE_NAME:
+        raise ToolRejected(
+            f"{LOCATION}'s 'name' is longer than {episodes.MAX_PLACE_NAME} characters"
+        )
+    return name
+
+
+def _fix_from(state: Any, text: str) -> dict[str, Any]:
+    """What ``here`` writes for ``text``: a saved place it names, coordinates,
+    or their words as the label."""
+    key = whereabouts.place_name(text)
+    for lead in ("i'm at ", "im at ", "i am at ", "at "):
+        if key.startswith(lead) and key[len(lead):] in state.places:
+            key = key[len(lead):]
+            break
+    place = state.places.get(key)
+    if place is not None:
+        return {"source": "saved", "place": place.name, "label": place.label,
+                "lat": place.lat, "lon": place.lon}
+    coords = whereabouts.coordinates(text)
+    if coords is not None:
+        return {"source": "said", "lat": coords[0], "lon": coords[1]}
+    return {"source": "said", "label": text}
+
+
+def _classify_location(box: "ToolBox", args: dict[str, Any]) -> Decision:
+    if not _locating(box):
+        raise ToolRejected(f"{LOCATION} runs only on their own message")
+    action = args.get("action")
+    if not isinstance(action, str) or action.strip().lower() not in _LOCATION_ACTIONS:
+        raise ToolRejected(f"{LOCATION}'s 'action' is one of {list(_LOCATION_ACTIONS)}")
+    action = action.strip().lower()
+    state = box.locations()
+    now = _location_now(box)
+    if action == "here":
+        text = _location_words(args, "text")
+        if not text:
+            raise ToolRejected(f"{LOCATION} here needs 'text': where they are, or a saved place's name")
+        return Decision(tool=LOCATION, tier=LOCAL, why="note where they are",
+                        args={"action": action, "fix": _fix_from(state, text)})
+    if action == "save":
+        name = _location_name(args)
+        text = _location_words(args, "text")
+        if not text or whereabouts.place_name(text) == "here":
+            fix = state.current
+            if fix is None:
+                raise ToolRejected(f"{LOCATION} save has no current location to save; give 'text'")
+            label = fix.label or fix.city
+            if fix.lat is None and not label:
+                raise ToolRejected(f"{LOCATION} save cannot name a location with nothing to name")
+            place = {"label": label, "lat": fix.lat, "lon": fix.lon}
+        else:
+            coords = whereabouts.coordinates(text)
+            place = ({"label": None, "lat": coords[0], "lon": coords[1]} if coords
+                     else {"label": text, "lat": None, "lon": None})
+        return Decision(tool=LOCATION, tier=LOCAL, why="save a place by name",
+                        args={"action": action, "name": name, **place})
+    if action == "forget":
+        name = _location_name(args)
+        if name not in state.places:
+            raise ToolRejected(f"{LOCATION} forget: no saved place has that name")
+        return Decision(tool=LOCATION, tier=LOCAL, why="forget a saved place",
+                        args={"action": action, "name": name})
+    if action == "where":
+        words = _location_words(args, "when")
+        when = None
+        if words and words.casefold() not in ("now", "currently", "right now"):
+            when = whereabouts.parse_when(words, now)
+            if when is None:
+                raise ToolRejected(
+                    f"{LOCATION} where could not read 'when': give HH:MM, yesterday HH:MM, "
+                    f"N hours ago, or an ISO date or time"
+                )
+        return Decision(tool=LOCATION, tier=EXPLORATION, why="read where they are",
+                        args={"action": action,
+                              "when": when.isoformat() if when is not None else None})
+    if action == "history":
+        days = _days(LOCATION, args, default=1, low=1, high=30)
+        return Decision(tool=LOCATION, tier=EXPLORATION, why="read where they have been",
+                        args={"action": action, "days": days})
+    return Decision(tool=LOCATION, tier=EXPLORATION, why="list their saved places",
+                    args={"action": action})
+
+
+def _location(box: "ToolBox", args: dict[str, Any]) -> str:
+    if box.append is None or box.locations is None:
+        raise ToolError("location cannot be read or noted from here: this box has no log")
+    action = args["action"]
+    now = _location_now(box)
+    if action == "here":
+        # Stamped with the turn's clock: they said it when their message
+        # arrived, which is also the moment `where` below is read against.
+        box.append(episodes.location_set(**args["fix"], at=now.isoformat()))
+        return whereabouts.where_text(box.locations(), now)
+    if action == "save":
+        box.append(episodes.place_saved(name=args["name"], label=args["label"],
+                                        lat=args["lat"], lon=args["lon"]))
+        return f"saved place {args['name']}"
+    if action == "forget":
+        box.append(episodes.place_forgotten(name=args["name"]))
+        return f"forgot saved place {args['name']}"
+    state = box.locations()
+    if action == "where":
+        when = datetime.fromisoformat(args["when"]) if args.get("when") else None
+        return whereabouts.where_text(state, now, when)
+    if action == "history":
+        return _cap(whereabouts.history_text(state, now, args["days"]))
+    return _cap(whereabouts.places_text(state))
+
+
 def _classify_pending(box: "ToolBox", args: dict[str, Any]) -> Decision:
     # Exploration: it reads the grants fold this turn already holds (DL-087
     # #8), and nothing else.
@@ -2826,6 +2993,34 @@ _FORGET_TOOL = _Tool(
 )
 
 
+#: ``location`` (DL-091), registered beside Ring 1 and not in it: see
+#: :data:`LOCATION`. :meth:`ToolBox.classify` reaches it only where
+#: :func:`_locating` holds.
+_LOCATION_TOOL = _Tool(
+    classify=_classify_location,
+    dispatch=_location,
+    schema=_schema(
+        LOCATION,
+        "Where they are. 'here' notes where they say they are (text: a place, "
+        "an address, 'lat,lon', or the name of a place they saved). 'where' "
+        "reads their location now, or as of 'when' (HH:MM, 'yesterday 18:00', "
+        "'3 hours ago', an ISO date or time). 'save' names a place (name, and "
+        "text, or no text to save where they are now); 'forget' drops a saved "
+        "place; 'places' lists them; 'history' lists where they have been over "
+        "'days'. Use it only for their own question, and pass their location "
+        "to another tool only when that question needs it.",
+        {
+            "action": {"type": "string", "enum": list(_LOCATION_ACTIONS)},
+            "text": {"type": "string", "description": "For here and save: the place."},
+            "name": {"type": "string", "description": "For save and forget: the saved place's name."},
+            "when": {"type": "string", "description": "For where: a past time, or blank for now."},
+            "days": {"type": "integer", "description": "For history: 1 to 30, default 1."},
+        },
+        ["action"],
+    ),
+)
+
+
 def schemas(hide: "frozenset[str] | set[str]" = frozenset()) -> list[dict[str, Any]]:
     """What is offered to the model, in the order the tools are declared.
 
@@ -2986,6 +3181,13 @@ class ToolBox:
     #: Consulted only when ``prompted`` is false; ``None`` is a box with no
     #: log to fold, which reads mail as it always did.
     mail_since: Optional[Callable[[Optional[str], bool], datetime]] = None
+    #: Where they are (DL-091): the :class:`omega.location.State` folded from
+    #: the turn's own log, read through the store the turn holds. Only their
+    #: own message, with this and ``append`` set, puts ``location`` in the box;
+    #: ``None`` leaves the box exactly as it was.
+    locations: Optional[Callable[[], Any]] = None
+    #: Whether the log held a fix or a saved place as of this turn.
+    located: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "store_root", Path(self.store_root).resolve())
@@ -3005,6 +3207,8 @@ class ToolBox:
             tool = _PROMISE_TOOL
         if tool is None and name == FORGET and _forgetting(self):
             tool = _FORGET_TOOL
+        if tool is None and name == LOCATION and _locating(self):
+            tool = _LOCATION_TOOL
         if tool is None and self.remote is not None and isinstance(arguments, dict):
             # An MCP tool, refused or cleared by the adapter: money, writes and
             # the allowlist are decided there, in code, from the name (DL-088).
@@ -3047,6 +3251,8 @@ class ToolBox:
             return _PROMISE_TOOL.dispatch(self, decision.args)
         if decision.tool == FORGET and decision.tool not in _TOOLS:
             return _FORGET_TOOL.dispatch(self, decision.args)
+        if decision.tool == LOCATION and decision.tool not in _TOOLS:
+            return _LOCATION_TOOL.dispatch(self, decision.args)
         return _TOOLS[decision.tool].dispatch(self, decision.args)
 
     def schemas(self, hide: "frozenset[str] | set[str]" = frozenset()) -> list[dict[str, Any]]:
@@ -3057,6 +3263,8 @@ class ToolBox:
             mine.append(_PROMISE_TOOL.schema)
         if _forgetting(self) and FORGET not in hide:
             mine.append(_FORGET_TOOL.schema)
+        if _locating(self) and LOCATION not in hide:
+            mine.append(_LOCATION_TOOL.schema)
         return mine + (self.remote.schemas() if self.remote is not None else [])
 
 

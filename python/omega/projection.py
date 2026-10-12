@@ -243,6 +243,9 @@ NOT_PROJECTED = frozenset(
         # review reaches the person as its turn's reply, and a strike as the
         # reply of the turn that asked for it.
         *episodes.LESSON_KINDS,
+        # DL-091. Where they are goes to no surface; the tool answers them in
+        # its turn's reply.
+        *episodes.LOCATION_KINDS,
     }
 )
 

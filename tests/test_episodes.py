@@ -227,6 +227,10 @@ def test_every_kind_round_trips():
         ep.skill_corrected(skill=13, cites=[6]),
         ep.skill_retired(skill=13, reason="corrected 2 times"),
         ep.review_done(since_seq=0, learned=1, retracted=0, skills=1),
+        # DL-091: where they are, and the places they named.
+        ep.location_set(source="shortcut", lat=12.5, lon=77.25, accuracy_m=20.0, city="Townsville"),
+        ep.place_saved(name="home", label="12 Example Street"),
+        ep.place_forgotten(name="home"),
     ]
     assert {p["kind"] for p in built} == ep.KINDS, "a kind has no round-trip test"
     for payload in built:

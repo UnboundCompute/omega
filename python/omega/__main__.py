@@ -33,7 +33,7 @@ import signal
 import sys
 import threading
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 from omega import (
     access,
@@ -47,6 +47,7 @@ from omega import (
     inbox,
     learn,
     listen,
+    location,
     machine,
     mcp,
     memory,
@@ -304,6 +305,31 @@ def _account_lines(environ=os.environ) -> list[str]:
     ] + [line for line in (mcp.account_line(environ),) if line]
 
 
+def _location_args(environ) -> dict[str, Any]:
+    """The runtime's location arguments: none at all without a usable token."""
+    wanted = location.settings(environ)
+    if not wanted.startable:
+        return {}
+    return {"location_token": wanted.token, "location_port": wanted.port}
+
+
+def _location_lines(rt: runtime.Runtime, environ=os.environ) -> list[str]:
+    """The phone's location door (DL-091), when a token asks for it.
+
+    Nothing at all without :data:`omega.location.ENV_TOKEN`, so a host that
+    never set one starts exactly as it did. The token itself is never printed.
+    """
+    wanted = location.settings(environ)
+    if not wanted.wanted:
+        return []
+    if wanted.problem:
+        return [f"location: not listening ({wanted.problem})"]
+    if rt.location_address is not None:
+        host, port = rt.location_address
+        return [f"location: listening for the phone on {host}:{port} (POST /location)"]
+    return [f"location: not listening ({rt.location_error or 'the runtime is not running'})"]
+
+
 def _startup_lines(rt: runtime.Runtime, *, interactive: bool = True) -> list[str]:
     """What omega says when it opens.
 
@@ -321,6 +347,7 @@ def _startup_lines(rt: runtime.Runtime, *, interactive: bool = True) -> list[str
     # into 15:30 IST without a word, which is DL-078's failure.
     out.append(f"local time zone {scheduling.zone_label()}: clock-time schedules run on it")
     out.extend(_account_lines())
+    out.extend(_location_lines(rt))
     out.extend(f"omega: {line}" for line in rt.report.lines())
     if rt.report.clean:
         out.append("(nothing was left in flight last time)")
@@ -694,6 +721,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         # DL-087 #3: checks a lost sign-in again, at most hourly: an IMAP
         # login, the Google refresh, or one MCP listing. Never a write.
         probe=access.probe,
+        # DL-091: the phone's Shortcut door, only when a usable token is set.
+        **_location_args(os.environ),
     )
     try:
         rt.start()

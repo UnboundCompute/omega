@@ -34,6 +34,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Optional, Sequence
 
 from omega import blobs, derive, episodes, grants as granted, learn, lessons as self_taught, notice, provider, schedule
+from omega import location as whereabouts
 from omega.tools import (
     NOTHING_NEW,
     FOLLOW_UP,
@@ -134,6 +135,9 @@ NOT_RECALLED = frozenset({
     # Lessons and skills (DL-086) reach the judge and act prompts through
     # their own section, read off the fold, never as lines of conversation.
     *episodes.LESSON_KINDS,
+    # Where they are (DL-091): never conversation, never a thing to learn. A
+    # prompted turn sees it as one line, read off the fold.
+    *episodes.LOCATION_KINDS,
 })
 
 #: **A count is not a budget** (DL-039). ``RECALL_N`` bounds how many episodes
@@ -321,6 +325,12 @@ class TurnContext:
     #: renders as nothing and offers nothing: a turn before the first review
     #: reads exactly as before.
     lessons: Any = None
+
+    #: Where they are, as of this turn (DL-091), a frozen
+    #: :class:`omega.location.State`. ``None`` or one with no fix renders as
+    #: nothing, and so does every unprompted turn: a turn over a log with no
+    #: location reads exactly as before.
+    location: Any = None
 
 
 #: Channels whose events nobody typed: omega's own look (DL-061) and the clock
@@ -704,6 +714,7 @@ def run_turn(
     promises: Any = None,
     lessons: Any = None,
     access: Any = None,
+    location: Any = None,
 ) -> TurnResult:
     """Run one turn over an already-claimed episode and record how it ended.
 
@@ -792,6 +803,7 @@ def run_turn(
         promises=promises,
         lessons=lessons,
         access=access,
+        location=location,
     )
 
     verdict: Optional[Verdict] = None
@@ -1225,6 +1237,7 @@ def _event_turn(
     event = _elide(_render_event(ctx.event), MAX_NEW_EVENT_CHARS)
     text = (
         f"{_clock_line(ctx.event)}"
+        f"{_location_section(ctx)}"
         f"{_learned_section(ctx.learned, at=str(ctx.event.get('at', '')))}"
         f"{self_taught.section(ctx.lessons) if lessons else ''}"
         f"Recent history:\n{_transcript(ctx.recalled)}\n\n"
@@ -1238,6 +1251,20 @@ def _event_turn(
     if not parts:
         return provider.user(text)
     return provider.user([provider.text_part(text), *parts])
+
+
+def _location_section(ctx: TurnContext) -> str:
+    """Where they are (DL-091), one line under the clock, so a maps tool can
+    answer "near me" and route questions.
+
+    Only on their own message: a brief, a watch, a look or a tell never
+    mentions it. Fresh for three hours; after that it is their *last known*
+    location and says so, never presented as current. Absent with no fix, so
+    a turn over a log without one renders exactly as before.
+    """
+    if ctx.location is None or unprompted(ctx):
+        return ""
+    return whereabouts.context_line(ctx.location, ctx.event.get("at"))
 
 
 def _clock_line(event: dict[str, Any]) -> str:

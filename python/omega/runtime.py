@@ -57,7 +57,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Optional, Sequence
 
-from omega import episodes, lessons, notice, projection, provider
+from omega import episodes, lessons, location, notice, projection, provider
 from omega.blobs import BlobStore
 from omega.channel import DEFAULT_HOST, DEFAULT_PORT, Channel
 from omega.executor import Executor, StartupReport
@@ -299,6 +299,12 @@ class Runtime:
         sense: float = SENSE_SECONDS,
         nudge: int = notice.LOOK_EVERY_SECONDS,
         turn_timeout: float = DEFAULT_TURN_TIMEOUT,
+        # DL-091: the phone's Shortcut door, ``POST /location`` on loopback.
+        # Empty is no listener at all, and that is the default for the
+        # reason the senses above are ``None``: `__main__` passes the token
+        # from the environment, and only when one is set.
+        location_token: str = "",
+        location_port: int = location.DEFAULT_PORT,
     ) -> None:
         if poll <= 0:
             raise ValueError(f"poll must be positive, got {poll}")
@@ -332,6 +338,11 @@ class Runtime:
         # `sense` down - waiting out a real hour is not a test.
         self._nudge_every = nudge
         self._turn_timeout = turn_timeout
+        self._location_token = location_token
+        self._location_port = location_port
+        self._location: Optional[location.Listener] = None
+        #: Why the location listener is not listening although asked to, or "".
+        self.location_error = ""
 
         self._store: Optional[MemoryStore] = None
         self._blobs: Optional[BlobStore] = None
@@ -423,6 +434,18 @@ class Runtime:
                     on_append=self._on_append,
                 )
                 self._channel.start()
+            if self._location_token:
+                # After the channel, for its reason: nothing arrives before
+                # there is a drain to take it. Through `append`, so the log
+                # keeps its one writer (this process). A port taken is told,
+                # not fatal: the rest of omega does not depend on it.
+                listener = location.Listener(
+                    self._location_token, self.append, port=self._location_port
+                )
+                try:
+                    self._location = listener.start()
+                except OSError as exc:
+                    self.location_error = f"could not listen on port {self._location_port}: {exc.strerror or exc}"
         except BaseException:
             # A half-started runtime still holds M0's exclusive lock, and the
             # next attempt would fail with AlreadyLocked naming nothing useful.
@@ -447,6 +470,10 @@ class Runtime:
         """
         self._stopping.set()
         self._woken.set()
+
+        if self._location is not None:
+            self._location.stop()
+            self._location = None
 
         if self._channel is not None:
             self._channel.stop()
@@ -552,6 +579,11 @@ class Runtime:
     def address(self) -> Optional[tuple[str, int]]:
         """Where the listener is bound, or ``None`` when it is disabled."""
         return None if self._channel is None else self._channel.address
+
+    @property
+    def location_address(self) -> Optional[tuple[str, int]]:
+        """Where the location listener is bound (DL-091), or ``None``."""
+        return None if self._location is None else self._location.address
 
     @property
     def turns(self) -> int:

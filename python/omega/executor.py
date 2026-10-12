@@ -42,6 +42,7 @@ from omega import (
     learn,
     lessons,
     listen,
+    location,
     machine,
     mailcursor,
     notice,
@@ -232,6 +233,7 @@ class Executor:
         "_promises",
         "_promises_now",
         "_lessons",
+        "_location",
         "_grants_now",
         "_moments",
         "_standing",
@@ -299,6 +301,9 @@ class Executor:
         # handled like the views above, and apart from `_learned`: what omega
         # learned about its own working is never a claim about the person.
         self._lessons = lessons.Lessons()
+        # Where they are (DL-091), kept at the turn being handled: a fix that
+        # arrives after the event is not where they were when they asked.
+        self._location = location.Locations()
         # A third view rather than a field on `_learned` (DL-062): what is
         # true and what happened have different lifetimes, and keeping them
         # in one fold is what would let events leak into the claim set.
@@ -1615,6 +1620,7 @@ class Executor:
         self._promises.advance(self._queue.store, upto=pending.seq)
         self._lessons.advance(self._queue.store, upto=pending.seq)
         self._access.advance(self._queue.store, upto=pending.seq)
+        self._location.advance(self._queue.store, upto=pending.seq)
         lost = self._pausing(pending.payload)
         if lost is not None:
             # DL-087 #3: what it reads from is lost and they have been told.
@@ -1654,6 +1660,7 @@ class Executor:
             promises=self._promises.state(),
             lessons=self._lessons.state(),
             access=self._access.state(),
+            location=self._location.state(),
         )
         self._queue.finish(pending.seq)
         # After the reply is durable, and never able to fail or hold it.

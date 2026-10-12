@@ -395,6 +395,10 @@ def test_every_m1_kind_is_accounted_for() -> None:
         episodes.REVIEW_DONE: episodes.review_done(
             since_seq=0, learned=0, retracted=0, skills=0, at=AT,
         ),
+        # DL-091: where they are goes to no surface.
+        episodes.LOCATION_SET: episodes.location_set(source="said", label="the office", at=AT),
+        episodes.PLACE_SAVED: episodes.place_saved(name="home", lat=1.0, lon=2.0, at=AT),
+        episodes.PLACE_FORGOTTEN: episodes.place_forgotten(name="home", at=AT),
     }
     assert set(made) == set(episodes.KINDS)
     for kind, payload in made.items():
