@@ -484,5 +484,8 @@ def test_without_configuration_the_act_loop_offers_what_it_always_did(
 
     # Ring 1 as a prompted turn with no grants is offered it: the DL-085
     # tools that need a grant, a research task or a past action stay hidden.
-    assert offered == schemas(hidden(ToolBox(store_root=q.store.root, prompted=True))) + hosted()
+    # DL-094: look_back rides every turn that can read the log, last of Ring 1.
+    look_back = ToolBox(store_root=q.store.root, history=list).schemas()[-1]
+    assert offered == schemas(hidden(ToolBox(store_root=q.store.root, prompted=True))) + [
+        look_back] + hosted()
     assert _REMOTE_RULES not in fp.calls_for(provider.ACT)[0][0]["content"]

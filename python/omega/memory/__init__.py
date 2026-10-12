@@ -201,7 +201,9 @@ class _Diagnostics:
 class MemoryStore:
     """Episodes go in durably and come back out in order. That is all of M0."""
 
-    __slots__ = ("_log", "_diagnostics")
+    # `__weakref__` so a derived view of the log can live exactly as long as
+    # the store it was read from, and no longer (DL-094's look-back index).
+    __slots__ = ("_log", "_diagnostics", "__weakref__")
 
     def __init__(self, raw: "_log.Log") -> None:
         self._log = raw

@@ -146,6 +146,7 @@ REVERSIBILITY: dict[str, str] = {
     "finance": READ,
     "projects": READ,  # reads the log only (DL-087 #7)
     "pending": READ,  # lists open proposals off the fold (DL-087 #8)
+    "look_back": READ,  # searches the past conversation in the log (DL-094)
     "fetch": READ,
     "web_search": READ,
     "watch": OWN,

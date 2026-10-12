@@ -76,7 +76,7 @@ import zlib
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional, Sequence
 from urllib.parse import urlsplit
@@ -85,6 +85,7 @@ from omega import calendar as calendars, episodes, finance as finances, grants, 
 from omega import projects as worklog
 from omega import promises as pledges
 from omega import location as whereabouts
+from omega import lookback as looking
 from omega import topics as kept
 from omega.schedule import CronError, describe_cron, next_match, validate_cron, zone_label
 
@@ -133,6 +134,7 @@ __all__ = [
     "promise_text",
     "asks",
     "PENDING",
+    "LOOK_BACK",
     "RESEARCH_LEAD",
     "research_instruction",
     "is_research",
@@ -227,6 +229,13 @@ LOCATION = "location"
 #: grant is live, or their words ask to keep up with something, so every
 #: other turn is exactly what it was.
 TOPICS = "topics"
+#: Searches the whole past conversation by words and dates (DL-094). Outside
+#: :data:`TOOL_NAMES` for :data:`PROMISE`'s reason, and on the same structural
+#: test alone: a box handed the log's history offers it, on every turn kind
+#: that has ``recall``, and a box handed none is exactly what it was. It is
+#: the read half of DL-014's *read its own memory*, as ``recall`` is, over the
+#: episodes rather than the claims.
+LOOK_BACK = "look_back"
 PENDING = "pending"
 
 #: Ring 1's remainder, and it is closed (DL-014). Spelled as a frozenset so
@@ -1996,6 +2005,80 @@ def _forget(box: "ToolBox", args: dict[str, Any]) -> str:
     return f"{args['kind']} {args['seq']} forgotten"
 
 
+# --- looking back over the conversation (DL-094) ---------------------------------
+
+
+def _looking_back(box: "ToolBox") -> bool:
+    """Is ``look_back`` there to be called? Wherever the box was handed the
+    log's history, and nowhere else. Never on what their words say."""
+    return box.history is not None
+
+
+def _past_date(name: str, value: Any) -> "Optional[date]":
+    if not _given(value):
+        return None
+    if not isinstance(value, str):
+        raise ToolRejected(f"{LOOK_BACK}'s '{name}' must be a date like 2026-08-14")
+    try:
+        return date.fromisoformat(value.strip()[:10])
+    except ValueError:
+        raise ToolRejected(
+            f"{LOOK_BACK}'s '{name}' must be a date like 2026-08-14, not {value!r}"
+        ) from None
+
+
+def _classify_look_back(box: "ToolBox", args: dict[str, Any]) -> Decision:
+    # Exploration: it reads the log the turn already holds and writes nothing.
+    query = args.get("query")
+    if _given(query) and not isinstance(query, str):
+        raise ToolRejected(f"{LOOK_BACK}'s 'query' must be words to find")
+    query = query.strip() if isinstance(query, str) else ""
+    since = _past_date("since", args.get("since"))
+    until = _past_date("until", args.get("until"))
+    if since and until and since > until:
+        raise ToolRejected(f"{LOOK_BACK}'s 'since' ({since}) is after its 'until' ({until})")
+    limit = args.get("limit")
+    if not _given(limit):
+        limit = looking.DEFAULT_LIMIT
+    elif isinstance(limit, bool) or not isinstance(limit, (int, float)):
+        raise ToolRejected(f"{LOOK_BACK}'s 'limit' must be a number")
+    limit = int(limit)
+    if not (1 <= limit <= looking.MAX_LIMIT):
+        raise ToolRejected(f"{LOOK_BACK}'s 'limit' must be 1 to {looking.MAX_LIMIT}, not {limit}")
+    span = "".join([
+        f" from {since}" if since else "",
+        f" up to {until}" if until else "",
+    ])
+    why = (
+        f"look back over the conversation for {query!r}{span}" if query
+        else f"look back over the conversation{span}"
+    )
+    return Decision(
+        tool=LOOK_BACK,
+        tier=EXPLORATION,
+        why=why,
+        args={
+            "query": query,
+            "since": since.isoformat() if since else "",
+            "until": until.isoformat() if until else "",
+            "limit": limit,
+        },
+    )
+
+
+def _look_back(box: "ToolBox", args: dict[str, Any]) -> str:
+    if box.history is None:
+        raise ToolError("the conversation cannot be read from this turn")
+    found = box.history()
+    return _cap(looking.tool_text(
+        found,
+        query=args.get("query") or "",
+        since=date.fromisoformat(args["since"]) if args.get("since") else None,
+        until=date.fromisoformat(args["until"]) if args.get("until") else None,
+        limit=int(args.get("limit") or looking.DEFAULT_LIMIT),
+    ))
+
+
 # --- where they are (DL-091) -----------------------------------------------------
 
 _LOCATION_ACTIONS = ("here", "where", "save", "forget", "places", "history")
@@ -3335,6 +3418,31 @@ _FORGET_TOOL = _Tool(
 )
 
 
+#: ``look_back`` (DL-094), registered beside Ring 1 and not in it: see
+#: :data:`LOOK_BACK`. Offered wherever :func:`_looking_back` holds.
+_LOOK_BACK_TOOL = _Tool(
+    classify=_classify_look_back,
+    dispatch=_look_back,
+    schema=_schema(
+        LOOK_BACK,
+        "Search everything ever said between you and them, the whole log, not "
+        "just what is in front of you: their messages, your replies, and what "
+        "you told or asked them. Every word in 'query' must appear (case and "
+        "accents ignored); 'since' and 'until' are dates (YYYY-MM-DD, "
+        "inclusive). Newest first, each with its date. Use it whenever an "
+        "answer depends on something said earlier than the conversation you "
+        "can see, and say when it was said (\"on 14 Aug you said...\").",
+        {
+            "query": {"type": "string", "description": "Words to find. Omit to list by date alone."},
+            "since": {"type": "string", "description": "Earliest date, YYYY-MM-DD."},
+            "until": {"type": "string", "description": "Latest date, YYYY-MM-DD."},
+            "limit": {"type": "integer", "description": f"At most this many, 1 to {looking.MAX_LIMIT}; default {looking.DEFAULT_LIMIT}."},
+        },
+        [],
+    ),
+)
+
+
 #: ``location`` (DL-091), registered beside Ring 1 and not in it: see
 #: :data:`LOCATION`. :meth:`ToolBox.classify` reaches it only where
 #: :func:`_locating` holds.
@@ -3536,6 +3644,11 @@ class ToolBox:
     locations: Optional[Callable[[], Any]] = None
     #: Whether the log held a fix or a saved place as of this turn.
     located: bool = False
+    #: The past conversation for ``look_back`` (DL-094): what was said before
+    #: this turn's event, read when the tool asks through the store the turn
+    #: already holds (:func:`omega.lookback.past`), so the box never opens the
+    #: log. ``None`` leaves the box exactly as it was.
+    history: Optional[Callable[[], Sequence[Any]]] = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "store_root", Path(self.store_root).resolve())
@@ -3559,6 +3672,8 @@ class ToolBox:
             tool = _LOCATION_TOOL
         if tool is None and name == TOPICS and _keeping_up(self):
             tool = _TOPICS_TOOL
+        if tool is None and name == LOOK_BACK and _looking_back(self):
+            tool = _LOOK_BACK_TOOL
         if tool is None and self.remote is not None and isinstance(arguments, dict):
             # An MCP tool, refused or cleared by the adapter: money, writes and
             # the allowlist are decided there, in code, from the name (DL-088).
@@ -3605,6 +3720,8 @@ class ToolBox:
             return _LOCATION_TOOL.dispatch(self, decision.args)
         if decision.tool == TOPICS and decision.tool not in _TOOLS:
             return _TOPICS_TOOL.dispatch(self, decision.args)
+        if decision.tool == LOOK_BACK and decision.tool not in _TOOLS:
+            return _LOOK_BACK_TOOL.dispatch(self, decision.args)
         return _TOOLS[decision.tool].dispatch(self, decision.args)
 
     def schemas(self, hide: "frozenset[str] | set[str]" = frozenset()) -> list[dict[str, Any]]:
@@ -3619,6 +3736,8 @@ class ToolBox:
             mine.append(_LOCATION_TOOL.schema)
         if _keeping_up(self) and TOPICS not in hide:
             mine.append(_TOPICS_TOOL.schema)
+        if _looking_back(self) and LOOK_BACK not in hide:
+            mine.append(_LOOK_BACK_TOOL.schema)
         names = _mailbox_names()
         if len(names) > 1:
             mine = [_inbox_schema(schema, names) for schema in mine]

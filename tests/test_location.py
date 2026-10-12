@@ -269,8 +269,10 @@ def test_with_nothing_recorded_the_tool_is_offered_only_when_they_speak_of_place
     from omega.tools import ToolBox, hidden, hosted, schemas
 
     _, plain = turn_with(q, "what's on tuesday", ["Nothing."])
+    # DL-094: every act turn is now also offered `look_back`, past location.
     assert plain.offers_for(provider.ACT)[0] == schemas(
-        hidden(ToolBox(store_root=q.store.root, prompted=True))) + hosted()
+        hidden(ToolBox(store_root=q.store.root, prompted=True))) + [
+        ToolBox(store_root=q.store.root, history=list).schemas()[-1]] + hosted()
     _, near = turn_with(q, "find coffee near me", ["Where are you?"])
     assert tools.LOCATION in offered(near)
     # Once there is a fix, every one of their turns is offered it.

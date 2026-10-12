@@ -45,7 +45,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-from omega import episodes, finance, grants, lessons, location, mailcursor, mcp, projects, provider
+from omega import episodes, finance, grants, lessons, location, lookback, mailcursor, mcp, projects, provider
 from omega import topics as kept
 from omega.tools import (
     EXTERNAL,
@@ -266,6 +266,9 @@ def act_loop(
             # and only in a turn their own message started.
             locations=(lambda: location.fold(ctx.queue.store)) if not unprompted(ctx) else None,
             located=bool(ctx.location),
+            # DL-094: the whole past conversation, read through the store the
+            # turn holds, on every turn kind (as `recall` is offered).
+            history=lambda: lookback.past(ctx.queue.store, before=ctx.seq),
         )
 
     # Their answer to a proposal is settled before the model is asked anything
