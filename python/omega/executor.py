@@ -33,6 +33,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional, Sequence
 
 from omega import (
+    access,
     blobs,
     episodes,
     grants,
@@ -65,6 +66,7 @@ from omega.turn import (
     _transcript,
     no_act_loop_yet,
     run_turn,
+    write_memory,
 )
 
 #: Messages that must arrive before another reflection pass runs (DL-054).
@@ -239,6 +241,10 @@ class Executor:
         "_inbox",
         "_inbox_after",
         "_readings",
+        "_access",
+        "_access_now",
+        "_probe",
+        "_probed",
     )
 
     def __init__(
@@ -251,6 +257,7 @@ class Executor:
         machine: Optional[Callable[[], Sequence[str]]] = None,
         calendar: Optional[Callable[[datetime], Sequence[str]]] = None,
         inbox: Optional[Callable[[datetime], Sequence[str]]] = None,
+        probe: Optional[Callable[[str], Optional[bool]]] = None,
     ) -> None:
         self._queue = queue
         self._complete = complete
@@ -302,6 +309,18 @@ class Executor:
         # does not, and folding the two together is how a stale value gets
         # treated as a belief.
         self._readings = Readings()
+        # Lost sign-ins (DL-087 #3): one fold kept at the turn being handled,
+        # which decides whether a fire is paused and what a brief lists, and
+        # one at the log's head for the idle pass that tells and probes.
+        self._access = access.Access()
+        self._access_now = access.Access()
+        # Asks whether a lost origin works again: ``True``, ``False`` or
+        # ``None``. Injected, so a test never logs in anywhere; ``None`` means
+        # no probing, and recovery is then seen only in a read that works.
+        self._probe = probe
+        # When each origin was last probed, this process. Not in the log: a
+        # restart is the usual fix, so the first idle pass after one probes.
+        self._probed: dict[str, datetime] = {}
         # Read-only: `due` and `fire` belong to the clock thread and are
         # never called from here. A second fold of the same log rather than
         # a shared object, because the clock mutates its copy on its own
@@ -1275,6 +1294,8 @@ class Executor:
                     )
                 )
                 return True
+            if self._lost_access(moment):
+                return True
             if self._follow_up(moment):
                 return True
             if not notice.may_look(
@@ -1293,8 +1314,21 @@ class Executor:
                 except Exception:  # noqa: BLE001 - a sense never kills the look
                     machine_lines = ()
             machine_lines = self._machines(machine_lines, now=moment)
-            calendar_lines = _sense(self._calendar, moment, "calendar")
-            inbox_lines, mail_at = self._look_mail(moment)
+            lost = self._access_now.state().lost
+            paused: list[str] = []
+            if self._calendar is not None and access.GOOGLE in lost:
+                calendar_lines: Sequence[str] = (access.paused_line(access.GOOGLE),)
+                paused.append(access.GOOGLE)
+            else:
+                calendar_lines = _sense(self._calendar, moment, "calendar")
+                self._refused_look(access.GOOGLE, calendar_lines, moment)
+            if self._inbox is not None and access.INBOX in lost:
+                inbox_lines: Sequence[str] = (access.paused_line(access.INBOX),)
+                mail_at: Optional[str] = None
+                paused.append(access.INBOX)
+            else:
+                inbox_lines, mail_at = self._look_mail(moment)
+                self._refused_look(access.INBOX, inbox_lines, moment)
             self._open.advance(store)
             self._learned.advance(store)
             self._moments.advance(store)
@@ -1321,7 +1355,7 @@ class Executor:
             # (notice.py), so the look's own stamp is the day budget's ledger
             # entry; letting it default would make the budget disagree with the
             # clock the decision was made against.
-            self._queue.append(
+            look = self._queue.append(
                 episodes.inbound(
                     text,
                     channel=notice.CHANNEL,
@@ -1330,9 +1364,105 @@ class Executor:
                     at=moment.isoformat(),
                 )
             )
+            for origin in paused:
+                self._queue.append(episodes.access_paused(
+                    origin=origin, for_seq=look, at=moment.isoformat(),
+                ))
         except Exception:  # noqa: BLE001 - see the docstring
             return False
         return True
+
+    def _lost_access(self, moment: datetime) -> bool:
+        """DL-087 #3: tell them, on the first refusal, which sign-in was lost
+        and what fixes it; say so once when it works again; and check a lost
+        one again at most hourly.
+
+        Folded from the log, so a restart neither repeats a tell nor forgets
+        one owed. One tell per pass, as :meth:`_follow_up`. With no refusal
+        in the log the view is empty, nothing is probed, and this returns
+        ``False`` having appended nothing.
+        """
+        self._access_now.advance(self._queue.store)
+        state = self._access_now.state()
+        if not state:
+            return False
+        at = moment.isoformat()
+        if state.recovering:
+            self._restore(state.recovering[0], at)
+            return True
+        if state.owed:
+            self._lose(state.owed[0].origin, at)
+            return True
+        if self._probe is None or not state.lost:
+            return False
+        if self._online is not None and not self._online():
+            return False
+        every = timedelta(seconds=access.PROBE_EVERY_SECONDS)
+        for origin in sorted(state.lost):
+            last = self._probed.get(origin)
+            if last is not None and moment - last < every:
+                continue
+            self._probed[origin] = moment
+            try:
+                works = self._probe(origin)
+            except Exception:  # noqa: BLE001 - a probe never kills the pass
+                works = None
+            if works is True:
+                self._restore(origin, at)
+                return True
+        return False
+
+    def _lose(self, origin: str, at: str) -> None:
+        """The one tell for a lost origin, then the record that it was told."""
+        self._queue.append(episodes.inbound(
+            tools.tell_instruction(access.lost_words(origin)),
+            channel="schedule",
+            at=at,
+        ))
+        self._queue.append(episodes.access_lost(
+            origin=origin, fix=access.fix_for(origin), at=at,
+        ))
+        self._access_now.advance(self._queue.store)
+
+    def _restore(self, origin: str, at: str) -> None:
+        self._queue.append(episodes.access_restored(origin=origin, at=at))
+        self._queue.append(episodes.inbound(
+            tools.tell_instruction(access.restored_words(origin)),
+            channel="schedule",
+            at=at,
+        ))
+        self._probed.pop(origin, None)
+        self._access_now.advance(self._queue.store)
+
+    def _refused_look(self, origin: str, lines: Sequence[str], moment: datetime) -> None:
+        """A look whose own read was refused tells them then and there, as a
+        tool's refusal does on the next pass. Its lines already say so."""
+        if not access.refused_in(origin, lines):
+            return
+        state = self._access_now.state()
+        if origin in state.lost:
+            return
+        self._lose(origin, moment.isoformat())
+
+    def _pausing(self, event: dict[str, Any]) -> Optional[str]:
+        """The lost origin this fire would read from, or ``None`` to run it.
+
+        Only a standing schedule is ever paused: a watch or a recurring job
+        whose own fire was refused. Never a tell, a brief (which lists what is
+        lost), a reminder or a research follow-up: those fire once, and a
+        skipped one would be lost rather than paused.
+        """
+        sid = event.get("schedule_id")
+        if event.get("channel") != "schedule" or not sid:
+            return None
+        if (
+            tools.is_tell(event)
+            or tools.is_brief(event)
+            or tools.is_reminder(event)
+            or tools.research_task(event) is not None
+        ):
+            return None
+        return self._access.state().pausing(str(sid))
 
     def _look_mail(self, moment: datetime) -> tuple[Sequence[str], Optional[str]]:
         """The look's mail lines, and the stamp to record if it read (DL-090).
@@ -1484,6 +1614,16 @@ class Executor:
         self._followups.advance(self._queue.store, upto=pending.seq)
         self._promises.advance(self._queue.store, upto=pending.seq)
         self._lessons.advance(self._queue.store, upto=pending.seq)
+        self._access.advance(self._queue.store, upto=pending.seq)
+        lost = self._pausing(pending.payload)
+        if lost is not None:
+            # DL-087 #3: what it reads from is lost and they have been told.
+            # Skipped, not failed: written down, closed quiet, and never a
+            # model call or a read the account would only refuse again.
+            self._queue.append(episodes.access_paused(origin=lost, for_seq=pending.seq))
+            record = write_memory(self._queue, seq=pending.seq, outcome="silent")
+            self._queue.finish(pending.seq)
+            return TurnResult(seq=pending.seq, outcome="silent", record_seq=record)
         result = run_turn(
             self._queue,
             pending,
@@ -1513,6 +1653,7 @@ class Executor:
             followups=self._followups.state(),
             promises=self._promises.state(),
             lessons=self._lessons.state(),
+            access=self._access.state(),
         )
         self._queue.finish(pending.seq)
         # After the reply is durable, and never able to fail or hold it.

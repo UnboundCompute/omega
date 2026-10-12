@@ -19,6 +19,7 @@ hierarchy would buy nothing the closed ``KINDS`` set does not already give.
 from __future__ import annotations
 
 import json
+import re
 from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any, Optional, Sequence
@@ -75,6 +76,14 @@ __all__ = [
     "FAILURE_KINDS",
     "FAILURE_SUBJECTS",
     "MAX_FAILURE_ERROR",
+    "ACCESS_LOST",
+    "ACCESS_PAUSED",
+    "ACCESS_RESTORED",
+    "ACCESS_KINDS",
+    "MAX_ACCESS_FIX",
+    "access_lost",
+    "access_paused",
+    "access_restored",
     "PROMISE_NOTED",
     "PROMISE_CLOSED",
     "PROMISE_KINDS",
@@ -266,6 +275,22 @@ FAILURE_SUBJECTS = frozenset({"schedule", "mcp", "research"})
 #: Ceiling on the error a failure record carries. A sentence, not a traceback.
 MAX_FAILURE_ERROR = 200
 
+#: Sign-ins and access omega has lost (DL-087 #3). ``access.lost`` is the one
+#: tell it gave when an account or server refused its credentials, naming the
+#: fix; ``access.paused`` a fire or a look that was skipped because what it
+#: reads from is lost; ``access.restored`` that origin working again. Records,
+#: never events: the refusals are already in the log (a ``tool.returned``),
+#: and the live view is a fold (:mod:`omega.access`). They remember what omega
+#: said and skipped, so it never says it twice.
+ACCESS_LOST = "access.lost"
+ACCESS_PAUSED = "access.paused"
+ACCESS_RESTORED = "access.restored"
+ACCESS_KINDS = frozenset({ACCESS_LOST, ACCESS_PAUSED, ACCESS_RESTORED})
+#: Ceiling on the fix an ``access.lost`` names. A sentence, never a token.
+MAX_ACCESS_FIX = 200
+#: What an origin is: the inbox, the Google sign-in, or one MCP server.
+_ACCESS_ORIGIN = re.compile(r"^(inbox|google|mcp:[a-z0-9]{1,16})$")
+
 #: Promises the person made in their own words (DL-087 #1). ``promise.noted``
 #: is one commitment read off one of their prompted messages, with the due
 #: instant code resolved (or none); ``promise.closed`` is it ending, because its
@@ -378,6 +403,7 @@ KINDS = frozenset(
         GRANT_WITHDRAWN,
         FAILURE_TOLD,
         FAILURE_RECOVERED,
+        *ACCESS_KINDS,
         PROMISE_NOTED,
         PROMISE_CLOSED,
         *LESSON_KINDS,
@@ -1850,6 +1876,9 @@ _REQUIRED: dict[str, tuple[str, ...]] = {
     ),
     FAILURE_TOLD: ("subject", "failure", "count", "last_error", "at"),
     FAILURE_RECOVERED: ("subject", "failure", "count", "last_error", "at"),
+    ACCESS_LOST: ("origin", "fix", "at"),
+    ACCESS_PAUSED: ("origin", "for_seq", "at"),
+    ACCESS_RESTORED: ("origin", "at"),
     PROMISE_NOTED: ("text", "due", "source_seq", "at"),
     PROMISE_CLOSED: ("promise", "how", "at"),
     LESSON_LEARNED: ("text", "cites", "at"),
@@ -1914,6 +1943,32 @@ def failure_recovered(
     payload = {"v": VERSION, "kind": FAILURE_RECOVERED, "subject": subject,
                "failure": kind, "count": count, "last_error": last_error,
                "at": at or now()}
+    _validate(payload)
+    return payload
+
+
+def access_lost(*, origin: str, fix: str, at: Optional[str] = None) -> dict[str, Any]:
+    """Omega told them, once, that ``origin`` refused its credentials, and
+    what fixes it (DL-087 #3). ``fix`` is omega's own sentence, never the
+    server's words, so it can carry no key."""
+    payload = {"v": VERSION, "kind": ACCESS_LOST, "origin": origin, "fix": fix,
+               "at": at or now()}
+    _validate(payload)
+    return payload
+
+
+def access_paused(*, origin: str, for_seq: int, at: Optional[str] = None) -> dict[str, Any]:
+    """The turn ``for_seq`` (a watch's or a job's fire, or a look) skipped
+    reading from ``origin`` because its access is lost (DL-087 #3)."""
+    payload = {"v": VERSION, "kind": ACCESS_PAUSED, "origin": origin,
+               "for_seq": for_seq, "at": at or now()}
+    _validate(payload)
+    return payload
+
+
+def access_restored(*, origin: str, at: Optional[str] = None) -> dict[str, Any]:
+    """A lost ``origin`` worked again (DL-087 #3)."""
+    payload = {"v": VERSION, "kind": ACCESS_RESTORED, "origin": origin, "at": at or now()}
     _validate(payload)
     return payload
 
@@ -2218,6 +2273,10 @@ def _validate(payload: dict[str, Any]) -> None:
         # No `for_seq`: a follow-up belongs to no one turn. It is about a run
         # of failures, named by its subject.
         _validate_failure(payload)
+    elif kind in ACCESS_KINDS:
+        # Named by the origin it is about. Only a pause names a turn: the
+        # fire or look that was skipped.
+        _validate_access(payload)
     elif kind in PROMISE_KINDS:
         # No `for_seq`: written after the turn's reply, by code, and named by
         # the message it came from (or the promise it ends) instead.
@@ -2677,6 +2736,19 @@ def _validate_failure(payload: dict[str, Any]) -> None:
     _require_str(payload, "last_error")
     if len(payload["last_error"]) > MAX_FAILURE_ERROR:
         raise BadPayload(f"last_error is longer than {MAX_FAILURE_ERROR} characters")
+    _require_str(payload, "at", non_empty=True)
+
+
+def _validate_access(payload: dict[str, Any]) -> None:
+    origin = payload["origin"]
+    if not isinstance(origin, str) or not _ACCESS_ORIGIN.match(origin):
+        raise BadPayload(f"origin {origin!r} is not inbox, google or mcp:<server>")
+    if payload["kind"] == ACCESS_LOST:
+        _require_str(payload, "fix", non_empty=True)
+        if len(payload["fix"]) > MAX_ACCESS_FIX:
+            raise BadPayload(f"fix is longer than {MAX_ACCESS_FIX} characters")
+    if payload["kind"] == ACCESS_PAUSED:
+        _require_seq(payload, "for_seq")
     _require_str(payload, "at", non_empty=True)
 
 

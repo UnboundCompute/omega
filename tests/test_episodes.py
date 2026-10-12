@@ -202,6 +202,13 @@ def test_every_kind_round_trips():
             subject="mcp:github", kind="mcp", count=3,
             last_error="the github MCP server timed out", at="2026-10-11T12:00:00+00:00",
         ),
+        # DL-087 #3: sign-ins and access lost, skipped around, and restored.
+        ep.access_lost(
+            origin="inbox", fix="IMAP refused the login: check the app password",
+            at="2026-10-11T12:00:00+00:00",
+        ),
+        ep.access_paused(origin="mcp:github", for_seq=1, at="2026-10-11T12:00:00+00:00"),
+        ep.access_restored(origin="google", at="2026-10-11T12:00:00+00:00"),
         # DL-087 #1: promises they made in their own words.
         ep.promise_noted(
             text="send the deck to Priya", due="2026-10-16T09:00:00+05:30",

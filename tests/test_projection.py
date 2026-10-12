@@ -372,6 +372,10 @@ def test_every_m1_kind_is_accounted_for() -> None:
         episodes.FAILURE_RECOVERED: episodes.failure_recovered(
             subject="w1", kind="schedule", count=3, last_error="boom", at=AT,
         ),
+        # DL-087 #3: what omega said and skipped about lost access, never pushed.
+        episodes.ACCESS_LOST: episodes.access_lost(origin="inbox", fix="check it", at=AT),
+        episodes.ACCESS_PAUSED: episodes.access_paused(origin="inbox", for_seq=1, at=AT),
+        episodes.ACCESS_RESTORED: episodes.access_restored(origin="inbox", at=AT),
         # DL-087 #1: promises they made, never pushed on their own.
         episodes.PROMISE_NOTED: episodes.promise_noted(
             text="call mum", due=None, source_seq=1, at=AT,

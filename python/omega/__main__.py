@@ -36,6 +36,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from omega import (
+    access,
     blobs,
     calendar,
     derive,
@@ -690,6 +691,9 @@ def main(argv: Optional[list[str]] = None) -> int:
             now, after=after,
             on_mails=lambda mails: finance.record(rt.queue, mails, now),
         ),
+        # DL-087 #3: checks a lost sign-in again, at most hourly: an IMAP
+        # login, the Google refresh, or one MCP listing. Never a write.
+        probe=access.probe,
     )
     try:
         rt.start()

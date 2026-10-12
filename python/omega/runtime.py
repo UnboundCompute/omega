@@ -279,6 +279,9 @@ class Runtime:
         # person's accounts inside every test. Each takes the look's clock.
         calendar: Optional[Callable[[datetime], Sequence[str]]] = None,
         inbox: Optional[Callable[[datetime], Sequence[str]]] = None,
+        # DL-087 #3: asks whether a lost sign-in works again. ``None`` for the
+        # same reason: a default would log into their accounts from a test.
+        probe: Optional[Callable[[str], Optional[bool]]] = None,
         # On by default because DL-035's whole point is that omega acts on time
         # without being asked, and a proactivity that has to be switched on is
         # one that is off in every deployment nobody remembered to configure.
@@ -314,6 +317,7 @@ class Runtime:
         self._machine = machine
         self._calendar = calendar
         self._inbox = inbox
+        self._probe = probe
         self._clock = clock
         self._self_review = self_review
         self._host = host
@@ -385,6 +389,7 @@ class Runtime:
                 machine=self._machine,
                 calendar=self._calendar,
                 inbox=self._inbox,
+                probe=self._probe,
             )
             self._report = self._executor.recover()
             self._thread = threading.Thread(

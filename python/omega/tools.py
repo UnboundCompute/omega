@@ -1063,7 +1063,9 @@ def _inbox(box: "ToolBox", args: dict[str, Any]) -> str:
     try:
         return _cap(inboxes.tool_text(**kw))
     except inboxes.InboxUnavailable as exc:
-        raise ToolError(f"could not read the inbox: {exc}") from None
+        raise ToolError(
+            f"could not read the inbox: {exc}{inboxes.refusal_suffix(exc)}"
+        ) from None
 
 
 def _classify_mail(box: "ToolBox", args: dict[str, Any]) -> Decision:
@@ -1133,7 +1135,9 @@ def _mail(box: "ToolBox", args: dict[str, Any]) -> "str | ToolText":
     try:
         opened = inboxes.open_mail(args["id"])
     except inboxes.InboxUnavailable as exc:
-        raise ToolError(f"could not read the mail: {exc}") from None
+        raise ToolError(
+            f"could not read the mail: {exc}{inboxes.refusal_suffix(exc)}"
+        ) from None
     if opened.held and not box.prompted:
         raise ToolError(
             "that mail is held (account recovery or Apple/Microsoft account); "

@@ -125,6 +125,9 @@ NOT_RECALLED = frozenset({
     # Follow-ups on omega's own failures (DL-087 #2): the tell is already in
     # the conversation as its own inbound; the record is bookkeeping.
     *episodes.FAILURE_KINDS,
+    # Lost sign-ins (DL-087 #3): the tell is its own inbound, the brief names
+    # what is still lost; the records are bookkeeping.
+    *episodes.ACCESS_KINDS,
     # Promises they made (DL-087 #1): their words are already in the
     # conversation as their own message; the brief names the open ones.
     *episodes.PROMISE_KINDS,
@@ -302,6 +305,11 @@ class TurnContext:
     #: :class:`omega.followups.State`. ``None`` or empty renders as nothing,
     #: so a turn over a log with no failures reads exactly as before.
     followups: Any = None
+
+    #: Sign-ins and access lost as of this turn (DL-087 #3), a frozen
+    #: :class:`omega.access.State`. ``None`` or one with nothing lost renders
+    #: as nothing, so a brief over a log with no refusals reads as before.
+    access: Any = None
 
     #: The promises they made, as of this turn (DL-087 #1), a frozen
     #: :class:`omega.promises.State`. ``None``, or one with no live grant,
@@ -695,6 +703,7 @@ def run_turn(
     at: Optional[str] = None,
     promises: Any = None,
     lessons: Any = None,
+    access: Any = None,
 ) -> TurnResult:
     """Run one turn over an already-claimed episode and record how it ended.
 
@@ -782,6 +791,7 @@ def run_turn(
         followups=followups,
         promises=promises,
         lessons=lessons,
+        access=access,
     )
 
     verdict: Optional[Verdict] = None
@@ -956,11 +966,32 @@ def run_turn(
 
 def _waiting(ctx: "TurnContext") -> str:
     """A brief's list of proposals waiting on them and of withdrawals (DL-087
-    #8); empty for any other turn, and for a brief with none of either."""
+    #8), and of the sign-ins still lost (#3), each with its fix; empty for any
+    other turn, and for a brief with none of these."""
     if not is_brief(ctx.event):
         return ""
     now = str(ctx.event.get("at", "")) or episodes.now()
-    return granted.briefing(ctx.grants, ctx.seq, now=now)
+    text = granted.briefing(ctx.grants, ctx.seq, now=now)
+    lost = ctx.access.lost if ctx.access is not None else {}
+    if not lost:
+        return text
+    rows = [
+        f"- {e.label} — {e.fix}, since {granted.since_words(e.since)}."
+        for e in sorted(lost.values(), key=lambda e: (e.since, e.origin))
+    ]
+    lines = text.splitlines() if text else []
+    if lines and lines[0] == _WAITING:
+        end = 1
+        while end < len(lines) and lines[end].startswith("- "):
+            end += 1
+        lines[end:end] = rows
+    else:
+        lines[0:0] = [_WAITING, *rows]
+    return "\n".join(lines)
+
+
+#: The heading :func:`omega.grants.briefing` gives what waits on them.
+_WAITING = "Waiting on you:"
 
 
 #: How every asking tell ends (:data:`omega.tools.FOLLOWUP_ASK`,

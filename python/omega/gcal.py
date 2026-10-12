@@ -64,6 +64,7 @@ __all__ = [
     "Credentials",
     "credentials",
     "read",
+    "probe",
     "authorize",
 ]
 
@@ -351,6 +352,22 @@ def read(
         raise CalendarUnavailable("Google sign-in is not set up on this host")
     found = _list(creds, _floor(start), _ceil(end), send)
     return [o for o in found if _overlaps(o, start, end)]
+
+
+def probe(
+    environ: Mapping[str, str] = os.environ, *, send: Send = send
+) -> Optional[bool]:
+    """Does the sign-in work again (DL-087 #3)? The ordinary refresh and
+    nothing more: ``True`` it gave an access token, ``False`` Google still
+    says the sign-in expired or was revoked, ``None`` anything else."""
+    creds = credentials(environ)
+    if creds is None:
+        return None
+    try:
+        _access_token(creds, send)
+    except CalendarUnavailable as exc:
+        return False if str(exc) == SIGN_IN_AGAIN else None
+    return True
 
 
 # --- signing in, once, where a browser is ---------------------------------------------

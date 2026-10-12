@@ -76,6 +76,7 @@ __all__ = [
     "Client",
     "Remote",
     "servers",
+    "probe",
     "money_refusal",
     "remote",
     "account_line",
@@ -475,6 +476,27 @@ def _content_text(result: dict[str, Any]) -> str:
 
 
 # --- the registry the ToolBox sees ---------------------------------------------
+
+
+def probe(
+    name: str,
+    environ: Mapping[str, str] = os.environ,
+    *,
+    post: Callable[[str, dict[str, str], bytes, float], Reply] = _post,
+) -> Optional[bool]:
+    """Does ``name`` take its token again (DL-087 #3)? One listing, which
+    calls no tool: ``True`` it answered, ``False`` it still refuses the
+    credentials, ``None`` anything else (not configured, the network)."""
+    server = next((s for s in servers(environ) if s.name == name), None)
+    if server is None:
+        return None
+    try:
+        Client(server, post=post).list_tools()
+    except ToolError as exc:
+        return False if "refused the credentials" in str(exc) else None
+    except Exception:  # noqa: BLE001 - a probe never raises
+        return None
+    return True
 
 
 @dataclass(frozen=True)

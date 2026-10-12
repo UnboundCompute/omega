@@ -78,6 +78,9 @@ __all__ = [
     "TEXT_CHARS",
     "MAX_HOURS",
     "FAILED",
+    "IMAP_FIX",
+    "refusal_suffix",
+    "probe",
     "InboxUnavailable",
     "Settings",
     "Mail",
@@ -159,12 +162,38 @@ _ARRIVAL_FETCH = (
 
 _AUTH_REASON = f"login refused (check {ENV_USER} and the app password)"
 
+#: The fix a refused login names (DL-087 #3), added to a read's failure only
+#: when the server said in so many words that it refused the credentials.
+IMAP_FIX = "IMAP refused the login: check the app password"
+
+#: What a server says when it refuses the credentials themselves, as opposed
+#: to a LOGIN that failed for any other reason (a disabled IMAP, a server
+#: hiccup). Explicit markers only: anything else stays a plain failure.
+_REFUSED = re.compile(
+    r"AUTHENTICATIONFAILED|AUTHORIZATIONFAILED|invalid credentials|"
+    r"LOGIN failed|authentication failed",
+    re.IGNORECASE,
+)
+
 _MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun",
            "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
 
 
 class InboxUnavailable(Exception):
-    """The inbox could not be read. The message is a short reason, never the password."""
+    """The inbox could not be read. The message is a short reason, never the password.
+
+    ``refused`` (DL-087 #3) is set only when the server refused the login in
+    so many words; the message is the same either way.
+    """
+
+    def __init__(self, *args: Any, refused: bool = False) -> None:
+        super().__init__(*args)
+        self.refused = refused
+
+
+def refusal_suffix(exc: BaseException) -> str:
+    """What a failed read's words gain when the login was refused: the fix."""
+    return f". {IMAP_FIX}" if getattr(exc, "refused", False) else ""
 
 
 @dataclass(frozen=True)
@@ -278,7 +307,12 @@ def _session(s: Settings, connect: Callable[..., Any]) -> Iterator[Any]:
         _ok(imap.select("INBOX", readonly=True), "select")
         yield imap
     except (imaplib.IMAP4.error, OSError) as exc:
-        raise InboxUnavailable(_reason(exc, phase, s.password)) from None
+        refused = (
+            phase == "login"
+            and isinstance(exc, imaplib.IMAP4.error)
+            and bool(_REFUSED.search(_text(exc.args[0] if exc.args else "")))
+        )
+        raise InboxUnavailable(_reason(exc, phase, s.password), refused=refused) from None
     finally:
         if imap is not None:
             _logout(imap)
@@ -647,6 +681,25 @@ def _reason(exc: BaseException, phase: str, password: str) -> str:
     return f"{name}: {text}" if text else name
 
 
+def probe(
+    environ: Mapping[str, str] = os.environ,
+    *,
+    connect: Callable[..., Any] = imaplib.IMAP4_SSL,
+) -> Optional[bool]:
+    """Does the login work again (DL-087 #3)? One read-only session that
+    lists nothing: ``True`` it does, ``False`` the server still refuses the
+    credentials, ``None`` anything else (not set up, the network)."""
+    s = settings(environ)
+    if s is None:
+        return None
+    try:
+        with _session(s, connect):
+            pass
+    except InboxUnavailable as exc:
+        return False if exc.refused else None
+    return True
+
+
 def _text(value: Any) -> str:
     if isinstance(value, bytes):
         return value.decode("utf-8", "replace")
@@ -722,7 +775,7 @@ def look_lines(
         mails = read(s, days=LOOK_DAYS, unread_only=False, connect=connect, now=now,
                      arrival=after is not None)
     except InboxUnavailable as exc:
-        return [f"{FAILED}: {exc}"]
+        return [f"{FAILED}: {exc}{refusal_suffix(exc)}"]
     if on_mails is not None:
         try:
             on_mails(mails)

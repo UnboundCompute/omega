@@ -27,6 +27,12 @@ one tell; the tell is written down (``failure.told``) so it is never given
 twice, and a told subject that works again is written down once more
 (``failure.recovered``) so the next brief can say so in a line.
 
+A refused sign-in (DL-087 #3, :mod:`omega.access`) is not counted here: it
+is told on the first refusal, with its fix, by that module. A call refused
+that way neither fails nor resets its MCP server, a fire that met one neither
+fails nor resets its schedule, and a fire skipped while its access is lost
+(``access.paused``) is neither too.
+
 Nothing here retries anything. It only counts, and remembers what was said.
 """
 
@@ -36,7 +42,7 @@ import re
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Iterable, Optional
 
-from omega import episodes
+from omega import access, episodes
 
 if TYPE_CHECKING:  # pragma: no cover
     from omega.memory import MemoryStore
@@ -189,7 +195,7 @@ class Followups:
 
     __slots__ = (
         "_through", "_fires", "_entries", "_recovering", "_unbriefed",
-        "_shown", "_briefed",
+        "_shown", "_briefed", "_refused",
     )
 
     def __init__(self) -> None:
@@ -202,6 +208,8 @@ class Followups:
         #: Research subject -> the count a brief last showed it at.
         self._shown: dict[str, int] = {}
         self._briefed: dict[int, Briefing] = {}
+        #: Fire seqs whose turn met a refused sign-in (DL-087 #3).
+        self._refused: set[int] = set()
 
     @property
     def through(self) -> int:
@@ -217,7 +225,10 @@ class Followups:
             self._inbound(seq, payload)
         elif kind == episodes.TURN_COMPLETED:
             fire = self._fires.pop(payload.get("for_seq"), None)  # type: ignore[arg-type]
-            if fire is not None:
+            if payload.get("for_seq") in self._refused:
+                # A refused sign-in is told by omega.access, with its fix.
+                self._refused.discard(payload.get("for_seq"))  # type: ignore[arg-type]
+            elif fire is not None:
                 subject, sub_kind, label, ref, at = fire
                 tools = payload.get("tools") or []
                 if payload.get("outcome") == "failed":
@@ -230,6 +241,10 @@ class Followups:
                     self._reset(subject)
         elif kind == episodes.TURN_BLOCKED:
             # Waiting on a person is neither a failure nor a fire that worked.
+            self._fires.pop(payload.get("for_seq"), None)  # type: ignore[arg-type]
+            self._refused.discard(payload.get("for_seq"))  # type: ignore[arg-type]
+        elif kind == episodes.ACCESS_PAUSED:
+            # Skipped because its access is lost: neither (DL-087 #3).
             self._fires.pop(payload.get("for_seq"), None)  # type: ignore[arg-type]
         elif kind == episodes.TOOL_RETURNED:
             self._returned(payload)
@@ -281,6 +296,12 @@ class Followups:
             self._unbriefed = []
 
     def _returned(self, payload: dict[str, Any]) -> None:
+        got = access.classify(payload)
+        if got is not None and got[1]:
+            # A refused sign-in: omega.access tells it, once, with the fix.
+            if payload.get("for_seq") in self._fires:
+                self._refused.add(payload["for_seq"])
+            return
         tool = str(payload.get("tool", ""))
         if _SEP not in tool:
             return
