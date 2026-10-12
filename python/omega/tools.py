@@ -1355,6 +1355,8 @@ def fence(source: str, text: str) -> str:
 
 #: How their inbox is named as a source, in a fence and in a hold's reason.
 INBOX_SOURCE = "their inbox"
+#: How the page watches' listing is named as one (DL-096).
+WATCHED_PAGES = "their watched pages"
 
 
 def untrusted_source(tool: str, args: dict[str, Any]) -> Optional[str]:
@@ -1376,6 +1378,13 @@ def untrusted_source(tool: str, args: dict[str, Any]) -> Optional[str]:
         return f"mail #{args.get('id')}"
     if tool == TOPICS and args.get("do") == "now":
         return f"web results on {args.get('name')}"
+    if tool == WATCH_PAGE and args.get("do") == "set":
+        # DL-096: setting a watch reads the page once, and says what it read.
+        if args.get("tool"):
+            return f"the {str(args['tool']).split('__', 1)[0]} MCP server"
+        return str(args.get("url") or "a watched page")
+    if tool == WATCH_PAGE and args.get("do") == "list":
+        return WATCHED_PAGES  # each watch's last error, as its server wrote it
     if "__" in tool and tool not in TOOL_NAMES:
         return f"the {tool.split('__', 1)[0]} MCP server"
     return None

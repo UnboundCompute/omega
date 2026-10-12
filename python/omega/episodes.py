@@ -804,6 +804,7 @@ def inbound(
     obligation: Optional[dict[str, Any]] = None,
     at: Optional[str] = None,
     mail_inboxes: Optional[dict[str, str]] = None,
+    untrusted: Optional[str] = None,
 ) -> dict[str, Any]:
     """Something arrived that omega may need to respond to.
 
@@ -882,6 +883,10 @@ def inbound(
         # dropped step (prose, no terminal) from one genuinely answered. It
         # names the task and the step; the gate-leak fix reads it, not words.
         payload["obligation"] = dict(obligation)
+    if untrusted is not None:
+        # DL-096 under DL-064: a tell that carries someone else's words (a
+        # watched page's change), naming whose. Absent on every other event.
+        payload["untrusted"] = untrusted
     _validate(payload)
     return payload
 
@@ -2661,6 +2666,12 @@ def _validate(payload: dict[str, Any]) -> None:
                 raise BadPayload("machine must be a list of lines")
         if "mail_at" in payload:
             _require_str(payload, "mail_at", non_empty=True)
+        if "untrusted" in payload:
+            source = payload["untrusted"]
+            if not isinstance(source, str) or not source or len(source) > MAX_HOLD_REASON:
+                raise BadPayload(
+                    f"untrusted is a source of 1 to {MAX_HOLD_REASON} characters"
+                )
         if "mail_inboxes" in payload:
             boxes = payload["mail_inboxes"]
             if not isinstance(boxes, dict) or not all(

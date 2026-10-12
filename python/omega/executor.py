@@ -2168,22 +2168,25 @@ class Executor:
             done = watcher.check(w, remote=remote, at=clock, complete=self._complete)
             self._queue.append(done.checked)
             if done.alert is not None:
-                self._tell(done.alert["text"], clock)
+                # The page's words, so the tell names whose (DL-064).
+                self._tell(done.alert["text"], clock, untrusted=watcher.source_of(w))
                 self._queue.append(done.alert)
             elif not done.ok:
                 failing = watcher.failing_alert(
                     self._watches.advance(self._queue.store).state().watches[w.id], clock
                 )
                 if failing is not None:
-                    self._tell(failing["text"], clock)
+                    # Carries the read's error, which the server wrote.
+                    self._tell(failing["text"], clock, untrusted=watcher.source_of(w))
                     self._queue.append(failing)
             return True
         except Exception:  # noqa: BLE001 - see the docstring
             return False
 
-    def _tell(self, words: str, at: str) -> None:
+    def _tell(self, words: str, at: str, *, untrusted: Optional[str] = None) -> None:
         self._queue.append(episodes.inbound(
             tools.tell_instruction(words), channel="schedule", at=at,
+            untrusted=untrusted,
         ))
 
     def _withdraw(self) -> None:

@@ -50,6 +50,7 @@ from omega.tools import (
     is_research,
     is_tell,
     is_watch,
+    fence,
     fence_open,
     must_speak,
     told,
@@ -401,6 +402,9 @@ def read_untrusted(ctx: "TurnContext") -> tuple[str, ...]:
             found.append(INBOX_SOURCE)
         elif kind == episodes.TOOL_RETURNED and payload.get("ok") and payload.get("tool") == MAIL:
             found.append(RECALLED_MAIL)
+        elif kind == episodes.MESSAGE_INBOUND and payload.get("untrusted"):
+            # A tell carrying a watched page's words (DL-096), as it says.
+            found.append(str(payload["untrusted"]))
     return tuple(dict.fromkeys(found))
 
 
@@ -845,7 +849,10 @@ def run_turn(
                     + f" {granted.how_to_answer(asked)}"
                 )
         record = write_memory(
-            queue, seq=pending.seq, outcome="spoke", reply_text=words, at=at
+            queue, seq=pending.seq, outcome="spoke", reply_text=words, at=at,
+            # A watched page's words (DL-096): the record says whose, so
+            # recall fences the reply as it fences the tell.
+            tainted=(str(event["untrusted"]),) if event.get("untrusted") else (),
         )
         return TurnResult(
             seq=pending.seq, outcome="spoke", record_seq=record, reply=words
@@ -1843,6 +1850,10 @@ def _render_payload(payload: dict[str, Any]) -> str:
             # reading its own looks back as the person's words would build a
             # memory of things they never said.
             return f"(nobody asked - you looked at what was open)\n{payload.get('text', '')}"
+        if payload.get("untrusted"):
+            # A tell carrying a watched page's words (DL-096), fenced as
+            # DL-064 fences every untrusted result.
+            return f"you: {fence(str(payload['untrusted']), str(payload.get('text', '')))}"
         return f"you: {payload.get('text', '')}"
     if kind == episodes.TURN_COMPLETED:
         outcome = payload.get("outcome")
@@ -1850,6 +1861,13 @@ def _render_payload(payload: dict[str, Any]) -> str:
             return "omega: (stayed silent)"
         if outcome == "failed":
             return f"omega: (turn failed: {payload.get('error')})"
+        tainted = payload.get("tainted")
+        if isinstance(tainted, list) and tainted:
+            # A reply from a turn that read someone else's words may repeat
+            # them (a watched page's alert does, DL-096): fenced in recall,
+            # as the words were where it read them (DL-064).
+            sources = ", ".join(str(t) for t in tainted)
+            return f"omega: {fence(sources, str(payload.get('reply', '')))}"
         return f"omega: {payload.get('reply', '')}"
     if kind == episodes.TURN_BLOCKED:
         return f"omega asked: {payload.get('needs', '')}"
