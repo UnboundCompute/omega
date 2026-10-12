@@ -44,10 +44,14 @@ not digest — or run whisper over — something the core already learned from.
 The Discord adapter asks it before it buzzes the phone with something nobody
 asked for. Read-only, folded from the latest presence report, and it fails
 toward the phone: no report, a stale one or an unreadable one is ``False``.
+
+**``blob`` hands back one stored blob by digest** (DL-097), base64, so the
+Discord adapter can send a document omega made as a file.
 """
 
 from __future__ import annotations
 
+import base64
 import json
 import socket
 import threading
@@ -58,7 +62,7 @@ from typing import Any, Callable, Iterator, Optional
 
 from omega import episodes, machine, projection
 from omega.derive import Learned, Readings
-from omega.blobs import BlobError, BlobStore
+from omega.blobs import BlobError, BlobStore, is_digest
 from omega.memory import WriteKeyConflict
 from omega.queue import EventQueue
 
@@ -67,6 +71,7 @@ __all__ = [
     "DEFAULT_HOST",
     "DEFAULT_PORT",
     "MAX_LINE",
+    "MAX_BLOB_OUT",
     "LOOPBACK",
     "ChannelError",
     "Channel",
@@ -83,6 +88,12 @@ DEFAULT_PORT = 7717
 #: allocation. One mebibyte is far more than a message plus its context ids and
 #: far less than a problem; a longer one is refused by name rather than read.
 MAX_LINE = 1 << 20
+
+#: The largest stored blob the ``blob`` op hands back (DL-097): a document
+#: omega made for them, which the Discord adapter delivers as a file. Far over
+#: a handoff document (:data:`omega.handoff.MAX_DOCUMENT_BYTES`) and under
+#: what a DM takes.
+MAX_BLOB_OUT = 8 << 20
 
 #: The only addresses the server will bind. Not a default that can be widened by
 #: passing a different host — a wrong value here exposes the assistant's entire
@@ -356,6 +367,8 @@ class Channel:
                 return self._reported(request)
             if op == "presence":
                 return self._presence()
+            if op == "blob":
+                return self._blob(request)
             if op == "ping":
                 return {"v": PROTOCOL, "op": "pong", "head": self._queue.head()}
             return self._error(f"unknown op {op!r}")
@@ -573,6 +586,32 @@ class Channel:
             "bytes": ref.bytes,
         }
 
+    def _blob(self, request: dict[str, Any]) -> dict[str, Any]:
+        """One stored blob's bytes, base64 (DL-097): the document a reply's
+        marker names, for a channel that delivers it as a file.
+
+        The reverse of ``attach``, and no more of an escalation for the same
+        reason: the sender is a local process running as the user, which can
+        read the store directly. It names a blob by its digest only, so it
+        reaches nothing outside the store.
+        """
+        digest = request.get("blob")
+        if not is_digest(digest):
+            raise ValueError("'blob' must be a blob reference (sha256:<hex>)")
+        if not self._blobs.has(digest):
+            raise ValueError(f"no blob {digest}")
+        path = self._blobs.path_for(digest)
+        if path.stat().st_size > MAX_BLOB_OUT:
+            raise ValueError(f"blob {digest} is over {MAX_BLOB_OUT} bytes")
+        data = path.read_bytes()
+        return {
+            "v": PROTOCOL,
+            "op": "blob",
+            "blob": digest,
+            "bytes": len(data),
+            "data": base64.b64encode(data).decode("ascii"),
+        }
+
     def _subscribe(self, conn: _Conn, request: dict[str, Any]) -> dict[str, Any]:
         since = request.get("since", 0)
         if not isinstance(since, int) or isinstance(since, bool) or since < 0:
@@ -766,6 +805,9 @@ class ChannelClient:
 
     def presence(self) -> dict[str, Any]:
         return self.request({"v": PROTOCOL, "op": "presence"})
+
+    def blob(self, digest: str) -> dict[str, Any]:
+        return self.request({"v": PROTOCOL, "op": "blob", "blob": digest})
 
     def updates(self, count: int) -> Iterator[dict[str, Any]]:
         for _ in range(count):

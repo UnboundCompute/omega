@@ -38,6 +38,11 @@ inbound's update, and an unprompted inbound is withheld from the wire entirely.
 So the origin is read back with ``history`` at exactly ``for_seq``: an inbound
 there names its channel, and nothing there means nobody asked.
 
+A document omega made for them (DL-097) rides in a reply as a marker,
+``[attached: plan.md sha256:<hex>]``; the adapter asks the core for that blob
+(the ``blob`` op) and sends it as a file after the words, with the marker taken
+out. A blob the core cannot hand back leaves its marker in the words.
+
 **At most one message twice, never one lost.** The cursor is written after a
 DM lands, so a crash between the send and the write re-sends that one message
 on restart. A first start with no cursor begins at the head: history is never
@@ -54,6 +59,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
+import io
 import os
 import re
 import sys
@@ -64,7 +71,7 @@ from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Mapping, Optional
 
-from omega import blobs, episodes, listen, projection, sarvam
+from omega import blobs, episodes, handoff, listen, projection, sarvam
 from omega.relay import _sha256
 from omega.channel import DEFAULT_HOST, DEFAULT_PORT, PROTOCOL, ChannelClient, ChannelError
 
@@ -620,10 +627,12 @@ class Outbound:
         connect: Callable[[tuple[str, int]], Any] = lambda a: ChannelClient(a, timeout=None),
         sleep: Callable[[float], None] = time.sleep,
         log: Callable[[str], None] = _stderr,
+        send_file: Optional[Callable[[str, bytes], None]] = None,
     ) -> None:
         self._address = address
         self._cursor = cursor
         self._send = send
+        self._send_file = send_file
         self._connect = connect
         self._sleep = sleep
         self._note = log
@@ -689,12 +698,32 @@ class Outbound:
 
         text = decide(update, origin=origin, at_the_mac=lambda: self._at_the_mac(client))
         if text is not None:
+            files: list[tuple[str, bytes]] = []
+            if self._send_file is not None and handoff.markers(text):
+                text, files = self._documents(client, text)
             parts = chunks(text)
             for part in parts:
                 self._send(part)
-            self._note(f"sent seq {seq} as {len(parts)} message(s)")
+            for name, data in files:
+                self._send_file(name, data)
+            self._note(f"sent seq {seq} as {len(parts)} message(s) and {len(files)} file(s)"
+                       if files else f"sent seq {seq} as {len(parts)} message(s)")
         self._cursor.save(seq)
         return text is not None
+
+    @staticmethod
+    def _documents(client: Any, text: str) -> tuple[str, list[tuple[str, bytes]]]:
+        """A reply's document markers (DL-097) as files, and the words without
+        them. A marker whose blob the core cannot hand back stays in the words,
+        so they see what was meant rather than nothing."""
+        files: list[tuple[str, bytes]] = []
+        for name, digest in handoff.markers(text):
+            answer = client.request({"v": PROTOCOL, "op": "blob", "blob": digest})
+            if answer.get("op") != "blob" or not isinstance(answer.get("data"), str):
+                continue
+            files.append((name, base64.b64decode(answer["data"])))
+            text = text.replace(f"[attached: {name} {digest}]", "", 1)
+        return text.strip(), files
 
     @staticmethod
     def _origin(client: Any, for_seq: int) -> Optional[str]:
@@ -805,13 +834,20 @@ def _run(
     def send(text: str) -> None:
         asyncio.run_coroutine_threadsafe(dm(text), client.loop).result(timeout=120)
 
+    async def dm_file(name: str, data: bytes) -> None:
+        user = client.get_user(owner_id) or await client.fetch_user(owner_id)
+        await user.send(file=discord.File(io.BytesIO(data), filename=name))
+
+    def send_file(name: str, data: bytes) -> None:
+        asyncio.run_coroutine_threadsafe(dm_file(name, data), client.loop).result(timeout=120)
+
     @client.event
     async def on_ready() -> None:
         if started.is_set():
             return  # a gateway reconnect, not a second start
         started.set()
         log("connected to Discord")
-        outbound = Outbound(address, cursor, send, log=log)
+        outbound = Outbound(address, cursor, send, log=log, send_file=send_file)
         threading.Thread(
             target=outbound.run, args=(stopping,), name="omega-discord-out", daemon=True
         ).start()

@@ -89,6 +89,7 @@ from omega import promises as pledges
 from omega import location as whereabouts
 from omega import lookback as looking
 from omega import topics as kept
+from omega import handoff
 from omega import watcher as pages
 from omega.schedule import CronError, describe_cron, next_match, validate_cron, zone_label
 
@@ -257,6 +258,12 @@ STEP = "step"
 #: only on their own message, in a box with the log to read and write, so
 #: ``watch`` and every unprompted turn are exactly what they were.
 WATCH_PAGE = "watch_page"
+#: Hands the work over (DL-097): a link to the page, the search or the
+#: directions, or a document they get as a file. Builds strings and stores a
+#: document, and can reach nothing else, so it is where money stops: omega
+#: hands over the link and they pay. Outside :data:`TOOL_NAMES` and offered
+#: on their own message only, for :data:`WATCH_PAGE`'s reason.
+HANDOFF = "handoff"
 PENDING = "pending"
 
 #: Ring 1's remainder, and it is closed (DL-014). Spelled as a frozenset so
@@ -2151,6 +2158,42 @@ def _step(box: "ToolBox", args: dict[str, Any]) -> str:
     return f"step recorded: {args['state']}"
 
 
+# --- the handoff (DL-097) -----------------------------------------------------------
+
+
+def _handing_off(box: "ToolBox") -> bool:
+    """Is ``handoff`` there in this box's turn? Structural only: their own
+    message, in a box with the log (a real turn's box)."""
+    return bool(box.prompted and box.append is not None)
+
+
+def _classify_handoff(box: "ToolBox", args: dict[str, Any]) -> Decision:
+    if not _handing_off(box):
+        raise ToolRejected(f"{HANDOFF} runs only on their own message")
+    kind = args.get("kind")
+    clean = {k: v for k, v in args.items() if _given(v)}
+    try:
+        if kind == "document":
+            # Checked here, stored at dispatch: the gate writes nothing.
+            handoff._name(clean.get("name"))
+            if not isinstance(clean.get("text"), str) or not clean["text"].strip():
+                raise handoff.HandoffError("a document needs its text")
+        else:
+            handoff.build(kind, clean)
+    except handoff.HandoffError as exc:
+        raise ToolRejected(f"{HANDOFF}: {exc}") from None
+    if kind == "document":
+        return Decision(tool=HANDOFF, tier=LOCAL, why="hand them a document", args=clean)
+    return Decision(tool=HANDOFF, tier=EXPLORATION, why=f"hand them a {kind} link", args=clean)
+
+
+def _handoff(box: "ToolBox", args: dict[str, Any]) -> str:
+    try:
+        return handoff.build(args["kind"], args, store_root=box.store_root)
+    except handoff.HandoffError as exc:
+        raise ToolError(f"{HANDOFF}: {exc}") from None
+
+
 # --- page watches (DL-096) ---------------------------------------------------------
 
 _PAGE_DOS = ("set", "list", "stop", "renew")
@@ -3943,6 +3986,39 @@ _STEP_TOOL = _Tool(
 )
 
 
+#: ``handoff`` (DL-097), beside Ring 1 and not in it: see :data:`HANDOFF`.
+_HANDOFF_TOOL = _Tool(
+    classify=_classify_handoff,
+    dispatch=_handoff,
+    schema=_schema(
+        HANDOFF,
+        "Hand the last step to them: a link they open, or a document they "
+        "get as a file. Never pay, order or book for them: hand over the "
+        "link and they finish it. 'directions' (destination, optional origin "
+        "and mode) is Google Maps; 'amazon', 'zomato' (optional city) and "
+        "'district' take a query, or the url of the item on that site; "
+        "'ixigo' is flights 'from' and 'to' (airport codes) on a 'date' "
+        "(YYYY-MM-DD); 'link' is any https page; 'document' stores 'text' "
+        "as 'name' and gives you a marker to put in your reply.",
+        {
+            "kind": {"type": "string", "enum": list(handoff.KINDS)},
+            "query": {"type": "string"},
+            "url": {"type": "string", "description": "The item or page itself."},
+            "destination": {"type": "string"},
+            "origin": {"type": "string"},
+            "mode": {"type": "string", "enum": list(handoff.MODES)},
+            "city": {"type": "string"},
+            "from": {"type": "string"},
+            "to": {"type": "string"},
+            "date": {"type": "string"},
+            "name": {"type": "string", "description": "For document: its file name."},
+            "text": {"type": "string", "description": "For document: all of it."},
+        },
+        ["kind"],
+    ),
+)
+
+
 def schemas(hide: "frozenset[str] | set[str]" = frozenset()) -> list[dict[str, Any]]:
     """What is offered to the model, in the order the tools are declared.
 
@@ -4166,6 +4242,8 @@ class ToolBox:
             tool = _STEP_TOOL
         if tool is None and name == WATCH_PAGE and _watching_pages(self):
             tool = _WATCH_PAGE_TOOL
+        if tool is None and name == HANDOFF and _handing_off(self):
+            tool = _HANDOFF_TOOL
         if tool is None and self.remote is not None and isinstance(arguments, dict):
             # An MCP tool, refused or cleared by the adapter: money, writes and
             # the allowlist are decided there, in code, from the name (DL-088).
@@ -4220,6 +4298,8 @@ class ToolBox:
             return _STEP_TOOL.dispatch(self, decision.args)
         if decision.tool == WATCH_PAGE and decision.tool not in _TOOLS:
             return _WATCH_PAGE_TOOL.dispatch(self, decision.args)
+        if decision.tool == HANDOFF and decision.tool not in _TOOLS:
+            return _HANDOFF_TOOL.dispatch(self, decision.args)
         return _TOOLS[decision.tool].dispatch(self, decision.args)
 
     def schemas(self, hide: "frozenset[str] | set[str]" = frozenset()) -> list[dict[str, Any]]:
@@ -4242,6 +4322,8 @@ class ToolBox:
             mine.append(_STEP_TOOL.schema)
         if _watching_pages(self) and WATCH_PAGE not in hide:
             mine.append(_WATCH_PAGE_TOOL.schema)
+        if _handing_off(self) and HANDOFF not in hide:
+            mine.append(_HANDOFF_TOOL.schema)
         names = _mailbox_names()
         if len(names) > 1:
             mine = [_inbox_schema(schema, names) for schema in mine]

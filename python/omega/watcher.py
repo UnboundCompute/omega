@@ -52,7 +52,7 @@ from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any, Callable, Iterable, Optional
 from urllib.parse import urlsplit
 
-from omega import episodes, provider
+from omega import episodes, handoff, provider
 
 if TYPE_CHECKING:  # pragma: no cover
     from omega.memory import MemoryStore
@@ -215,9 +215,8 @@ def adapter_for(url: Optional[str], tool: Optional[str], args: Optional[dict[str
 def link_for(adapter: dict[str, Any]) -> Optional[str]:
     """The page an alert hands them, when the adapter reads one."""
     url = adapter.get("url") if adapter["kind"] == "fetch" else (adapter.get("args") or {}).get("url")
-    if isinstance(url, str) and re.match(r"^https?://\S+$", url) and len(url) <= episodes.MAX_WATCHER_URL:
-        return url
-    return None
+    # The handoff's (DL-097): an alert hands over a link and nothing else.
+    return handoff.page(url, episodes.MAX_WATCHER_URL)
 
 
 def tool_of(adapter: dict[str, Any]) -> str:
@@ -523,9 +522,10 @@ def _alert_words(watch: Watch, hit_value: Optional[float], added: list[str], sum
             f"{c['kind']} {_number_words(c['number'])}"
         )
     words = f"{summary}\n{head}." if summary else f"{head}."
-    if watch.link:
-        words += f"\nOpen it: {watch.link}"
-    return words[: episodes.MAX_WATCHER_ALERT]
+    # The link is the handoff's (DL-097), and a long alert is cut before it,
+    # never through it: the link is the one part they act on.
+    tail = handoff.open_line(watch.link) if watch.link else ""
+    return words[: episodes.MAX_WATCHER_ALERT - len(tail)] + tail
 
 
 def check(
