@@ -91,6 +91,7 @@ from omega import lookback as looking
 from omega import topics as kept
 from omega import handoff
 from omega import watcher as pages
+from omega import leave
 from omega.schedule import CronError, describe_cron, next_match, validate_cron, zone_label
 
 __all__ = [
@@ -134,6 +135,7 @@ __all__ = [
     "LOCATION",
     "TOPICS",
     "TOPIC_ASK",
+    "LEAVE_BY",
     "topic_text",
     "promise_text",
     "asks",
@@ -264,6 +266,11 @@ WATCH_PAGE = "watch_page"
 #: hands over the link and they pay. Outside :data:`TOOL_NAMES` and offered
 #: on their own message only, for :data:`WATCH_PAGE`'s reason.
 HANDOFF = "handoff"
+#: Sets, lists or stops the leave-now alarm (DL-093). Outside
+#: :data:`TOOL_NAMES` for :data:`PROMISE`'s reason: offered only on their own
+#: message and only where the Maps MCP server is configured, never on their
+#: words, so every other turn is exactly what it was.
+LEAVE_BY = "leave_by"
 PENDING = "pending"
 
 #: Ring 1's remainder, and it is closed (DL-014). Spelled as a frozenset so
@@ -2372,6 +2379,199 @@ def _watch_page(box: "ToolBox", args: dict[str, Any]) -> str:
         box.append(first.alert)
         said += f" It already holds; tell them: {first.alert['text']}"
     return said
+# --- the leave-now alarm (DL-093) ----------------------------------------------
+
+
+_LEAVE_DOS = ("set", "list", "cancel")
+#: How far ahead an alarm may be set: beyond this, traffic now says nothing.
+_LEAVE_AHEAD = timedelta(days=7)
+_LEAVE_CLOCK = re.compile(r"^(\d{1,2})(?:[:.](\d{2}))?\s*(am|pm)?$")
+
+
+def _maps_configured(remote: Any) -> bool:
+    try:
+        return bool(remote is not None and remote.knows(leave.FULL))
+    except Exception:  # noqa: BLE001 - an adapter that cannot say is not configured
+        return False
+
+
+def _leaving(box: "ToolBox") -> bool:
+    """Is ``leave_by`` there to be called in this box's turn?
+
+    Only on their own message, in a box with the log to read and write, and
+    only when the Maps MCP server is configured with its routes tool. Never
+    on their words (DL-093): every other box is exactly what it was.
+    """
+    return bool(
+        box.prompted and box.append is not None and box.leaves is not None
+        and _maps_configured(box.remote)
+    )
+
+
+def _leave_arrive_by(raw: str, now: datetime) -> datetime:
+    """``arrive_by`` as an aware moment: an ISO date-time (no zone is their
+    local clock), or a clock time, the next one to come."""
+    text = " ".join(raw.split()).lower()
+    found = _LEAVE_CLOCK.match(text)
+    if found:
+        hour, minute = int(found.group(1)), int(found.group(2) or 0)
+        half = found.group(3)
+        if half is not None:
+            if not 1 <= hour <= 12:
+                raise ToolRejected(f"{LEAVE_BY}'s 'arrive_by' is not a time of day")
+            hour = hour % 12 + (12 if half == "pm" else 0)
+        if hour > 23 or minute > 59:
+            raise ToolRejected(f"{LEAVE_BY}'s 'arrive_by' is not a time of day")
+        local = now.astimezone()
+        moment = local.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        return moment if moment > local else moment + timedelta(days=1)
+    try:
+        moment = datetime.fromisoformat(raw.strip())
+    except ValueError:
+        raise ToolRejected(
+            f"{LEAVE_BY}'s 'arrive_by' must be a time like 18:30 or a date-time "
+            "like 2026-05-01T18:30"
+        ) from None
+    return moment if moment.tzinfo else moment.astimezone()
+
+
+def _leave_place(args: dict[str, Any], key: str) -> str:
+    value = args.get(key)
+    if not _given(value):
+        return ""
+    if not isinstance(value, str):
+        raise ToolRejected(f"{LEAVE_BY}'s {key!r} must be a string")
+    value = " ".join(value.split())
+    if len(value) > episodes.MAX_LEAVE_PLACE:
+        raise ToolRejected(
+            f"{LEAVE_BY}'s {key!r} is longer than {episodes.MAX_LEAVE_PLACE} characters"
+        )
+    return value
+
+
+def _leave_from(place: Any) -> str:
+    """A fix or a saved place as an origin Maps can route from."""
+    if getattr(place, "lat", None) is not None and getattr(place, "lon", None) is not None:
+        return f"{place.lat:.6f},{place.lon:.6f}"
+    for name in ("label", "place", "city"):
+        words = getattr(place, name, None)
+        if isinstance(words, str) and words.strip():
+            return " ".join(words.split())[: episodes.MAX_LEAVE_PLACE]
+    return ""
+
+
+def _leave_origin(box: "ToolBox", said: str, now: datetime) -> tuple[str, str]:
+    """Where they leave from, and how that is known: what they said, else a
+    fresh fix (:data:`omega.location.FRESH_SECONDS`), else the saved place
+    ``home``. ``("", "")`` when none of those is there."""
+    if said:
+        return said, "said"
+    state = box.locations() if box.locations is not None else None
+    if state:
+        fix = state.current
+        if fix is not None and whereabouts.fresh(fix, now):
+            origin = _leave_from(fix)
+            if origin:
+                return origin, "fix"
+        home = state.places.get("home")
+        if home is not None:
+            origin = _leave_from(home)
+            if origin:
+                return origin, "home"
+    return "", ""
+
+
+def _leave_id(box: "ToolBox", state: Any) -> str:
+    base = f"l{max(box.for_seq, 1)}"
+    taken = set(state.alarms) if state else set()
+    if base not in taken:
+        return base
+    n = 2
+    while f"{base}-{n}" in taken:
+        n += 1
+    return f"{base}-{n}"
+
+
+def _classify_leave(box: "ToolBox", args: dict[str, Any]) -> Decision:
+    if not box.prompted:
+        raise ToolRejected(f"{LEAVE_BY} runs only on their own message")
+    do = _text(LEAVE_BY, args, "do").strip().lower()
+    if do not in _LEAVE_DOS:
+        raise ToolRejected(f"{LEAVE_BY}'s 'do' is one of {list(_LEAVE_DOS)}")
+    if do == "list":
+        return Decision(tool=LEAVE_BY, tier=EXPLORATION, why="list the leave-now alarms",
+                        args={"do": "list"})
+    state = box.leaves() if box.leaves is not None else None
+    if do == "cancel":
+        wanted = _leave_place(args, "id") or _leave_place(args, "destination")
+        found = [a for a in (state.open() if state else [])
+                 if not wanted or a.id == wanted
+                 or pledges.normalized(wanted) in pledges.normalized(a.destination)]
+        if len(found) != 1:
+            standing = ", ".join(f"{a.id} ({a.destination})" for a in (state.open() if state else []))
+            raise ToolRejected(
+                f"{'more than one' if found else 'no'} leave-now alarm matches; "
+                f"standing: {standing or 'none'}"
+            )
+        return Decision(tool=LEAVE_BY, tier=LOCAL,
+                        why=f"stop the leave-now alarm for {found[0].destination}",
+                        args={"do": "cancel", "id": found[0].id})
+    destination = _leave_place(args, "destination")
+    if not destination:
+        raise ToolRejected(f"{LEAVE_BY} needs 'destination': where they need to be")
+    raw = args.get("arrive_by")
+    if not isinstance(raw, str) or not raw.strip():
+        raise ToolRejected(f"{LEAVE_BY} needs 'arrive_by': when they need to be there")
+    now = _location_now(box)
+    arrive_by = _leave_arrive_by(raw, now)
+    if arrive_by <= now:
+        raise ToolRejected(f"{LEAVE_BY}'s 'arrive_by' has already passed")
+    if arrive_by - now > _LEAVE_AHEAD:
+        raise ToolRejected(f"{LEAVE_BY} is set at most {_LEAVE_AHEAD.days} days ahead")
+    origin, via = _leave_origin(box, _leave_place(args, "origin"), now)
+    if not origin:
+        raise ToolRejected(
+            "no place to leave from: they gave none, there is no location fix "
+            "from the last 3 hours and no saved place called home; ask them "
+            "where they'll leave from"
+        )
+    return Decision(
+        tool=LEAVE_BY, tier=LOCAL,
+        why=f"tell them when to leave for {destination} to be there by {arrive_by:%H:%M}",
+        args={"do": "set", "id": _leave_id(box, state), "destination": destination,
+              "arrive_by": arrive_by.isoformat(), "origin": origin, "origin_via": via},
+    )
+
+
+def _leave_by(box: "ToolBox", args: dict[str, Any]) -> str:
+    do = args["do"]
+    now = _location_now(box)
+    state = box.leaves() if box.leaves is not None else None
+    if do == "list":
+        return leave.listing(state or leave.State(), now)
+    if box.append is None:
+        raise ToolError("a leave-now alarm cannot change from here: this box has no log")
+    if do == "cancel":
+        alarm = state.alarms.get(args["id"]) if state else None
+        if alarm is None or not alarm.open:
+            return f"{args['id']} is not standing any more; nothing to cancel"
+        box.append(episodes.leave_cancelled(id=alarm.id, at=now.isoformat()))
+        return f"stopped the leave-now alarm for {alarm.destination}"
+    if state and args["id"] in state.alarms:
+        raise ToolError(f"{args['id']} is already set")
+    box.append(episodes.leave_set(
+        id=args["id"], destination=args["destination"], arrive_by=args["arrive_by"],
+        origin=args["origin"], origin_via=args["origin_via"], for_seq=max(box.for_seq, 1),
+        at=now.isoformat(),
+    ))
+    arrive = datetime.fromisoformat(args["arrive_by"])
+    via = {"said": "where they said", "fix": "where they are now",
+           "home": "home"}[args["origin_via"]]
+    return (
+        f"set: they will be told when to leave for {args['destination']} to be there "
+        f"by {arrive.astimezone():%H:%M}, from {via}, by live traffic from Maps, and "
+        "told again if traffic gets worse"
+    )
 
 
 # --- omega's own lessons and skills (DL-086) -----------------------------------
@@ -3819,6 +4019,31 @@ _TOPICS_TOOL = _Tool(
 )
 
 
+#: ``leave_by`` (DL-093), registered beside Ring 1 and not in it: see
+#: :data:`LEAVE_BY`. :meth:`ToolBox.classify` reaches it only where
+#: :func:`_leaving` holds.
+_LEAVE_TOOL = _Tool(
+    classify=_classify_leave,
+    dispatch=_leave_by,
+    schema=_schema(
+        LEAVE_BY,
+        "A leave-now alarm: when they need to be somewhere by a time, 'set' "
+        "one and they are told when to leave by live traffic (driving), and "
+        "told again if it gets worse. 'list' the alarms standing; 'cancel' one. "
+        "Leave 'origin' out unless they said where they leave from: where they "
+        "are, else home, is used.",
+        {
+            "do": {"type": "string", "enum": list(_LEAVE_DOS)},
+            "destination": {"type": "string", "description": "Where they need to be: an address or a place name."},
+            "arrive_by": {"type": "string", "description": "When they need to be there: 18:30, or 2026-05-01T18:30."},
+            "origin": {"type": "string", "description": "Where they leave from, only if they said."},
+            "id": {"type": "string", "description": "For 'cancel': the alarm's id from 'list'."},
+        },
+        ["do"],
+    ),
+)
+
+
 #: ``forget`` (DL-086), registered beside Ring 1 and not in it: see
 #: :data:`FORGET`. :meth:`ToolBox.classify` reaches it only where
 #: :func:`_forgetting` holds.
@@ -4205,6 +4430,11 @@ class ToolBox:
     #: already holds (:func:`omega.lookback.past`), so the box never opens the
     #: log. ``None`` leaves the box exactly as it was.
     history: Optional[Callable[[], Sequence[Any]]] = None
+    #: The leave-now alarms (DL-093): the :class:`omega.leave.State` folded
+    #: from the turn's own log, read only when ``leave_by`` is called. Only
+    #: their own message, with this and ``append`` set and the Maps MCP server
+    #: configured, puts ``leave_by`` in the box; ``None`` leaves it as it was.
+    leaves: Optional[Callable[[], Any]] = None
 
     #: The tasks as of this turn (DL-095): a frozen :class:`omega.tasks.State`,
     #: or ``None``. With ``OMEGA_TASKS`` on and on their own message it puts
@@ -4253,6 +4483,8 @@ class ToolBox:
             tool = _WATCH_PAGE_TOOL
         if tool is None and name == HANDOFF and _handing_off(self):
             tool = _HANDOFF_TOOL
+        if tool is None and name == LEAVE_BY and _leaving(self):
+            tool = _LEAVE_TOOL
         if tool is None and self.remote is not None and isinstance(arguments, dict):
             # An MCP tool, refused or cleared by the adapter: money, writes and
             # the allowlist are decided there, in code, from the name (DL-088).
@@ -4309,6 +4541,8 @@ class ToolBox:
             return _WATCH_PAGE_TOOL.dispatch(self, decision.args)
         if decision.tool == HANDOFF and decision.tool not in _TOOLS:
             return _HANDOFF_TOOL.dispatch(self, decision.args)
+        if decision.tool == LEAVE_BY and decision.tool not in _TOOLS:
+            return _LEAVE_TOOL.dispatch(self, decision.args)
         return _TOOLS[decision.tool].dispatch(self, decision.args)
 
     def schemas(self, hide: "frozenset[str] | set[str]" = frozenset()) -> list[dict[str, Any]]:
@@ -4333,6 +4567,8 @@ class ToolBox:
             mine.append(_WATCH_PAGE_TOOL.schema)
         if _handing_off(self) and HANDOFF not in hide:
             mine.append(_HANDOFF_TOOL.schema)
+        if _leaving(self) and LEAVE_BY not in hide:
+            mine.append(_LEAVE_TOOL.schema)
         names = _mailbox_names()
         if len(names) > 1:
             mine = [_inbox_schema(schema, names) for schema in mine]

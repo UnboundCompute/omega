@@ -424,6 +424,15 @@ def test_every_m1_kind_is_accounted_for() -> None:
         episodes.WATCHER_ALERTED: episodes.watcher_alerted(id="w1", reason="hit",
                                                            digest="0" * 16, text="x", at=AT),
         episodes.WATCHER_STOPPED: episodes.watcher_stopped(id="w1", reason="asked", at=AT),
+        # DL-093: a leave-now alarm reaches them as its tells, never as these.
+        episodes.LEAVE_SET: episodes.leave_set(
+            id="l1", destination="the airport", arrive_by=AT, origin="home",
+            origin_via="home", for_seq=1, at=AT,
+        ),
+        episodes.LEAVE_CHECKED: episodes.leave_checked(id="l1", eta_min=30, at=AT),
+        episodes.LEAVE_PINGED: episodes.leave_pinged(id="l1", how="live", eta_min=30, at=AT),
+        episodes.LEAVE_CANCELLED: episodes.leave_cancelled(id="l1", at=AT),
+        episodes.LEAVE_DONE: episodes.leave_done(id="l1", at=AT),
     }
     assert set(made) == set(episodes.KINDS)
     for kind, payload in made.items():

@@ -40,6 +40,7 @@ from omega import (
     habits,
     inbox as inboxes,
     learn,
+    leave,
     lessons,
     listen,
     location,
@@ -244,6 +245,7 @@ class Executor:
         "_tasks",
         "_tasks_now",
         "_watches",
+        "_leaves",
         "_moments",
         "_standing",
         "_online",
@@ -330,6 +332,9 @@ class Executor:
         self._tasks_now = tasks.Tasks()
         # Page watches (DL-096), kept at the log's head for the idle pass.
         self._watches = watcher.Watches()
+        # The leave-now alarms (DL-093), folded at the log's head: what the
+        # sense pass checks, pings and closes.
+        self._leaves = leave.Leaves()
         # A third view rather than a field on `_learned` (DL-062): what is
         # true and what happened have different lifetimes, and keeping them
         # in one fold is what would let events leak into the claim set.
@@ -2188,6 +2193,100 @@ class Executor:
             tools.tell_instruction(words), channel="schedule", at=at,
             untrusted=untrusted,
         ))
+
+    def leave_now(self, *, now: Optional[str] = None) -> bool:
+        """The leave-now alarms (DL-093), on every sense pass. Returns whether
+        anything was written.
+
+        Code and nothing else: no model call. For each open alarm,
+        :func:`omega.leave.due` says what is due and this does it: one Maps
+        ``compute_routes`` call written down as ``leave.checked``, the ping
+        and its ``leave.pinged`` when that check says it is time, the second
+        ping when traffic got worse, the one estimate tell when traffic could
+        not be read, and ``leave.done`` once ``arrive_by`` has passed. Each
+        tell is appended before the record that it went, so a crash between
+        the two repeats a ping rather than losing one. With no alarm set it is
+        a fold and nothing else: no call, no record.
+
+        **Never raises.**
+        """
+        if not self._recovered:
+            return False
+        try:
+            view = self._leaves.advance(self._queue.store).state()
+            alarms = view.open()
+            if not alarms:
+                return False
+            moment = datetime.fromisoformat(now or episodes.now())
+            if moment.tzinfo is None:
+                moment = moment.replace(tzinfo=timezone.utc)
+            wrote = False
+            for alarm in alarms:
+                try:
+                    wrote = self._leave_one(alarm, moment) or wrote
+                except Exception:  # noqa: BLE001 - one alarm never stops another
+                    continue
+            return wrote
+        except Exception:  # noqa: BLE001 - see the docstring
+            return False
+
+    def _leave_one(self, alarm: "leave.Alarm", moment: datetime) -> bool:
+        at = moment.isoformat()
+        what = leave.due(alarm, moment)
+        if what is None:
+            return False
+        if what == "done":
+            self._queue.append(episodes.leave_done(id=alarm.id, at=at))
+            self._leaves.advance(self._queue.store)
+            return True
+        if what == "ping":
+            # The call cap is spent: the last drive time Maps gave stands.
+            self._leave_tell(alarm, "live", alarm.estimate, leave.ping_text(
+                alarm, alarm.estimate, moment), at)
+            return True
+        remote = mcp.remote()
+        lost = access.mcp_origin(leave.SERVER) in self._access_now.advance(
+            self._queue.store).state().lost
+        if remote is None or not remote.knows(leave.FULL) or lost:
+            # Not configured, or its key refused and not yet working again:
+            # no call is spent, and they are told once, by the estimate.
+            if alarm.pings:
+                return False
+            self._leave_tell(alarm, "estimate", alarm.estimate, leave.estimate_text(alarm), at)
+            return True
+        error: Optional[str] = None
+        eta: Optional[int] = None
+        try:
+            decision = remote.classify(leave.FULL, leave.route_args(alarm))
+            if decision is None or not decision.dispatches:
+                raise tools.ToolError(f"the {leave.SERVER} MCP server would not run {leave.TOOL}")
+            answer = remote.dispatch(decision)
+            eta = leave.eta_minutes(str(getattr(answer, "log", answer)))
+            if eta is None:
+                error = f"no drive time in the {leave.SERVER} MCP server's answer"
+        except Exception as exc:  # noqa: BLE001 - written down, then said
+            # The adapter's own first line only (DL-064): past it an isError
+            # answer carries the server's words, which no record keeps.
+            error = ((str(exc) or type(exc).__name__).split("\n", 1)[0].strip()
+                     or type(exc).__name__)[: episodes.MAX_FAILURE_ERROR]
+        self._queue.append(episodes.leave_checked(id=alarm.id, eta_min=eta, error=error, at=at))
+        alarm = self._leaves.advance(self._queue.store).state().alarms[alarm.id]
+        then = leave.after_check(alarm, moment)
+        if then == "ping":
+            self._leave_tell(alarm, "live", eta, leave.ping_text(alarm, eta, moment), at)  # type: ignore[arg-type]
+        elif then == "again":
+            self._leave_tell(alarm, "again", eta, leave.ping_text(  # type: ignore[arg-type]
+                alarm, eta, moment, again=True), at)  # type: ignore[arg-type]
+        elif then == "estimate":
+            self._leave_tell(alarm, "estimate", alarm.estimate, leave.estimate_text(alarm), at)
+        return True
+
+    def _leave_tell(self, alarm: "leave.Alarm", how: str, eta: int, text: str, at: str) -> None:
+        self._queue.append(episodes.inbound(
+            tools.tell_instruction(text), channel="schedule", at=at,
+        ))
+        self._queue.append(episodes.leave_pinged(id=alarm.id, how=how, eta_min=eta, at=at))
+        self._leaves.advance(self._queue.store)
 
     def _withdraw(self) -> None:
         """Write down every proposal that stopped applying (DL-087 #8): its

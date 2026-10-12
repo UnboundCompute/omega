@@ -746,6 +746,9 @@ class Runtime:
         # Page watches (DL-096): at most one due check per pass, all code.
         # With no watch standing it is a fold.
         executor.watch_pages()
+        # The leave-now alarms (DL-093): code only, one Maps call when one is
+        # due. With no alarm set it is a fold.
+        executor.leave_now()
         # Last, and unconditional. Last because the three passes above *write
         # memory* and this one *reads* it to decide whether to speak — running it
         # first would have it judge a moment it had not yet finished perceiving.

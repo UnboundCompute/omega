@@ -95,6 +95,8 @@ _CALENDAR_TOOL = "calendar"
 _SEP = "__"
 _MCP_REFUSED = "the {server} MCP server refused the credentials ("
 _MCP_ANSWERED = "(Result from the {server} MCP server"
+#: The server the leave-now alarm routes through (omega.leave.SERVER).
+_LEAVE_SERVER = "maps"
 #: How a Google failure inside a calendar answer that still read its feeds
 #: begins (omega.calendar.lines).
 _GOOGLE_PARTIAL = "couldn't read Google calendar:"
@@ -165,7 +167,8 @@ def classify_all(payload: Mapping[str, Any]) -> list[tuple[str, bool]]:
     in name order. A listing's lines are all omega's own; an opened mail's
     are the sender's past its first line, so only that one is read.
     """
-    if payload.get("kind") not in (episodes.TOOL_RETURNED, episodes.WATCHER_CHECKED):
+    if payload.get("kind") not in (episodes.TOOL_RETURNED, episodes.WATCHER_CHECKED,
+                                   episodes.LEAVE_CHECKED):
         # A page watch's check (DL-096) counts as :func:`classify` says.
         return []
     tool = str(payload.get("tool", ""))
@@ -194,6 +197,15 @@ def classify(payload: Mapping[str, Any]) -> Optional[tuple[str, bool]]:
     the gate turned away, a tool that reads from no account) is ``None``.
     An answer tagged with mailboxes (DL-092) is :func:`classify_all`'s.
     """
+    if payload.get("kind") == episodes.LEAVE_CHECKED:
+        # DL-093: the leave-now alarm's own Maps call, written down as a
+        # ``leave.checked`` rather than a ``tool.returned``, says the same.
+        server = _LEAVE_SERVER
+        if payload.get("eta_min") is not None:
+            return mcp_origin(server), False
+        if str(payload.get("error") or "").startswith(_MCP_REFUSED.format(server=server)):
+            return mcp_origin(server), True
+        return None
     # A page watch's check (DL-096) reads through the same MCP servers and
     # carries the same fields, so it counts as any MCP read does.
     if payload.get("kind") not in (episodes.TOOL_RETURNED, episodes.WATCHER_CHECKED):
@@ -304,7 +316,8 @@ class Access:
                 self._fires[seq] = str(sid)
         elif kind in (episodes.TURN_COMPLETED, episodes.TURN_BLOCKED):
             self._fires.pop(payload.get("for_seq"), None)  # type: ignore[arg-type]
-        elif kind in (episodes.TOOL_RETURNED, episodes.WATCHER_CHECKED):
+        elif kind in (episodes.TOOL_RETURNED, episodes.WATCHER_CHECKED,
+                      episodes.LEAVE_CHECKED):
             self._returned(payload)
         elif kind == episodes.ACCESS_LOST:
             origin = str(payload["origin"])

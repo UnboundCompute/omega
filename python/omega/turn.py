@@ -154,6 +154,16 @@ NOT_RECALLED = frozenset({
     # conversation; the set, the checks and the stops are bookkeeping, and
     # the watch tool lists them off the fold when asked.
     *episodes.WATCHER_KINDS,
+    # The leave-now alarm (DL-093): every check, ping and close. A ping
+    # reaches the conversation as its own tell; a check is one of up to a
+    # dozen per alarm and would crowd out what they said. ``leave.set`` is
+    # recalled: one per request, beside the message that asked for it, and
+    # rendered as its kind alone, so a later turn sees an alarm was set
+    # without where they are.
+    episodes.LEAVE_CHECKED,
+    episodes.LEAVE_PINGED,
+    episodes.LEAVE_CANCELLED,
+    episodes.LEAVE_DONE,
 })
 
 #: **A count is not a budget** (DL-039). ``RECALL_N`` bounds how many episodes

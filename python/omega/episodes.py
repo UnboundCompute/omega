@@ -153,6 +153,21 @@ __all__ = [
     "task_step",
     "task_dropped",
     "task_cancelled",
+    "LEAVE_SET",
+    "LEAVE_CHECKED",
+    "LEAVE_PINGED",
+    "LEAVE_CANCELLED",
+    "LEAVE_DONE",
+    "LEAVE_KINDS",
+    "LEAVE_VIAS",
+    "LEAVE_HOWS",
+    "MAX_LEAVE_PLACE",
+    "MAX_LEAVE_ETA",
+    "leave_set",
+    "leave_checked",
+    "leave_pinged",
+    "leave_cancelled",
+    "leave_done",
     "REPORT_TRANSCRIPT",
     "REPORT_USAGE",
     "REPORT_RECORDING",
@@ -502,6 +517,30 @@ MAX_WATCHER_TEXT = 200
 MAX_WATCHER_EXCERPT = 4000
 MAX_WATCHER_ALERT = 1000
 _WATCHER_ID = re.compile(r"^w[0-9]+(?:-[0-9]+)?$")
+#: The leave-now alarm (DL-093). ``leave.set`` is one alarm they asked for:
+#: be at ``destination`` by ``arrive_by``, driving from ``origin`` (which they
+#: gave, a fresh fix, or their saved home: ``origin_via``). ``leave.checked`` is
+#: one Maps call and what it said, the ETA in minutes or why there is none;
+#: ``leave.pinged`` one message telling them to go (``how``: the first from
+#: live traffic, once more when traffic got worse, or an estimate when traffic
+#: could not be read); ``leave.cancelled`` they called it off; ``leave.done``
+#: its arrive-by passed. All state is a fold (:mod:`omega.leave`). None is
+#: projected; only ``leave.set`` is recalled (see :data:`omega.turn.NOT_RECALLED`).
+LEAVE_SET = "leave.set"
+LEAVE_CHECKED = "leave.checked"
+LEAVE_PINGED = "leave.pinged"
+LEAVE_CANCELLED = "leave.cancelled"
+LEAVE_DONE = "leave.done"
+LEAVE_KINDS = frozenset({LEAVE_SET, LEAVE_CHECKED, LEAVE_PINGED, LEAVE_CANCELLED, LEAVE_DONE})
+#: Where an alarm's origin came from: their words, a fresh fix, saved home.
+LEAVE_VIAS = frozenset({"said", "fix", "home"})
+#: What a ping was: from live traffic, again on worse traffic, or an estimate.
+LEAVE_HOWS = frozenset({"live", "again", "estimate"})
+#: A destination or an origin is an address, not a paragraph.
+MAX_LEAVE_PLACE = 200
+#: Minutes. A drive longer than a day is not one to be pinged for.
+MAX_LEAVE_ETA = 24 * 60
+_LEAVE_ID = re.compile(r"^l[1-9][0-9]*(?:-[1-9][0-9]*)?$")
 
 #: The senses a relay may report for, by the name of the sense rather than of
 #: the file it read. Three of them end in a learning receipt; the machine sense
@@ -579,6 +618,7 @@ KINDS = frozenset(
         *TOPIC_KINDS,
         *TASK_KINDS,
         *WATCHER_KINDS,
+        *LEAVE_KINDS,
     }
 )
 
@@ -2118,6 +2158,11 @@ _REQUIRED: dict[str, tuple[str, ...]] = {
     WATCHER_CHECKED: ("id", "tool", "ok", "at"),
     WATCHER_ALERTED: ("id", "reason", "digest", "text", "at"),
     WATCHER_STOPPED: ("id", "reason", "at"),
+    LEAVE_SET: ("id", "destination", "arrive_by", "origin", "origin_via", "for_seq", "at"),
+    LEAVE_CHECKED: ("id", "eta_min", "at"),
+    LEAVE_PINGED: ("id", "how", "eta_min", "at"),
+    LEAVE_CANCELLED: ("id", "at"),
+    LEAVE_DONE: ("id", "at"),
     GRANT_GIVEN: ("for_seq", "scope", "at"),
     GRANT_REVOKED: ("for_seq", "scope", "at"),
     GRANT_RESTORED: ("for_seq", "scope", "at"),
@@ -2434,6 +2479,24 @@ def watcher_set(
     return payload
 
 
+def leave_set(
+    *,
+    id: str,
+    destination: str,
+    arrive_by: str,
+    origin: str,
+    origin_via: str,
+    for_seq: int,
+    at: Optional[str] = None,
+) -> dict[str, Any]:
+    """One leave-now alarm they asked for (DL-093)."""
+    payload = {"v": VERSION, "kind": LEAVE_SET, "id": id, "destination": destination,
+               "arrive_by": arrive_by, "origin": origin, "origin_via": origin_via,
+               "for_seq": for_seq, "at": at or now()}
+    _validate(payload)
+    return payload
+
+
 def task_started(*, for_seq: int, task: int, at: Optional[str] = None) -> dict[str, Any]:
     """The person approved the plan ``task`` (a :data:`TASK_PROPOSED` seq), so
     the run begins (DL-095). ``for_seq`` is the turn that settled their yes.
@@ -2504,6 +2567,19 @@ def watcher_checked(
     return payload
 
 
+def leave_checked(
+    *, id: str, eta_min: Optional[int], error: Optional[str] = None, at: Optional[str] = None
+) -> dict[str, Any]:
+    """One Maps call for alarm ``id`` (DL-093): the drive in minutes, or
+    ``None`` and the ``error`` that stood in for it."""
+    payload: dict[str, Any] = {"v": VERSION, "kind": LEAVE_CHECKED, "id": id,
+                               "eta_min": eta_min, "at": at or now()}
+    if error is not None:
+        payload["error"] = error
+    _validate(payload)
+    return payload
+
+
 def task_dropped(
     *, for_seq: int, task: int, n: int, at: Optional[str] = None
 ) -> dict[str, Any]:
@@ -2536,6 +2612,14 @@ def watcher_alerted(
     return payload
 
 
+def leave_pinged(*, id: str, how: str, eta_min: int, at: Optional[str] = None) -> dict[str, Any]:
+    """Alarm ``id`` told them to go (DL-093), reckoning ``eta_min``."""
+    payload = {"v": VERSION, "kind": LEAVE_PINGED, "id": id, "how": how,
+               "eta_min": eta_min, "at": at or now()}
+    _validate(payload)
+    return payload
+
+
 def task_cancelled(*, task: int, at: Optional[str] = None) -> dict[str, Any]:
     """Retire a task (DL-095). Append-only, as ``schedule.cancelled`` is: the
     plan and what it did stay in the log; the fold simply stops driving it."""
@@ -2548,6 +2632,20 @@ def watcher_stopped(*, id: str, reason: str, at: Optional[str] = None) -> dict[s
     """Watch ``id`` ended (DL-096): ``asked`` or ``expired``."""
     payload = {"v": VERSION, "kind": WATCHER_STOPPED, "id": id, "reason": reason,
                "at": at or now()}
+    _validate(payload)
+    return payload
+
+
+def leave_cancelled(*, id: str, at: Optional[str] = None) -> dict[str, Any]:
+    """They called alarm ``id`` off (DL-093)."""
+    payload = {"v": VERSION, "kind": LEAVE_CANCELLED, "id": id, "at": at or now()}
+    _validate(payload)
+    return payload
+
+
+def leave_done(*, id: str, at: Optional[str] = None) -> dict[str, Any]:
+    """Alarm ``id``'s arrive-by passed (DL-093)."""
+    payload = {"v": VERSION, "kind": LEAVE_DONE, "id": id, "at": at or now()}
     _validate(payload)
     return payload
 
@@ -2821,6 +2919,10 @@ def _validate(payload: dict[str, Any]) -> None:
         # Named by the watch's id. Only the set, and a check or alert said in
         # the reply that set it, name a turn.
         _validate_watcher(payload)
+    elif kind in LEAVE_KINDS:
+        # Named by the alarm's id. Only the set names a turn: the message
+        # that asked for it; checks and pings belong to the alarm, not a turn.
+        _validate_leave(payload)
     elif kind in TOPIC_KINDS:
         # No `for_seq` required: a follow or a drop is named by the topic, and
         # an update by it too, with the turn that asked only when one did.
@@ -3543,6 +3645,51 @@ def _validate_topic(payload: dict[str, Any]) -> None:
         _require_seq(payload, "for_seq")
     if "reason" in payload:
         _require_sentence(payload, "reason", cap=MAX_FAILURE_ERROR)
+
+
+def _zoned(payload: dict[str, Any], field: str) -> None:
+    _require_str(payload, field, non_empty=True)
+    try:
+        stamp = datetime.fromisoformat(payload[field])
+    except ValueError as exc:
+        raise BadPayload(f"{field} must be an ISO datetime: {exc}") from exc
+    if stamp.tzinfo is None:
+        raise BadPayload(f"{field} must carry its zone")
+
+
+def _validate_leave(payload: dict[str, Any]) -> None:
+    kind = payload["kind"]
+    if not isinstance(payload["id"], str) or not _LEAVE_ID.match(payload["id"]):
+        raise BadPayload("id must be an alarm id like l12")
+    _zoned(payload, "at")
+    if kind == LEAVE_SET:
+        _require_sentence(payload, "destination", cap=MAX_LEAVE_PLACE)
+        _require_sentence(payload, "origin", cap=MAX_LEAVE_PLACE)
+        _zoned(payload, "arrive_by")
+        if payload["origin_via"] not in LEAVE_VIAS:
+            raise BadPayload(f"origin_via must be one of {sorted(LEAVE_VIAS)}")
+        _require_seq(payload, "for_seq")
+        return
+    if kind not in (LEAVE_CHECKED, LEAVE_PINGED):
+        return
+    eta = payload["eta_min"]
+    if eta is not None and (
+        isinstance(eta, bool) or not isinstance(eta, int) or not 0 <= eta <= MAX_LEAVE_ETA
+    ):
+        raise BadPayload(f"eta_min must be null or 0 to {MAX_LEAVE_ETA} minutes")
+    if kind == LEAVE_PINGED:
+        if payload["how"] not in LEAVE_HOWS:
+            raise BadPayload(f"how must be one of {sorted(LEAVE_HOWS)}")
+        if eta is None:
+            raise BadPayload("a ping says how many minutes it reckoned with")
+        return
+    # A check is a minute count or the reason there is none, never both.
+    if eta is None:
+        if "error" not in payload:
+            raise BadPayload("a check with no eta says why")
+        _require_sentence(payload, "error", cap=MAX_FAILURE_ERROR)
+    elif "error" in payload:
+        raise BadPayload("a check with an eta carries no error")
 
 
 def _require_cites(payload: dict[str, Any]) -> None:

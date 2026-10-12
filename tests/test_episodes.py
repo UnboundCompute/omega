@@ -277,6 +277,16 @@ def test_every_kind_round_trips():
         ep.watcher_checked(id="w12", tool="fetch", ok=False, error="timed out"),
         ep.watcher_alerted(id="w12", reason="hit", digest="0123456789abcdef", text="Below 400."),
         ep.watcher_stopped(id="w12", reason="expired"),
+        # DL-093: a leave-now alarm, a check that read the drive and one that
+        # could not, its pings, and its two ends.
+        ep.leave_set(id="l7", destination="Example Airport", arrive_by="2026-10-12T18:00:00+00:00",
+                     origin="12.500000,77.250000", origin_via="fix", for_seq=7),
+        ep.leave_checked(id="l7", eta_min=35),
+        ep.leave_checked(id="l7", eta_min=None, error="the maps MCP server could not be reached"),
+        ep.leave_pinged(id="l7", how="live", eta_min=35),
+        ep.leave_pinged(id="l7", how="estimate", eta_min=60),
+        ep.leave_cancelled(id="l7"),
+        ep.leave_done(id="l7-2"),
     ]
     assert {p["kind"] for p in built} == ep.KINDS, "a kind has no round-trip test"
     for payload in built:
