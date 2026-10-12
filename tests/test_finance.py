@@ -334,7 +334,9 @@ def test_tool_text_not_started_and_empty() -> None:
     assert empty.splitlines()[1:] == ["- none recorded"]
 
 
-def test_tool_through_the_box(tmp_path) -> None:
+def test_tool_through_the_box(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # The ledger is dated around NOW; the tool's window must be too.
+    monkeypatch.setattr(tools, "_now", lambda: NOW)
     box = ToolBox(store_root=tmp_path, ledger=_ledger)
     decision = box.classify("finance", {})
     assert decision.tier == EXPLORATION and decision.args == {"days": 7}

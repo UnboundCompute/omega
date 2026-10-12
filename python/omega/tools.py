@@ -1094,7 +1094,7 @@ def _finance(box: "ToolBox", args: dict[str, Any]) -> str:
     if box.ledger is None:
         raise ToolError("the finance ledger cannot be read from this turn")
     return _cap(finances.tool_text(
-        box.ledger(), days=args["days"], now=datetime.now(timezone.utc)
+        box.ledger(), days=args["days"], now=_now()
     ))
 
 
