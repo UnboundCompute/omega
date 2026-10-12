@@ -314,8 +314,11 @@ ACCESS_RESTORED = "access.restored"
 ACCESS_KINDS = frozenset({ACCESS_LOST, ACCESS_PAUSED, ACCESS_RESTORED})
 #: Ceiling on the fix an ``access.lost`` names. A sentence, never a token.
 MAX_ACCESS_FIX = 200
-#: What an origin is: the inbox, the Google sign-in, or one MCP server.
-_ACCESS_ORIGIN = re.compile(r"^(inbox|google|mcp:[a-z0-9]{1,16})$")
+#: What an origin is: the inbox, an extra mailbox (DL-092), the Google
+#: sign-in, or one MCP server.
+_ACCESS_ORIGIN = re.compile(r"^(inbox|inbox:[a-z][a-z0-9]{0,15}|google|mcp:[a-z0-9]{1,16})$")
+#: What an extra mailbox may be called (:mod:`omega.inbox`, DL-092).
+_MAILBOX_NAME = re.compile(r"^[a-z][a-z0-9]{0,15}$")
 
 #: Promises the person made in their own words (DL-087 #1). ``promise.noted``
 #: is one commitment read off one of their prompted messages, with the due
@@ -699,6 +702,7 @@ def inbound(
     machine: Optional[list[str]] = None,
     mail_at: Optional[str] = None,
     at: Optional[str] = None,
+    mail_inboxes: Optional[dict[str, str]] = None,
 ) -> dict[str, Any]:
     """Something arrived that omega may need to respond to.
 
@@ -767,6 +771,10 @@ def inbound(
         # A look that read the inbox and got an answer (DL-090): when it
         # began reading, which is where the look's next mail read starts.
         payload["mail_at"] = mail_at
+    if mail_inboxes:
+        # DL-092: the same stamp for each extra mailbox the look read, by
+        # name. Absent unless one was, so a look with one mailbox is as it was.
+        payload["mail_inboxes"] = dict(mail_inboxes)
     _validate(payload)
     return payload
 
@@ -2319,6 +2327,14 @@ def _validate(payload: dict[str, Any]) -> None:
                 raise BadPayload("machine must be a list of lines")
         if "mail_at" in payload:
             _require_str(payload, "mail_at", non_empty=True)
+        if "mail_inboxes" in payload:
+            boxes = payload["mail_inboxes"]
+            if not isinstance(boxes, dict) or not all(
+                isinstance(k, str) and _MAILBOX_NAME.match(k) and k != "personal"
+                and isinstance(v, str) and v
+                for k, v in boxes.items()
+            ):
+                raise BadPayload("mail_inboxes must map extra mailbox names to stamps")
         if "schedule_slot" in payload:
             _require_str(payload, "schedule_slot", non_empty=True)
             if not payload.get("schedule_id"):
@@ -2916,7 +2932,9 @@ def _validate_failure(payload: dict[str, Any]) -> None:
 def _validate_access(payload: dict[str, Any]) -> None:
     origin = payload["origin"]
     if not isinstance(origin, str) or not _ACCESS_ORIGIN.match(origin):
-        raise BadPayload(f"origin {origin!r} is not inbox, google or mcp:<server>")
+        raise BadPayload(
+            f"origin {origin!r} is not inbox, inbox:<name>, google or mcp:<server>"
+        )
     if payload["kind"] == ACCESS_LOST:
         _require_str(payload, "fix", non_empty=True)
         if len(payload["fix"]) > MAX_ACCESS_FIX:

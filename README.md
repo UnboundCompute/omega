@@ -102,6 +102,25 @@ repo root — and deliberately not in whatever directory you happened to run it 
 "it works from the repo and nowhere else" is a rule nobody can see. Without a key it prints
 one sentence naming the exact file to put it in, and exits.
 
+### Mail (opt-in, read-only)
+
+`OMEGA_IMAP_USER` and `OMEGA_IMAP_PASSWORD` (a Gmail app password) let omega read your
+inbox: never marking anything read, never sending. More mailboxes, such as a work Google
+Workspace inbox, sit beside it, each with its own login:
+
+```sh
+OMEGA_INBOXES=work                     # short lowercase names, comma separated
+OMEGA_IMAP_WORK_USER=user@example.com  # required
+OMEGA_IMAP_WORK_PASSWORD=...           # required; that account's app password
+OMEGA_IMAP_WORK_HOST=imap.gmail.com    # optional; Gmail's by default
+```
+
+The first mailbox is then called `personal`. Every mail line says which mailbox it is from,
+the inbox tools take an `inbox` argument (a name, or `all`), and each mailbox keeps its own
+hourly cursor and its own sign-in: a refused work login pauses only what reads the work
+mailbox. On Workspace an admin may have to allow IMAP and app passwords. With
+`OMEGA_INBOXES` unset, omega behaves exactly as it did with one inbox.
+
 ### Other MCP servers as tools (opt-in)
 
 omega can call tools on remote MCP servers (Streamable HTTP, `https://` only). Nothing is

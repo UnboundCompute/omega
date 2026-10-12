@@ -15,7 +15,12 @@ words that it refused the credentials, and nothing else counts:
 - ``google`` — the ``calendar`` tool or the look's calendar read carrying
   :data:`omega.gcal.SIGN_IN_AGAIN` (the refresh answered ``invalid_grant``);
 - ``mcp:<server>`` — a call whose adapter error says the server refused the
-  credentials (HTTP 401 or 403).
+  credentials (HTTP 401 or 403);
+- ``inbox:<name>`` — an extra mailbox (DL-092), read from the same tools and
+  the same look, whose tagged failure line carries that mailbox's own fix
+  (:func:`omega.inbox.imap_fix`). The default mailbox stays ``inbox``. One
+  answer can say one mailbox worked and another was refused; each is its own
+  origin, so a refusal of one pauses only what reads that one.
 
 Anything else is a plain failure and stays :mod:`omega.followups`'s.
 
@@ -40,19 +45,22 @@ from typing import TYPE_CHECKING, Any, Callable, Iterable, Mapping, Optional, Se
 from omega import episodes
 from omega.calendar import NOT_CONFIGURED
 from omega.gcal import SIGN_IN_AGAIN
-from omega.inbox import IMAP_FIX, NOT_CONNECTED
+from omega.inbox import IMAP_FIX, NOT_CONNECTED, PERSONAL, imap_fix, outcomes
 
 if TYPE_CHECKING:  # pragma: no cover
     from omega.memory import MemoryStore
 
 __all__ = [
     "INBOX",
+    "INBOX_PREFIX",
     "GOOGLE",
     "PROBE_EVERY_SECONDS",
     "Lost",
     "State",
     "Access",
     "classify",
+    "classify_all",
+    "inbox_origin",
     "refused_in",
     "mcp_origin",
     "fix_for",
@@ -66,6 +74,13 @@ __all__ = [
 INBOX = "inbox"
 GOOGLE = "google"
 _MCP = "mcp:"
+#: An extra mailbox's origin is this and its name (DL-092).
+INBOX_PREFIX = "inbox:"
+
+
+def inbox_origin(name: str) -> str:
+    """The origin of mailbox ``name``: ``inbox`` for the default, as always."""
+    return INBOX if name == PERSONAL else f"{INBOX_PREFIX}{name}"
 
 #: How often a lost origin is checked again, at most: hourly, the mail
 #: cursor's cadence. Cheap (a login, a token refresh, a listing), but it is
@@ -75,6 +90,7 @@ PROBE_EVERY_SECONDS = 60 * 60
 # As omega.tools and omega.mcp; repeated, because mcp imports tools, which
 # imports the world. tests/test_access.py pins them to the originals.
 _INBOX_TOOLS = frozenset({"inbox", "mail"})
+_MAIL_TOOL = "mail"
 _CALENDAR_TOOL = "calendar"
 _SEP = "__"
 _MCP_REFUSED = "the {server} MCP server refused the credentials ("
@@ -92,6 +108,8 @@ def fix_for(origin: str) -> str:
     """The one concrete thing that fixes ``origin``, in omega's words."""
     if origin == INBOX:
         return IMAP_FIX
+    if origin.startswith(INBOX_PREFIX):
+        return imap_fix(origin[len(INBOX_PREFIX):])
     if origin == GOOGLE:
         return SIGN_IN_AGAIN
     server = origin[len(_MCP):]
@@ -101,9 +119,17 @@ def fix_for(origin: str) -> str:
     )
 
 
-def label_for(origin: str) -> str:
+def label_for(origin: str, environ: Optional[Mapping[str, str]] = None) -> str:
     if origin == INBOX:
-        return "your inbox"
+        # Named only beside another mailbox (DL-092), so a machine with one
+        # says what it always said.
+        import os
+
+        from omega.inbox import multi
+
+        return "your personal inbox" if multi(os.environ if environ is None else environ) else "your inbox"
+    if origin.startswith(INBOX_PREFIX):
+        return f"your {origin[len(INBOX_PREFIX):]} inbox"
     if origin == GOOGLE:
         return "your Google calendar"
     return f"the {origin[len(_MCP):]} MCP server"
@@ -131,12 +157,41 @@ def paused_line(origin: str) -> str:
 # --- the classifier -----------------------------------------------------------
 
 
+def classify_all(payload: Mapping[str, Any]) -> list[tuple[str, bool]]:
+    """What one ``tool.returned`` says about every origin it read (DL-092).
+
+    Exactly ``[classify(payload)]`` (or nothing) unless the answer is an
+    inbox tool's tagged with mailboxes: then one fact per mailbox it names,
+    in name order. A listing's lines are all omega's own; an opened mail's
+    are the sender's past its first line, so only that one is read.
+    """
+    if payload.get("kind") != episodes.TOOL_RETURNED:
+        return []
+    tool = str(payload.get("tool", ""))
+    if tool in _INBOX_TOOLS:
+        ok = payload.get("ok") is True
+        text = str((payload.get("result") if ok else payload.get("error")) or "")
+        lines = text.split("\n")
+        if ok and tool == _MAIL_TOOL:
+            lines = lines[:1]
+        said = outcomes(lines)
+        if said:
+            return [
+                (inbox_origin(name), not worked)
+                for name, worked in sorted(said.items())
+                if worked is not None
+            ]
+    one = classify(payload)
+    return [one] if one is not None else []
+
+
 def classify(payload: Mapping[str, Any]) -> Optional[tuple[str, bool]]:
     """What one ``tool.returned`` says about an origin, or ``None``.
 
     ``(origin, True)`` is a refusal of the credentials; ``(origin, False)``
     is the origin working. Anything else (a timeout, a server error, a call
     the gate turned away, a tool that reads from no account) is ``None``.
+    An answer tagged with mailboxes (DL-092) is :func:`classify_all`'s.
     """
     if payload.get("kind") != episodes.TOOL_RETURNED:
         return None
@@ -166,7 +221,11 @@ def classify(payload: Mapping[str, Any]) -> Optional[tuple[str, bool]]:
 
 
 def refused_in(origin: str, lines: Sequence[str]) -> bool:
-    """Does a look's block for ``origin`` carry a refusal?"""
+    """Does a look's block for ``origin`` carry a refusal? An extra
+    mailbox's (DL-092) only in its own tagged failure line."""
+    if origin.startswith(INBOX_PREFIX):
+        name = origin[len(INBOX_PREFIX):]
+        return outcomes(lines).get(name, True) is False
     mark = IMAP_FIX if origin == INBOX else SIGN_IN_AGAIN
     return any(mark in str(line) for line in lines)
 
@@ -260,10 +319,10 @@ class Access:
         self._through = seq
 
     def _returned(self, payload: dict[str, Any]) -> None:
-        got = classify(payload)
-        if got is None:
-            return
-        origin, refused = got
+        for origin, refused in classify_all(payload):
+            self._one(payload, origin, refused)
+
+    def _one(self, payload: dict[str, Any], origin: str, refused: bool) -> None:
         if refused:
             sid = self._fires.get(payload.get("for_seq"))  # type: ignore[arg-type]
             if sid is not None:
@@ -324,6 +383,10 @@ def probe(origin: str, environ: Optional[Mapping[str, str]] = None) -> Optional[
             from omega import inbox
 
             return inbox.probe(env)
+        if origin.startswith(INBOX_PREFIX):
+            from omega import inbox
+
+            return inbox.probe(env, name=origin[len(INBOX_PREFIX):])
         if origin == GOOGLE:
             from omega import gcal
 

@@ -66,6 +66,7 @@ from the tool name and its arguments.
 
 from __future__ import annotations
 
+import copy
 import http.client
 import ipaddress
 import os
@@ -1057,15 +1058,75 @@ def _classify_inbox(box: "ToolBox", args: dict[str, Any]) -> Decision:
     decided = {"from": sender, "days": days, "unread_only": unread_only}
     if hours is not None:
         decided["hours"] = hours
-    return Decision(
-        tool=INBOX,
-        tier=EXPLORATION,
-        why=(
-            f"read their {'unread ' if unread_only else ''}mail"
-            f"{f' from {sender!r}' if sender else ''} of the last {span}"
-        ),
-        args=decided,
+    why = (
+        f"read their {'unread ' if unread_only else ''}mail"
+        f"{f' from {sender!r}' if sender else ''} of the last {span}"
     )
+    # DL-092: with more than the default mailbox, which ones. Absent with
+    # only the default, so the decision and its log are what they were.
+    names = _mailbox_names()
+    if names:
+        boxes = _which_inboxes(INBOX, args.get("inbox"), names)
+        decided["inbox"] = boxes
+        why += f" in the {' and '.join(boxes)} inbox{'es' if len(boxes) > 1 else ''}"
+    return Decision(tool=INBOX, tier=EXPLORATION, why=why, args=decided)
+
+
+def _mailbox_names() -> list[str]:
+    """Every configured mailbox when there is more than the default one
+    (DL-092), and nothing otherwise: then no tool says a mailbox's name."""
+    return inboxes.names() if inboxes.multi() else []
+
+
+def _which_inboxes(tool: str, value: Any, names: Sequence[str]) -> list[str]:
+    """``inbox``'s ``inbox``: one mailbox, or ``all`` (the default)."""
+    if not _given(value) or (isinstance(value, str) and value.strip().lower() == inboxes.ALL):
+        return list(names)
+    if isinstance(value, str) and value.strip().lower() in names:
+        return [value.strip().lower()]
+    raise ToolRejected(
+        f"{tool}'s 'inbox' must be one of {[*names, inboxes.ALL]}, not {value!r}"
+    )
+
+
+def _which_inbox(tool: str, value: Any, names: Sequence[str]) -> str:
+    """``mail``'s ``inbox``: the one mailbox the mail's UID is from."""
+    if not _given(value) and len(names) == 1:
+        return names[0]
+    if isinstance(value, str) and value.strip().lower() in names:
+        return value.strip().lower()
+    raise ToolRejected(
+        f"{tool} needs 'inbox', the mailbox in the [...] tag of the mail's "
+        f"inbox line: one of {list(names)}"
+    )
+
+
+def _inbox_schema(schema: dict[str, Any], names: Sequence[str]) -> dict[str, Any]:
+    """``inbox`` and ``mail`` as offered with more than one mailbox (DL-092):
+    the same schema with an ``inbox`` argument naming them. Every other
+    schema, and these with one mailbox, are untouched."""
+    name = schema["function"]["name"]
+    if name not in (INBOX, MAIL):
+        return schema
+    out = copy.deepcopy(schema)
+    params = out["function"]["parameters"]
+    if name == INBOX:
+        params["properties"]["inbox"] = {
+            "type": "string",
+            "enum": [*names, inboxes.ALL],
+            "description": (
+                f"Which mailbox: {', '.join(names)}, or {inboxes.ALL} (the "
+                "default). Each line says its mailbox in [brackets]."
+            ),
+        }
+    else:
+        params["properties"]["inbox"] = {
+            "type": "string",
+            "enum": list(names),
+            "description": "The mailbox in [brackets] at the start of the mail's inbox line.",
+        }
+        params["required"] = [*params["required"], "inbox"]
+    return out
 
 
 def _hours(args: dict[str, Any]) -> Optional[int]:
@@ -1087,6 +1148,19 @@ def _inbox(box: "ToolBox", args: dict[str, Any]) -> str:
     }
     if args.get("hours") is not None:
         kw["hours"] = args["hours"]
+    boxes = args.get("inbox")
+    if isinstance(boxes, list):
+        # DL-092: each mailbox from its own cursor, every line tagged; one
+        # mailbox failing says so in its line and never hides the others.
+        if not box.prompted and box.mail_since is not None:
+            kw["after"] = {
+                name: box.mail_since(args["from"], args["unread_only"], mailbox=name)
+                for name in boxes
+            }
+        text, failed = inboxes.tool_text_multi(boxes, **kw)
+        if failed:
+            raise ToolError(f"could not read the inbox:\n{text}")
+        return _cap(text)
     if not box.prompted and box.mail_since is not None:
         # DL-090: nobody asked, so only what arrived since this origin last
         # read the same mail. Their own question never takes this branch.
@@ -1106,6 +1180,12 @@ def _classify_mail(box: "ToolBox", args: dict[str, Any]) -> Decision:
     uid = args.get("id")
     if isinstance(uid, bool) or not isinstance(uid, int) or uid < 1:
         raise ToolRejected(f"{MAIL} needs 'id', the whole number after '#' in an inbox line")
+    names = _mailbox_names()
+    if names:
+        # DL-092: a UID names a mail only inside its own mailbox.
+        name = _which_inbox(MAIL, args.get("inbox"), names)
+        return Decision(tool=MAIL, tier=EXPLORATION, why=f"open mail #{uid} in the {name} inbox",
+                        args={"id": uid, "inbox": name})
     return Decision(tool=MAIL, tier=EXPLORATION, why=f"open mail #{uid}", args={"id": uid})
 
 
@@ -1163,9 +1243,17 @@ HELD_LEAD = "opened held mail at their request — "
 def _mail(box: "ToolBox", args: dict[str, Any]) -> "str | ToolText":
     """One mail in full. Held mail opens only in a turn their own message
     started (DL-082 #4), and then the log keeps a redacted digest of it."""
+    name = args.get("inbox")
     try:
-        opened = inboxes.open_mail(args["id"])
+        opened = (
+            inboxes.open_mail(args["id"]) if name is None
+            else inboxes.open_mail(args["id"], name=name)
+        )
     except inboxes.InboxUnavailable as exc:
+        if name is not None:
+            raise ToolError("could not read the mail:\n" + inboxes.tag(
+                name, f"{inboxes.FAILED}: {exc}{inboxes.refusal_suffix(exc, name)}"
+            )) from None
         raise ToolError(
             f"could not read the mail: {exc}{inboxes.refusal_suffix(exc)}"
         ) from None
@@ -1175,7 +1263,9 @@ def _mail(box: "ToolBox", args: dict[str, Any]) -> "str | ToolText":
             "it opens only when they ask for it in their own message"
         )
     date = opened.date.astimezone().strftime("%a %d %b %Y %H:%M") if opened.date else "undated"
-    text = "\n".join([
+    # DL-092: which mailbox it came from, first, in omega's own words.
+    lead = [inboxes.tag(name, f"mail #{args['id']}")] if name is not None else []
+    text = "\n".join(lead + [
         f"From: {opened.sender or 'unknown sender'}",
         f"Subject: {opened.subject or '(no subject)'}",
         f"Date: {date}",
@@ -1189,6 +1279,8 @@ def _mail(box: "ToolBox", args: dict[str, Any]) -> "str | ToolText":
         f"{HELD_LEAD}from {opened.sender}: {inboxes.redact(opened.subject)} — "
         f"{inboxes.redact(opened.text[:200])}"
     )
+    if name is not None:
+        digest += "\n" + inboxes.tag(name, f"mail #{args['id']}")
     return ToolText(model=text, log=digest)
 
 
@@ -3469,6 +3561,9 @@ class ToolBox:
             mine.append(_LOCATION_TOOL.schema)
         if _keeping_up(self) and TOPICS not in hide:
             mine.append(_TOPICS_TOOL.schema)
+        names = _mailbox_names()
+        if len(names) > 1:
+            mine = [_inbox_schema(schema, names) for schema in mine]
         return mine + (self.remote.schemas() if self.remote is not None else [])
 
 

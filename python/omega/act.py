@@ -165,10 +165,13 @@ def _mail_since(ctx: TurnContext) -> Any:
     from the log at the moment of the read, never counting this turn's own."""
     where = mailcursor.origin(ctx.event) or "unknown"
 
-    def since(sender: Optional[str], unread_only: bool) -> Any:
+    def since(sender: Optional[str], unread_only: bool, mailbox: str = mailcursor.PERSONAL) -> Any:
+        # DL-092: ``mailbox`` is whose cursor; the default mailbox's is the
+        # one every read before it kept.
         return mailcursor.since(
             ctx.queue.store, where, now=datetime.now(timezone.utc),
             sender=sender, unread_only=unread_only, exclude=ctx.seq,
+            mailbox=mailbox,
         )
 
     return since

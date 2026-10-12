@@ -295,6 +295,9 @@ def _account_lines(environ=os.environ) -> list[str]:
     if gcal.credentials(environ) is not None:  # DL-081: the work calendar's way in
         sources.append("Google sign-in")
     found = inbox.settings(environ)
+    # DL-092: the other mailboxes, each on its own line; one left out says
+    # why, once, here, and is never guessed at.
+    more = inbox.extras(environ, warn=_inbox_warn)
     return [
         f"calendar: {' + '.join(sources)} (read-only)"
         if sources
@@ -302,7 +305,13 @@ def _account_lines(environ=os.environ) -> list[str]:
         f"inbox: reading {found.user} at {found.host} (read-only)"
         if found is not None
         else f"inbox: not connected ({inbox.ENV_USER}/{inbox.ENV_PASSWORD} unset)",
+    ] + [
+        f"inbox {s.name}: reading {s.user} at {s.host} (read-only)" for s in more
     ] + [line for line in (mcp.account_line(environ),) if line]
+
+
+def _inbox_warn(text: str) -> None:
+    print(f"omega: inbox: {text}", file=sys.stderr)
 
 
 def _location_args(environ) -> dict[str, Any]:
@@ -721,6 +730,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         # DL-087 #3: checks a lost sign-in again, at most hourly: an IMAP
         # login, the Google refresh, or one MCP listing. Never a write.
         probe=access.probe,
+        # DL-092: every mailbox, when there is more than the default one.
+        inbox_names=tuple(inbox.names()) if inbox.multi() else (),
         # DL-091: the phone's Shortcut door, only when a usable token is set.
         **_location_args(os.environ),
     )

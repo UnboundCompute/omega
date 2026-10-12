@@ -246,6 +246,7 @@ class Executor:
         "_calendar",
         "_inbox",
         "_inbox_after",
+        "_inbox_names",
         "_readings",
         "_access",
         "_access_now",
@@ -264,6 +265,7 @@ class Executor:
         calendar: Optional[Callable[[datetime], Sequence[str]]] = None,
         inbox: Optional[Callable[[datetime], Sequence[str]]] = None,
         probe: Optional[Callable[[str], Optional[bool]]] = None,
+        inbox_names: Sequence[str] = (),
     ) -> None:
         self._queue = queue
         self._complete = complete
@@ -282,6 +284,9 @@ class Executor:
         # mail cursor, once an hour; one that takes only the clock is read at
         # every look, as before, and nothing is recorded of it.
         self._inbox_after = _takes_after(inbox)
+        # DL-092: every mailbox the inbox sense reads, when there is more
+        # than the default one; empty is the one mailbox, read as before.
+        self._inbox_names = tuple(inbox_names)
         self._recovered = False
         self._open = OpenWork()
         self._learned = Learned()
@@ -1336,7 +1341,18 @@ class Executor:
             else:
                 calendar_lines = _sense(self._calendar, moment, "calendar")
                 self._refused_look(access.GOOGLE, calendar_lines, moment)
-            if self._inbox is not None and access.INBOX in lost:
+            mail_more: dict[str, str] = {}
+            if self._inbox is not None and self._inbox_names and self._inbox_after:
+                inbox_lines, mail_at, mail_more, held = self._look_mailboxes(moment, lost)
+                paused += held
+                for name in self._inbox_names:
+                    origin = access.inbox_origin(name)
+                    if origin not in held:
+                        self._refused_look(origin, [
+                            line for line in inbox_lines
+                            if str(line).startswith(inboxes.tag(name, ""))
+                        ], moment)
+            elif self._inbox is not None and access.INBOX in lost:
                 inbox_lines: Sequence[str] = (access.paused_line(access.INBOX),)
                 mail_at: Optional[str] = None
                 paused.append(access.INBOX)
@@ -1376,6 +1392,7 @@ class Executor:
                     machine=list(machine_lines),
                     mail_at=mail_at,
                     at=moment.isoformat(),
+                    mail_inboxes=mail_more or None,
                 )
             )
             for origin in paused:
@@ -1504,6 +1521,56 @@ class Executor:
         lines = _sense(lambda now: self._inbox(now, after=after), moment, "inbox")
         read = bool(lines) and not str(lines[0]).startswith(inboxes.FAILED)
         return lines, (moment.isoformat() if read else None)
+
+    def _look_mailboxes(
+        self, moment: datetime, lost: Any
+    ) -> tuple[Sequence[str], Optional[str], dict[str, str], list[str]]:
+        """:meth:`_look_mail` for more than one mailbox (DL-092).
+
+        Each mailbox keeps its own hour and its own cursor: one read within
+        the hour says so in its own line, one whose origin is lost says it
+        is paused, and the rest are read in one go, each from its own
+        cursor. Returns the lines, the default mailbox's ``mail_at``, the
+        other mailboxes' stamps, and the origins this look paused. A
+        mailbox stamps only when its own reading came back.
+        """
+        store = self._queue.store
+        gap = timedelta(seconds=notice.MAIL_EVERY_SECONDS)
+        said: dict[str, list[str]] = {name: [] for name in self._inbox_names}
+        afters: dict[str, datetime] = {}
+        held: list[str] = []
+        for name in self._inbox_names:
+            origin = access.inbox_origin(name)
+            if origin in lost:
+                said[name].append(inboxes.tag(name, access.paused_line(origin)))
+                held.append(origin)
+                continue
+            last = mailcursor.last_read(store, mailcursor.LOOK, mailbox=name)
+            if last is not None and moment - last < gap:
+                when = last.astimezone().strftime("%H:%M")
+                said[name].append(inboxes.tag(
+                    name,
+                    f"mail is read once an hour; last read at {when}, and "
+                    f"nothing that arrived since is lost",
+                ))
+                continue
+            afters[name] = last if last is not None else moment - timedelta(
+                seconds=mailcursor.FIRST_WINDOW_SECONDS
+            )
+        loose: list[str] = []
+        read: list[str] = []
+        if afters:
+            got = _sense(lambda now: self._inbox(now, after=afters), moment, "inbox")
+            seen = inboxes.outcomes(got)
+            read = [name for name in afters if seen.get(name) is True]
+            for line in got:
+                owner = next((n for n in said if str(line).startswith(inboxes.tag(n, ""))), None)
+                (said[owner] if owner is not None else loose).append(line)
+        lines = [line for name in self._inbox_names for line in said[name]] + loose
+        stamp = moment.isoformat()
+        mail_at = stamp if inboxes.PERSONAL in read else None
+        more = {name: stamp for name in read if name != inboxes.PERSONAL}
+        return tuple(lines), mail_at, more, held
 
     def _follow_up(self, moment: datetime) -> bool:
         """DL-087 #2: tell them, once, about one thing that kept failing.

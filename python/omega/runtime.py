@@ -282,6 +282,9 @@ class Runtime:
         # DL-087 #3: asks whether a lost sign-in works again. ``None`` for the
         # same reason: a default would log into their accounts from a test.
         probe: Optional[Callable[[str], Optional[bool]]] = None,
+        # DL-092: every mailbox the inbox sense reads, when there is more
+        # than the default one. Empty, the one mailbox is read as before.
+        inbox_names: Sequence[str] = (),
         # On by default because DL-035's whole point is that omega acts on time
         # without being asked, and a proactivity that has to be switched on is
         # one that is off in every deployment nobody remembered to configure.
@@ -324,6 +327,7 @@ class Runtime:
         self._calendar = calendar
         self._inbox = inbox
         self._probe = probe
+        self._inbox_names = tuple(inbox_names)
         self._clock = clock
         self._self_review = self_review
         self._host = host
@@ -401,6 +405,7 @@ class Runtime:
                 calendar=self._calendar,
                 inbox=self._inbox,
                 probe=self._probe,
+                inbox_names=self._inbox_names,
             )
             self._report = self._executor.recover()
             self._thread = threading.Thread(

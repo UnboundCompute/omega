@@ -43,6 +43,14 @@ listing headers, and a mail that arrived before ``after`` is dropped before its
 body is fetched. The search itself stays a coarse ``SINCE`` date. Which moment
 that is, is :mod:`omega.mailcursor`'s business, not this module's. A read with
 no ``after`` sends exactly the commands it always did.
+
+**More than one mailbox (DL-092).** The ``OMEGA_IMAP_*`` variables are the
+default mailbox, named ``personal``. ``OMEGA_INBOXES=work`` adds mailboxes,
+each read from its own ``OMEGA_IMAP_<NAME>_{USER,PASSWORD,HOST}`` and read
+exactly as the default is: read-only, peeks only. A UID means something only
+inside its own mailbox, so whenever an extra mailbox is configured every line
+read here is tagged ``[name]`` and ``mail`` is told which mailbox to open.
+With no extra mailbox configured nothing below changes by a byte.
 """
 
 from __future__ import annotations
@@ -94,11 +102,39 @@ __all__ = [
     "arrived_since",
     "look_lines",
     "tool_text",
+    "PERSONAL",
+    "ALL",
+    "ENV_INBOXES",
+    "imap_fix",
+    "extras",
+    "mailboxes",
+    "names",
+    "multi",
+    "tag",
+    "outcomes",
+    "failed_names",
+    "tool_text_multi",
 ]
 
 ENV_USER = "OMEGA_IMAP_USER"
 ENV_PASSWORD = "OMEGA_IMAP_PASSWORD"
 ENV_HOST = "OMEGA_IMAP_HOST"
+
+#: The extra mailboxes (DL-092), a comma list of names; each is read from
+#: ``OMEGA_IMAP_<NAME>_USER``, ``_PASSWORD`` and ``_HOST``.
+ENV_INBOXES = "OMEGA_INBOXES"
+
+#: The default mailbox's name, the one ``OMEGA_IMAP_*`` configures. Reserved.
+PERSONAL = "personal"
+
+#: What the ``inbox`` argument says to read every configured mailbox.
+ALL = "all"
+
+#: What an extra mailbox may be called: as an MCP server's name.
+_BOX_NAME = re.compile(r"^[a-z][a-z0-9]{0,15}$")
+
+#: A line one mailbox's reading was tagged with (:func:`tag`).
+_TAGGED = re.compile(r"^\[([a-z][a-z0-9]{0,15})\] (.*)$", re.DOTALL)
 
 DEFAULT_HOST = "imap.gmail.com"
 DEFAULT_PORT = 993
@@ -191,9 +227,10 @@ class InboxUnavailable(Exception):
         self.refused = refused
 
 
-def refusal_suffix(exc: BaseException) -> str:
-    """What a failed read's words gain when the login was refused: the fix."""
-    return f". {IMAP_FIX}" if getattr(exc, "refused", False) else ""
+def refusal_suffix(exc: BaseException, name: str = PERSONAL) -> str:
+    """What a failed read's words gain when the login was refused: the fix
+    for mailbox ``name`` (DL-092), the default mailbox's unless told."""
+    return f". {imap_fix(name)}" if getattr(exc, "refused", False) else ""
 
 
 @dataclass(frozen=True)
@@ -202,6 +239,8 @@ class Settings:
     password: str = field(repr=False)
     host: str = DEFAULT_HOST
     port: int = DEFAULT_PORT
+    #: Which mailbox these are (DL-092): ``personal`` for ``OMEGA_IMAP_*``.
+    name: str = PERSONAL
 
 
 @dataclass(frozen=True)
@@ -247,6 +286,115 @@ def settings(environ: Mapping[str, str] = os.environ) -> Optional[Settings]:
         return None
     host = (environ.get(ENV_HOST) or "").strip() or DEFAULT_HOST
     return Settings(user=user, password=password, host=host)
+
+
+def _box_env(name: str, part: str) -> str:
+    return f"OMEGA_IMAP_{name.upper()}_{part}"
+
+
+def extras(
+    environ: Mapping[str, str] = os.environ,
+    *,
+    warn: Optional[Callable[[str], None]] = None,
+) -> list[Settings]:
+    """The extra mailboxes ``OMEGA_INBOXES`` names (DL-092), in order.
+
+    A name that is not 1-16 lowercase letters and digits starting with a
+    letter, ``personal``, a repeat, or one without both its user and its
+    password is left out, and ``warn`` is told why in one line: the startup
+    log passes it, every other caller reads quietly. Never raises.
+    """
+    out: list[Settings] = []
+    for raw in re.split(r"[\s,]+", environ.get(ENV_INBOXES, "") or ""):
+        if not raw:
+            continue
+        name = raw.lower()
+        if not _BOX_NAME.match(name) or name == PERSONAL or any(s.name == name for s in out):
+            if warn is not None:
+                warn(
+                    f"skipping inbox {raw!r}: a name is 1-16 lowercase letters "
+                    f"and digits, starting with a letter, once, and not {PERSONAL!r}"
+                )
+            continue
+        user = (environ.get(_box_env(name, "USER")) or "").strip()
+        password = (environ.get(_box_env(name, "PASSWORD")) or "").strip()
+        if not user or not password:
+            if warn is not None:
+                warn(
+                    f"skipping inbox {name!r}: set both {_box_env(name, 'USER')} "
+                    f"and {_box_env(name, 'PASSWORD')}"
+                )
+            continue
+        host = (environ.get(_box_env(name, "HOST")) or "").strip() or DEFAULT_HOST
+        out.append(Settings(user=user, password=password, host=host, name=name))
+    return out
+
+
+def mailboxes(environ: Mapping[str, str] = os.environ) -> list[Settings]:
+    """Every configured mailbox, the default (``personal``) first."""
+    s = settings(environ)
+    return ([s] if s is not None else []) + extras(environ)
+
+
+def names(environ: Mapping[str, str] = os.environ) -> list[str]:
+    """The configured mailboxes' names, the default first."""
+    return [s.name for s in mailboxes(environ)]
+
+
+def multi(environ: Mapping[str, str] = os.environ) -> bool:
+    """Is any extra mailbox configured? Only then is anything tagged."""
+    return bool(extras(environ))
+
+
+def _settings_for(name: str, environ: Mapping[str, str]) -> Optional[Settings]:
+    if name == PERSONAL:
+        return settings(environ)
+    return next((s for s in extras(environ) if s.name == name), None)
+
+
+def imap_fix(name: str = PERSONAL) -> str:
+    """The fix a refused login to mailbox ``name`` names. The default
+    mailbox's is :data:`IMAP_FIX`, word for word; an extra mailbox's never
+    contains it, so a refusal is always told about the mailbox it was."""
+    if name == PERSONAL:
+        return IMAP_FIX
+    return (
+        f"IMAP refused the login to the {name} inbox: check its app password "
+        f"({_box_env(name, 'PASSWORD')}); on Google Workspace an admin may have "
+        "to allow IMAP and app passwords"
+    )
+
+
+def tag(name: str, line: str) -> str:
+    """One line of mailbox ``name``'s reading, said as that mailbox's."""
+    return f"[{name}] {line}"
+
+
+def outcomes(lines: Sequence[str]) -> dict[str, Optional[bool]]:
+    """What tagged lines say about each mailbox they name: ``True`` it was
+    read, ``False`` its login was refused, ``None`` it failed otherwise.
+
+    Every line here is omega's own: a tag, then a time, "no ...", "new
+    since" or :data:`FAILED`. A mail's own words are one cleaned line after
+    the tag and the time, so they cannot pose as a failure. Untagged lines
+    are not counted.
+    """
+    out: dict[str, Optional[bool]] = {}
+    for line in lines:
+        found = _TAGGED.match(str(line))
+        if found is None:
+            continue
+        name, rest = found.groups()
+        if rest.startswith(f"{FAILED}:"):
+            out[name] = False if imap_fix(name) in rest else None
+        else:
+            out.setdefault(name, True)
+    return out
+
+
+def failed_names(lines: Sequence[str]) -> set[str]:
+    """The mailboxes tagged lines say could not be read, refused or not."""
+    return {name for name, ok in outcomes(lines).items() if ok is not True}
 
 
 # --------------------------------------------------------------------------
@@ -312,7 +460,9 @@ def _session(s: Settings, connect: Callable[..., Any]) -> Iterator[Any]:
             and isinstance(exc, imaplib.IMAP4.error)
             and bool(_REFUSED.search(_text(exc.args[0] if exc.args else "")))
         )
-        raise InboxUnavailable(_reason(exc, phase, s.password), refused=refused) from None
+        raise InboxUnavailable(
+            _reason(exc, phase, s.password, user_env=_user_env(s)), refused=refused
+        ) from None
     finally:
         if imap is not None:
             _logout(imap)
@@ -559,13 +709,17 @@ def open_mail(
     *,
     environ: Mapping[str, str] = os.environ,
     connect: Callable[..., Any] = imaplib.IMAP4_SSL,
+    name: str = PERSONAL,
 ) -> Opened:
     """One mail, whole, by UID — on a read-only select, with peeks only.
+
+    ``name`` is the mailbox the UID is from (DL-092): a UID names a mail only
+    inside its own mailbox.
 
     Raises :class:`InboxUnavailable` when there is no inbox, no such mail, a
     mail too large to open, or anything the server or the network did.
     """
-    s = settings(environ)
+    s = settings(environ) if name == PERSONAL else _settings_for(name, environ)
     if s is None:
         raise InboxUnavailable(NOT_CONNECTED)
     key = str(int(uid)).encode()
@@ -668,11 +822,17 @@ def _logout(imap: Any) -> None:
         pass
 
 
-def _reason(exc: BaseException, phase: str, password: str) -> str:
+def _user_env(s: Settings) -> str:
+    return ENV_USER if s.name == PERSONAL else _box_env(s.name, "USER")
+
+
+def _reason(exc: BaseException, phase: str, password: str, *, user_env: str = ENV_USER) -> str:
     """A short, password-free reason for :class:`InboxUnavailable`."""
     if isinstance(exc, (socket.timeout, TimeoutError)):
         return "timed out"
     if phase == "login" and isinstance(exc, imaplib.IMAP4.error):
+        if user_env != ENV_USER:
+            return f"login refused (check {user_env} and the app password)"
         return _AUTH_REASON
     text = _clean(_text(exc.args[0] if exc.args else ""), 120)
     if password:
@@ -685,11 +845,13 @@ def probe(
     environ: Mapping[str, str] = os.environ,
     *,
     connect: Callable[..., Any] = imaplib.IMAP4_SSL,
+    name: str = PERSONAL,
 ) -> Optional[bool]:
     """Does the login work again (DL-087 #3)? One read-only session that
     lists nothing: ``True`` it does, ``False`` the server still refuses the
-    credentials, ``None`` anything else (not set up, the network)."""
-    s = settings(environ)
+    credentials, ``None`` anything else (not set up, the network). ``name``
+    is the mailbox to check (DL-092), the default unless told."""
+    s = settings(environ) if name == PERSONAL else _settings_for(name, environ)
     if s is None:
         return None
     try:
@@ -751,7 +913,7 @@ def look_lines(
     environ: Mapping[str, str] = os.environ,
     connect: Callable[..., Any] = imaplib.IMAP4_SSL,
     on_mails: Optional[Callable[[Sequence[Mail]], None]] = None,
-    after: Optional[datetime] = None,
+    after: "Optional[datetime] | Mapping[str, datetime]" = None,
 ) -> list[str]:
     """What the look says about the inbox: nothing, a failure, or what is there.
 
@@ -766,16 +928,38 @@ def look_lines(
     only when the reading succeeded — the finance sweep (DL-083) rides the
     look's one IMAP read rather than making its own. It never costs the look
     its lines: whatever it raises is dropped here.
+
+    With an extra mailbox configured (DL-092) every line is tagged with its
+    mailbox, and ``after`` may be a mapping of mailbox name to that
+    mailbox's own cursor: only the mailboxes it names are read. ``on_mails``
+    is then handed the default mailbox's reading only, as before.
     """
+    if multi(environ):
+        return _look_multi(now, environ=environ, connect=connect,
+                           on_mails=on_mails, after=after)
+    if isinstance(after, Mapping):
+        after = after.get(PERSONAL)
     s = settings(environ)
     if s is None:
         return []
     now = now or datetime.now(timezone.utc)
+    return _look_one(s, now, connect=connect, on_mails=on_mails, after=after)
+
+
+def _look_one(
+    s: Settings,
+    now: datetime,
+    *,
+    connect: Callable[..., Any],
+    on_mails: Optional[Callable[[Sequence[Mail]], None]],
+    after: Optional[datetime],
+) -> list[str]:
+    """One mailbox's look lines: :func:`look_lines` for the default mailbox."""
     try:
         mails = read(s, days=LOOK_DAYS, unread_only=False, connect=connect, now=now,
                      arrival=after is not None)
     except InboxUnavailable as exc:
-        return [f"{FAILED}: {exc}{refusal_suffix(exc)}"]
+        return [f"{FAILED}: {exc}{refusal_suffix(exc, s.name)}"]
     if on_mails is not None:
         try:
             on_mails(mails)
@@ -793,6 +977,34 @@ def look_lines(
     ]
     if bulk:
         out.append(f"(and {bulk} newsletters/notifications, not listed)")
+    return out
+
+
+def _look_multi(
+    now: Optional[datetime],
+    *,
+    environ: Mapping[str, str],
+    connect: Callable[..., Any],
+    on_mails: Optional[Callable[[Sequence[Mail]], None]],
+    after: "Optional[datetime] | Mapping[str, datetime]",
+) -> list[str]:
+    """Every mailbox's look lines (DL-092), each tagged, one mailbox's
+    failure never another's. A mapping ``after`` reads only what it names,
+    each from its own cursor; a moment or ``None`` applies to all."""
+    now = now or datetime.now(timezone.utc)
+    out: list[str] = []
+    for s in mailboxes(environ):
+        if isinstance(after, Mapping):
+            if s.name not in after:
+                continue
+            since = after[s.name]
+        else:
+            since = after
+        lines = _look_one(
+            s, now, connect=connect,
+            on_mails=on_mails if s.name == PERSONAL else None, after=since,
+        )
+        out += [tag(s.name, line) for line in lines]
     return out
 
 
@@ -832,6 +1044,22 @@ def tool_text(
     if s is None:
         return NOT_CONNECTED
     now = now or datetime.now(timezone.utc)
+    return _answer(s, sender=sender, days=days, unread_only=unread_only, now=now,
+                   connect=connect, hours=hours, after=after)
+
+
+def _answer(
+    s: Settings,
+    *,
+    sender: Optional[str],
+    days: int,
+    unread_only: bool,
+    now: datetime,
+    connect: Callable[..., Any],
+    hours: Optional[int],
+    after: Optional[datetime],
+) -> str:
+    """One mailbox's tool answer: :func:`tool_text` once it has settings."""
     bound = after
     if hours is not None:
         start = now - timedelta(hours=hours)
@@ -851,3 +1079,44 @@ def tool_text(
         return f"no {kind}{who} in the last {span}"
     listing = "\n".join(_line(m, now, tag_bulk=True) for m in mails)
     return f"new since {_when(after, now)}:\n{listing}" if cursor else listing
+
+
+def tool_text_multi(
+    boxes: Sequence[str],
+    *,
+    sender: Optional[str] = None,
+    days: int = LOOK_DAYS,
+    unread_only: bool = True,
+    now: Optional[datetime] = None,
+    environ: Mapping[str, str] = os.environ,
+    connect: Callable[..., Any] = imaplib.IMAP4_SSL,
+    hours: Optional[int] = None,
+    after: Optional[Mapping[str, datetime]] = None,
+) -> tuple[str, bool]:
+    """The named mailboxes as one tool answer (DL-092), and whether every
+    one of them failed.
+
+    Each mailbox is read as :func:`tool_text` reads the default one, from
+    its own cursor in ``after``, and every line is tagged with its mailbox.
+    Failures come first, so a capped answer never loses one: the mail
+    cursor reads them to know which mailboxes this read covered. One
+    mailbox failing never hides another's mail.
+    """
+    configured = {s.name: s for s in mailboxes(environ)}
+    now = now or datetime.now(timezone.utc)
+    failed: list[str] = []
+    answered: list[str] = []
+    for name in boxes:
+        s = configured.get(name)
+        if s is None:
+            failed.append(tag(name, f"{FAILED}: that mailbox is not configured"))
+            continue
+        try:
+            text = _answer(s, sender=sender, days=days, unread_only=unread_only,
+                           now=now, connect=connect, hours=hours,
+                           after=(after or {}).get(name))
+        except InboxUnavailable as exc:
+            failed.append(tag(name, f"{FAILED}: {exc}{refusal_suffix(exc, name)}"))
+            continue
+        answered += [tag(name, line) for line in text.split("\n")]
+    return "\n".join(failed + answered), not answered

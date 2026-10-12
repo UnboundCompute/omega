@@ -35,6 +35,17 @@ this one asks for.
 
 With no earlier read from this origin the window is the last
 :data:`FIRST_WINDOW_SECONDS` — an hour, the sweep's own cadence.
+
+**Per mailbox, too (DL-092).** With more than one mailbox each keeps its own
+cursor under every origin: a read of the work mailbox never cuts the next
+read of the personal one, and a mailbox whose read failed inside a read that
+covered others keeps its own cursor where it was. Which mailboxes a read
+asked for is in its ``tool.called`` arguments (``inbox``, a list), which
+read in its ``tool.returned`` tagged lines; a look records its extra
+mailboxes' stamps in ``mail_inboxes`` beside ``mail_at``. A read without
+the argument, and every record written before it existed, is the default
+mailbox's, so the default mailbox's cursor is read from the records it
+always was.
 """
 
 from __future__ import annotations
@@ -44,6 +55,7 @@ from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any, Mapping, Optional
 
 from omega import episodes
+from omega.inbox import PERSONAL, outcomes
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from omega.memory import MemoryStore
@@ -81,6 +93,7 @@ class Read:
     sender: Optional[str]     # the ``from`` it was narrowed to, or None for all
     unread_only: bool
     for_seq: int              # the turn it was made in
+    mailbox: str = PERSONAL   # which mailbox it read (DL-092)
 
 
 def origin(event: Mapping[str, Any]) -> Optional[str]:
@@ -129,6 +142,12 @@ def reads(store: "MemoryStore") -> list[Read]:
                 at = _stamp(payload.get("mail_at"))
                 if where == LOOK and at is not None:
                     found.append(Read(LOOK, at, None, False, episode.seq))
+                more = payload.get("mail_inboxes")
+                if where == LOOK and isinstance(more, dict):
+                    for name, stamp in sorted(more.items()):
+                        at = _stamp(stamp)
+                        if isinstance(name, str) and name != PERSONAL and at is not None:
+                            found.append(Read(LOOK, at, None, False, episode.seq, name))
         elif kind == episodes.TOOL_CALLED:
             if payload.get("tool") == _INBOX and payload.get("for_seq") in origins:
                 args = payload.get("args")
@@ -142,13 +161,15 @@ def reads(store: "MemoryStore") -> list[Read]:
                 if payload.get("ok") is True and at is not None:
                     sender = args.get("from")
                     unread = args.get("unread_only")
-                    found.append(Read(
-                        origin=origins[seq],
-                        at=at,
-                        sender=sender if isinstance(sender, str) and sender else None,
-                        unread_only=unread if isinstance(unread, bool) else True,
-                        for_seq=seq,
-                    ))
+                    for box in _covered(args, payload.get("result")):
+                        found.append(Read(
+                            origin=origins[seq],
+                            at=at,
+                            sender=sender if isinstance(sender, str) and sender else None,
+                            unread_only=unread if isinstance(unread, bool) else True,
+                            for_seq=seq,
+                            mailbox=box,
+                        ))
         elif kind == episodes.TURN_COMPLETED:
             if payload.get("outcome") != "failed":
                 finished.add(payload.get("for_seq"))
@@ -156,6 +177,20 @@ def reads(store: "MemoryStore") -> list[Read]:
             finished.add(payload.get("for_seq"))
 
     return [r for r in found if r.for_seq in finished]
+
+
+def _covered(args: Mapping[str, Any], result: Any) -> list[str]:
+    """The mailboxes one successful ``inbox`` read covered (DL-092).
+
+    Without an ``inbox`` argument, the default mailbox, as every read before
+    it. With one, each mailbox it asked for that its answer shows as read:
+    one tagged as failed, or not answered at all, is not covered.
+    """
+    asked = args.get("inbox")
+    if not isinstance(asked, list):
+        return [PERSONAL]
+    said = outcomes(str(result or "").split("\n"))
+    return [b for b in asked if isinstance(b, str) and said.get(b) is True]
 
 
 def _covers(earlier: Read, sender: Optional[str], unread_only: bool) -> bool:
@@ -173,15 +208,18 @@ def last_read(
     sender: Optional[str] = None,
     unread_only: bool = False,
     exclude: Optional[int] = None,
+    mailbox: str = PERSONAL,
 ) -> Optional[datetime]:
     """When ``where`` last read everything this read asks for, or ``None``.
 
     ``exclude`` is the current turn: two reads inside one turn see the same
-    mail, so the second is never cut by the first.
+    mail, so the second is never cut by the first. ``mailbox`` is whose
+    cursor (DL-092): only that mailbox's reads count.
     """
     stamps = [
         r.at for r in reads(store)
-        if r.origin == where and r.for_seq != exclude and _covers(r, sender, unread_only)
+        if r.origin == where and r.mailbox == mailbox and r.for_seq != exclude
+        and _covers(r, sender, unread_only)
     ]
     return max(stamps) if stamps else None
 
@@ -194,8 +232,10 @@ def since(
     sender: Optional[str] = None,
     unread_only: bool = True,
     exclude: Optional[int] = None,
+    mailbox: str = PERSONAL,
 ) -> datetime:
-    """The moment after which mail is new to ``where``: its last covering
-    read, or :data:`FIRST_WINDOW_SECONDS` ago when it has none."""
-    last = last_read(store, where, sender=sender, unread_only=unread_only, exclude=exclude)
+    """The moment after which mail is new to ``where`` in ``mailbox``: its
+    last covering read, or :data:`FIRST_WINDOW_SECONDS` ago when it has none."""
+    last = last_read(store, where, sender=sender, unread_only=unread_only,
+                     exclude=exclude, mailbox=mailbox)
     return last if last is not None else now - timedelta(seconds=FIRST_WINDOW_SECONDS)
