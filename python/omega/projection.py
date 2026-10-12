@@ -254,6 +254,9 @@ NOT_PROJECTED = frozenset(
         # run as the brief's running/waiting section and each step's reply.
         # None is pushed as an update of its own.
         *episodes.TASK_KINDS,
+        # DL-096. A page watch's alert reaches the person as its tell inbound;
+        # the records only remember the watch and its checks.
+        *episodes.WATCHER_KINDS,
     }
 )
 

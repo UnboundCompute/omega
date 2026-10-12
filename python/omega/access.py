@@ -165,7 +165,8 @@ def classify_all(payload: Mapping[str, Any]) -> list[tuple[str, bool]]:
     in name order. A listing's lines are all omega's own; an opened mail's
     are the sender's past its first line, so only that one is read.
     """
-    if payload.get("kind") != episodes.TOOL_RETURNED:
+    if payload.get("kind") not in (episodes.TOOL_RETURNED, episodes.WATCHER_CHECKED):
+        # A page watch's check (DL-096) counts as :func:`classify` says.
         return []
     tool = str(payload.get("tool", ""))
     if tool in _INBOX_TOOLS:
@@ -193,7 +194,9 @@ def classify(payload: Mapping[str, Any]) -> Optional[tuple[str, bool]]:
     the gate turned away, a tool that reads from no account) is ``None``.
     An answer tagged with mailboxes (DL-092) is :func:`classify_all`'s.
     """
-    if payload.get("kind") != episodes.TOOL_RETURNED:
+    # A page watch's check (DL-096) reads through the same MCP servers and
+    # carries the same fields, so it counts as any MCP read does.
+    if payload.get("kind") not in (episodes.TOOL_RETURNED, episodes.WATCHER_CHECKED):
         return None
     tool = str(payload.get("tool", ""))
     ok = payload.get("ok") is True
@@ -301,7 +304,7 @@ class Access:
                 self._fires[seq] = str(sid)
         elif kind in (episodes.TURN_COMPLETED, episodes.TURN_BLOCKED):
             self._fires.pop(payload.get("for_seq"), None)  # type: ignore[arg-type]
-        elif kind == episodes.TOOL_RETURNED:
+        elif kind in (episodes.TOOL_RETURNED, episodes.WATCHER_CHECKED):
             self._returned(payload)
         elif kind == episodes.ACCESS_LOST:
             origin = str(payload["origin"])

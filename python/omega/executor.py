@@ -55,6 +55,7 @@ from omega import (
     tools,
     topics,
     transcripts,
+    watcher,
 )
 from omega.derive import Learned, Moments, OpenWork, Readings
 from omega.followups import Followups
@@ -242,6 +243,7 @@ class Executor:
         "_topics_now",
         "_tasks",
         "_tasks_now",
+        "_watches",
         "_moments",
         "_standing",
         "_online",
@@ -326,6 +328,8 @@ class Executor:
         # head on the idle pass (what is drivable right now).
         self._tasks = tasks.Tasks()
         self._tasks_now = tasks.Tasks()
+        # Page watches (DL-096), kept at the log's head for the idle pass.
+        self._watches = watcher.Watches()
         # A third view rather than a field on `_learned` (DL-062): what is
         # true and what happened have different lifetimes, and keeping them
         # in one fold is what would let events leak into the claim set.
@@ -2125,6 +2129,62 @@ class Executor:
             return True
         except Exception:  # noqa: BLE001 - see the docstring
             return False
+
+    def watch_pages(self, *, now: Optional[str] = None) -> bool:
+        """One due page-watch check (DL-096). Returns whether one ran.
+
+        Expiry first: a watch past its ``until`` is stopped and they are told
+        once. Then the watch most overdue is checked: a read and a comparison
+        in code (:func:`omega.watcher.check`), with no model call unless it
+        alerts and was set to ``summarize``. An alert is one tell. A watch
+        whose MCP server lost its credentials waits until access is restored.
+        With no watch standing it is a fold and nothing else.
+
+        **Never raises.**
+        """
+        if not self._recovered:
+            return False
+        try:
+            view = self._watches.advance(self._queue.store).state()
+            if not view:
+                return False
+            clock = now or episodes.now()
+            moment = datetime.fromisoformat(clock)
+            for w in view.oldest():
+                if watcher.expired(w, moment):
+                    self._queue.append(episodes.watcher_stopped(id=w.id, reason="expired", at=clock))
+                    self._tell(watcher.expiry_words(w), clock)
+                    return True
+            lost = self._access_now.advance(self._queue.store).state().lost
+            due = [
+                w for w in view.oldest()
+                if watcher.due(w, moment)
+                and access.mcp_origin(watcher.server_of(w.adapter) or "") not in lost
+            ]
+            if not due:
+                return False
+            w = min(due, key=lambda x: (x.checked_at or "", x.since, x.id))
+            remote = mcp.remote() if w.adapter["kind"] == "mcp" else None
+            done = watcher.check(w, remote=remote, at=clock, complete=self._complete)
+            self._queue.append(done.checked)
+            if done.alert is not None:
+                self._tell(done.alert["text"], clock)
+                self._queue.append(done.alert)
+            elif not done.ok:
+                failing = watcher.failing_alert(
+                    self._watches.advance(self._queue.store).state().watches[w.id], clock
+                )
+                if failing is not None:
+                    self._tell(failing["text"], clock)
+                    self._queue.append(failing)
+            return True
+        except Exception:  # noqa: BLE001 - see the docstring
+            return False
+
+    def _tell(self, words: str, at: str) -> None:
+        self._queue.append(episodes.inbound(
+            tools.tell_instruction(words), channel="schedule", at=at,
+        ))
 
     def _withdraw(self) -> None:
         """Write down every proposal that stopped applying (DL-087 #8): its

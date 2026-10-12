@@ -123,6 +123,16 @@ __all__ = [
     "MAX_TOPIC_TITLE",
     "MAX_TOPIC_URL",
     "MAX_TOPIC_ITEMS",
+    "WATCHER_SET",
+    "WATCHER_CHECKED",
+    "WATCHER_ALERTED",
+    "WATCHER_STOPPED",
+    "WATCHER_KINDS",
+    "WATCHER_CONDITIONS",
+    "watcher_set",
+    "watcher_checked",
+    "watcher_alerted",
+    "watcher_stopped",
     "topic_followed",
     "topic_dropped",
     "topic_update",
@@ -470,6 +480,28 @@ MAX_TASK_STEP_TEXT = 2000
 DEFAULT_TASK_BUDGET = 200_000
 
 _DIGEST = re.compile(r"^[0-9a-f]{16}$")
+#: Page watches (DL-096). ``watcher.set`` is one watch taken on, or renewed
+#: (the same id written again with a later ``until``); ``watcher.checked`` one
+#: deterministic check of it, with the digest of what was read; ``watcher.alerted``
+#: one alert said (or, with ``for_seq``, said in the reply that set it);
+#: ``watcher.stopped`` the end of one, asked for or expired. Records, neither
+#: recalled nor projected: the live set is a fold (:mod:`omega.watcher`) and an
+#: alert reaches them as a tell.
+WATCHER_SET = "watcher.set"
+WATCHER_CHECKED = "watcher.checked"
+WATCHER_ALERTED = "watcher.alerted"
+WATCHER_STOPPED = "watcher.stopped"
+WATCHER_KINDS = frozenset({WATCHER_SET, WATCHER_CHECKED, WATCHER_ALERTED, WATCHER_STOPPED})
+WATCHER_CONDITIONS = ("changed", "contains", "below", "above", "appears", "disappears")
+_WATCHER_ADAPTERS = ("fetch", "mcp")
+_WATCHER_ALERTS = ("hit", "failing")
+_WATCHER_STOPS = ("asked", "expired")
+MAX_WATCHER_NAME = 80
+MAX_WATCHER_URL = 500
+MAX_WATCHER_TEXT = 200
+MAX_WATCHER_EXCERPT = 4000
+MAX_WATCHER_ALERT = 1000
+_WATCHER_ID = re.compile(r"^w[0-9]+(?:-[0-9]+)?$")
 
 #: The senses a relay may report for, by the name of the sense rather than of
 #: the file it read. Three of them end in a learning receipt; the machine sense
@@ -546,6 +578,7 @@ KINDS = frozenset(
         *LOCATION_KINDS,
         *TOPIC_KINDS,
         *TASK_KINDS,
+        *WATCHER_KINDS,
     }
 )
 
@@ -2073,6 +2106,13 @@ _REQUIRED: dict[str, tuple[str, ...]] = {
     TASK_STEP: ("for_seq", "task", "n", "state", "evidence", "why", "at"),
     TASK_DROPPED: ("for_seq", "task", "n", "at"),
     TASK_CANCELLED: ("task", "at"),
+    WATCHER_SET: (
+        "id", "name", "adapter", "condition", "every_minutes", "max_per_day",
+        "until", "summarize", "link", "for_seq", "at",
+    ),
+    WATCHER_CHECKED: ("id", "tool", "ok", "at"),
+    WATCHER_ALERTED: ("id", "reason", "digest", "text", "at"),
+    WATCHER_STOPPED: ("id", "reason", "at"),
     GRANT_GIVEN: ("for_seq", "scope", "at"),
     GRANT_REVOKED: ("for_seq", "scope", "at"),
     GRANT_RESTORED: ("for_seq", "scope", "at"),
@@ -2363,6 +2403,32 @@ def task_proposed(
     return payload
 
 
+def watcher_set(
+    *,
+    id: str,
+    name: str,
+    adapter: dict[str, Any],
+    condition: dict[str, Any],
+    every_minutes: int,
+    max_per_day: int,
+    until: str,
+    summarize: bool,
+    link: Optional[str],
+    for_seq: int,
+    at: Optional[str] = None,
+) -> dict[str, Any]:
+    """A page watch taken on, or renewed (DL-096)."""
+    payload = {
+        "v": VERSION, "kind": WATCHER_SET, "id": id, "name": name,
+        "adapter": dict(adapter), "condition": dict(condition),
+        "every_minutes": every_minutes, "max_per_day": max_per_day,
+        "until": until, "summarize": summarize, "link": link,
+        "for_seq": for_seq, "at": at or now(),
+    }
+    _validate(payload)
+    return payload
+
+
 def task_started(*, for_seq: int, task: int, at: Optional[str] = None) -> dict[str, Any]:
     """The person approved the plan ``task`` (a :data:`TASK_PROPOSED` seq), so
     the run begins (DL-095). ``for_seq`` is the turn that settled their yes.
@@ -2407,6 +2473,32 @@ def task_step(
     return payload
 
 
+def watcher_checked(
+    *,
+    id: str,
+    tool: str,
+    ok: bool,
+    digest: Optional[str] = None,
+    value: Optional[float] = None,
+    hit: Optional[bool] = None,
+    excerpt: Optional[str] = None,
+    error: Optional[str] = None,
+    for_seq: Optional[int] = None,
+    at: Optional[str] = None,
+) -> dict[str, Any]:
+    """One check of watch ``id`` (DL-096): through ``tool``, and either what
+    it read (its ``digest``, the ``value`` a number rule found, whether the
+    condition held, and ``excerpt`` when the content changed) or ``error``."""
+    payload: dict[str, Any] = {"v": VERSION, "kind": WATCHER_CHECKED, "id": id,
+                               "tool": tool, "ok": ok, "at": at or now()}
+    for key, value_ in (("digest", digest), ("value", value), ("hit", hit),
+                        ("excerpt", excerpt), ("error", error), ("for_seq", for_seq)):
+        if value_ is not None:
+            payload[key] = value_
+    _validate(payload)
+    return payload
+
+
 def task_dropped(
     *, for_seq: int, task: int, n: int, at: Optional[str] = None
 ) -> dict[str, Any]:
@@ -2420,10 +2512,37 @@ def task_dropped(
     return payload
 
 
+def watcher_alerted(
+    *,
+    id: str,
+    reason: str,
+    digest: str,
+    text: str,
+    for_seq: Optional[int] = None,
+    at: Optional[str] = None,
+) -> dict[str, Any]:
+    """One alert for watch ``id`` (DL-096), deduped by ``digest``."""
+    payload: dict[str, Any] = {"v": VERSION, "kind": WATCHER_ALERTED, "id": id,
+                               "reason": reason, "digest": digest, "text": text,
+                               "at": at or now()}
+    if for_seq is not None:
+        payload["for_seq"] = for_seq
+    _validate(payload)
+    return payload
+
+
 def task_cancelled(*, task: int, at: Optional[str] = None) -> dict[str, Any]:
     """Retire a task (DL-095). Append-only, as ``schedule.cancelled`` is: the
     plan and what it did stay in the log; the fold simply stops driving it."""
     payload = {"v": VERSION, "kind": TASK_CANCELLED, "task": task, "at": at or now()}
+    _validate(payload)
+    return payload
+
+
+def watcher_stopped(*, id: str, reason: str, at: Optional[str] = None) -> dict[str, Any]:
+    """Watch ``id`` ended (DL-096): ``asked`` or ``expired``."""
+    payload = {"v": VERSION, "kind": WATCHER_STOPPED, "id": id, "reason": reason,
+               "at": at or now()}
     _validate(payload)
     return payload
 
@@ -2687,6 +2806,10 @@ def _validate(payload: dict[str, Any]) -> None:
         # No `for_seq`: a fix from the phone belongs to no turn, and one they
         # said is about them, not about the turn that wrote it down.
         _validate_location(payload)
+    elif kind in WATCHER_KINDS:
+        # Named by the watch's id. Only the set, and a check or alert said in
+        # the reply that set it, name a turn.
+        _validate_watcher(payload)
     elif kind in TOPIC_KINDS:
         # No `for_seq` required: a follow or a drop is named by the topic, and
         # an update by it too, with the turn that asked only when one did.
@@ -3295,6 +3418,93 @@ def _validate_location(payload: dict[str, Any]) -> None:
         raise BadPayload(f"at must be an ISO datetime: {exc}") from exc
     if stamp.tzinfo is None:
         raise BadPayload("at must carry its zone")
+
+
+def _validate_watcher(payload: dict[str, Any]) -> None:
+    kind = payload["kind"]
+    if not isinstance(payload["id"], str) or not _WATCHER_ID.match(payload["id"]):
+        raise BadPayload("a watch's id is w<seq> or w<seq>-<n>")
+    _require_str(payload, "at", non_empty=True)
+    if kind == WATCHER_SET:
+        _require_sentence(payload, "name", cap=MAX_WATCHER_NAME)
+        _require_seq(payload, "for_seq")
+        adapter, condition = payload["adapter"], payload["condition"]
+        if not isinstance(adapter, dict) or adapter.get("kind") not in _WATCHER_ADAPTERS:
+            raise BadPayload(f"adapter is {{kind: one of {list(_WATCHER_ADAPTERS)}, ...}}")
+        if adapter["kind"] == "fetch":
+            if set(adapter) != {"kind", "url"}:
+                raise BadPayload("a fetch adapter is exactly {kind, url}")
+            _watcher_url(adapter["url"])
+        else:
+            if set(adapter) != {"kind", "tool", "args"} or not isinstance(adapter["args"], dict):
+                raise BadPayload("an mcp adapter is exactly {kind, tool, args}")
+            if not isinstance(adapter["tool"], str) or "__" not in adapter["tool"]:
+                raise BadPayload("an mcp adapter's tool is <server>__<tool>")
+        if not isinstance(condition, dict) or condition.get("kind") not in WATCHER_CONDITIONS:
+            raise BadPayload(f"condition is {{kind: one of {list(WATCHER_CONDITIONS)}, ...}}")
+        ckind = condition["kind"]
+        if ckind == "changed":
+            allowed: set[str] = {"kind"}
+        elif ckind in ("contains", "appears", "disappears"):
+            allowed = {"kind", "text"}
+            _require_sentence(condition, "text", cap=MAX_WATCHER_TEXT)
+        else:
+            allowed = {"kind", "number", "label"}
+            n = condition.get("number")
+            if isinstance(n, bool) or not isinstance(n, (int, float)) or not math.isfinite(n):
+                raise BadPayload("a below or above condition carries a finite number")
+            if condition.get("label") is not None:
+                _require_sentence(condition, "label", cap=MAX_WATCHER_TEXT)
+        if not set(condition) <= allowed:
+            raise BadPayload(f"a {ckind} condition carries only {sorted(allowed)}")
+        for field_, top in (("every_minutes", 24 * 60), ("max_per_day", 24 * 4)):
+            v = payload[field_]
+            if isinstance(v, bool) or not isinstance(v, int) or not 1 <= v <= top:
+                raise BadPayload(f"{field_} must be an int from 1 to {top}")
+        _require_str(payload, "until", non_empty=True)
+        if not isinstance(payload["summarize"], bool):
+            raise BadPayload("summarize must be true or false")
+        if payload["link"] is not None:
+            _watcher_url(payload["link"])
+    elif kind == WATCHER_CHECKED:
+        _require_str(payload, "tool", non_empty=True)
+        if not isinstance(payload["ok"], bool):
+            raise BadPayload("ok must be true or false")
+        if payload["ok"]:
+            if not isinstance(payload.get("digest"), str) or not _DIGEST.match(payload["digest"]):
+                raise BadPayload("a check that read something carries its 16-hex digest")
+            if "error" in payload:
+                raise BadPayload("a check that read something carries no error")
+            if not isinstance(payload.get("hit"), bool):
+                raise BadPayload("a check that read something says whether it held")
+        else:
+            _require_sentence(payload, "error", cap=MAX_FAILURE_ERROR)
+            if {"digest", "hit", "value", "excerpt"} & set(payload):
+                raise BadPayload("a failed check carries only its error")
+        if "value" in payload:
+            v = payload["value"]
+            if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v):
+                raise BadPayload("value must be a finite number")
+        if "excerpt" in payload:
+            _require_sentence(payload, "excerpt", cap=MAX_WATCHER_EXCERPT, empty=True)
+        if "for_seq" in payload:
+            _require_seq(payload, "for_seq")
+    elif kind == WATCHER_ALERTED:
+        if payload["reason"] not in _WATCHER_ALERTS:
+            raise BadPayload(f"reason is one of {list(_WATCHER_ALERTS)}")
+        if not isinstance(payload["digest"], str) or not _DIGEST.match(payload["digest"]):
+            raise BadPayload("digest must be 16 hex characters")
+        _require_sentence(payload, "text", cap=MAX_WATCHER_ALERT)
+        if "for_seq" in payload:
+            _require_seq(payload, "for_seq")
+    else:  # WATCHER_STOPPED
+        if payload["reason"] not in _WATCHER_STOPS:
+            raise BadPayload(f"reason is one of {list(_WATCHER_STOPS)}")
+
+
+def _watcher_url(url: Any) -> None:
+    if not isinstance(url, str) or not re.match(r"^https?://\S+$", url) or len(url) > MAX_WATCHER_URL:
+        raise BadPayload(f"url must be an http(s) url of at most {MAX_WATCHER_URL} characters")
 
 
 def _validate_topic(payload: dict[str, Any]) -> None:

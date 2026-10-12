@@ -413,6 +413,17 @@ def test_every_m1_kind_is_accounted_for() -> None:
         ),
         episodes.TASK_DROPPED: episodes.task_dropped(for_seq=5, task=1, n=0, at=AT),
         episodes.TASK_CANCELLED: episodes.task_cancelled(task=1, at=AT),
+        # DL-096: page watches are bookkeeping; their alerts arrive as tells.
+        episodes.WATCHER_SET: episodes.watcher_set(
+            id="w1", name="x", adapter={"kind": "fetch", "url": "https://x.example"},
+            condition={"kind": "changed"}, every_minutes=60, max_per_day=24,
+            until=AT, summarize=False, link=None, for_seq=1, at=AT,
+        ),
+        episodes.WATCHER_CHECKED: episodes.watcher_checked(id="w1", tool="fetch", ok=False,
+                                                           error="down", at=AT),
+        episodes.WATCHER_ALERTED: episodes.watcher_alerted(id="w1", reason="hit",
+                                                           digest="0" * 16, text="x", at=AT),
+        episodes.WATCHER_STOPPED: episodes.watcher_stopped(id="w1", reason="asked", at=AT),
     }
     assert set(made) == set(episodes.KINDS)
     for kind, payload in made.items():

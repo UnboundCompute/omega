@@ -149,6 +149,10 @@ NOT_RECALLED = frozenset({
     # brief's running/waiting section. Each step's reply is already in the
     # conversation; the task.* records are bookkeeping, not conversation.
     *episodes.TASK_KINDS,
+    # Page watches (DL-096): an alert reaches them as a tell, which is
+    # conversation; the set, the checks and the stops are bookkeeping, and
+    # the watch tool lists them off the fold when asked.
+    *episodes.WATCHER_KINDS,
 })
 
 #: **A count is not a budget** (DL-039). ``RECALL_N`` bounds how many episodes

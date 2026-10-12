@@ -743,6 +743,9 @@ class Runtime:
         # inbound is perceived in the same pass it is filed. Off by default and
         # a fold with nothing to drive, so most polls it does nothing.
         executor.drive_tasks()
+        # Page watches (DL-096): at most one due check per pass, all code.
+        # With no watch standing it is a fold.
+        executor.watch_pages()
         # Last, and unconditional. Last because the three passes above *write
         # memory* and this one *reads* it to decide whether to speak — running it
         # first would have it judge a moment it had not yet finished perceiving.

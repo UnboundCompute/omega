@@ -258,6 +258,25 @@ def test_every_kind_round_trips():
         ),
         ep.task_dropped(for_seq=55, task=50, n=1, at="2026-10-11T12:00:00+00:00"),
         ep.task_cancelled(task=50, at="2026-10-11T12:00:00+00:00"),
+        # DL-096: a page watched, checked (read and failed), alerted and stopped.
+        ep.watcher_set(
+            id="w12", name="shop.example", adapter={"kind": "fetch", "url": "https://shop.example/p"},
+            condition={"kind": "below", "number": 400.0, "label": "price"}, every_minutes=60,
+            max_per_day=24, until="2026-11-10T12:00:00+00:00", summarize=False,
+            link="https://shop.example/p", for_seq=12,
+        ),
+        ep.watcher_set(
+            id="w12-1", name="shop", adapter={"kind": "mcp", "tool": "fire__firecrawl_scrape",
+                                              "args": {"url": "https://shop.example/p"}},
+            condition={"kind": "contains", "text": "in stock"}, every_minutes=30,
+            max_per_day=10, until="2026-11-10T12:00:00+00:00", summarize=True, link=None,
+            for_seq=12,
+        ),
+        ep.watcher_checked(id="w12", tool="fetch", ok=True, digest="0123456789abcdef",
+                           value=399.0, hit=True, excerpt="Price 399", for_seq=12),
+        ep.watcher_checked(id="w12", tool="fetch", ok=False, error="timed out"),
+        ep.watcher_alerted(id="w12", reason="hit", digest="0123456789abcdef", text="Below 400."),
+        ep.watcher_stopped(id="w12", reason="expired"),
     ]
     assert {p["kind"] for p in built} == ep.KINDS, "a kind has no round-trip test"
     for payload in built:

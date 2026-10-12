@@ -170,6 +170,7 @@ REVERSIBILITY: dict[str, str] = {
     "topics": OWN,  # follows, drops or looks up a topic (DL-087 #6)
     "task": OWN,  # drafts, cancels or reports on a task's plan (DL-095)
     "step": OWN,  # records a driven step's terminal state (DL-095)
+    "watch_page": OWN,  # sets or stops a page watch in the log (DL-096)
     "write_file": OWN,  # inside the store; outside it is irreversible
     "run_code": READ,  # read-only argv; anything else is irreversible
 }

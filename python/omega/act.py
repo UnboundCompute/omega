@@ -48,6 +48,7 @@ from typing import Any, Optional
 from omega import episodes, finance, grants, lessons, location, lookback, mailcursor, mcp, projects, provider
 from omega import tasks
 from omega import topics as kept
+from omega import watcher
 from omega.tools import (
     EXTERNAL,
     GRANT,
@@ -276,6 +277,9 @@ def act_loop(
             # was.
             tasks=getattr(ctx, "tasks", None),
             task_run=tasks.obligation_of(ctx.event),
+            # DL-096: page watches, folded from the log when the tool asks,
+            # and only in a turn their own message started.
+            pages=(lambda: watcher.fold(ctx.queue.store)) if not unprompted(ctx) else None,
         )
 
     # Their answer to a proposal is settled before the model is asked anything

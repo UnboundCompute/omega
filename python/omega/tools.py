@@ -69,7 +69,9 @@ from __future__ import annotations
 import copy
 import http.client
 import ipaddress
+import math
 import os
+import re
 import socket
 import subprocess
 import zlib
@@ -87,6 +89,7 @@ from omega import promises as pledges
 from omega import location as whereabouts
 from omega import lookback as looking
 from omega import topics as kept
+from omega import watcher as pages
 from omega.schedule import CronError, describe_cron, next_match, validate_cron, zone_label
 
 __all__ = [
@@ -248,6 +251,12 @@ TASK = "task"
 #: and offered only inside a driven step's own unattended turn, so it exists
 #: nowhere else and no other turn can see or call it.
 STEP = "step"
+#: Sets, lists, stops or renews a page watch (DL-096): a deterministic check
+#: of a page or an MCP read, alerting on a condition with no model call per
+#: check. Outside :data:`TOOL_NAMES` for :data:`PROMISE`'s reason: offered
+#: only on their own message, in a box with the log to read and write, so
+#: ``watch`` and every unprompted turn are exactly what they were.
+WATCH_PAGE = "watch_page"
 PENDING = "pending"
 
 #: Ring 1's remainder, and it is closed (DL-014). Spelled as a frozenset so
@@ -2142,6 +2151,177 @@ def _step(box: "ToolBox", args: dict[str, Any]) -> str:
     return f"step recorded: {args['state']}"
 
 
+# --- page watches (DL-096) ---------------------------------------------------------
+
+_PAGE_DOS = ("set", "list", "stop", "renew")
+
+
+def _watching_pages(box: "ToolBox") -> bool:
+    """Is ``watch_page`` there to be called in this box's turn? Structural
+    only: their own message, and a box that can read and write the log."""
+    return bool(box.prompted and box.pages is not None and box.append is not None)
+
+
+def _page_clock(box: "ToolBox") -> str:
+    return box.at or _now().isoformat()
+
+
+def _page_int(args: dict[str, Any], key: str, default: int, low: int, high: int) -> int:
+    value = args.get(key)
+    if not _given(value):
+        return default
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value != int(value):
+        raise ToolRejected(f"{WATCH_PAGE}'s {key!r} must be a whole number")
+    if not low <= int(value) <= high:
+        raise ToolRejected(f"{WATCH_PAGE}'s {key!r} is {low} to {high}, not {int(value)}")
+    return int(value)
+
+
+def _one_page(box: "ToolBox", args: dict[str, Any]) -> Any:
+    state = box.pages() if box.pages is not None else None
+    wid = str(args.get("id") or "").strip()
+    if not state or wid not in state.watches:
+        raise ToolRejected(
+            f"no page watch has id {wid!r}; standing: "
+            + (", ".join(w.id for w in state.oldest()) if state else "none")
+        )
+    return state.watches[wid]
+
+
+def _classify_watch_page(box: "ToolBox", args: dict[str, Any]) -> Decision:
+    if not box.prompted:
+        raise ToolRejected(f"{WATCH_PAGE} runs only on their own message")
+    do = _text(WATCH_PAGE, args, "do").strip().lower()
+    if do not in _PAGE_DOS:
+        raise ToolRejected(f"{WATCH_PAGE}'s 'do' is one of {list(_PAGE_DOS)}")
+    if do == "list":
+        return Decision(tool=WATCH_PAGE, tier=EXPLORATION, why="list the page watches",
+                        args={"do": "list"})
+    if do in ("stop", "renew"):
+        w = _one_page(box, args)
+        verb = "stop watching" if do == "stop" else "keep watching for another 30 days"
+        return Decision(tool=WATCH_PAGE, tier=LOCAL, why=f"{verb} {w.name}",
+                        args={"do": do, "id": w.id})
+    state = box.pages() if box.pages is not None else None
+    if state is not None and len(state.watches) >= pages.MAX_WATCHES:
+        raise ToolRejected(f"already {pages.MAX_WATCHES} page watches; stop one first")
+    url = args.get("url") if _given(args.get("url")) else None
+    tool = args.get("tool") if _given(args.get("tool")) else None
+    tool_args = args.get("args") if _given(args.get("args")) else {}
+    if url is not None:
+        if (not isinstance(url, str) or not re.match(r"^https?://\S+$", url.strip())
+                or len(url.strip()) > episodes.MAX_WATCHER_URL):
+            raise ToolRejected(f"{WATCH_PAGE}'s 'url' is an http(s) address")
+        url = url.strip()
+    if tool is not None:
+        if not isinstance(tool, str) or not isinstance(tool_args, dict):
+            raise ToolRejected(f"{WATCH_PAGE}'s 'tool' is an MCP tool's name, 'args' an object")
+        if grants.is_money(tool):
+            raise ToolRejected(grants.money_refusal(tool))
+        decided = box.remote.classify(tool, dict(tool_args)) if box.remote is not None else None
+        if decided is None or not decided.dispatches:
+            raise ToolRejected(f"{tool!r} is not an MCP read omega may run")
+    elif url is None:
+        raise ToolRejected(f"{WATCH_PAGE} needs the page's 'url' (or an MCP read 'tool')")
+    kind = _text(WATCH_PAGE, args, "condition").strip().lower()
+    if kind not in episodes.WATCHER_CONDITIONS:
+        raise ToolRejected(f"{WATCH_PAGE}'s 'condition' is one of {list(episodes.WATCHER_CONDITIONS)}")
+    condition: dict[str, Any] = {"kind": kind}
+    if kind in ("contains", "appears", "disappears"):
+        text = " ".join(_text(WATCH_PAGE, args, "text").split())
+        if len(text) > episodes.MAX_WATCHER_TEXT:
+            raise ToolRejected(f"{WATCH_PAGE}'s 'text' is at most {episodes.MAX_WATCHER_TEXT} characters")
+        condition["text"] = text
+    elif kind in ("below", "above"):
+        number = args.get("number")
+        if isinstance(number, str):
+            # "₹40,000" as well as "40000": the same rule the checks read by.
+            number = pages.number_in(number) or pages.number_in(f"₹{number.strip()}")
+        if isinstance(number, bool) or not isinstance(number, (int, float)) or not math.isfinite(number):
+            raise ToolRejected(f"{WATCH_PAGE}'s 'number' must be a number for {kind}")
+        condition["number"] = number
+        label = args.get("label")
+        if _given(label):
+            if not isinstance(label, str) or len(label.strip()) > episodes.MAX_WATCHER_TEXT:
+                raise ToolRejected(f"{WATCH_PAGE}'s 'label' is a short text")
+            condition["label"] = " ".join(label.split())
+    every = _page_int(args, "every_minutes", pages.DEFAULT_EVERY, pages.MIN_EVERY, 24 * 60)
+    per_day = _page_int(args, "max_per_day", pages.DEFAULT_PER_DAY, 1, pages.MAX_PER_DAY)
+    name = args.get("name")
+    name = " ".join(name.split())[: episodes.MAX_WATCHER_NAME] if isinstance(name, str) and name.strip() else pages.name_from(url, tool)
+    return Decision(
+        tool=WATCH_PAGE, tier=LOCAL,
+        why=f"watch {name} and tell them {pages.condition_words(condition)}",
+        args={
+            "do": "set", "url": url, "tool": tool, "args": dict(tool_args) if tool else None,
+            "condition": condition, "every_minutes": every, "max_per_day": per_day,
+            "name": name, "summarize": args.get("summarize") is True,
+        },
+    )
+
+
+def _watch_page(box: "ToolBox", args: dict[str, Any]) -> str:
+    state = box.pages() if box.pages is not None else None
+    if args["do"] == "list":
+        return pages.listing(state)
+    if box.append is None:
+        raise ToolError("page watches cannot change from here: this box has no log")
+    at = _page_clock(box)
+    if args["do"] in ("stop", "renew"):
+        w = state.watches.get(args["id"]) if state else None
+        if w is None:
+            return f"no page watch {args['id']}; nothing to {args['do']}"
+        if args["do"] == "stop":
+            box.append(episodes.watcher_stopped(id=w.id, reason="asked", at=at))
+            return f"stopped watching {w.name}"
+        until = pages.until_from(at)
+        box.append(episodes.watcher_set(
+            id=w.id, name=w.name, adapter=w.adapter, condition=w.condition,
+            every_minutes=w.every_minutes, max_per_day=w.max_per_day, until=until,
+            summarize=w.summarize, link=w.link, for_seq=max(box.for_seq, 1), at=at,
+        ))
+        return f"watching {w.name} until {until[:10]}"
+    base = f"w{max(box.for_seq, 1)}"
+    taken = state.ids if state else frozenset()
+    wid, n = base, 1
+    while wid in taken:
+        n += 1
+        wid = f"{base}-{n}"
+    adapter = pages.adapter_for(args["url"], args["tool"], args["args"], box.remote)
+    watch = pages.Watch(
+        id=wid, name=args["name"], adapter=adapter, condition=args["condition"],
+        every_minutes=args["every_minutes"], max_per_day=args["max_per_day"],
+        until=pages.until_from(at), summarize=args["summarize"],
+        link=pages.link_for(adapter), since=at,
+    )
+    # The first check runs now, before anything is written: a page that
+    # cannot be read, or a price rule that finds no number, sets no watch.
+    first = pages.check(watch, remote=box.remote, at=at, for_seq=max(box.for_seq, 1))
+    if not first.ok:
+        raise ToolError(f"could not read {watch.name}, so no watch was set: {first.checked['error']}")
+    if watch.condition["kind"] in ("below", "above") and "value" not in first.checked:
+        raise ToolError(
+            f"found no {'number after ' + repr(watch.condition['label']) if watch.condition.get('label') else 'price'} "
+            f"on {watch.name}, so no watch was set; name the label the number follows"
+        )
+    box.append(episodes.watcher_set(
+        id=wid, name=watch.name, adapter=adapter, condition=watch.condition,
+        every_minutes=watch.every_minutes, max_per_day=watch.max_per_day,
+        until=watch.until, summarize=watch.summarize, link=watch.link,
+        for_seq=max(box.for_seq, 1), at=at,
+    ))
+    box.append(first.checked)
+    said = (
+        f"watching {watch.name} ({wid}) {watch.words()}: every {watch.every_minutes} "
+        f"minutes, at most {watch.max_per_day} checks a day, until {watch.until[:10]}. "
+        f"Right now {first.found}."
+    )
+    if first.alert is not None:
+        box.append(first.alert)
+        said += f" It already holds; tell them: {first.alert['text']}"
+    return said
+
+
 # --- omega's own lessons and skills (DL-086) -----------------------------------
 
 
@@ -3699,6 +3879,45 @@ _TASK_TOOL = _Tool(
 )
 
 
+#: ``watch_page`` (DL-096), registered beside Ring 1 and not in it: see
+#: :data:`WATCH_PAGE`. :meth:`ToolBox.classify` reaches it only where
+#: :func:`_watching_pages` holds.
+_WATCH_PAGE_TOOL = _Tool(
+    classify=_classify_watch_page,
+    dispatch=_watch_page,
+    schema=_schema(
+        WATCH_PAGE,
+        "Watch a web page for them and tell them when something happens on "
+        "it: 'set' with the page's url and a condition: changed, contains or "
+        "appears or disappears (a text, e.g. 'tickets on sale'), below or "
+        "above (a number: the first price on the page, or the number after "
+        "'label'). Checks are code, not you, every 'every_minutes' (default "
+        f"{pages.DEFAULT_EVERY}, at least {pages.MIN_EVERY}), at most "
+        f"'max_per_day' (default {pages.DEFAULT_PER_DAY}), for "
+        f"{pages.LIFETIME_DAYS} days unless they 'renew'. Use it, not watch, "
+        "for a page, a price or tickets opening. 'list' them; 'stop' or "
+        "'renew' one by its id. 'tool' and 'args' instead of a url watch an "
+        "MCP read tool's answer.",
+        {
+            "do": {"type": "string", "enum": list(_PAGE_DOS)},
+            "url": {"type": "string", "description": "For set: the page."},
+            "condition": {"type": "string", "enum": list(episodes.WATCHER_CONDITIONS)},
+            "text": {"type": "string", "description": "For contains, appears, disappears."},
+            "number": {"type": "number", "description": "For below and above."},
+            "label": {"type": "string", "description": "For below and above: the words the number follows; blank for the first price."},
+            "every_minutes": {"type": "integer"},
+            "max_per_day": {"type": "integer"},
+            "name": {"type": "string", "description": "A short name for the watch."},
+            "summarize": {"type": "boolean", "description": "Say a change in one line of your own when it alerts."},
+            "tool": {"type": "string", "description": "An MCP read tool to watch instead of a page."},
+            "args": {"type": "object", "description": "That tool's arguments."},
+            "id": {"type": "string", "description": "For stop and renew: the watch's id (w12)."},
+        },
+        ["do"],
+    ),
+)
+
+
 #: ``step`` (DL-095), registered beside Ring 1 and not in it: see :data:`STEP`.
 #: :meth:`ToolBox.classify` reaches it only where :func:`_stepping` holds — so
 #: it exists only inside a driven step's own unattended turn.
@@ -3912,6 +4131,10 @@ class ToolBox:
     #: puts ``step`` in the box, so ``step`` exists nowhere but inside a step's
     #: own turn.
     task_run: Optional[dict[str, Any]] = None
+    #: Page watches (DL-096): the :class:`omega.watcher.State` folded from the
+    #: turn's own log. Only their own message, with this and ``append`` set,
+    #: puts ``watch_page`` in the box; ``None`` leaves the box as it was.
+    pages: Optional[Callable[[], Any]] = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "store_root", Path(self.store_root).resolve())
@@ -3941,6 +4164,8 @@ class ToolBox:
             tool = _TASK_TOOL
         if tool is None and name == STEP and _stepping(self):
             tool = _STEP_TOOL
+        if tool is None and name == WATCH_PAGE and _watching_pages(self):
+            tool = _WATCH_PAGE_TOOL
         if tool is None and self.remote is not None and isinstance(arguments, dict):
             # An MCP tool, refused or cleared by the adapter: money, writes and
             # the allowlist are decided there, in code, from the name (DL-088).
@@ -3993,6 +4218,8 @@ class ToolBox:
             return _TASK_TOOL.dispatch(self, decision.args)
         if decision.tool == STEP and decision.tool not in _TOOLS:
             return _STEP_TOOL.dispatch(self, decision.args)
+        if decision.tool == WATCH_PAGE and decision.tool not in _TOOLS:
+            return _WATCH_PAGE_TOOL.dispatch(self, decision.args)
         return _TOOLS[decision.tool].dispatch(self, decision.args)
 
     def schemas(self, hide: "frozenset[str] | set[str]" = frozenset()) -> list[dict[str, Any]]:
@@ -4013,6 +4240,8 @@ class ToolBox:
             mine.append(_TASK_TOOL.schema)
         if _stepping(self) and STEP not in hide:
             mine.append(_STEP_TOOL.schema)
+        if _watching_pages(self) and WATCH_PAGE not in hide:
+            mine.append(_WATCH_PAGE_TOOL.schema)
         names = _mailbox_names()
         if len(names) > 1:
             mine = [_inbox_schema(schema, names) for schema in mine]
