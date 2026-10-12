@@ -691,6 +691,9 @@ def main(argv: Optional[list[str]] = None) -> int:
         store_dir,
         # DL-086: omega's weekly self-review, held for itself.
         self_review=True,
+        # DL-098: thinking time twice a day, and unprompted messages held
+        # for a good moment, at most two a day.
+        pace=True,
         listen=args.listen,
         host=args.host,
         port=args.port,

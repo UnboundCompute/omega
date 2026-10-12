@@ -36,6 +36,7 @@ from typing import Any, Callable, Optional, Sequence
 from omega import blobs, derive, episodes, grants as granted, learn, lessons as self_taught, notice, provider, schedule
 from omega import location as whereabouts
 from omega import tasks as _tasks
+from omega import outbox
 from omega.tools import (
     INBOX_SOURCE,
     MAIL,
@@ -143,6 +144,10 @@ NOT_RECALLED = frozenset({
     # Where they are (DL-091): never conversation, never a thing to learn. A
     # prompted turn sees it as one line, read off the fold.
     *episodes.LOCATION_KINDS,
+    # Picking the moment (DL-098): a held draft is shown to the look and the
+    # thinking turn in their own situation text, and a delivered one is
+    # already in the conversation as the reply that carried it.
+    *episodes.OUTBOX_KINDS,
     # Topics kept up with (DL-087 #6): their news reaches them in the brief,
     # read off the fold; the records are bookkeeping.
     *episodes.TOPIC_KINDS,
@@ -794,6 +799,7 @@ def run_turn(
     location: Any = None,
     topics: Any = None,
     tasks: Any = None,
+    gate: Any = None,
 ) -> TurnResult:
     """Run one turn over an already-claimed episode and record how it ended.
 
@@ -831,6 +837,11 @@ def run_turn(
     fires on this event, a claim can only be contradicted by one that was never
     going to fire alongside it, and *what do you remember about me* is a
     question about the set rather than about the turn.
+
+    ``gate`` is the outbox's decision for a non-urgent unprompted turn
+    (DL-098, :class:`omega.outbox.Gate`), or ``None`` for every other turn,
+    which then runs exactly as before. A turn it holds ends silent with its
+    words written down as a draft; one it lets speak is counted.
     """
     # Metered here, once, so every model call the turn makes — judge, act
     # loop, reply and teach extraction all go through `ctx.complete` — lands
@@ -858,6 +869,9 @@ def run_turn(
                     words[: -len(_REPLY_YES_NO)]
                     + f" {granted.how_to_answer(asked)}"
                 )
+        if gate is not None and outbox.settle(queue, pending.seq, gate, words):
+            record = write_memory(queue, seq=pending.seq, outcome="silent", at=at)
+            return TurnResult(seq=pending.seq, outcome="silent", record_seq=record)
         record = write_memory(
             queue, seq=pending.seq, outcome="spoke", reply_text=words, at=at,
             # A watched page's words (DL-096): the record says whose, so
@@ -868,7 +882,9 @@ def run_turn(
             seq=pending.seq, outcome="spoke", record_seq=record, reply=words
         )
     if self_taught.is_review(event):
-        return _review(queue, pending, complete, meter, lessons=lessons, at=at)
+        return _review(
+            queue, pending, complete, meter, lessons=lessons, at=at, gate=gate
+        )
     recalled = recall(queue, before=pending.seq, n=recall_n)
     ctx = TurnContext(
         seq=pending.seq,
@@ -1018,6 +1034,8 @@ def run_turn(
     if text is None and receipt is None:
         # Silence. A success, recorded as one, with `reply` null rather than
         # empty so that "said nothing" can never be read as "said ''".
+        if gate is not None:
+            outbox.dropped(queue, pending.seq, gate)
         record = write_memory(
             queue,
             seq=pending.seq,
@@ -1057,6 +1075,26 @@ def run_turn(
             )
         )
         text = f"{text}\n\n{words}"
+
+    if gate is not None and outbox.settle(queue, pending.seq, gate, text):
+        # DL-098: not now. The words wait as a draft for a better moment;
+        # the turn itself ends quiet, with what the judge said kept.
+        record = write_memory(
+            queue,
+            seq=pending.seq,
+            outcome="silent",
+            tools=acted.tools,
+            usage=meter.usage(),
+            judged=_judged(verdict),
+            at=at,
+        )
+        return TurnResult(
+            seq=pending.seq,
+            outcome="silent",
+            record_seq=record,
+            tools=tuple(acted.tools),
+            verdict=verdict,
+        )
 
     record = write_memory(
         queue,
@@ -1500,6 +1538,7 @@ def _review(
     *,
     lessons: Any,
     at: Optional[str],
+    gate: Any = None,
 ) -> TurnResult:
     """omega's weekly self-review (DL-086), in place of judge, act and reply.
 
@@ -1523,7 +1562,9 @@ def _review(
         return TurnResult(
             seq=pending.seq, outcome="failed", record_seq=record, error=error
         )
-    if done.report is None:
+    if done.report is None or (
+        gate is not None and outbox.settle(queue, pending.seq, gate, done.report)
+    ):
         record = write_memory(
             queue, seq=pending.seq, outcome="silent", usage=meter.usage(), at=at
         )

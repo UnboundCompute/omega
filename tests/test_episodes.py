@@ -287,6 +287,16 @@ def test_every_kind_round_trips():
         ep.leave_pinged(id="l7", how="estimate", eta_min=60),
         ep.leave_cancelled(id="l7"),
         ep.leave_done(id="l7-2"),
+        ep.message_queued(
+            text="The disk is nearly full.", source="look", why="they are away",
+            for_seq=41, at="2026-09-23T10:00:00+00:00",
+        ),
+        ep.message_delivered(for_seq=41, queued=[40], at="2026-09-23T10:00:00+00:00"),
+        ep.message_dropped(queued=[40], why="not sent", at="2026-09-23T10:00:00+00:00"),
+        ep.inbound(
+            "a look", channel="self", queued=[40], thinking="2026-09-23 morning",
+            at="2026-09-23T10:00:00+00:00",
+        ),
     ]
     assert {p["kind"] for p in built} == ep.KINDS, "a kind has no round-trip test"
     for payload in built:

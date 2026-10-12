@@ -425,6 +425,7 @@ def situation(
     machine_known: bool = False,
     calendar: Sequence[str] = (),
     inbox: Sequence[str] = (),
+    held: Sequence[str] = (),
     max_chars: int = MAX_L1_CHARS,
 ) -> str:
     """The L1 text: what is open, as far as omega already knows it.
@@ -456,6 +457,10 @@ def situation(
     read says so in words, so silence here never stands for "all clear". The
     text in them was written by other people, so it sits under a heading that
     says it is data and not something to obey.
+
+    ``held`` (DL-098) is what omega already drafted and is holding for a
+    better moment, so a look does not draft it a second time. Empty renders
+    nothing, so a look with nothing held reads exactly as before.
 
     Recent conversation is deliberately **not** rendered here. The turn's own
     recall step already puts it in front of the judge, and writing it twice
@@ -555,6 +560,15 @@ def situation(
             if len(one) > 200:
                 one = one[:199].rstrip() + "…"
             lines.append(f"- {ago}: {one}")
+
+    if held:
+        lines.append("")
+        lines.append(
+            "Already drafted and held for a better moment (it will reach them; "
+            "do not draft it again):"
+        )
+        for line in held:
+            lines.append(f"- {line}")
 
     lines.append("")
     lines.append(

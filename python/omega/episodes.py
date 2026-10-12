@@ -168,6 +168,15 @@ __all__ = [
     "leave_pinged",
     "leave_cancelled",
     "leave_done",
+    "MESSAGE_QUEUED",
+    "MESSAGE_DELIVERED",
+    "MESSAGE_DROPPED",
+    "OUTBOX_KINDS",
+    "OUTBOX_SOURCES",
+    "MAX_QUEUED_TEXT",
+    "message_queued",
+    "message_delivered",
+    "message_dropped",
     "REPORT_TRANSCRIPT",
     "REPORT_USAGE",
     "REPORT_RECORDING",
@@ -541,6 +550,24 @@ MAX_LEAVE_PLACE = 200
 #: Minutes. A drive longer than a day is not one to be pinged for.
 MAX_LEAVE_ETA = 24 * 60
 _LEAVE_ID = re.compile(r"^l[1-9][0-9]*(?:-[1-9][0-9]*)?$")
+#: Picking the moment to speak (DL-098). ``message.queued`` is one unprompted
+#: message omega drafted and held for a better moment, with the text it would
+#: have said, what drafted it and why it waits; ``message.delivered`` is one
+#: non-urgent unprompted message that reached them (it is what the day budget
+#: counts), naming the drafts it carried; ``message.dropped`` the drafts a
+#: thinking turn saw and did not send, or folded into a newer draft. Records,
+#: neither recalled nor projected: the queue and the budget are a fold
+#: (:mod:`omega.outbox`), and what reaches them is the turn that speaks.
+MESSAGE_QUEUED = "message.queued"
+MESSAGE_DELIVERED = "message.delivered"
+MESSAGE_DROPPED = "message.dropped"
+OUTBOX_KINDS = frozenset({MESSAGE_QUEUED, MESSAGE_DELIVERED, MESSAGE_DROPPED})
+#: What can draft a held message: a look, a thinking turn, a failure
+#: follow-up and the weekly self-review.
+OUTBOX_SOURCES = frozenset({"look", "thinking", "followup", "review"})
+#: A held draft is a chat message, not a document.
+MAX_QUEUED_TEXT = 4_000
+MAX_OUTBOX_WHY = 200
 
 #: The senses a relay may report for, by the name of the sense rather than of
 #: the file it read. Three of them end in a learning receipt; the machine sense
@@ -619,6 +646,7 @@ KINDS = frozenset(
         *TASK_KINDS,
         *WATCHER_KINDS,
         *LEAVE_KINDS,
+        *OUTBOX_KINDS,
     }
 )
 
@@ -842,6 +870,8 @@ def inbound(
     machine: Optional[list[str]] = None,
     mail_at: Optional[str] = None,
     obligation: Optional[dict[str, Any]] = None,
+    queued: Optional[list[int]] = None,
+    thinking: Optional[str] = None,
     at: Optional[str] = None,
     mail_inboxes: Optional[dict[str, str]] = None,
     untrusted: Optional[str] = None,
@@ -927,6 +957,14 @@ def inbound(
         # DL-096 under DL-064: a tell that carries someone else's words (a
         # watched page's change), naming whose. Absent on every other event.
         payload["untrusted"] = untrusted
+    if queued is not None:
+        # DL-098: an unprompted message routed through the outbox. On a tell,
+        # the held drafts it delivers (empty for a follow-up told at once); on
+        # a thinking turn, the drafts it was shown to send, merge or drop.
+        payload["queued"] = list(queued)
+    if thinking is not None:
+        # DL-098: the thinking-time slot this look serves, "<date> morning".
+        payload["thinking"] = thinking
     _validate(payload)
     return payload
 
@@ -2163,6 +2201,9 @@ _REQUIRED: dict[str, tuple[str, ...]] = {
     LEAVE_PINGED: ("id", "how", "eta_min", "at"),
     LEAVE_CANCELLED: ("id", "at"),
     LEAVE_DONE: ("id", "at"),
+    MESSAGE_QUEUED: ("text", "source", "why", "at"),
+    MESSAGE_DELIVERED: ("for_seq", "queued", "at"),
+    MESSAGE_DROPPED: ("queued", "why", "at"),
     GRANT_GIVEN: ("for_seq", "scope", "at"),
     GRANT_REVOKED: ("for_seq", "scope", "at"),
     GRANT_RESTORED: ("for_seq", "scope", "at"),
@@ -2778,6 +2819,10 @@ def _validate(payload: dict[str, Any]) -> None:
                 for k, v in boxes.items()
             ):
                 raise BadPayload("mail_inboxes must map extra mailbox names to stamps")
+        if "queued" in payload:
+            _require_seqs(payload, "queued")
+        if "thinking" in payload:
+            _require_str(payload, "thinking", non_empty=True)
         if "schedule_slot" in payload:
             _require_str(payload, "schedule_slot", non_empty=True)
             if not payload.get("schedule_id"):
@@ -2923,6 +2968,10 @@ def _validate(payload: dict[str, Any]) -> None:
         # Named by the alarm's id. Only the set names a turn: the message
         # that asked for it; checks and pings belong to the alarm, not a turn.
         _validate_leave(payload)
+    elif kind in OUTBOX_KINDS:
+        # `for_seq` only where a turn is behind it: a follow-up held before it
+        # was ever told has none, and a drop is named by the drafts it drops.
+        _validate_outbox(payload)
     elif kind in TOPIC_KINDS:
         # No `for_seq` required: a follow or a drop is named by the topic, and
         # an update by it too, with the turn that asked only when one did.
@@ -3618,6 +3667,69 @@ def _validate_watcher(payload: dict[str, Any]) -> None:
 def _watcher_url(url: Any) -> None:
     if not isinstance(url, str) or not re.match(r"^https?://\S+$", url) or len(url) > MAX_WATCHER_URL:
         raise BadPayload(f"url must be an http(s) url of at most {MAX_WATCHER_URL} characters")
+
+
+def _require_seqs(payload: dict[str, Any], field: str) -> None:
+    value = payload[field]
+    if not isinstance(value, list) or not all(
+        isinstance(v, int) and not isinstance(v, bool) and v >= 1 for v in value
+    ):
+        raise BadPayload(f"{field} must be a list of seqs")
+
+
+def _validate_outbox(payload: dict[str, Any]) -> None:
+    kind = payload["kind"]
+    _require_str(payload, "at", non_empty=True)
+    if "for_seq" in payload or kind == MESSAGE_DELIVERED:
+        _require_seq(payload, "for_seq")
+    if kind == MESSAGE_QUEUED:
+        _require_sentence(payload, "text", cap=MAX_QUEUED_TEXT)
+        if payload["source"] not in OUTBOX_SOURCES:
+            raise BadPayload(f"source {payload['source']!r} not in {sorted(OUTBOX_SOURCES)}")
+    else:
+        _require_seqs(payload, "queued")
+    if kind != MESSAGE_DELIVERED:
+        _require_sentence(payload, "why", cap=MAX_OUTBOX_WHY)
+
+
+def message_queued(
+    *, text: str, source: str, why: str, for_seq: Optional[int] = None,
+    at: Optional[str] = None,
+) -> dict[str, Any]:
+    """omega drafted an unprompted message and holds it for a better moment
+    (DL-098): quiet hours, over the day's budget, or they are not here."""
+    payload: dict[str, Any] = {"v": VERSION, "kind": MESSAGE_QUEUED, "text": text,
+                               "source": source, "why": why, "at": at or now()}
+    if for_seq is not None:
+        payload["for_seq"] = for_seq
+    _validate(payload)
+    return payload
+
+
+def message_delivered(
+    *, for_seq: int, queued: Sequence[int] = (), at: Optional[str] = None
+) -> dict[str, Any]:
+    """One non-urgent unprompted message reached them (DL-098): the turn
+    ``for_seq`` spoke it, carrying the held drafts ``queued``. The day budget
+    counts these."""
+    payload = {"v": VERSION, "kind": MESSAGE_DELIVERED, "for_seq": for_seq,
+               "queued": list(queued), "at": at or now()}
+    _validate(payload)
+    return payload
+
+
+def message_dropped(
+    *, queued: Sequence[int], why: str, for_seq: Optional[int] = None,
+    at: Optional[str] = None,
+) -> dict[str, Any]:
+    """Held drafts that will not be sent as they are (DL-098): a thinking turn
+    saw them and chose silence, or folded them into a newer draft."""
+    payload: dict[str, Any] = {"v": VERSION, "kind": MESSAGE_DROPPED,
+                               "queued": list(queued), "why": why, "at": at or now()}
+    if for_seq is not None:
+        payload["for_seq"] = for_seq
+    _validate(payload)
+    return payload
 
 
 def _validate_topic(payload: dict[str, Any]) -> None:

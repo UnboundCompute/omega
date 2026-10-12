@@ -295,6 +295,11 @@ class Runtime:
         # into every test's log would change what every test's log says.
         # `__main__` turns it on; it needs the clock to ever fire.
         self_review: bool = False,
+        # DL-098: thinking time and picking the moment to speak. Off by
+        # default for the self-review's reason: twice-daily looks and held
+        # nudges would change what every test's log says. `__main__` turns
+        # it on.
+        pace: bool = False,
         host: str = DEFAULT_HOST,
         port: int = DEFAULT_PORT,
         poll: float = DEFAULT_POLL,
@@ -330,6 +335,7 @@ class Runtime:
         self._inbox_names = tuple(inbox_names)
         self._clock = clock
         self._self_review = self_review
+        self._pace = pace
         self._host = host
         self._port = port
         self._poll = poll
@@ -406,6 +412,7 @@ class Runtime:
                 inbox=self._inbox,
                 probe=self._probe,
                 inbox_names=self._inbox_names,
+                pace=self._pace,
             )
             self._report = self._executor.recover()
             self._thread = threading.Thread(

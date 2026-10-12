@@ -245,6 +245,9 @@ NOT_PROJECTED = frozenset(
         # DL-093. A leave-now alarm reaches the person as its pings, each its
         # own tell inbound; the records only remember the alarm.
         *episodes.LEAVE_KINDS,
+        # DL-098. A held draft reaches the person only when a turn speaks it;
+        # the queue and the day budget are bookkeeping about that turn.
+        *episodes.OUTBOX_KINDS,
         # DL-086. Omega's lessons and skills are its own working notes; a
         # review reaches the person as its turn's reply, and a strike as the
         # reply of the turn that asked for it.

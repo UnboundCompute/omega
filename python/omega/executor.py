@@ -48,6 +48,7 @@ from omega import (
     mailcursor,
     mcp,
     notice,
+    outbox,
     projects,
     promises,
     provider,
@@ -259,6 +260,8 @@ class Executor:
         "_access_now",
         "_probe",
         "_probed",
+        "_pace",
+        "_outbox",
     )
 
     def __init__(
@@ -273,6 +276,7 @@ class Executor:
         inbox: Optional[Callable[[datetime], Sequence[str]]] = None,
         probe: Optional[Callable[[str], Optional[bool]]] = None,
         inbox_names: Sequence[str] = (),
+        pace: bool = False,
     ) -> None:
         self._queue = queue
         self._complete = complete
@@ -357,6 +361,12 @@ class Executor:
         # When each origin was last probed, this process. Not in the log: a
         # restart is the usual fix, so the first idle pass after one probes.
         self._probed: dict[str, datetime] = {}
+        # The person core (DL-098): thinking time twice a day, and holding a
+        # non-urgent unprompted message for a good moment. Off by default, so
+        # an executor built without it runs every turn exactly as before; the
+        # runtime turns it on. The fold is kept at the log's head.
+        self._pace = pace
+        self._outbox = outbox.Outbox()
         # Read-only: `due` and `fire` belong to the clock thread and are
         # never called from here. A second fold of the same log rather than
         # a shared object, because the clock mutates its copy on its own
@@ -1334,6 +1344,19 @@ class Executor:
                 return True
             if self._follow_up(moment):
                 return True
+            slot: Optional[str] = None
+            drafts: Sequence[outbox.Draft] = ()
+            if self._pace:
+                self._outbox.advance(store)
+                if self._deliver_held(moment, st):
+                    return True
+                box = self._outbox.state()
+                drafts = box.drafts
+                slot = outbox.slot_due(box, moment)
+                if slot is not None and not outbox.thinking_left(box, moment):
+                    # Over the day's thinking spend: the slot is not thought,
+                    # and the ordinary look runs in its place.
+                    slot = None
             if not notice.may_look(
                 st, now=moment, look_every_seconds=look_every_seconds
             ):
@@ -1396,7 +1419,10 @@ class Executor:
                 machine_known=st.machine_known,
                 calendar=calendar_lines,
                 inbox=inbox_lines,
+                held=() if slot else outbox.held_lines(drafts, now=moment),
             )
+            if slot is not None:
+                text = self._thinking_text(slot, text, drafts, moment)
             # Stamped with ``moment``, not left to default to wall-clock now.
             # ``notice.standing`` charges a spoken nudge to the day of the *look*
             # (notice.py), so the look's own stamp is the day budget's ledger
@@ -1408,6 +1434,8 @@ class Executor:
                     channel=notice.CHANNEL,
                     machine=list(machine_lines),
                     mail_at=mail_at,
+                    queued=[d.seq for d in drafts] if slot else None,
+                    thinking=slot,
                     at=moment.isoformat(),
                     mail_inboxes=mail_more or None,
                 )
@@ -1619,10 +1647,28 @@ class Executor:
         if not owed:
             return False
         e = owed[0]
+        if self._pace:
+            # DL-098: a follow-up is not urgent, so it waits for a good moment
+            # like any other unprompted message. Held, it is a draft (without
+            # the pause proposal, which needs the tell to ask it).
+            self._outbox.advance(store)
+            box = self._outbox.state()
+            why = outbox.hold(box, moment, here=self._here(moment, box))
+            if why is not None:
+                self._queue.append(episodes.message_queued(
+                    text=tools.followup_text(e)[len(tools.TELL_LEAD):].strip(),
+                    source="followup", why=why, at=at,
+                ))
+                self._queue.append(episodes.failure_told(
+                    subject=e.subject, kind=e.kind, count=e.count,
+                    last_error=e.last_error, at=at,
+                ))
+                return True
         proposal = self._pause_proposal(e) if e.watch else None
         seq = self._queue.append(episodes.inbound(
             tools.followup_text(e, propose=proposal is not None),
             channel="schedule",
+            queued=[] if self._pace else None,
             at=at,
         ))
         if proposal is not None:
@@ -1635,6 +1681,102 @@ class Executor:
             last_error=e.last_error, at=at,
         ))
         return True
+
+    def _here(self, moment: datetime, box: outbox.State) -> bool:
+        """Are they here (DL-098)? The Mac's presence report or a message of
+        theirs, recently enough. A sense that fails says "no"."""
+        try:
+            self._readings.advance(self._queue.store)
+            latest = self._readings.latest(episodes.REPORT_PRESENCE, machine.MAC)
+        except Exception:  # noqa: BLE001 - a sense never kills the pass
+            latest = None
+        return outbox.present(latest, box.heard_at, now=moment)
+
+    def _deliver_held(self, moment: datetime, st: notice.Standing) -> bool:
+        """Send what was held, as one message, now that it may go (DL-098):
+        they are here, it is not quiet hours, and the day has budget left.
+
+        A tell, delivered as written: the words were judged when they were
+        drafted. It names the drafts it carries, which takes them at once. Not
+        while a look or a thinking turn is outstanding, which may carry them.
+        """
+        box = self._outbox.state()
+        if not box.drafts or st.outstanding:
+            return False
+        if outbox.hold(box, moment, here=self._here(moment, box)) is not None:
+            return False
+        self._queue.append(episodes.inbound(
+            tools.tell_instruction(outbox.merged(box.drafts)),
+            channel="schedule",
+            queued=[d.seq for d in box.drafts],
+            at=moment.isoformat(),
+        ))
+        return True
+
+    def _thinking_text(
+        self, slot: str, situation: str, held: Sequence[outbox.Draft], moment: datetime
+    ) -> str:
+        """The thinking turn's text (DL-098): the look's situation, with what
+        is open over all of it. Each fold is read at the log's head."""
+        store = self._queue.store
+        self._promises_now.advance(store)
+        self._followups.advance(store)
+        self._topics_now.advance(store)
+        self._grants_now.advance(store)
+        p = self._promises_now.state()
+        f = self._followups.state()
+        t = self._topics_now.state()
+        g = self._grants_now.state()
+        a = self._access_now.state()
+        return outbox.thinking_text(
+            slot,
+            situation=situation,
+            promises=[x.words() for x in p.oldest()],
+            failing=[
+                f"{e.label or e.subject}: failed {e.count} times in a row (last: {e.last_error})"
+                for e in sorted(f.entries.values(), key=lambda e: e.first_seen)
+                if e.count
+            ],
+            topics=[x.name for x in t.oldest()],
+            lost=[f"{x.label}: {x.fix}" for x in a.lost.values()],
+            tasks=[f"task {k}: {v}" for k, v in sorted(g.tasks.items())],
+            held=outbox.held_lines(held, now=moment),
+        )
+
+    def _gate(self, event: dict[str, Any]) -> Optional[outbox.Gate]:
+        """The outbox's decision for this turn (DL-098), or ``None`` for a turn
+        it has no say over: everything they asked for, and every tell but the
+        ones it sent. A look, a thinking turn and the self-review may be held;
+        a tell it sent was already let through when it was written."""
+        if event.get("kind", episodes.MESSAGE_INBOUND) != episodes.MESSAGE_INBOUND:
+            return None
+        channel = event.get("channel")
+        at = str(event.get("at", ""))
+        if channel == "schedule" and tools.is_tell(event):
+            queued = event.get("queued")
+            if not isinstance(queued, list):
+                return None
+            return outbox.Gate(hold=None, source="followup", at=at, queued=tuple(queued))
+        look = channel == notice.CHANNEL
+        if not (look or lessons.is_review(event)):
+            return None
+        slot = look and isinstance(event.get("thinking"), str)
+        self._outbox.advance(self._queue.store)
+        box = self._outbox.state()
+        try:
+            moment: Optional[datetime] = datetime.fromisoformat(at)
+        except ValueError:
+            moment = None
+        if moment is None or moment.tzinfo is None:
+            why: Optional[str] = outbox.HOLD_CLOCK
+        else:
+            why = outbox.hold(box, moment, here=self._here(moment, box), slot=slot)
+        return outbox.Gate(
+            hold=why,
+            source="thinking" if slot else ("look" if look else "review"),
+            at=at,
+            queued=tuple(event.get("queued") or ()) if slot else (),
+        )
 
     def _pause_proposal(self, entry: Any) -> Optional[dict[str, Any]]:
         """Pausing a failing watch, as the ``tidy`` tool would propose it, or
@@ -1761,6 +1903,7 @@ class Executor:
             location=self._location.state(),
             topics=self._topics.state(),
             tasks=self._tasks.state(),
+            gate=self._gate(pending.payload) if self._pace else None,
         )
         self._queue.finish(pending.seq)
         # After the reply is durable, and never able to fail or hold it.

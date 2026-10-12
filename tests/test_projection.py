@@ -433,6 +433,12 @@ def test_every_m1_kind_is_accounted_for() -> None:
         episodes.LEAVE_PINGED: episodes.leave_pinged(id="l1", how="live", eta_min=30, at=AT),
         episodes.LEAVE_CANCELLED: episodes.leave_cancelled(id="l1", at=AT),
         episodes.LEAVE_DONE: episodes.leave_done(id="l1", at=AT),
+        # DL-098: the outbox's own ledger goes to no surface.
+        episodes.MESSAGE_QUEUED: episodes.message_queued(
+            text="The disk is nearly full.", source="look", why="away", at=AT,
+        ),
+        episodes.MESSAGE_DELIVERED: episodes.message_delivered(for_seq=1, at=AT),
+        episodes.MESSAGE_DROPPED: episodes.message_dropped(queued=[1], why="w", at=AT),
     }
     assert set(made) == set(episodes.KINDS)
     for kind, payload in made.items():
