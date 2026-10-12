@@ -33,6 +33,18 @@ AT = "2026-10-11T09:00:00+00:00"
 WEEK_ON = "2026-10-19T09:00:00+00:00"
 
 
+@pytest.fixture(autouse=True)
+def clock(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every episode built without an ``at`` is stamped :data:`AT`.
+
+    A proposal filed by the act loop takes its ``at`` from
+    :func:`episodes.now`, and the brief says ``since <that day>`` and marks
+    it old a week on. Left on the wall clock, both expectations held only
+    while today was the day the fixtures were written.
+    """
+    monkeypatch.setattr(episodes, "now", lambda: AT)
+
+
 @pytest.fixture
 def q(store: MemoryStore) -> EventQueue:
     return EventQueue(store)
