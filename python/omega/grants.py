@@ -61,6 +61,7 @@ __all__ = [
     "PROMISES",
     "TOPICS",
     "SCOPES",
+    "GIVABLE",
     "GATE_DROP_AFTER",
     "GATED_TOOLS",
     "PROPOSED_TOOLS",
@@ -95,8 +96,13 @@ RESEARCH = "research"
 TIDY = "tidy"
 PROMISES = "promises"
 TOPICS = "topics"
+TASKS = "tasks"
 SCOPES = episodes.GRANT_SCOPES
-assert {RESEARCH, TIDY, PROMISES, TOPICS} == SCOPES
+assert {RESEARCH, TIDY, PROMISES, TOPICS, TASKS} == SCOPES
+#: The scopes a person can give, revoke or re-gate with the `grant` tool.
+#: `tasks` is not one: it is only the queue a plan's approval is filed under
+#: (DL-095), approved per plan and never held as a standing grant.
+GIVABLE = SCOPES - {TASKS}
 
 #: Yeses in a row, for one scope, before omega asks whether it may stop
 #: asking. Asks, never drops.
@@ -162,6 +168,8 @@ REVERSIBILITY: dict[str, str] = {
     "forget": OWN,  # strikes one of omega's own lessons or skills (DL-086)
     "location": OWN,  # notes or names where they are, in the log (DL-091)
     "topics": OWN,  # follows, drops or looks up a topic (DL-087 #6)
+    "task": OWN,  # drafts, cancels or reports on a task's plan (DL-095)
+    "step": OWN,  # records a driven step's terminal state (DL-095)
     "write_file": OWN,  # inside the store; outside it is irreversible
     "run_code": READ,  # read-only argv; anything else is irreversible
 }
@@ -242,11 +250,13 @@ class Proposal:
     seq: int  # its id
     for_seq: int  # the turn that asked
     scope: str
-    proposes: str  # "action" or "drop_gate"
+    proposes: str  # "action", "drop_gate" or "task"
     actions: tuple[dict[str, Any], ...] = ()
     at: str = ""  # when it was asked
     #: Why a held call was held (DL-064): "this turn read ...". Empty otherwise.
     reason: str = ""
+    task: Optional[int] = None  # the task.proposed seq, when proposes == "task"
+    summary: str = ""  # the task's goal, for the words it asks (DL-095)
 
     @property
     def pid(self) -> str:
@@ -256,6 +266,8 @@ class Proposal:
         """What it asks, in words a person can answer."""
         if self.proposes == "drop_gate":
             return f"stop asking first before {self.scope} actions"
+        if self.proposes == "task":
+            return f"run the plan: {self.summary}" if self.summary else "run the plan"
         words = "; ".join(str(a.get("why", a.get("tool"))) for a in self.actions)
         return f"{words} ({self.reason})" if self.reason else words
 
@@ -423,6 +435,7 @@ class Grants:
                 f"you put the {scope} gate back on",
             )
         elif kind == episodes.GRANT_PROPOSED:
+            task = payload.get("task")
             self._pending[seq] = Proposal(
                 seq=seq,
                 for_seq=int(payload["for_seq"]),
@@ -431,6 +444,8 @@ class Grants:
                 actions=tuple(dict(a) for a in payload["actions"]),
                 at=str(payload.get("at", "")),
                 reason=str(payload.get("reason", "")),
+                task=int(task) if isinstance(task, int) and not isinstance(task, bool) else None,
+                summary=str(payload.get("summary", "")),
             )
         elif kind == episodes.GRANT_ANSWERED:
             p = self._pending.pop(int(payload["proposal"]), None)

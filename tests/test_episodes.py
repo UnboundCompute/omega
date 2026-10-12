@@ -242,6 +242,22 @@ def test_every_kind_round_trips():
         ),
         ep.topic_update(name="Rust 2027 edition", items=[], for_seq=40, reason="no search"),
         ep.topic_dropped(name="Rust 2027 edition"),
+        # DL-095: a task planned, started, driven step by step, dropped and cancelled.
+        ep.task_proposed(
+            for_seq=50, goal="tidy the shared drive",
+            steps=[{"do": "list the stale files", "done": "a list is written down"},
+                   {"do": "archive each one", "done": "every file is moved"}],
+            budget=120_000, at="2026-10-11T12:00:00+00:00",
+        ),
+        ep.task_started(for_seq=52, task=50, at="2026-10-11T12:00:00+00:00"),
+        ep.task_step(
+            for_seq=53, task=50, n=0, state="done", evidence="seq 54",
+            usage=[{"role": "act", "model": "m", "calls": 1, "input": 10,
+                    "cached": 0, "output": 5, "reasoning": 0, "unmetered": 0}],
+            at="2026-10-11T12:00:00+00:00",
+        ),
+        ep.task_dropped(for_seq=55, task=50, n=1, at="2026-10-11T12:00:00+00:00"),
+        ep.task_cancelled(task=50, at="2026-10-11T12:00:00+00:00"),
     ]
     assert {p["kind"] for p in built} == ep.KINDS, "a kind has no round-trip test"
     for payload in built:

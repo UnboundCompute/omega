@@ -50,6 +50,7 @@ from omega import (
     projects,
     promises,
     provider,
+    tasks,
     tidy,
     tools,
     topics,
@@ -239,6 +240,8 @@ class Executor:
         "_grants_now",
         "_topics",
         "_topics_now",
+        "_tasks",
+        "_tasks_now",
         "_moments",
         "_standing",
         "_online",
@@ -318,6 +321,11 @@ class Executor:
         # pass after each reply and the daily look.
         self._topics = topics.Topics()
         self._topics_now = topics.Topics()
+        # DL-095: one fold advanced through each handled event (the turn's own
+        # view, for the brief and the step obligation) and one advanced to the
+        # head on the idle pass (what is drivable right now).
+        self._tasks = tasks.Tasks()
+        self._tasks_now = tasks.Tasks()
         # A third view rather than a field on `_learned` (DL-062): what is
         # true and what happened have different lifetimes, and keeping them
         # in one fold is what would let events leak into the claim set.
@@ -1698,6 +1706,7 @@ class Executor:
         self._access.advance(self._queue.store, upto=pending.seq)
         self._location.advance(self._queue.store, upto=pending.seq)
         self._topics.advance(self._queue.store, upto=pending.seq)
+        self._tasks.advance(self._queue.store, upto=pending.seq)
         lost = self._pausing(pending.payload)
         if lost is not None:
             # DL-087 #3: what it reads from is lost and they have been told.
@@ -1707,6 +1716,9 @@ class Executor:
             record = write_memory(self._queue, seq=pending.seq, outcome="silent")
             self._queue.finish(pending.seq)
             return TurnResult(seq=pending.seq, outcome="silent", record_seq=record)
+        # DL-095 gate-leak: the store head before the turn, so what the turn
+        # wrote with this event's for_seq can be told from what stood before it.
+        head_before = self._queue.store.head()
         result = run_turn(
             self._queue,
             pending,
@@ -1739,11 +1751,13 @@ class Executor:
             access=self._access.state(),
             location=self._location.state(),
             topics=self._topics.state(),
+            tasks=self._tasks.state(),
         )
         self._queue.finish(pending.seq)
         # After the reply is durable, and never able to fail or hold it.
         self._hold_promises(pending)
         self._notice_topics(pending)
+        self._discharge_obligation(pending, result, head_before)
         self._withdraw()
         return result
 
@@ -1987,6 +2001,126 @@ class Executor:
             self._queue.append(episodes.topic_update(
                 name=topic.name, items=view.fresh(topic.key, found),
                 usage=meter.usage(), at=clock,
+            ))
+            return True
+        except Exception:  # noqa: BLE001 - see the docstring
+            return False
+
+    def _discharge_obligation(
+        self, pending: Pending, result: Optional[TurnResult], head_before: int
+    ) -> None:
+        """DL-095/DL-040 gate-leak. A turn that carried a task-step obligation
+        and ended in prose — no terminal ``step`` and no gated call it was
+        blocked on — did not do the step. Record it ``task.dropped``, restate
+        the step once, and on a second drop block it and tell the person once.
+
+        Structural, read from the records only: it never inspects the turn's
+        words, so it covers a bare schedule fire exactly when a scheduling path
+        attached an obligation to it. After the terminal record, as
+        :meth:`_hold_promises`. A no-op with the engine off. **Never raises.**
+        """
+        if not tools.tasks_on():
+            return
+        try:
+            ob = tasks.obligation_of(pending.payload)
+            if ob is None:
+                return
+            task, n = ob["task"], ob["n"]
+            # Blocked on a gated/external "May I?" is work that owed a gated
+            # action and asked for it — not a leak.
+            if result is not None and result.outcome == "blocked":
+                return
+            # A terminal step, or a proposal/act under this event, discharges it.
+            for episode in self._queue.store.episodes_since(head_before):
+                payload = episodes.decode(episode.payload)
+                if payload.get("for_seq") != pending.seq:
+                    continue
+                if payload.get("kind") in (
+                    episodes.TASK_STEP, episodes.GRANT_PROPOSED, episodes.GRANT_ACTED
+                ):
+                    return
+            # A drop. Record it, then restate once or block on the second.
+            self._queue.append(episodes.task_dropped(for_seq=pending.seq, task=task, n=n))
+            view = self._tasks.advance(self._queue.store).state()
+            live = view.task(task)
+            if live is None or n >= live.total:
+                return
+            clock = str(pending.payload.get("at")) or None
+            step = live.plan.steps[n]
+            if live.drops.get(n, 0) >= 2:
+                why = "the step ended twice with nothing recorded about how it finished"
+                self._queue.append(episodes.task_step(
+                    for_seq=pending.seq, task=task, n=n, state="blocked",
+                    why=why, at=clock,
+                ))
+                self._queue.append(episodes.inbound(
+                    tools.task_blocked_text(live.plan.goal, n, why),
+                    channel="schedule", at=clock,
+                ))
+            else:
+                self._queue.append(episodes.inbound(
+                    tools.task_step_text(
+                        live.plan.goal, n, live.total, step["do"], step["done"],
+                        retry=True,
+                    ),
+                    channel="task", obligation={"task": task, "n": n}, at=clock,
+                ))
+        except Exception:  # noqa: BLE001 - see the docstring
+            return
+
+    def _block_step(self, live: Any, n: int, clock: Optional[str], why: str) -> None:
+        """Stop a task at step ``n`` on a cap and tell the person once (DL-095).
+        The block has no turn of its own, so it is attributed to the task's own
+        ``task.proposed`` seq."""
+        self._queue.append(episodes.task_step(
+            for_seq=live.plan.task, task=live.task, n=n, state="blocked",
+            why=why, at=clock,
+        ))
+        self._queue.append(episodes.inbound(
+            tools.task_blocked_text(live.plan.goal, n, why),
+            channel="schedule", at=clock,
+        ))
+
+    def drive_tasks(self, *, now: Optional[str] = None) -> bool:
+        """Drive one task step as its own unattended turn (DL-095). Returns
+        whether a step was driven or a cap enforced.
+
+        One step per call, oldest task first. A waiting step does not resume on
+        its own; a step whose task has spent its token budget, or that would be
+        this day's step past the per-day cap, is blocked and the person told
+        once. Off by default and a fold otherwise — with the engine off, or no
+        task drivable, it writes nothing. **Never raises.**
+        """
+        if not tools.tasks_on() or not self._recovered:
+            return False
+        try:
+            view = self._tasks_now.advance(self._queue.store).state()
+            clock = now or episodes.now()
+            day = tasks._local_day(clock)
+            # A running task that has spent its budget before its next step can
+            # run is stopped first (``drivable`` already excludes it).
+            for live in view.running():
+                if live.current is None and live.cursor < live.total \
+                        and live.spent >= live.plan.budget:
+                    self._block_step(
+                        live, live.cursor, clock,
+                        f"the task's token budget of {live.plan.budget} is spent",
+                    )
+                    return True
+            nxt = view.drivable()
+            if nxt is None:
+                return False
+            task, n, step = nxt
+            live = view.task(task)
+            if view.steps_today(day) >= tasks.DAILY_STEPS:
+                self._block_step(
+                    live, n, clock,
+                    f"the daily limit of {tasks.DAILY_STEPS} task steps is reached",
+                )
+                return True
+            self._queue.append(episodes.inbound(
+                tools.task_step_text(live.plan.goal, n, live.total, step["do"], step["done"]),
+                channel="task", obligation={"task": task, "n": n}, at=clock,
             ))
             return True
         except Exception:  # noqa: BLE001 - see the docstring

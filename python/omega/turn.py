@@ -35,6 +35,7 @@ from typing import Any, Callable, Optional, Sequence
 
 from omega import blobs, derive, episodes, grants as granted, learn, lessons as self_taught, notice, provider, schedule
 from omega import location as whereabouts
+from omega import tasks as _tasks
 from omega.tools import (
     INBOX_SOURCE,
     MAIL,
@@ -144,6 +145,10 @@ NOT_RECALLED = frozenset({
     # Topics kept up with (DL-087 #6): their news reaches them in the brief,
     # read off the fold; the records are bookkeeping.
     *episodes.TOPIC_KINDS,
+    # A task's records (DL-095): derived-view state, read off the fold into the
+    # brief's running/waiting section. Each step's reply is already in the
+    # conversation; the task.* records are bookkeeping, not conversation.
+    *episodes.TASK_KINDS,
 })
 
 #: **A count is not a budget** (DL-039). ``RECALL_N`` bounds how many episodes
@@ -345,6 +350,10 @@ class TurnContext:
     #: :class:`omega.topics.State`. ``None``, or one with nothing followed and
     #: no grant, renders as nothing and offers nothing.
     topics: Any = None
+    #: The tasks as of this turn (DL-095), a frozen :class:`omega.tasks.State`.
+    #: ``None``, or one with nothing running, renders as nothing in the brief
+    #: and offers nothing, so a log with no tasks reads exactly as before.
+    tasks: Any = None
 
 
 #: Channels whose events nobody typed: omega's own look (DL-061) and the clock
@@ -766,6 +775,7 @@ def run_turn(
     access: Any = None,
     location: Any = None,
     topics: Any = None,
+    tasks: Any = None,
 ) -> TurnResult:
     """Run one turn over an already-claimed episode and record how it ended.
 
@@ -856,6 +866,7 @@ def run_turn(
         access=access,
         location=location,
         topics=topics,
+        tasks=tasks,
     )
 
     verdict: Optional[Verdict] = None
@@ -912,6 +923,13 @@ def run_turn(
             # they never opened what they were watching. Any verdict but ACT
             # becomes ACT, as for a brief; the watch may still end quiet, but
             # only after it has looked. ``raw`` keeps what the judge said.
+            verdict = Verdict(choice=ACT_THEN_SPEAK, raw=verdict.raw)
+        elif verdict.choice != ACT_THEN_SPEAK and _tasks.obligation_of(ctx.event) is not None:
+            # A driven task step carries an obligation (DL-095): it must do the
+            # step and end by calling `step`. A judge that let it speak would
+            # be the DL-040 gate-leak — work that owed a gated action ending in
+            # prose. ACT, so the step's own tool is reached; the executor still
+            # checks afterwards that it was called.
             verdict = Verdict(choice=ACT_THEN_SPEAK, raw=verdict.raw)
         if verdict.choice == ACT_THEN_SPEAK:
             acted = act(ctx)
@@ -1067,10 +1085,33 @@ def _waiting(ctx: "TurnContext") -> str:
 
 
 def _brief_tail(ctx: "TurnContext") -> str:
-    """What code appends to a brief: :func:`_waiting`, then what is new on
-    the topics kept up with (DL-087 #6). Exactly :func:`_waiting` when no
-    topic has news."""
-    return "\n\n".join(part for part in (_waiting(ctx), _keeping(ctx)) if part)
+    """What code appends to a brief: :func:`_waiting`, what is new on the
+    topics kept up with (DL-087 #6), then the tasks under way (DL-095). Each
+    part empty when there is nothing, so no section is ever empty."""
+    return "\n\n".join(
+        part for part in (_waiting(ctx), _keeping(ctx), _running_tasks(ctx)) if part
+    )
+
+
+#: The heading a brief gives the tasks under way (DL-095).
+TASKS_RUNNING = "Tasks:"
+
+
+def _running_tasks(ctx: "TurnContext") -> str:
+    """A brief's running and waiting tasks (DL-095): each task started, not
+    finished, not stopped, with where its run has got to. Empty on any other
+    turn and when nothing is running, so a brief over a log with no tasks reads
+    exactly as before."""
+    if not is_brief(ctx.event) or ctx.tasks is None:
+        return ""
+    running = ctx.tasks.running()
+    if not running:
+        return ""
+    lines = [TASKS_RUNNING]
+    for t in running:
+        where = "waiting" if t.waiting else f"on step {t.cursor + 1} of {t.total}"
+        lines.append(f"- {t.plan.goal}: {where}")
+    return "\n".join(lines)
 
 
 #: The heading a brief gives the topics with news (DL-087 #6).

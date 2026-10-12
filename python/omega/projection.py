@@ -249,6 +249,11 @@ NOT_PROJECTED = frozenset(
         # DL-091. Where they are goes to no surface; the tool answers them in
         # its turn's reply.
         *episodes.LOCATION_KINDS,
+        # DL-095. A task's records are derived-view state: the plan reaches the
+        # person as its approval proposal (the turn's own question), and the
+        # run as the brief's running/waiting section and each step's reply.
+        # None is pushed as an update of its own.
+        *episodes.TASK_KINDS,
     }
 )
 

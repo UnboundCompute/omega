@@ -46,6 +46,7 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 
 from omega import episodes, finance, grants, lessons, location, lookback, mailcursor, mcp, projects, provider
+from omega import tasks
 from omega import topics as kept
 from omega.tools import (
     EXTERNAL,
@@ -269,6 +270,13 @@ def act_loop(
             # DL-094: the whole past conversation, read through the store the
             # turn holds, on every turn kind (as `recall` is offered).
             history=lambda: lookback.past(ctx.queue.store, before=ctx.seq),
+            # The task engine (DL-095): the tasks as of this turn, so `task`
+            # can report and cancel; `task_run` is the step obligation this
+            # turn carries, if any, which is what puts `step` in the box. Both
+            # are inert unless OMEGA_TASKS is on, so the box is otherwise as it
+            # was.
+            tasks=getattr(ctx, "tasks", None),
+            task_run=tasks.obligation_of(ctx.event),
         )
 
     # Their answer to a proposal is settled before the model is asked anything
@@ -681,6 +689,21 @@ def _resolve(
     ))
     state = ctx.grants
     live = state.live(proposal.scope) if state is not None else None
+    if proposal.proposes == "task":
+        # A plan to run (DL-095). A yes writes ``task.started`` and the runtime
+        # drives each step as its own unattended turn; it runs no tool here, so
+        # there is nothing to gate or undo. A no leaves the plan unstarted.
+        if yes and proposal.task is not None:
+            ctx.queue.append(episodes.task_started(for_seq=ctx.seq, task=proposal.task))
+            return (
+                f"\n\n(They said yes to {proposal.pid}: the plan is approved and "
+                "will now run step by step, one unattended turn at a time. Tell "
+                "them so in a sentence.)"
+            ), [], ""
+        return (
+            f"\n\n(They said no to {proposal.pid} ({proposal.words()}); the plan "
+            "will not run. Acknowledge it in a few words.)"
+        ), [], ""
     if proposal.proposes == "drop_gate":
         if yes:
             return (

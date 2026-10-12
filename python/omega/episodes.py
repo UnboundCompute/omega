@@ -126,6 +126,23 @@ __all__ = [
     "topic_followed",
     "topic_dropped",
     "topic_update",
+    "TASK_PROPOSED",
+    "TASK_STARTED",
+    "TASK_STEP",
+    "TASK_DROPPED",
+    "TASK_CANCELLED",
+    "TASK_KINDS",
+    "TASK_STEP_STATES",
+    "MAX_TASK_STEPS",
+    "MAX_TASK_GOAL",
+    "MAX_TASK_STEP_TEXT",
+    "DEFAULT_TASK_BUDGET",
+    "TASK_WAITS_ON",
+    "task_proposed",
+    "task_started",
+    "task_step",
+    "task_dropped",
+    "task_cancelled",
     "REPORT_TRANSCRIPT",
     "REPORT_USAGE",
     "REPORT_RECORDING",
@@ -282,10 +299,11 @@ MAX_WITHDRAWN_REASON = 200
 #: research tasks to the end, tidy their reminders and watches, hold them to
 #: the promises they make in their own messages, and offer to keep up with
 #: what they keep asking about. Closed, like the tool set.
-GRANT_SCOPES = frozenset({"research", "tidy", "promises", "topics"})
-#: What a proposal asks: to do the actions it lists, to stop asking first, or
-#: (DL-064) to run what a turn that read untrusted content wanted to send out.
-GRANT_PROPOSES = frozenset({"action", "drop_gate", "hold"})
+GRANT_SCOPES = frozenset({"research", "tidy", "promises", "topics", "tasks"})
+#: What a proposal asks: to do the actions it lists, to stop asking first,
+#: (DL-064) to run what a turn that read untrusted content wanted to send out,
+#: or (DL-095) to run a plan.
+GRANT_PROPOSES = frozenset({"action", "drop_gate", "hold", "task"})
 #: The scope a held proposal is filed under (DL-064). Not a grant: nothing can
 #: give it, and a yes to a held call moves no grant's streak.
 HOLD_SCOPE = "untrusted"
@@ -411,6 +429,46 @@ MAX_TOPIC_TITLE = 200
 MAX_TOPIC_URL = 500
 #: The most items one update carries.
 MAX_TOPIC_ITEMS = 5
+
+#: A delegated multi-step task (DL-095). The person approves the plan once and
+#: omega then drives each step as its own unattended turn. All records, never
+#: events: writing a plan down, starting a task, or ending a step must not
+#: itself run a turn — the driving is an executor pass, as the clock's fires
+#: are. Neither recalled nor projected: the live task is a fold
+#: (:mod:`omega.tasks`) and its progress reaches them in the brief, while a
+#: step's own turn runs from the instruction the driver puts on its inbound.
+#:
+#: ``task.proposed`` carries the plan (its seq is the task's id);
+#: ``task.started`` names it on the person's approval; ``task.step`` records
+#: one step reaching an explicit terminal state with its evidence or reason;
+#: ``task.dropped`` records an obligation-carrying step that ended in prose
+#: with nothing done (the gate-leak, DL-040), so a retry is a fact in the log;
+#: ``task.cancelled`` retires a task, as ``schedule.cancelled`` retires a
+#: schedule.
+TASK_PROPOSED = "task.proposed"
+TASK_STARTED = "task.started"
+TASK_STEP = "task.step"
+TASK_DROPPED = "task.dropped"
+TASK_CANCELLED = "task.cancelled"
+TASK_KINDS = frozenset(
+    {TASK_PROPOSED, TASK_STARTED, TASK_STEP, TASK_DROPPED, TASK_CANCELLED}
+)
+#: How a step ends, always explicitly (DL-095). ``done`` carries evidence (a
+#: record id, a URL or a tool-result reference, never bare prose); ``waiting``
+#: names what it waits on and until when; ``blocked`` and ``failed`` carry why.
+TASK_STEP_STATES = frozenset({"done", "waiting", "blocked", "failed"})
+#: What a waiting step waits on: a tap (the person, e.g. a payment hand-off),
+#: a time, or a watch coming due.
+TASK_WAITS_ON = frozenset({"tap", "time", "watch"})
+#: A plan is small and legible: a bounded number of steps, a goal and
+#: per-step text that are labels rather than essays, and a token budget.
+MAX_TASK_STEPS = 20
+MAX_TASK_GOAL = 2000
+MAX_TASK_STEP_TEXT = 2000
+#: The default per-task token budget, counted the way :mod:`omega.topics`
+#: counts usage. A task that spends it is blocked and the person told once.
+DEFAULT_TASK_BUDGET = 200_000
+
 _DIGEST = re.compile(r"^[0-9a-f]{16}$")
 
 #: The senses a relay may report for, by the name of the sense rather than of
@@ -487,6 +545,7 @@ KINDS = frozenset(
         *LESSON_KINDS,
         *LOCATION_KINDS,
         *TOPIC_KINDS,
+        *TASK_KINDS,
     }
 )
 
@@ -709,6 +768,7 @@ def inbound(
     schedule_slot: Optional[str] = None,
     machine: Optional[list[str]] = None,
     mail_at: Optional[str] = None,
+    obligation: Optional[dict[str, Any]] = None,
     at: Optional[str] = None,
     mail_inboxes: Optional[dict[str, str]] = None,
 ) -> dict[str, Any]:
@@ -783,6 +843,12 @@ def inbound(
         # DL-092: the same stamp for each extra mailbox the look read, by
         # name. Absent unless one was, so a look with one mailbox is as it was.
         payload["mail_inboxes"] = dict(mail_inboxes)
+    if obligation is not None:
+        # A driven task step (DL-095): the structural marker that this
+        # unattended turn carries an obligation, so the executor can tell a
+        # dropped step (prose, no terminal) from one genuinely answered. It
+        # names the task and the step; the gate-leak fix reads it, not words.
+        payload["obligation"] = dict(obligation)
     _validate(payload)
     return payload
 
@@ -1706,6 +1772,8 @@ def grant_proposed(
     scope: str,
     proposes: str,
     actions: list[dict[str, Any]],
+    task: Optional[int] = None,
+    summary: str = "",
     at: Optional[str] = None,
     reason: Optional[str] = None,
 ) -> dict[str, Any]:
@@ -1714,7 +1782,9 @@ def grant_proposed(
     ``actions`` are the calls exactly as classified (tool, why, args), so a
     yes runs the thing they were shown and not a re-reading of it.
     ``proposes`` is ``"drop_gate"`` for the one other question: may omega
-    stop asking first.
+    stop asking first; ``"task"`` for a plan to run (DL-095), which carries
+    its ``task`` (a :data:`TASK_PROPOSED` seq) and a ``summary`` of its goal
+    and lists no actions — a yes starts the run, it does not run a tool.
 
     ``"hold"`` (DL-064) is a call a turn that read untrusted content wanted to
     make outward: filed under :data:`HOLD_SCOPE`, with ``reason`` saying what
@@ -1735,6 +1805,10 @@ def grant_proposed(
     }
     if reason is not None:
         payload["reason"] = reason
+    if task is not None:
+        payload["task"] = task
+    if summary:
+        payload["summary"] = summary
     _validate(payload)
     return payload
 
@@ -1994,6 +2068,11 @@ _REQUIRED: dict[str, tuple[str, ...]] = {
     TOPIC_FOLLOWED: ("name", "query", "since", "at"),
     TOPIC_DROPPED: ("name", "at"),
     TOPIC_UPDATE: ("name", "items", "at"),
+    TASK_PROPOSED: ("for_seq", "goal", "steps", "budget", "at"),
+    TASK_STARTED: ("for_seq", "task", "at"),
+    TASK_STEP: ("for_seq", "task", "n", "state", "evidence", "why", "at"),
+    TASK_DROPPED: ("for_seq", "task", "n", "at"),
+    TASK_CANCELLED: ("task", "at"),
     GRANT_GIVEN: ("for_seq", "scope", "at"),
     GRANT_REVOKED: ("for_seq", "scope", "at"),
     GRANT_RESTORED: ("for_seq", "scope", "at"),
@@ -2255,6 +2334,100 @@ def topic_update(
     return payload
 
 
+def task_proposed(
+    *,
+    for_seq: int,
+    goal: str,
+    steps: Sequence[dict[str, Any]],
+    budget: int = DEFAULT_TASK_BUDGET,
+    at: Optional[str] = None,
+) -> dict[str, Any]:
+    """A plan omega drafted for the person to approve once (DL-095).
+
+    Its seq is the task's id. ``goal`` is what the whole task is for; ``steps``
+    is the ordered list of ``{do, done}`` — what each step does and the
+    criteria that say it is finished — and ``budget`` the task's token ceiling.
+    A record, so drafting a plan never runs a turn; the approval is an ordinary
+    ``grant.proposed`` filed beside it, and the run begins only on a yes.
+    """
+    payload = {
+        "v": VERSION,
+        "kind": TASK_PROPOSED,
+        "for_seq": for_seq,
+        "goal": goal,
+        "steps": [dict(s) for s in steps],
+        "budget": budget,
+        "at": at or now(),
+    }
+    _validate(payload)
+    return payload
+
+
+def task_started(*, for_seq: int, task: int, at: Optional[str] = None) -> dict[str, Any]:
+    """The person approved the plan ``task`` (a :data:`TASK_PROPOSED` seq), so
+    the run begins (DL-095). ``for_seq`` is the turn that settled their yes.
+    Written by the act step that resolves the approval, like ``grant.acted``."""
+    payload = {"v": VERSION, "kind": TASK_STARTED, "for_seq": for_seq,
+               "task": task, "at": at or now()}
+    _validate(payload)
+    return payload
+
+
+def task_step(
+    *,
+    for_seq: int,
+    task: int,
+    n: int,
+    state: str,
+    evidence: Optional[str] = None,
+    why: Optional[str] = None,
+    on: Optional[str] = None,
+    until: Optional[str] = None,
+    usage: Optional[list[dict[str, Any]]] = None,
+    at: Optional[str] = None,
+) -> dict[str, Any]:
+    """Step ``n`` of ``task`` reached an explicit terminal state (DL-095).
+
+    ``state`` is one of :data:`TASK_STEP_STATES`. ``done`` carries
+    ``evidence`` — a record id, a URL or a tool-result reference, never bare
+    prose. ``waiting`` names what it waits ``on`` (:data:`TASK_WAITS_ON`) and
+    ``until`` when. ``blocked`` and ``failed`` carry ``why``. ``for_seq`` is
+    the step's own unattended turn.
+    """
+    payload: dict[str, Any] = {
+        "v": VERSION, "kind": TASK_STEP, "for_seq": for_seq, "task": task,
+        "n": n, "state": state, "evidence": evidence, "why": why, "at": at or now(),
+    }
+    if on is not None:
+        payload["on"] = on
+    if until is not None:
+        payload["until"] = until
+    _with_usage(payload, usage)
+    _validate(payload)
+    return payload
+
+
+def task_dropped(
+    *, for_seq: int, task: int, n: int, at: Optional[str] = None
+) -> dict[str, Any]:
+    """Step ``n`` of ``task`` carried an obligation and ended in prose with no
+    terminal state and no gated call (DL-040, DL-095): the gate-leak. Recorded
+    so the drop is a fact and a retry can restate the obligation once; a second
+    drop blocks the step. ``for_seq`` is the dropped step's turn."""
+    payload = {"v": VERSION, "kind": TASK_DROPPED, "for_seq": for_seq,
+               "task": task, "n": n, "at": at or now()}
+    _validate(payload)
+    return payload
+
+
+def task_cancelled(*, task: int, at: Optional[str] = None) -> dict[str, Any]:
+    """Retire a task (DL-095). Append-only, as ``schedule.cancelled`` is: the
+    plan and what it did stay in the log; the fold simply stops driving it."""
+    payload = {"v": VERSION, "kind": TASK_CANCELLED, "task": task, "at": at or now()}
+    _validate(payload)
+    return payload
+
+
 #: The kinds a pass ends on, and so the only ones that may carry ``usage``
 #: (DL-070): what that pass spent on the model, per role and model, as
 #: :meth:`omega.provider.Meter.usage` tallies it. Optional and additive — a
@@ -2270,6 +2443,7 @@ METERED_KINDS = frozenset(
         MEMORY_TIDIED,
         PROJECT_STATE,
         TOPIC_UPDATE,
+        TASK_STEP,
     }
 )
 
@@ -2382,6 +2556,16 @@ def _validate(payload: dict[str, Any]) -> None:
                 # A slot with no schedule is unattributable: it would claim a
                 # fire was owed without saying what owes it.
                 raise BadPayload("schedule_slot requires schedule_id")
+        if "obligation" in payload:
+            ob = payload["obligation"]
+            if not isinstance(ob, dict):
+                raise BadPayload("obligation must be an object")
+            task = ob.get("task")
+            n = ob.get("n")
+            if isinstance(task, bool) or not isinstance(task, int) or task < 1:
+                raise BadPayload("obligation.task must be a positive int")
+            if isinstance(n, bool) or not isinstance(n, int) or n < 0:
+                raise BadPayload("obligation.n must be a non-negative int")
     elif kind == TRANSCRIPT_INGESTED:
         # Identified by the session it read, not by a turn and not by a cursor
         # into omega's own log: the thing being tracked lives outside, so the
@@ -2511,6 +2695,10 @@ def _validate(payload: dict[str, Any]) -> None:
         # No `for_seq`: written by the self-review (DL-086), which names its
         # evidence by seq instead, or by `forget`, which names their message.
         _validate_lesson(payload)
+    elif kind in TASK_KINDS:
+        # A task (DL-095). ``task.cancelled`` names the task it retires and no
+        # turn; the other three name both the task and their own turn.
+        _validate_task(payload)
     elif kind == GRANT_WITHDRAWN:
         # No `for_seq`: written by the executor, not by a turn. It names the
         # proposal it closes instead.
@@ -2692,6 +2880,14 @@ def _validate_grant(payload: dict[str, Any]) -> None:
                     raise BadPayload(f"actions[{i}].{field} must be a non-empty string")
             if not isinstance(action.get("args"), dict):
                 raise BadPayload(f"actions[{i}].args must be an object")
+        if payload["proposes"] == "task":
+            if "task" not in payload:
+                raise BadPayload("a task proposal names its task")
+            _require_seq(payload, "task")
+        elif "task" in payload:
+            raise BadPayload("only a task proposal names a task")
+        if "summary" in payload and not isinstance(payload["summary"], str):
+            raise BadPayload("summary must be a string")
     elif kind == GRANT_ANSWERED:
         _require_seq(payload, "proposal")
         _require_seq(payload, "proposed_for")
@@ -3183,6 +3379,60 @@ def _validate_lesson(payload: dict[str, Any]) -> None:
             value = payload[field]
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 raise BadPayload(f"{field} must be a non-negative count")
+    _require_str(payload, "at", non_empty=True)
+
+
+def _validate_task(payload: dict[str, Any]) -> None:
+    kind = payload["kind"]
+    if kind != TASK_CANCELLED:
+        _require_seq(payload, "for_seq")
+    if kind != TASK_PROPOSED:
+        _require_seq(payload, "task")
+    if kind == TASK_PROPOSED:
+        _require_str(payload, "goal", non_empty=True)
+        if len(payload["goal"]) > MAX_TASK_GOAL:
+            raise BadPayload(f"goal is longer than {MAX_TASK_GOAL} characters")
+        steps = payload["steps"]
+        if not isinstance(steps, list) or not steps:
+            raise BadPayload("steps must be a non-empty list")
+        if len(steps) > MAX_TASK_STEPS:
+            raise BadPayload(f"steps must be at most {MAX_TASK_STEPS}")
+        for i, step in enumerate(steps):
+            if not isinstance(step, dict) or set(step) != {"do", "done"}:
+                raise BadPayload(f"steps[{i}] is exactly {{do, done}}")
+            for field in ("do", "done"):
+                value = step[field]
+                if not isinstance(value, str) or not value.strip():
+                    raise BadPayload(f"steps[{i}].{field} must be a non-empty string")
+                if len(value) > MAX_TASK_STEP_TEXT:
+                    raise BadPayload(
+                        f"steps[{i}].{field} is longer than {MAX_TASK_STEP_TEXT} characters"
+                    )
+        budget = payload["budget"]
+        if isinstance(budget, bool) or not isinstance(budget, int) or budget <= 0:
+            raise BadPayload("budget must be a positive int")
+    elif kind == TASK_STEP:
+        n = payload["n"]
+        if isinstance(n, bool) or not isinstance(n, int) or n < 0:
+            raise BadPayload("n must be a non-negative int")
+        state = payload["state"]
+        if state not in TASK_STEP_STATES:
+            raise BadPayload(f"state {state!r} not in {sorted(TASK_STEP_STATES)}")
+        if state == "done":
+            _require_str(payload, "evidence", non_empty=True)
+        elif state == "waiting":
+            on = payload.get("on")
+            if on not in TASK_WAITS_ON:
+                raise BadPayload(f"waiting on {on!r} not in {sorted(TASK_WAITS_ON)}")
+            until = payload.get("until")
+            if not isinstance(until, str) or not until.strip():
+                raise BadPayload("waiting carries a non-empty until")
+        else:  # blocked, failed
+            _require_str(payload, "why", non_empty=True)
+    elif kind == TASK_DROPPED:
+        n = payload["n"]
+        if isinstance(n, bool) or not isinstance(n, int) or n < 0:
+            raise BadPayload("n must be a non-negative int")
     _require_str(payload, "at", non_empty=True)
 
 

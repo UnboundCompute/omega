@@ -135,6 +135,11 @@ __all__ = [
     "asks",
     "PENDING",
     "LOOK_BACK",
+    "TASK",
+    "STEP",
+    "tasks_on",
+    "task_step_text",
+    "task_blocked_text",
     "RESEARCH_LEAD",
     "research_instruction",
     "is_research",
@@ -236,6 +241,15 @@ TOPICS = "topics"
 #: the read half of DL-014's *read its own memory*, as ``recall`` is, over the
 #: episodes rather than the claims.
 LOOK_BACK = "look_back"
+#: Drafts, cancels or reports on a task's plan (DL-095). Outside
+#: :data:`TOOL_NAMES` for :data:`PROMISE`'s reason: offered only on their own
+#: message and only when ``OMEGA_TASKS`` is on, so with the flag off — the
+#: default — every turn is exactly what it was.
+TASK = "task"
+#: Records a driven step's terminal state (DL-095). Outside :data:`TOOL_NAMES`
+#: and offered only inside a driven step's own unattended turn, so it exists
+#: nowhere else and no other turn can see or call it.
+STEP = "step"
 PENDING = "pending"
 
 #: Ring 1's remainder, and it is closed (DL-014). Spelled as a frozenset so
@@ -512,6 +526,56 @@ def asks(event: dict[str, Any]) -> bool:
     (DL-087 #8), and a plain "yes" answers it while it is the newest thing
     omega asked."""
     return is_tell(event) and told(event).endswith((FOLLOWUP_ASK, PROMISE_ASK, TOPIC_ASK))
+
+
+def tasks_on() -> bool:
+    """Is the task engine (DL-095) switched on? Off by default.
+
+    With it off, ``task`` and ``step`` are never offered, the runtime drives
+    nothing and no ``task.*`` record is ever written, so every turn, every
+    schema and every record is exactly what it was before this feature.
+    ``OMEGA_TASKS`` in {1, on, true, yes} turns it on — a flag, not words over
+    any message, so the standing rule holds.
+    """
+    return os.environ.get("OMEGA_TASKS", "").strip().lower() in ("1", "on", "true", "yes")
+
+
+#: The do-verbs of ``task``.
+_TASK_DOS = ("propose", "status", "cancel")
+
+#: How a driven step's unattended turn begins (DL-095). It names the task and
+#: the step and tells the model to do it and end by calling ``step``. These are
+#: only the turn's visible words; what the executor and the box key on is the
+#: structural ``obligation`` marker beside them, never this text.
+TASK_LEAD = "A step of a task you are running, to carry out now, unattended: "
+
+
+def task_step_text(
+    goal: str, n: int, total: int, do: str, done: str, *, retry: bool = False
+) -> str:
+    """The inbound text that drives one step (DL-095)."""
+    head = (
+        "You ended the last attempt at this step in prose without calling "
+        "`step` to record how it finished. This is the one retry; this time "
+        "you must end by calling `step`. "
+        if retry else ""
+    )
+    return (
+        f"{TASK_LEAD}{head}The task's goal: {goal}. Step {n + 1} of {total}: "
+        f"{do}. It is finished when: {done}. Do the step now, then call `step` "
+        "to record how it ended — done (with evidence: a record id, a link or "
+        "a tool-result reference, never just words), waiting (on tap, time or "
+        "watch, until something), blocked (why) or failed (why). If the step "
+        "needs a payment, do not pay: end it waiting on tap with a hand-off "
+        "link, as the money rule requires."
+    )
+
+
+def task_blocked_text(goal: str, n: int, why: str) -> str:
+    """The one tell when a step is blocked and the run stops (DL-095)."""
+    return tell_instruction(
+        f'I\'ve had to stop the task "{goal}" at step {n + 1}: {why}.'
+    )
 
 
 #: How every research follow-up's fire text begins (DL-085).
@@ -1486,9 +1550,9 @@ _GRANT_CHANGES = ("give", "revoke", "restore_gate")
 
 def _scope(tool: str, args: dict[str, Any]) -> str:
     scope = _text(tool, args, "scope").strip().lower()
-    if scope not in grants.SCOPES:
+    if scope not in grants.GIVABLE:
         raise ToolRejected(
-            f"{tool}: the grants are {sorted(grants.SCOPES)}; {scope!r} is not one. "
+            f"{tool}: the grants are {sorted(grants.GIVABLE)}; {scope!r} is not one. "
             "Calendar, mail and money can never be granted."
         )
     return scope
@@ -1948,6 +2012,163 @@ def _topics(box: "ToolBox", args: dict[str, Any]) -> str:
     if not new:
         return f"nothing new on {topic.name} since the last look"
     return f"new on {topic.name}:\n{_items_words(new)}"
+
+
+# --- the task engine (DL-095) --------------------------------------------------
+
+
+def _tasking(box: "ToolBox") -> bool:
+    """Is ``task`` there to be called in this box's turn? Only with the engine
+    on and on their own message — structural, never words over the message."""
+    return tasks_on() and box.prompted
+
+
+def _stepping(box: "ToolBox") -> bool:
+    """Is ``step`` there? Only with the engine on and only inside a driven
+    step's own unattended turn, which the obligation marker identifies."""
+    return tasks_on() and box.task_run is not None
+
+
+def _task_id(args: dict[str, Any]) -> int:
+    value = args.get("task")
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ToolRejected(f"{TASK} needs 'task', the task's number")
+    return value
+
+
+def _clean_steps(args: dict[str, Any]) -> list[dict[str, str]]:
+    steps = args.get("steps")
+    if not isinstance(steps, list) or not steps:
+        raise ToolRejected(f"{TASK} propose needs 'steps', a non-empty list")
+    if len(steps) > episodes.MAX_TASK_STEPS:
+        raise ToolRejected(
+            f"a plan has at most {episodes.MAX_TASK_STEPS} steps, not {len(steps)}"
+        )
+    out: list[dict[str, str]] = []
+    for i, step in enumerate(steps):
+        if not isinstance(step, dict):
+            raise ToolRejected(f"steps[{i}] must be an object with 'do' and 'done'")
+        do, done = step.get("do"), step.get("done")
+        for label, value in (("do", do), ("done", done)):
+            if not isinstance(value, str) or not value.strip():
+                raise ToolRejected(f"steps[{i}].{label} must be a non-empty string")
+            if len(value) > episodes.MAX_TASK_STEP_TEXT:
+                raise ToolRejected(
+                    f"steps[{i}].{label} is longer than {episodes.MAX_TASK_STEP_TEXT}"
+                )
+        out.append({"do": do.strip(), "done": done.strip()})
+    return out
+
+
+def _classify_task(box: "ToolBox", args: dict[str, Any]) -> Decision:
+    if not box.prompted:
+        raise ToolRejected(f"{TASK} runs only on their own message")
+    do = _text(TASK, args, "do").strip().lower()
+    if do not in _TASK_DOS:
+        raise ToolRejected(f"{TASK}'s 'do' is one of {list(_TASK_DOS)}")
+    if do == "status":
+        return Decision(tool=TASK, tier=EXPLORATION, why="list the running tasks",
+                        args={"do": "status"})
+    if do == "cancel":
+        task = _task_id(args)
+        return Decision(tool=TASK, tier=LOCAL, why=f"cancel task {task}",
+                        args={"do": "cancel", "task": task})
+    goal = _text(TASK, args, "goal").strip()
+    if len(goal) > episodes.MAX_TASK_GOAL:
+        raise ToolRejected(f"a goal is at most {episodes.MAX_TASK_GOAL} characters")
+    steps = _clean_steps(args)
+    budget = args.get("budget", episodes.DEFAULT_TASK_BUDGET)
+    if isinstance(budget, bool) or not isinstance(budget, int) or budget <= 0:
+        raise ToolRejected(f"{TASK}'s 'budget' is a positive number of tokens")
+    return Decision(
+        tool=TASK, tier=LOCAL, why=f"propose a plan: {goal}",
+        args={"do": "propose", "goal": goal, "steps": steps, "budget": budget},
+    )
+
+
+def _task(box: "ToolBox", args: dict[str, Any]) -> str:
+    do = args["do"]
+    state = box.tasks
+    if do == "status":
+        running = state.running() if state is not None else []
+        if not running:
+            return "no tasks are running"
+        lines = []
+        for t in running:
+            where = ("waiting" if t.waiting else f"on step {t.cursor + 1} of {t.total}")
+            lines.append(
+                f"task {t.task} ({t.plan.goal}): {where}; "
+                f"{t.spent} of {t.plan.budget} tokens spent"
+            )
+        return "\n".join(lines)
+    if box.append is None:
+        raise ToolError("tasks cannot change from here: this box has no log")
+    clock = box.at or None
+    if do == "cancel":
+        task = int(args["task"])
+        live = state.task(task) if state is not None else None
+        if live is None:
+            raise ToolError(f"there is no task {task} to cancel")
+        if live.cancelled:
+            return f"task {task} was already cancelled"
+        box.append(episodes.task_cancelled(task=task, at=clock))
+        return f"task {task} cancelled; it will not run any further"
+    # propose
+    seq = box.append(episodes.task_proposed(
+        for_seq=box.for_seq, goal=args["goal"], steps=args["steps"],
+        budget=args["budget"], at=clock,
+    ))
+    pseq = box.append(episodes.grant_proposed(
+        for_seq=box.for_seq, scope=grants.TASKS, proposes="task", actions=[],
+        task=seq, summary=args["goal"], at=clock,
+    ))
+    pid = grants.pid(pseq)
+    readback = "; ".join(
+        f"{i + 1}. {s['do']} (done when: {s['done']})"
+        for i, s in enumerate(args["steps"])
+    )
+    return (
+        f"Plan filed as task {seq}, now waiting on their approval ({pid}). It "
+        "does not run until they say yes. Relay the plan to them and end your "
+        f"reply with exactly: {grants.how_to_answer(pid)}\n"
+        f"Goal: {args['goal']}. Budget: {args['budget']} tokens. Steps: {readback}."
+    )
+
+
+def _classify_step(box: "ToolBox", args: dict[str, Any]) -> Decision:
+    if box.task_run is None:
+        raise ToolRejected(f"{STEP} runs only inside a task step's own turn")
+    state = _text(STEP, args, "state").strip().lower()
+    if state not in episodes.TASK_STEP_STATES:
+        raise ToolRejected(
+            f"{STEP}'s 'state' is one of {sorted(episodes.TASK_STEP_STATES)}"
+        )
+    out: dict[str, Any] = {"state": state}
+    if state == "done":
+        out["evidence"] = _text(STEP, args, "evidence").strip()
+    elif state == "waiting":
+        on = _text(STEP, args, "on").strip().lower()
+        if on not in episodes.TASK_WAITS_ON:
+            raise ToolRejected(
+                f"{STEP} waiting is on one of {sorted(episodes.TASK_WAITS_ON)}"
+            )
+        out["on"] = on
+        out["until"] = _text(STEP, args, "until").strip()
+    else:  # blocked, failed
+        out["why"] = _text(STEP, args, "why").strip()
+    return Decision(tool=STEP, tier=LOCAL, why=f"record this step {state}", args=out)
+
+
+def _step(box: "ToolBox", args: dict[str, Any]) -> str:
+    if box.append is None:
+        raise ToolError("a step cannot be recorded from here: this box has no log")
+    ob = box.task_run or {}
+    box.append(episodes.task_step(
+        for_seq=box.for_seq, task=int(ob["task"]), n=int(ob["n"]),
+        state=args["state"], evidence=args.get("evidence"), why=args.get("why"),
+        on=args.get("on"), until=args.get("until"), at=box.at or None,
+    ))
+    return f"step recorded: {args['state']}"
 
 
 # --- omega's own lessons and skills (DL-086) -----------------------------------
@@ -3275,7 +3496,7 @@ _TOOLS: dict[str, _Tool] = {
             "before each action until they agree to stop being asked. "
             "'restore_gate' is for when they want to be asked first again.",
             {
-                "scope": {"type": "string", "enum": sorted(grants.SCOPES)},
+                "scope": {"type": "string", "enum": sorted(grants.GIVABLE)},
                 "change": {"type": "string", "enum": list(_GRANT_CHANGES)},
             },
             ["scope", "change"],
@@ -3471,6 +3692,69 @@ _LOCATION_TOOL = _Tool(
 )
 
 
+#: ``task`` (DL-095), registered beside Ring 1 and not in it: see :data:`TASK`.
+#: :meth:`ToolBox.classify` reaches it only where :func:`_tasking` holds.
+_TASK_TOOL = _Tool(
+    classify=_classify_task,
+    dispatch=_task,
+    schema=_schema(
+        TASK,
+        "Run a longer job for them as a plan you draft once and they approve "
+        "once. 'propose' drafts it: a goal, an ordered list of steps (each with "
+        "its 'do' and the 'done' criteria that say it is finished) and a token "
+        "budget; it is filed for their approval and runs only on their yes, one "
+        "step at a time, unattended. 'status' lists the tasks running now. "
+        "'cancel' retires one by its number. Propose a plan when they ask you "
+        "to carry a multi-step job through on your own, not for something you "
+        "can finish in this reply.",
+        {
+            "do": {"type": "string", "enum": list(_TASK_DOS)},
+            "goal": {"type": "string", "description": "For propose: what the whole task is for."},
+            "steps": {
+                "type": "array",
+                "description": "For propose: the ordered steps.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "do": {"type": "string", "description": "What this step does."},
+                        "done": {"type": "string", "description": "The criteria that say it is finished."},
+                    },
+                    "required": ["do", "done"],
+                },
+            },
+            "budget": {"type": "integer", "description": "For propose: the task's token ceiling (default 200000)."},
+            "task": {"type": "integer", "description": "For cancel: the task's number."},
+        },
+        ["do"],
+    ),
+)
+
+
+#: ``step`` (DL-095), registered beside Ring 1 and not in it: see :data:`STEP`.
+#: :meth:`ToolBox.classify` reaches it only where :func:`_stepping` holds — so
+#: it exists only inside a driven step's own unattended turn.
+_STEP_TOOL = _Tool(
+    classify=_classify_step,
+    dispatch=_step,
+    schema=_schema(
+        STEP,
+        "End the task step you are running now by recording how it finished. "
+        "'done' needs 'evidence' — a record id, a link or a tool-result "
+        "reference, never just a description. 'waiting' needs 'on' (tap for a "
+        "hand-off the person must tap, time, or watch) and 'until'. 'blocked' "
+        "and 'failed' need 'why'. Call it exactly once, at the end of the step.",
+        {
+            "state": {"type": "string", "enum": sorted(episodes.TASK_STEP_STATES)},
+            "evidence": {"type": "string", "description": "For done: the proof it finished."},
+            "on": {"type": "string", "enum": sorted(episodes.TASK_WAITS_ON), "description": "For waiting."},
+            "until": {"type": "string", "description": "For waiting: until when or what."},
+            "why": {"type": "string", "description": "For blocked or failed."},
+        },
+        ["state"],
+    ),
+)
+
+
 def schemas(hide: "frozenset[str] | set[str]" = frozenset()) -> list[dict[str, Any]]:
     """What is offered to the model, in the order the tools are declared.
 
@@ -3650,6 +3934,17 @@ class ToolBox:
     #: log. ``None`` leaves the box exactly as it was.
     history: Optional[Callable[[], Sequence[Any]]] = None
 
+    #: The tasks as of this turn (DL-095): a frozen :class:`omega.tasks.State`,
+    #: or ``None``. With ``OMEGA_TASKS`` on and on their own message it puts
+    #: ``task`` in the box (propose/status/cancel) and feeds the brief; off or
+    #: unset, the box is exactly what it was.
+    tasks: Any = None
+    #: The step obligation a driven step's unattended turn carries (DL-095):
+    #: ``{"task": int, "n": int}`` or ``None``. Only this, with the flag on,
+    #: puts ``step`` in the box, so ``step`` exists nowhere but inside a step's
+    #: own turn.
+    task_run: Optional[dict[str, Any]] = None
+
     def __post_init__(self) -> None:
         object.__setattr__(self, "store_root", Path(self.store_root).resolve())
         object.__setattr__(self, "remembered", tuple(self.remembered))
@@ -3674,6 +3969,10 @@ class ToolBox:
             tool = _TOPICS_TOOL
         if tool is None and name == LOOK_BACK and _looking_back(self):
             tool = _LOOK_BACK_TOOL
+        if tool is None and name == TASK and _tasking(self):
+            tool = _TASK_TOOL
+        if tool is None and name == STEP and _stepping(self):
+            tool = _STEP_TOOL
         if tool is None and self.remote is not None and isinstance(arguments, dict):
             # An MCP tool, refused or cleared by the adapter: money, writes and
             # the allowlist are decided there, in code, from the name (DL-088).
@@ -3722,6 +4021,10 @@ class ToolBox:
             return _TOPICS_TOOL.dispatch(self, decision.args)
         if decision.tool == LOOK_BACK and decision.tool not in _TOOLS:
             return _LOOK_BACK_TOOL.dispatch(self, decision.args)
+        if decision.tool == TASK and decision.tool not in _TOOLS:
+            return _TASK_TOOL.dispatch(self, decision.args)
+        if decision.tool == STEP and decision.tool not in _TOOLS:
+            return _STEP_TOOL.dispatch(self, decision.args)
         return _TOOLS[decision.tool].dispatch(self, decision.args)
 
     def schemas(self, hide: "frozenset[str] | set[str]" = frozenset()) -> list[dict[str, Any]]:
@@ -3738,6 +4041,10 @@ class ToolBox:
             mine.append(_TOPICS_TOOL.schema)
         if _looking_back(self) and LOOK_BACK not in hide:
             mine.append(_LOOK_BACK_TOOL.schema)
+        if _tasking(self) and TASK not in hide:
+            mine.append(_TASK_TOOL.schema)
+        if _stepping(self) and STEP not in hide:
+            mine.append(_STEP_TOOL.schema)
         names = _mailbox_names()
         if len(names) > 1:
             mine = [_inbox_schema(schema, names) for schema in mine]

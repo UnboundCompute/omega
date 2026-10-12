@@ -739,6 +739,10 @@ class Runtime:
         # The daily look at the topics kept up with (DL-087 #6), before the
         # look, for tidy's reason. With nothing followed it is a fold.
         executor.keep_up()
+        # Drive one approved task step (DL-095), before the look so a step's
+        # inbound is perceived in the same pass it is filed. Off by default and
+        # a fold with nothing to drive, so most polls it does nothing.
+        executor.drive_tasks()
         # Last, and unconditional. Last because the three passes above *write
         # memory* and this one *reads* it to decide whether to speak — running it
         # first would have it judge a moment it had not yet finished perceiving.

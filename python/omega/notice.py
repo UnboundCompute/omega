@@ -74,7 +74,7 @@ CHANNEL = "self"
 
 #: The channels nobody typed on: omega's own look and the clock. What omega
 #: said on these is what it said *unprompted*, which is what novelty is about.
-UNPROMPTED_CHANNELS = frozenset({CHANNEL, "schedule"})
+UNPROMPTED_CHANNELS = frozenset({CHANNEL, "schedule", "task"})
 
 #: How often omega may *look*. Not how often it may speak. Halved from an hour
 #: by DL-068, which also gave the look a machine sense that can change in it.

@@ -402,6 +402,17 @@ def test_every_m1_kind_is_accounted_for() -> None:
         episodes.TOPIC_FOLLOWED: episodes.topic_followed(name="rust", query="rust news", since=1, at=AT),
         episodes.TOPIC_DROPPED: episodes.topic_dropped(name="rust", at=AT),
         episodes.TOPIC_UPDATE: episodes.topic_update(name="rust", items=[], at=AT),
+        # DL-095: a task's records go to no surface — they are fold state.
+        episodes.TASK_PROPOSED: episodes.task_proposed(
+            for_seq=1, goal="tidy the drive",
+            steps=[{"do": "list files", "done": "a list exists"}], at=AT,
+        ),
+        episodes.TASK_STARTED: episodes.task_started(for_seq=2, task=1, at=AT),
+        episodes.TASK_STEP: episodes.task_step(
+            for_seq=3, task=1, n=0, state="done", evidence="seq 4", at=AT,
+        ),
+        episodes.TASK_DROPPED: episodes.task_dropped(for_seq=5, task=1, n=0, at=AT),
+        episodes.TASK_CANCELLED: episodes.task_cancelled(task=1, at=AT),
     }
     assert set(made) == set(episodes.KINDS)
     for kind, payload in made.items():
