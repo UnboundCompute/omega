@@ -500,9 +500,12 @@ def test_the_brief_lists_the_lost_mailbox_by_name(store: MemoryStore, boxes: Box
 # --------------------------------------------------------------------------
 
 #: Digests of :func:`_equivalence_record`, taken from the code before DL-092
-#: (and again from this code, which must match them).
+#: (and again from this code, which must match them). ``schemas`` was
+#: retaken when ``topics`` came to be offered on every prompted turn; with
+#: ``topics`` left out of ``box.schemas()`` it is still the pre-DL-092
+#: digest, 6664b2a47e611bb4fec4ceced8f8a778abc87697ac15b5079a39296f568a7703.
 GOLDEN = {
-    "schemas": "6664b2a47e611bb4fec4ceced8f8a778abc87697ac15b5079a39296f568a7703",
+    "schemas": "bbfdd0ed13461bcf17136abc3ed7c7b8edd1e781eb2d9553d41725ecb7a4aba6",
     "decisions": "2c4dce3c91de59c6a04cae8410eff9fc2289959ec56142f4804f9d1e0fb8c190",
     "mail": "804f1d2668f4ae0779d57ed156443b465043318c19e29ae63d20f391362fad0a",
     "sweep": "a82b1e92db42f1f10e7e4cf8f5565991002744e5368e81feb200250f970d5da0",

@@ -230,9 +230,7 @@ FORGET = "forget"
 LOCATION = "location"
 #: Lists, follows, drops or looks up the topics omega keeps up with (DL-087
 #: #6). Outside :data:`TOOL_NAMES` for :data:`PROMISE`'s reason: offered only
-#: on their own message, and only when a topic is followed, the ``topics``
-#: grant is live, or their words ask to keep up with something, so every
-#: other turn is exactly what it was.
+#: on their own message, so every unprompted turn neither sees nor calls it.
 TOPICS = "topics"
 #: Searches the whole past conversation by words and dates (DL-094). Outside
 #: :data:`TOOL_NAMES` for :data:`PROMISE`'s reason, and on the same structural
@@ -1885,22 +1883,14 @@ def _promise(box: "ToolBox", args: dict[str, Any]) -> str:
 
 _TOPIC_DOS = ("list", "follow", "drop", "now")
 
-#: Their words that ask to keep up with something, or to stop.
-_FOLLOW_WORDS = (
-    "keep up with", "keeping up with", "keep track of", "keep me posted",
-    "keep me updated", "keep an eye on",
-)
-
-
 def _keeping_up(box: "ToolBox") -> bool:
-    """Is ``topics`` there to be called in this box's turn?"""
-    if not box.prompted:
-        return False
-    state = box.topics
-    if state is not None and (state.followed or state.granted):
-        return True
-    said = box.said.lower()
-    return any(w in said for w in _FOLLOW_WORDS)
+    """Is ``topics`` there to be called in this box's turn?
+
+    On every turn their own message started, and on no other: whether they
+    are asking to keep up with something is the model's to judge, not a
+    word list's.
+    """
+    return bool(box.prompted)
 
 
 def _topic_clock(box: "ToolBox") -> str:

@@ -224,7 +224,9 @@ def test_without_the_grant_nothing_is_called_written_or_offered(q: EventQueue) -
     assert not any(p["kind"].startswith("topic.") for p in payloads(q))
     assert ex.keep_up(now=AT) is False and script.searched == []
     offered = {s["function"]["name"] for o in script.fp.offers if o for s in o if "function" in s}
-    assert tools.TOPICS not in offered, "an ordinary turn is not offered topics"
+    # Offered on every turn of theirs (no word list decides it); offering it
+    # is not calling it, and nothing above was followed or written.
+    assert tools.TOPICS in offered, "every turn of theirs is offered topics"
 
 
 def test_a_revoked_grant_stops_the_offers(q: EventQueue) -> None:
@@ -554,3 +556,15 @@ def test_the_fold_survives_a_restart_and_is_incremental(q: EventQueue) -> None:
     ex2 = executor(q, Script())
     assert ex2.keep_up(now=AT) is False
     assert view(q).seen["copper price"] == {topics.digest("https://a.example/1")}
+
+
+def test_topics_is_offered_on_every_turn_of_theirs_and_never_unprompted() -> None:
+    # No word list decides it: any phrasing of theirs is offered the tool,
+    # nothing followed or granted; a turn they did not start never is.
+    for said in ("keep up with the rust edition", "can u watch rust news 4 me", "hello", ""):
+        box = tools.ToolBox(store_root=".", prompted=True, said=said)
+        assert tools.TOPICS in {s["function"]["name"] for s in box.schemas()}, said
+    box = tools.ToolBox(store_root=".", prompted=False, said="keep up with rust")
+    assert tools.TOPICS not in {s["function"]["name"] for s in box.schemas()}
+    with pytest.raises(tools.ToolRejected):
+        box.classify(tools.TOPICS, {"do": "list"})

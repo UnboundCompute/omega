@@ -274,7 +274,7 @@ def test_with_nothing_recorded_the_tool_is_offered_on_every_turn_of_theirs(q: Ev
     assert tools.LOCATION in offered(plain)
     # DL-094: every act turn is now also offered `look_back`, past location.
     assert [s for s in plain.offers_for(provider.ACT)[0]
-            if s.get("function", {}).get("name") != tools.LOCATION] == schemas(
+            if s.get("function", {}).get("name") not in (tools.LOCATION, tools.TOPICS)] == schemas(
         hidden(ToolBox(store_root=q.store.root, prompted=True))) + [
         ToolBox(store_root=q.store.root, history=list).schemas()[-1]] + hosted()
     for words in ("find coffee near me", "wher am i?", "whre am i", "am I near the office?",

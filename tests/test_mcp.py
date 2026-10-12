@@ -487,6 +487,9 @@ def test_without_configuration_the_act_loop_offers_what_it_always_did(
     # `location` is offered on every turn of theirs with a log (DL-091).
     assert tools.LOCATION in [t.get("function", {}).get("name") for t in offered]
     offered = [t for t in offered if t.get("function", {}).get("name") != tools.LOCATION]
+    # So is `topics` (DL-087 #6): no word list decides either offer.
+    assert tools.TOPICS in [t.get("function", {}).get("name") for t in offered]
+    offered = [t for t in offered if t.get("function", {}).get("name") != tools.TOPICS]
     # DL-094: look_back rides every turn that can read the log, last of Ring 1.
     look_back = ToolBox(store_root=q.store.root, history=list).schemas()[-1]
     assert offered == schemas(hidden(ToolBox(store_root=q.store.root, prompted=True))) + [
