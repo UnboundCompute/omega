@@ -95,6 +95,9 @@
 | 68 | Inbox-reading plus autonomous action = a standing injection target | Instinct | **AVOID** | DL-014 (rings) |
 | 69 | Local-first, model-agnostic, reaching the user through chat apps they already run | OpenClaw | **ADAPT** | DL-004 (channels) |
 | 70 | Reactive-only assistants died of latency and reliability — proactivity was never the issue | Humane, Rabbit | **N/A** | — (honest negative) |
+| 71 | Homogeneous self-improvement: one model executes, judges its own work, and trains on what it judged best | MASS (Sakana) | **AVOID** | DL-013 (verification isolated) |
+| 72 | Delegation spec = what the delegate must **return and check** (contract) + call order (hop), not role prose | MASS (Sakana) | **ADAPT** | DL-011 (isolate mode) |
+| 73 | Revise a procedure by pairwise champion-vs-candidate comparison with a stated reason | MASS (Sakana) | **ADAPT** | DL-014 (ring 3), parked |
 
 ---
 
@@ -806,6 +809,42 @@ amendment (the four categories) and a DL-014 revisit (provenance-gated rings), r
 written into the tray unilaterally.
 
 ---
+
+## 4. MASS — multi-agent self-supervision (Sakana, read 2026-10-12)
+
+*Source: pub.sakana.ai/mass, arXiv:2610.12176, and the HN thread (item 50048522). This is a
+paper about training an open-weight model, not a harness we run. Read it for what it says about
+delegation and self-judging, not as a system to copy.*
+
+**What it is.** One model (Qwen3.6-27B) does three jobs. It runs a multi-agent "workflow" written
+as a prompt, it judges pairs of outcomes, and it rewrites the workflow. The best team's runs are
+then distilled into the same model with LoRA, and the loop repeats for two rounds. Results are
+real but small: 12 synthetic tasks, two rounds, gains on research and data-science benchmarks,
+and none on SWE-bench Verified or Terminal-Bench (0.94×, 0.96×). On HN, one commenter said the
+released code does not match the paper.
+
+**Why most of it does not transfer.** omega calls API models and never fine-tunes, so the outer
+loop is irrelevant. The inner loop, where the same model judges its own work, is the pattern
+DL-013 rules out. Their own numbers support that rule: the self-judge agreed with external
+judges only 73% of the time at the start, and the authors name shared blind spots in a
+homogeneous loop as the safety risk. (Row 71.)
+
+**What is worth keeping.**
+- **Contracts and hops carry the weight.** As the workflow search improved, the useful
+  information shifted toward *contract* (what each subagent must return and check) and *hop*
+  (call order, including going back), and away from *role* and *instruction* prose. That is
+  evidence for how omega should brief an isolate-mode delegate: specify the return shape and the
+  checks it must run, and drop the persona. It fits the existing rule that a delegate "returns a
+  result". (Row 72.) Caveat: the authors themselves say this analysis covers only 8–9 tasks.
+- **The optimizer was the bottleneck, not the judge.** Upgrading only the evaluator to a frontier
+  model barely helped. Upgrading the optimizer as well solved all 12 tasks within 5 iterations.
+  This bears on ring 3: if omega ever revises a learned skill, the quality of the rewrite matters
+  more than how well the rewrite is graded. Champion-vs-candidate with a stated reason is a
+  sensible shape for that comparison, provided the judge is isolated. Parked: there are no
+  revisable skills yet. (Row 73.)
+- **Search is noisy.** Good iterations were often followed by sharp regressions. Any future skill
+  revision should keep the champion until a candidate actually beats it, and never overwrite it
+  in place. That matches append-only and supersede.
 
 ## Cross-cutting findings
 
