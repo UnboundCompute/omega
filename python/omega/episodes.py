@@ -72,6 +72,7 @@ __all__ = [
     "MAX_WITHDRAWN_REASON",
     "GRANT_SCOPES",
     "GRANT_PROPOSES",
+    "HOLD_SCOPE",
     "FAILURE_TOLD",
     "FAILURE_RECOVERED",
     "FAILURE_KINDS",
@@ -282,8 +283,15 @@ MAX_WITHDRAWN_REASON = 200
 #: the promises they make in their own messages, and offer to keep up with
 #: what they keep asking about. Closed, like the tool set.
 GRANT_SCOPES = frozenset({"research", "tidy", "promises", "topics"})
-#: What a proposal asks: to do the actions it lists, or to stop asking first.
-GRANT_PROPOSES = frozenset({"action", "drop_gate"})
+#: What a proposal asks: to do the actions it lists, to stop asking first, or
+#: (DL-064) to run what a turn that read untrusted content wanted to send out.
+GRANT_PROPOSES = frozenset({"action", "drop_gate", "hold"})
+#: The scope a held proposal is filed under (DL-064). Not a grant: nothing can
+#: give it, and a yes to a held call moves no grant's streak.
+HOLD_SCOPE = "untrusted"
+#: Ceiling on why a call was held, and on each untrusted source a turn record
+#: names. One clause each: "this turn read https://...".
+MAX_HOLD_REASON = 300
 
 #: Omega following up on its own failures (DL-087 #2). ``failure.told`` is the
 #: one tell it gave about a subject that kept failing; ``failure.recovered`` is
@@ -785,6 +793,7 @@ def blocked(
     needs: str,
     usage: Optional[list[dict[str, Any]]] = None,
     at: Optional[str] = None,
+    tainted: Optional[list[str]] = None,
 ) -> dict[str, Any]:
     """omega stopped to ask. A terminal record: it ends the turn.
 
@@ -800,6 +809,7 @@ def blocked(
         "needs": needs,
         "at": at or now(),
     }
+    _with_tainted(payload, tainted)
     _with_usage(payload, usage)
     _validate(payload)
     return payload
@@ -815,8 +825,13 @@ def completed(
     usage: Optional[list[dict[str, Any]]] = None,
     judged: Optional[str] = None,
     at: Optional[str] = None,
+    tainted: Optional[list[str]] = None,
 ) -> dict[str, Any]:
     """The turn ended. A terminal record.
+
+    ``tainted`` names the untrusted content the turn read (DL-064): a fetched
+    URL, an MCP server, their inbox. Present only when it read some, so a
+    clean turn writes the bytes it always did.
 
     ``judged`` is what the judge answered, word and reason (DL-076). Without
     it a silent look is a row that says *that* omega stayed quiet and never
@@ -838,6 +853,7 @@ def completed(
     }
     if judged is not None:
         payload["judged"] = judged
+    _with_tainted(payload, tainted)
     _with_usage(payload, usage)
     _validate(payload)
     return payload
@@ -1691,6 +1707,7 @@ def grant_proposed(
     proposes: str,
     actions: list[dict[str, Any]],
     at: Optional[str] = None,
+    reason: Optional[str] = None,
 ) -> dict[str, Any]:
     """Omega asking before it acts under a grant. Its own seq is its id.
 
@@ -1698,6 +1715,10 @@ def grant_proposed(
     yes runs the thing they were shown and not a re-reading of it.
     ``proposes`` is ``"drop_gate"`` for the one other question: may omega
     stop asking first.
+
+    ``"hold"`` (DL-064) is a call a turn that read untrusted content wanted to
+    make outward: filed under :data:`HOLD_SCOPE`, with ``reason`` saying what
+    the turn read. Only a held proposal carries a reason.
     """
     payload = {
         "v": VERSION,
@@ -1712,6 +1733,8 @@ def grant_proposed(
         ],
         "at": at or now(),
     }
+    if reason is not None:
+        payload["reason"] = reason
     _validate(payload)
     return payload
 
@@ -2253,6 +2276,24 @@ METERED_KINDS = frozenset(
 _USAGE_COUNTS = ("calls", "input", "cached", "output", "reasoning", "unmetered")
 
 
+def _with_tainted(payload: dict[str, Any], tainted: Optional[list[str]]) -> None:
+    """Attach what untrusted content a turn read (DL-064), only when it read
+    some, so a clean turn's record is byte-for-byte what it was."""
+    if tainted:
+        payload["tainted"] = list(tainted)
+
+
+def _validate_tainted(payload: dict[str, Any]) -> None:
+    sources = payload["tainted"]
+    if not isinstance(sources, list) or not sources:
+        raise BadPayload("tainted must be a non-empty list when present")
+    for source in sources:
+        if not isinstance(source, str) or not source or len(source) > MAX_HOLD_REASON:
+            raise BadPayload(
+                f"each tainted source is a string of 1 to {MAX_HOLD_REASON} characters"
+            )
+
+
 def _with_usage(payload: dict[str, Any], usage: Optional[list[dict[str, Any]]]) -> None:
     """Attach ``usage`` only when there is some, so a pass that never called
     the model writes the same bytes it always did."""
@@ -2506,6 +2547,9 @@ def _validate(payload: dict[str, Any]) -> None:
         # terminal record per inbound" stops being checkable.
         _require_seq(payload, "for_seq")
 
+    if kind in (TURN_COMPLETED, TURN_BLOCKED) and "tainted" in payload:
+        _validate_tainted(payload)
+
     if kind == TURN_COMPLETED:
         if "judged" in payload:
             _require_str(payload, "judged", non_empty=True)
@@ -2611,17 +2655,31 @@ def _validate(payload: dict[str, Any]) -> None:
 
 def _validate_grant(payload: dict[str, Any]) -> None:
     kind = payload["kind"]
-    if payload["scope"] not in GRANT_SCOPES:
+    held = kind == GRANT_PROPOSED and payload.get("proposes") == "hold"
+    # A held call (DL-064) is filed, answered or withdrawn under its own
+    # scope, which no grant can be given, revoked or acted under.
+    holdable = held or kind in (GRANT_ANSWERED, GRANT_WITHDRAWN)
+    if payload["scope"] not in GRANT_SCOPES and not (
+        holdable and payload["scope"] == HOLD_SCOPE
+    ):
         raise BadPayload(f"scope {payload['scope']!r} not in {sorted(GRANT_SCOPES)}")
     if kind == GRANT_PROPOSED:
         if payload["proposes"] not in GRANT_PROPOSES:
             raise BadPayload(
                 f"proposes {payload['proposes']!r} not in {sorted(GRANT_PROPOSES)}"
             )
+        if held != (payload["scope"] == HOLD_SCOPE):
+            raise BadPayload(f"a held call is filed under {HOLD_SCOPE!r}, and only one is")
+        if held != ("reason" in payload):
+            raise BadPayload("a held call says why it was held, and only one does")
+        if held:
+            _require_str(payload, "reason", non_empty=True)
+            if len(payload["reason"]) > MAX_HOLD_REASON:
+                raise BadPayload(f"reason must be at most {MAX_HOLD_REASON} characters")
         actions = payload["actions"]
         if not isinstance(actions, list):
             raise BadPayload("actions must be a list")
-        if (payload["proposes"] == "action") != bool(actions):
+        if (payload["proposes"] in ("action", "hold")) != bool(actions):
             # An action proposal with nothing in it would be a yes to nothing,
             # and a gate proposal carrying actions would run them on a yes that
             # was only about the gate.

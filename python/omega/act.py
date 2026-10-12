@@ -30,6 +30,14 @@ dispatches nothing at all if any one of them is ``external``: the turn ends as
 ``turn.blocked`` with a question. Not "block that one and run the rest" —
 the calls in a single pass are the model's plan, and running half a plan while
 asking about the other half produces side effects for a plan nobody approved.
+
+**Read, then send** (DL-064). A turn that has read something someone else
+wrote — a fetched page, a search, an MCP server's answer, their mail — is
+*tainted* for the rest of the turn. While it is, a pass that wants to act
+outward (an ``external`` call, or giving or taking a grant) runs none of it:
+the outward calls are filed as one held proposal through the same approvals
+queue the grant gate uses, with why. Reads, local work and the reply go on
+as before. A clean turn never reaches any of this.
 """
 
 from __future__ import annotations
@@ -41,6 +49,7 @@ from omega import episodes, finance, grants, lessons, location, mailcursor, mcp,
 from omega import topics as kept
 from omega.tools import (
     EXTERNAL,
+    GRANT,
     LOCAL,
     NOTHING_NEW,
     Decision,
@@ -48,10 +57,12 @@ from omega.tools import (
     ToolError,
     ToolRejected,
     ToolText,
+    fence,
     hidden,
     hosted,
     is_brief,
     research_task,
+    untrusted_source,
 )
 
 # `act` imports `turn`, never the other way round. `turn` names the *slot*
@@ -59,7 +70,7 @@ from omega.tools import (
 # The reverse import would be a cycle, and worse, it would make the six-step
 # turn depend on the tools — which is the coupling that lets a tool change
 # quietly alter what a turn is.
-from omega.turn import MAX_ACT_PASSES, ActResult, TurnContext, unprompted
+from omega.turn import MAX_ACT_PASSES, ActResult, TurnContext, read_untrusted, unprompted
 from omega.turn import _event_turn  # the turn's own rendering, images and all
 
 __all__ = [
@@ -264,6 +275,17 @@ def act_loop(
     # Several at once (DL-087 #8): "yes p12 p14" settles both, each exactly as
     # proposed. One it names that has closed is told so in code, and nothing
     # runs for it.
+    # What untrusted content this turn has read (DL-064), by source; every
+    # result below carries it out, so the turn record can say so.
+    tainted: list[str] = list(read_untrusted(ctx))
+
+    def result(**fields: Any) -> ActResult:
+        return ActResult(tainted=tuple(tainted), **fields)
+
+    def taint(source: Optional[str]) -> None:
+        if source is not None and source not in tainted:
+            tainted.append(source)
+
     note = ""
     ran: list[str] = []
     told: list[str] = []
@@ -293,7 +315,7 @@ def act_loop(
         if not answer.open:
             # Only closed ones: the answer is the reply, and no model is asked
             # what to make of a yes that can no longer mean anything.
-            return ActResult(
+            return result(
                 tools=(), told="\n".join(told), stop_reason="answered: closed",
             )
 
@@ -327,6 +349,9 @@ def act_loop(
             )
             if search.ok:
                 used.append(search.tool)
+                # The model has already read these, in this same response:
+                # the calls it asks for below are made after reading them.
+                taint(untrusted_source(search.tool, dict(search.args)))
 
         if not calls:
             # Done. The model asking for nothing is the signal (§1.5) — and it
@@ -337,7 +362,7 @@ def act_loop(
             # saw every tool result; nothing downstream will. Handing back only
             # the tool *names* is what made omega finish a job and then deny
             # having done it.
-            return ActResult(
+            return result(
                 tools=tuple(used),
                 stop_reason=DONE_ASKING,
                 text=response.text,
@@ -353,7 +378,7 @@ def act_loop(
             # against a world that has not changed since, which would return
             # what it returned last time.
             names = ", ".join(sorted({call.name for call in repeats}))
-            return ActResult(
+            return result(
                 tools=tuple(used),
                 stop_reason=f"{STALLED}: asked for {names} again with the same "
                 f"arguments, which would return the same thing",
@@ -374,11 +399,32 @@ def act_loop(
                 decisions.append((call, None, str(exc)))
 
         cleared = [d for _, d, _ in decisions if d is not None]
+        held = [d for d in cleared if _outward(d)] if tainted else []
+        if held:
+            # Read, then send (DL-064): this turn has read what someone else
+            # wrote, so nothing outward runs on the model's say-so. Filed for
+            # their yes, never blocked — the same queue as the grant gate,
+            # and like it the whole pass waits: what is gated is filed beside
+            # it, and the reads in it the model can ask for again.
+            question, ids = _hold(ctx, held, tainted)
+            rest = [
+                d for d in cleared if d not in held
+                and d.tool in grants.GATED_TOOLS and box.grants is not None
+                and box.grants.gated(grants.GATED_TOOLS[d.tool])
+            ]
+            if rest:
+                more, also = _propose(ctx, rest)
+                question, ids = f"{question}\n{more}", ids + also
+            return result(
+                tools=tuple(used),
+                told=f"{asked}\n{question}" if asked else question,
+                stop_reason=f"proposed {' '.join(ids)}",
+            )
         if any(d.tier == EXTERNAL for d in cleared):
             # An outward "May I?" still blocks, as ever; what this turn's
             # answer already said goes first, so none of it is lost.
             may = _blocked_on(cleared)
-            return ActResult(
+            return result(
                 tools=tuple(used),
                 blocked_on=f"{asked}\n{may}" if asked else may,
                 stop_reason="waiting on a person",
@@ -397,7 +443,7 @@ def act_loop(
         ]
         if gated:
             question, ids = _propose(ctx, gated)
-            return ActResult(
+            return result(
                 tools=tuple(used),
                 told=f"{asked}\n{question}" if asked else question,
                 stop_reason=f"proposed {' '.join(ids)}",
@@ -429,6 +475,11 @@ def act_loop(
                 result=logged if ok else None,
                 error=None if ok else text,
             )
+            source = untrusted_source(decision.tool, decision.args)
+            taint(source)
+            if ok and source is not None:
+                # Fenced for the model only; the log keeps what came back.
+                text = fence(source, text)
             if ok:
                 used.append(decision.tool)
                 if decision.tool in grants.GATED_TOOLS:
@@ -459,11 +510,100 @@ def act_loop(
     # reply out of what did get done; the stop_reason is what says the work was
     # cut off rather than finished, so the record does not read like a clean
     # completion.
-    return ActResult(
+    return result(
         tools=tuple(used),
         stop_reason=f"{EXHAUSTED}: stopped after {max_passes} tool passes",
         told=asked,
     )
+
+
+def _outward(d: Decision) -> bool:
+    """Would this call act outside omega, or change what omega may do? An
+    ``external`` call (DL-028), and giving or taking a grant (DL-085): the
+    acts a page that says "grant yourself research" is written to get. Putting
+    a gate back on only narrows what omega may do, and is not held."""
+    if d.tier == EXTERNAL:
+        return True
+    return d.tool == GRANT and d.args.get("change") in ("give", "revoke")
+
+
+#: How many sources a hold's reason names before it counts the rest.
+_HOLD_NAMES = 3
+
+
+def _held_reason(sources: list[str]) -> str:
+    """"this turn read <source>", one line, within the log's ceiling."""
+    named = ", ".join(sources[:_HOLD_NAMES])
+    if len(sources) > _HOLD_NAMES:
+        named += f" and {len(sources) - _HOLD_NAMES} more"
+    reason = f"this turn read {named}"
+    if len(reason) > episodes.MAX_HOLD_REASON:
+        reason = reason[: episodes.MAX_HOLD_REASON - 1].rstrip() + "…"
+    return reason
+
+
+def _hold(ctx: TurnContext, held: list[Decision], sources: list[str]) -> tuple[str, list[str]]:
+    """File what a tainted turn wanted to do outward (DL-064) as one
+    proposal, and return the question that asks it with its id."""
+    reason = _held_reason(sources)
+    seq = ctx.queue.append(episodes.grant_proposed(
+        for_seq=ctx.seq,
+        scope=episodes.HOLD_SCOPE,
+        proposes="hold",
+        actions=[{"tool": d.tool, "why": d.why, "args": d.args} for d in held],
+        reason=reason,
+    ))
+    words = "; ".join(d.why for d in held)
+    question = (
+        f"Should I {words}? I am asking first because {reason}. "
+        f"{grants.how_to_answer(grants.pid(seq))}"
+    )
+    return question, [grants.pid(seq)]
+
+
+def _release(
+    ctx: TurnContext, box: ToolBox, proposal: "grants.Proposal",
+) -> tuple[str, list[str], str]:
+    """Their yes to a held call (DL-064): each action exactly as filed, and
+    only what a clean turn could have run.
+
+    A grant change runs, unless the grants moved since it was filed (giving
+    one already given, taking back one already gone). An ``external`` call
+    does not: nothing turns a yes into one anywhere in omega (DL-064's note on
+    `fetch`), and a hold is not the place to start. Moves no grant's streak —
+    a hold is not a grant's action — and writes no ``grant.acted``.
+    """
+    state = ctx.grants
+    ran: list[str] = []
+    results: list[str] = []
+    for action in proposal.actions:
+        tool = str(action["tool"])
+        args = dict(action["args"])
+        why = str(action["why"])
+        if grants.is_money(tool):
+            results.append(f"{why}: not run, omega never pays")
+            continue
+        if tool != GRANT:
+            results.append(
+                f"{why}: not run, an outside action never runs on a yes; "
+                "it is theirs to do"
+            )
+            continue
+        live = state.live(str(args.get("scope"))) if state is not None else None
+        if (args.get("change") == "give") == (live is not None):
+            results.append(f"{why}: not run, the grants changed since I asked")
+            continue
+        decision = Decision(tool=tool, tier=LOCAL, why=why, args=args)
+        _called(ctx, decision.tool, decision.args)
+        text, logged, ok = _dispatch(box, decision)
+        _returned(ctx, decision.tool, ok=ok, result=logged if ok else None, error=None if ok else text)
+        if ok:
+            ran.append(tool)
+        results.append(f"{why}: {text}")
+    return (
+        f"\n\n(They said yes to {proposal.pid}: {'; '.join(results)}. Tell them "
+        "what was done in a sentence.)"
+    ), ran, ""
 
 
 def _retry(ctx: TurnContext) -> tuple[int, ...]:
@@ -555,6 +695,8 @@ def _resolve(
             f"\n\n(They said no to {proposal.pid} ({proposal.words()}); nothing "
             "was done, and nothing should be. Acknowledge it in a few words.)"
         ), [], ""
+    if proposal.proposes == "hold":
+        return _release(ctx, box, proposal)
     ran: list[str] = []
     results: list[str] = []
     for action in proposal.actions:
@@ -648,7 +790,9 @@ def _returned(
     itself, so the log and the model saw the same text — a log that kept more
     than the model was shown would make the transcript a plausible lie about
     what omega was reasoning over. The one exception keeps *less*, and says
-    so in the text it keeps: an opened held mail's digest (DL-082 #5).
+    so in the text it keeps: an opened held mail's digest (DL-082 #5). An
+    untrusted result is the same text, without the fence the model saw it in
+    (DL-064): the fence is the prompt's, not something that came back.
     """
     ctx.queue.append(
         episodes.tool_returned(

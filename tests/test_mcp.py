@@ -20,7 +20,7 @@ from omega.act import DONE_ASKING, _REMOTE_RULES, act_loop
 from omega.memory import MemoryStore
 from omega.provider import ToolCall
 from omega.queue import EventQueue
-from omega.tools import EXPLORATION, MAX_RESULT_CHARS, ToolBox, ToolError, ToolRejected
+from omega.tools import EXPLORATION, MAX_RESULT_CHARS, ToolBox, ToolError, ToolRejected, fence
 from omega.turn import TurnContext
 
 AT = "2026-10-11T12:00:00+00:00"
@@ -434,10 +434,11 @@ def test_the_act_loop_offers_calls_and_logs_a_remote_tool(q: EventQueue, tmp_pat
     called, returned = tool_episodes(q, c.seq)
     assert called["tool"] == "github__list_pull_requests" and called["args"] == {"repo": "omega"}
     assert returned["ok"] is True
-    # The log kept exactly what the model was shown.
+    # The log kept what the model was shown, less the fence around it.
     second = fp.calls_for(provider.ACT)[1]
     shown = [m["content"] for m in second if m.get("role") == "tool"]
-    assert shown == [returned["result"]]
+    # Fenced as data for the model only (DL-064); the content is the same.
+    assert shown == [fence("the github MCP server", returned["result"])]
     assert returned["result"].startswith("(Result from the github MCP server")
     assert TOKEN not in json.dumps([p.payload for p in q.recent(50)])
 

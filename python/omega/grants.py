@@ -244,6 +244,8 @@ class Proposal:
     proposes: str  # "action" or "drop_gate"
     actions: tuple[dict[str, Any], ...] = ()
     at: str = ""  # when it was asked
+    #: Why a held call was held (DL-064): "this turn read ...". Empty otherwise.
+    reason: str = ""
 
     @property
     def pid(self) -> str:
@@ -253,7 +255,8 @@ class Proposal:
         """What it asks, in words a person can answer."""
         if self.proposes == "drop_gate":
             return f"stop asking first before {self.scope} actions"
-        return "; ".join(str(a.get("why", a.get("tool"))) for a in self.actions)
+        words = "; ".join(str(a.get("why", a.get("tool"))) for a in self.actions)
+        return f"{words} ({self.reason})" if self.reason else words
 
 
 @dataclass(frozen=True)
@@ -426,6 +429,7 @@ class Grants:
                 proposes=payload["proposes"],
                 actions=tuple(dict(a) for a in payload["actions"]),
                 at=str(payload.get("at", "")),
+                reason=str(payload.get("reason", "")),
             )
         elif kind == episodes.GRANT_ANSWERED:
             p = self._pending.pop(int(payload["proposal"]), None)

@@ -506,7 +506,9 @@ GOLDEN = {
     "decisions": "2c4dce3c91de59c6a04cae8410eff9fc2289959ec56142f4804f9d1e0fb8c190",
     "mail": "804f1d2668f4ae0779d57ed156443b465043318c19e29ae63d20f391362fad0a",
     "sweep": "a82b1e92db42f1f10e7e4cf8f5565991002744e5368e81feb200250f970d5da0",
-    "look": "4ac1cf050c5fab95ca302e037470ced8af2bd7fd209dcc043a9dedababc7c64b",
+    # A look that lists mail fences it as data (DL-064); with that fence taken
+    # out, the look's records digest to the value this golden had before it.
+    "look": "df81b5def046c6e98e9eea7a11f9f25e70a2d5fc2726ee00ad2a956734583ed3",
 }
 
 _ISO = re.compile(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?(?:[+-]\d\d:\d\d|Z)?")

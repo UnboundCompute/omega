@@ -36,6 +36,8 @@ from typing import Any, Callable, Optional, Sequence
 from omega import blobs, derive, episodes, grants as granted, learn, lessons as self_taught, notice, provider, schedule
 from omega import location as whereabouts
 from omega.tools import (
+    INBOX_SOURCE,
+    MAIL,
     NOTHING_NEW,
     FOLLOW_UP,
     REPORT,
@@ -47,6 +49,7 @@ from omega.tools import (
     is_research,
     is_tell,
     is_watch,
+    fence_open,
     must_speak,
     told,
 )
@@ -259,6 +262,10 @@ class ActResult:
     #: the question a proposal asks, with its id and how to answer it, and
     #: "that one's closed" for an answer that came too late. Never blocks.
     told: str = ""
+    #: The untrusted content the turn read (DL-064), by source: a URL, an MCP
+    #: server, their inbox. Empty for a clean turn, which is every turn that
+    #: read none.
+    tainted: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -353,6 +360,35 @@ def unprompted(ctx: "TurnContext") -> bool:
     if ctx.event.get("kind", episodes.MESSAGE_INBOUND) != episodes.MESSAGE_INBOUND:
         return True
     return str(ctx.event.get("channel", "")) in UNPROMPTED_CHANNELS
+
+
+#: What a turn opening its own mail reads back in recall (`_mail_digest`):
+#: one line of From and Subject, which the sender wrote.
+RECALLED_MAIL = "a mail opened earlier"
+
+
+def read_untrusted(ctx: "TurnContext") -> tuple[str, ...]:
+    """The untrusted content a turn holds before it calls anything (DL-064).
+
+    A look that listed their mail, as its own event or recalled, and a mail
+    opened in a recalled turn, whose From and Subject recall renders. Read
+    from structure only: the look's text is omega's own (its inbox block is
+    fenced by :func:`omega.notice.situation`), and a person's message is never
+    inspected, so nothing they type can taint or clean a turn.
+    """
+    found: list[str] = []
+    marker = fence_open(INBOX_SOURCE)
+    for payload in [ctx.event, *(p.payload for p in ctx.recalled)]:
+        kind = payload.get("kind")
+        if (
+            kind == episodes.MESSAGE_INBOUND
+            and str(payload.get("channel", "")) == notice.CHANNEL
+            and marker in str(payload.get("text", ""))
+        ):
+            found.append(INBOX_SOURCE)
+        elif kind == episodes.TOOL_RETURNED and payload.get("ok") and payload.get("tool") == MAIL:
+            found.append(RECALLED_MAIL)
+    return tuple(dict.fromkeys(found))
 
 
 def is_look(ctx: "TurnContext") -> bool:
@@ -582,8 +618,12 @@ def write_memory(
     usage: Optional[list[dict[str, Any]]] = None,
     judged: Optional[str] = None,
     at: Optional[str] = None,
+    tainted: Sequence[str] = (),
 ) -> int:
     """Step 6 — append the turn's terminal record and return its seq.
+
+    ``tainted`` is what untrusted content the turn read (DL-064); empty, the
+    record is the one it always was.
 
     Carries ``write_key = "turn:N"`` (:func:`omega.episodes.turn_write_key`), so
     a second terminal record for the same turn is rejected **by the log** with
@@ -600,7 +640,9 @@ def write_memory(
     if outcome == "blocked":
         if not needs:
             raise ValueError("a blocked turn must say what it needs")
-        payload = episodes.blocked(for_seq=seq, needs=needs, usage=usage, at=at)
+        payload = episodes.blocked(
+            for_seq=seq, needs=needs, usage=usage, at=at, tainted=list(tainted)
+        )
     else:
         payload = episodes.completed(
             for_seq=seq,
@@ -611,6 +653,7 @@ def write_memory(
             usage=usage,
             judged=judged,
             at=at,
+            tainted=list(tainted),
         )
     return queue.append(payload, episodes.turn_write_key(seq))
 
@@ -817,6 +860,13 @@ def run_turn(
 
     verdict: Optional[Verdict] = None
     acted = ActResult()
+    # DL-064: what untrusted content the turn read lasts the whole turn and
+    # lands on its record — what it held before acting, and what acting read.
+    held = read_untrusted(ctx)
+
+    def tainted() -> tuple[str, ...]:
+        return tuple(dict.fromkeys((*held, *acted.tainted)))
+
     try:
         verdict = judge(ctx)
         if verdict.choice != ACT_THEN_SPEAK and not unprompted(ctx) and granted.answers(
@@ -877,6 +927,7 @@ def run_turn(
                     needs=acted.blocked_on,
                     usage=meter.usage(),
                     at=at,
+                    tainted=tainted(),
                 )
                 return TurnResult(
                     seq=pending.seq,
@@ -900,6 +951,7 @@ def run_turn(
             usage=meter.usage(),
             judged=_judged(verdict),
             at=at,
+            tainted=tainted(),
         )
         return TurnResult(
             seq=pending.seq,
@@ -935,6 +987,7 @@ def run_turn(
             usage=meter.usage(),
             judged=_judged(verdict),
             at=at,
+            tainted=tainted(),
         )
         return TurnResult(
             seq=pending.seq,
@@ -975,6 +1028,7 @@ def run_turn(
         usage=meter.usage(),
         judged=_judged(verdict),
         at=at,
+        tainted=tainted(),
     )
     return TurnResult(
         seq=pending.seq,

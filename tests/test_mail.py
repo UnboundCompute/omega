@@ -312,7 +312,8 @@ def test_ordinary_opened_mail_is_logged_in_full(
 ) -> None:
     _served(monkeypatch, {4: {}})
     fp, returned = _run(q, "self")
-    assert returned["ok"] is True and returned["result"] == _handed(fp)
+    # The log keeps what came back; the model saw it fenced as data (DL-064).
+    assert returned["ok"] is True and tools.fence("mail #4", returned["result"]) == _handed(fp)
 
 
 # --------------------------------------------------------------------------
