@@ -1530,19 +1530,6 @@ def _unwatch(box: "ToolBox", args: dict[str, Any]) -> str:
 
 # --- standing grants (DL-085) --------------------------------------------------
 
-#: Words their message must contain for ``grant`` to *give* a scope: the grant
-#: is theirs to give, so the message that gives it has to be about it.
-_GRANT_WORDS = {
-    grants.RESEARCH: ("research", "look into", "dig into", "investigate", "find out"),
-    grants.TIDY: ("tidy", "clean up", "clean", "watches", "reminders"),
-    grants.PROMISES: (
-        "promise", "commit", "hold me to", "keep me to", "my word",
-        "what i say i'll", "what i said i'd", "remind me of what i",
-    ),
-    grants.TOPICS: (
-        "topic", "keep up", "keep track", "keep me posted", "what i keep asking",
-    ),
-}
 _GRANT_CHANGES = ("give", "revoke", "restore_gate")
 
 
@@ -1574,12 +1561,6 @@ def _classify_grant(box: "ToolBox", args: dict[str, Any]) -> Decision:
         raise ToolRejected(f"{GRANT}'s 'change' is one of {list(_GRANT_CHANGES)}")
     live = _live(box, scope)
     if change == "give":
-        said = box.said.lower()
-        if not any(w in said for w in _GRANT_WORDS[scope]):
-            raise ToolRejected(
-                f"their message does not ask for the {scope} grant; give it only "
-                "when they say so in their own words"
-            )
         if live is not None:
             raise ToolRejected(f"the {scope} grant is already given")
     elif live is None:
@@ -3875,8 +3856,9 @@ class ToolBox:
     #: nobody told fails closed: every grant tool refuses.
     grants: Any = None
 
-    #: Their own words, when their message started the turn: ``grant`` gives
-    #: a scope only if the message asks for it. Empty otherwise.
+    #: Their own words, when their message started the turn; empty otherwise.
+    #: No offer and no gate reads it: what a message asks for is the model's
+    #: to judge, and what may run is decided by the turn's shape.
     said: str = ""
 
     #: The research task a follow-up fire carries, or ``None``.

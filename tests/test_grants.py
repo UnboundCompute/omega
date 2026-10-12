@@ -181,10 +181,14 @@ def test_a_box_nobody_told_refuses_to_grant(tmp_path) -> None:
         box.classify("grant", {"scope": "tidy", "change": "give"})
 
 
-def test_a_message_that_does_not_ask_for_it_gives_nothing(q: EventQueue) -> None:
-    seq = say(q, "what's the weather")
+def test_no_word_list_decides_a_grant_on_their_own_message(q: EventQueue) -> None:
+    # Whether their message asks for a grant is the model's to judge: however
+    # they put it, a give on their own message, before anything from outside
+    # is in the turn, is taken.
+    seq = say(q, "u can go dig stuff up 4 me whenever")
     turn(q, seq, act=[call("grant", scope="research", change="give"), "ok"])
-    assert kinds(q, episodes.GRANT_GIVEN) == []
+    [given] = kinds(q, episodes.GRANT_GIVEN)
+    assert given["scope"] == "research" and given["for_seq"] == seq
 
 
 def test_only_two_grants_exist(q: EventQueue) -> None:
