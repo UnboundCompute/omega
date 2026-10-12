@@ -1124,8 +1124,20 @@ def test_a_nudge_reaches_the_wire_and_the_look_behind_it_does_not(
     stray `message.inbound` as `role: .user`, so projecting it would put omega's
     internal digest in the conversation as something the person said.
     """
-    with runtime_at(store_dir, _reads_transcripts("you left it dirty"),
-                    sense=0.0, nudge=0) as rt:
+    # nudge=0 lets a second look run before the runtime stops, and whether it
+    # had was down to thread timing: two spoken looks failed the exact count
+    # below. The judge speaks for "morning" and the first look, the only two
+    # turns the drain can reach first, and stays silent after, so how many
+    # looks ran no longer changes what crossed to the wire.
+    fake = _reads_transcripts("you left it dirty")
+    judged = []
+
+    def judge(role: str, messages: list) -> str:
+        judged.append(role)
+        return "SPEAK" if len(judged) <= 2 else "SILENT"
+
+    fake._answers[provider.JUDGE] = judge
+    with runtime_at(store_dir, fake, sense=0.0, nudge=0) as rt:
         rt.say("morning")
         assert until(
             lambda: any(

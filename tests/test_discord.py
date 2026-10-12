@@ -356,7 +356,18 @@ def test_presence_reads_the_latest_report(client: ChannelClient) -> None:
     assert client.presence()["at_the_mac"] is True
 
 
-def test_presence_goes_stale(client: ChannelClient, clock: dict[str, datetime]) -> None:
+def test_presence_goes_stale(
+    client: ChannelClient, clock: dict[str, datetime], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The report is stamped by `episodes.now`, at second resolution, and its
+    # age read against this clock. Left on the wall clock, a second ticking
+    # over between the fixture and the report made the age 599.99 s, a hair
+    # under stale. Stamped from the same clock, the age is exactly the ten
+    # minutes moved below.
+    monkeypatch.setattr(
+        episodes, "now", lambda: clock["now"].replace(microsecond=0).isoformat()
+    )
+    clock["now"] = clock["now"].replace(microsecond=0)
     presence(client, idle=30.0)
     clock["now"] += timedelta(minutes=10)
     assert client.presence()["at_the_mac"] is False

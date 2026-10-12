@@ -127,7 +127,13 @@ def test_case_36_concurrent_readers_during_appends(store: MemoryStore) -> None:
     def reader() -> None:
         try:
             reads = 0
-            while not stop.is_set() or reads < 3:
+            finished = False
+            while not finished or reads < 3:
+                # Taken before the read, so the last pass is one that began
+                # after the writer finished. Checked after it, a reader mid-read
+                # when the last append landed stopped on 399 of 400, and the
+                # max(observed) below failed on thread timing.
+                finished = stop.is_set()
                 episodes = list(store.episodes_since(0))
                 seqs = [e.seq for e in episodes]
                 assert seqs == list(range(1, len(episodes) + 1)), "gap in the view"

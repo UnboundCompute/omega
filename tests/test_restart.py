@@ -13,17 +13,16 @@ as a pass.
 from __future__ import annotations
 
 import os
-import random
 import re
 import signal
 import subprocess
 import sys
-import time
 from pathlib import Path
 
 import pytest
 
 import invariants
+import loop_child
 from omega import episodes, provider
 from omega.executor import INTERRUPTED_ERROR, Executor
 from omega.memory import MemoryStore
@@ -187,24 +186,38 @@ def test_a_restart_never_re_runs_the_work(store_dir: Path) -> None:
 def test_kill9_at_a_random_moment_leaves_a_gradeable_queue(
     store_dir: Path, trial: int
 ) -> None:
-    """The randomized case: the kill lands wherever it lands.
+    """The randomized case, with the kill point injected rather than timed.
 
-    Between the first append and the last DONE there are five distinct windows
-    — mid-append, after claim, after the record but before DONE, between turns,
-    and idle — and a fixed delay would only ever probe one of them. Each trial
-    kills at a random offset and then grades the reopened queue against the
-    violation metric.
+    Between the first append and the last DONE there are six distinct windows
+    — before an append, after claim, mid-turn, after the record but before
+    DONE, halfway through skipping a record, and between turns — and a fixed
+    delay would only ever probe one of them. Each trial parks the child in one
+    of the six, at its first to fourth time there (``loop_child.POINTS``),
+    kills it there and then grades the reopened queue against the violation
+    metric. The judge's choices still come from the trial's seed.
+
+    It used to sleep a random 5-120 ms and kill wherever the child had got to.
+    On a loaded machine the child often had not reached a turn in that window,
+    so the control case below failed for want of a mid-turn kill: a test of
+    the machine's speed, not of recovery.
     """
-    proc = _spawn("churn", str(store_dir), str(1000 + trial))
+    point = loop_child.POINTS[trial % len(loop_child.POINTS)]
+    nth = 1 + trial // len(loop_child.POINTS)
+    proc = _spawn("churn", str(store_dir), str(1000 + trial), point, str(nth))
     try:
         first = proc.stdout.readline().strip()
         assert APPEND_RE.match(first), (
             f"child never got going: {first!r} {proc.stderr.read()!r}"
         )
-        time.sleep(random.uniform(0.005, 0.120))
+        lines = [first]
+        while not lines[-1].startswith("PARKED "):
+            line = proc.stdout.readline()
+            assert line, f"child exited before parking: {lines} {proc.stderr.read()!r}"
+            lines.append(line.strip())
+        assert lines[-1] == f"PARKED {point} {nth}", lines
         assert proc.poll() is None, f"child died early: {proc.stderr.read()}"
         assert _kill9(proc) == -signal.SIGKILL
-        stdout = first + "\n" + proc.stdout.read()
+        stdout = "\n".join(lines) + "\n" + proc.stdout.read()
         stderr = proc.stderr.read()
     finally:
         if proc.poll() is None:
@@ -254,12 +267,18 @@ def test_kill9_at_a_random_moment_leaves_a_gradeable_queue(
     CHURN.append(
         {
             "trial": trial,
+            "point": point,
             "verdict": graded.verdict,
             "turns": len(acked_turns),
             "events": graded.events,
             "settled": graded.done,
             "interrupted": report.interrupted is not None,
             "released": report.released_record_seq is not None,
+            "finished": (
+                report.interrupted.finished_before_crash
+                if report.interrupted is not None
+                else None
+            ),
         }
     )
 
@@ -292,9 +311,9 @@ def test_the_randomized_trials_actually_determined_something() -> None:
         assert trial["events"] >= 1 and trial["settled"] >= 1, trial
 
     # And across the set, turns really did run to completion under the kill
-    # timings — not merely appends. The bar is deliberately low because the
-    # kill offset is random by design; a zero here would mean every trial died
-    # before its first turn ever finished.
+    # points — not merely appends. The bar is deliberately low because it was
+    # set when the kill offset was random; a zero here would mean every trial
+    # died before its first turn ever finished.
     assert sum(t["turns"] for t in CHURN) >= TRIALS // 4, (
         f"only {sum(t['turns'] for t in CHURN)} turns were acknowledged across "
         f"{TRIALS} trials: {CHURN}"
@@ -304,3 +323,22 @@ def test_the_randomized_trials_actually_determined_something() -> None:
         "no trial was killed inside a turn, so recovery was never exercised; "
         f"trials: {CHURN}"
     )
+
+    # With the kill point injected, each window is hit on purpose, so each must
+    # show the recovery it is there to exercise: a claimed turn with no record
+    # is reported interrupted and unfinished, a recorded one whose cursor had
+    # not followed is reported interrupted but finished, a half-skipped record
+    # is released, and a kill between turns or before an append leaves nothing
+    # to recover.
+    assert {t["point"] for t in CHURN} == set(loop_child.POINTS), CHURN
+    for trial in CHURN:
+        expected = {
+            "append": (False, None, False),
+            "claimed": (True, False, False),
+            "think": (True, False, False),
+            "record": (True, True, False),
+            "skip": (False, None, True),
+            "between": (False, None, False),
+        }[trial["point"]]
+        got = (trial["interrupted"], trial["finished"], trial["released"])
+        assert got == expected, trial

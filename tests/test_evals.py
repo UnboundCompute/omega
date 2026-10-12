@@ -915,7 +915,14 @@ TAKES_IT_BLACK = "I take my coffee black."
 
 
 def _long_probe(opening: str) -> list[str]:
-    """Run one long task and return every ``act`` prompt it produced."""
+    """Run one long task and return every ``act`` prompt it produced.
+
+    Reflection is held off. Its window still holds the opening at the twentieth
+    message, and whether a pass ran there depended on whether the drain went
+    dry before the next line landed — thread timing, which filed the opening as
+    a learned claim on a loaded machine and failed the horizon check. Neither
+    case here is about reflection, so it does not run.
+    """
     complete, prompts = _prompt_watcher()
     scenario = Scenario(
         name="long-probe",
@@ -923,7 +930,9 @@ def _long_probe(opening: str) -> list[str]:
         capability=evals._recalls("black"),
         violation=evals._stayed_quiet_as_it_grew,
     )
-    evals.run_once(scenario, complete=complete)
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(executor, "REFLECT_EVERY", evals.FILLERS * 10)
+        evals.run_once(scenario, complete=complete)
     return prompts
 
 
