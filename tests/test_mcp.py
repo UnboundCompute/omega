@@ -15,7 +15,7 @@ from typing import Any, Callable, Optional
 
 import pytest
 
-from omega import episodes, mcp, provider
+from omega import episodes, mcp, provider, tools
 from omega.act import DONE_ASKING, _REMOTE_RULES, act_loop
 from omega.memory import MemoryStore
 from omega.provider import ToolCall
@@ -484,6 +484,9 @@ def test_without_configuration_the_act_loop_offers_what_it_always_did(
 
     # Ring 1 as a prompted turn with no grants is offered it: the DL-085
     # tools that need a grant, a research task or a past action stay hidden.
+    # `location` is offered on every turn of theirs with a log (DL-091).
+    assert tools.LOCATION in [t.get("function", {}).get("name") for t in offered]
+    offered = [t for t in offered if t.get("function", {}).get("name") != tools.LOCATION]
     # DL-094: look_back rides every turn that can read the log, last of Ring 1.
     look_back = ToolBox(store_root=q.store.root, history=list).schemas()[-1]
     assert offered == schemas(hidden(ToolBox(store_root=q.store.root, prompted=True))) + [

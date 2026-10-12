@@ -64,7 +64,6 @@ __all__ = [
     "describe",
     "context_line",
     "place_name",
-    "speaks_of_place",
     "parse_when",
     "Settings",
     "settings",
@@ -319,30 +318,6 @@ def place_name(text: str) -> str:
     return _SPACES.sub(" ", text).strip().strip(".,;:!?").strip().casefold()
 
 
-#: Words that make their message about where they are or where something is:
-#: "I'm at", "where was I", "near me", "directions", "save this place". Read
-#: only to decide whether the ``location`` tool is offered on a turn over a
-#: log with no fix and no saved place yet, so that such a turn is offered
-#: exactly what it always was. A miss costs one offer; once there is a fix
-#: (the phone's, say) the tool is offered on every turn of theirs.
-_PLACE_WORDS = re.compile(
-    r"(?<![\w'])("
-    r"i'?m (?:at|in|home|back)|i am (?:at|in|home|back)|im (?:at|in|home)|"
-    r"(?:arrived|landed|heading|headed|on my way|staying|checked in)\b|"
-    r"where (?:am|was|were|have) i|where i (?:am|was)|"
-    r"near(?:by| me| here)|around (?:me|here)|close to (?:me|here)|"
-    r"locations?|places?|directions?|route|how far|commute|"
-    r"(?:my|the) (?:home|office|hotel|address)|at home|at work|"
-    r"save (?:this|here|it)|i'?m here|i am here|from here"
-    r")"
-)
-
-
-def speaks_of_place(text: str) -> bool:
-    """Does their message talk about where they are, or where somewhere is?"""
-    return bool(_PLACE_WORDS.search(_SPACES.sub(" ", text.replace("\u2019", "'")).casefold()))
-
-
 _COORDS = re.compile(r"^\s*(-?\d{1,3}(?:\.\d+)?)\s*,\s*(-?\d{1,3}(?:\.\d+)?)\s*$")
 
 
@@ -409,17 +384,28 @@ def parse_when(text: str, now: datetime) -> Optional[datetime]:
 # --- what the tool answers --------------------------------------------------------
 
 
+#: What ``where`` adds when there is no fix or only a stale one: how they
+#: can give one, and that a place recalled from earlier conversation is
+#: only ever where they were as of when they said it.
+_UNKNOWN_HELP = (
+    "They can say \"I'm at <place>\", save a place (\"home is <address>\"), or "
+    "set up the iPhone Shortcut. A place recalled from earlier conversation "
+    "is not where they are now: give it only with its date (\"as of ...\")."
+)
+
+
 def where_text(state: State, now: datetime, when: Optional[datetime] = None) -> str:
     """``where``: now, or as of ``when``."""
     if when is None:
         fix = state.current
         if fix is None:
-            return "no location recorded: they have not said where they are"
+            return f"no location recorded: they have not said where they are. {_UNKNOWN_HELP}"
         line = f"{describe(fix)}, as of {_clock(fix.at, now)} via {_VIA[fix.source]}"
         if fresh(fix, now):
             return f"their location: {line}"
         return (f"not known now; last known {line}, {_age(now - fix.at)} ago "
-                f"(older than {FRESH_SECONDS // 3600} hours, so not where they are now)")
+                f"(older than {FRESH_SECONDS // 3600} hours, so not where they are now). "
+                f"{_UNKNOWN_HELP}")
     fix = state.at_or_before(when)
     if fix is None:
         return "no location recorded at or before then"

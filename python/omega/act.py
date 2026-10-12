@@ -266,7 +266,6 @@ def act_loop(
             # DL-091: where they are, folded from the log when the tool asks,
             # and only in a turn their own message started.
             locations=(lambda: location.fold(ctx.queue.store)) if not unprompted(ctx) else None,
-            located=bool(ctx.location),
             # DL-094: the whole past conversation, read through the store the
             # turn holds, on every turn kind (as `recall` is offered).
             history=lambda: lookback.past(ctx.queue.store, before=ctx.seq),

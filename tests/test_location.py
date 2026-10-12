@@ -265,25 +265,54 @@ def test_no_record_renders_and_offers_exactly_as_no_location_at_all(tmp_path) ->
     assert rendered[0] == rendered[1] == rendered[2]
 
 
-def test_with_nothing_recorded_the_tool_is_offered_only_when_they_speak_of_place(q: EventQueue) -> None:
+def test_with_nothing_recorded_the_tool_is_offered_on_every_turn_of_theirs(q: EventQueue) -> None:
     from omega.tools import ToolBox, hidden, hosted, schemas
 
+    # Whether a question needs where they are is the model's to judge: no
+    # word list decides the offer, so any phrasing of theirs is offered it.
     _, plain = turn_with(q, "what's on tuesday", ["Nothing."])
+    assert tools.LOCATION in offered(plain)
     # DL-094: every act turn is now also offered `look_back`, past location.
-    assert plain.offers_for(provider.ACT)[0] == schemas(
+    assert [s for s in plain.offers_for(provider.ACT)[0]
+            if s.get("function", {}).get("name") != tools.LOCATION] == schemas(
         hidden(ToolBox(store_root=q.store.root, prompted=True))) + [
         ToolBox(store_root=q.store.root, history=list).schemas()[-1]] + hosted()
-    _, near = turn_with(q, "find coffee near me", ["Where are you?"])
-    assert tools.LOCATION in offered(near)
-    # Once there is a fix, every one of their turns is offered it.
+    for words in ("find coffee near me", "wher am i?", "whre am i", "am I near the office?",
+                  "which city is this", "location?", "hello"):
+        _, fp = turn_with(q, words, ["Hmm."])
+        assert tools.LOCATION in offered(fp), words
     q.append(fix_at(1))
     _, after = turn_with(q, "what's on tuesday", ["Nothing."])
     assert tools.LOCATION in offered(after)
-    for words, expected in (("I'm at the office", True), ("I\u2019m home", True),
-                            ("where was I at noon", True), ("give me directions", True),
-                            ("what PRs are open?", False), ("Here is the doc", False),
-                            ("remind me at 5", False), ("hello", False)):
-        assert location.speaks_of_place(words) is expected, words
+    # Still never on a turn they did not start.
+    _, brief = turn_with(q, "Daily brief you promised them: the day", ["Nothing."],
+                         channel="schedule", schedule_id="brief")
+    assert tools.LOCATION not in offered(brief)
+
+
+def test_where_with_no_fix_says_how_to_give_one_and_dates_a_recalled_place(q: EventQueue) -> None:
+    _, fp = turn_with(q, "wher am i?", [call(tools.LOCATION, action="where"), "Unsure."])
+    answer = results(fp)
+    assert "no location recorded" in answer
+    assert "I'm at <place>" in answer and "home is <address>" in answer
+    assert "iPhone Shortcut" in answer and "as of" in answer and "not where they are now" in answer
+    q.append(fix_at(600, source="said", label="the office"))
+    _, fp = turn_with(q, "where am I", [call(tools.LOCATION, action="where"), "Unsure."])
+    stale = results(fp)
+    assert "last known the office" in stale and "iPhone Shortcut" in stale
+    assert "give it only with its date" in stale
+    q.append(fix_at(5, source="said", label="the station"))
+    _, fp = turn_with(q, "where am I", [call(tools.LOCATION, action="where"), "The station."])
+    assert "their location: the station" in results(fp) and "iPhone Shortcut" not in results(fp)
+
+
+def test_the_tool_tells_the_model_to_look_before_answering_where() -> None:
+    box = tools.ToolBox(store_root=".", prompted=True, append=lambda p: 1,
+                        locations=lambda: location.State())
+    words = next(s for s in box.schemas()
+                 if s["function"]["name"] == tools.LOCATION)["function"]["description"]
+    assert "Call 'where' before answering" in words
+    assert "never give a place recalled from conversation as current" in words
 
 
 def test_the_section_is_empty_without_a_fix() -> None:

@@ -2309,15 +2309,11 @@ _LOCATION_WRITES = frozenset({"here", "save", "forget"})
 def _locating(box: "ToolBox") -> bool:
     """Is ``location`` there to be called in this box's turn?
 
-    Only on their own message, in a box with the log, and only once there is
-    something to read (a fix or a saved place) or their words are about
-    where they are: a turn over a log without either is offered exactly what
-    it always was.
+    On every turn their own message started, in a box with the log, whether
+    or not anything is recorded yet: whether a question needs where they are
+    is the model's to judge, not a word list's.
     """
-    return bool(
-        box.prompted and box.locations is not None and box.append is not None
-        and (box.located or whereabouts.speaks_of_place(box.said))
-    )
+    return bool(box.prompted and box.locations is not None and box.append is not None)
 
 
 def _location_now(box: "ToolBox") -> datetime:
@@ -3678,8 +3674,10 @@ _LOCATION_TOOL = _Tool(
         "'3 hours ago', an ISO date or time). 'save' names a place (name, and "
         "text, or no text to save where they are now); 'forget' drops a saved "
         "place; 'places' lists them; 'history' lists where they have been over "
-        "'days'. Use it only for their own question, and pass their location "
-        "to another tool only when that question needs it.",
+        "'days'. Call 'where' before answering anything that needs where they "
+        "are now (where they are, what is nearby); never give a place recalled "
+        "from conversation as current. Use it only for their own question, and "
+        "pass their location to another tool only when that question needs it.",
         {
             "action": {"type": "string", "enum": list(_LOCATION_ACTIONS)},
             "text": {"type": "string", "description": "For here and save: the place."},
@@ -3926,8 +3924,6 @@ class ToolBox:
     #: own message, with this and ``append`` set, puts ``location`` in the box;
     #: ``None`` leaves the box exactly as it was.
     locations: Optional[Callable[[], Any]] = None
-    #: Whether the log held a fix or a saved place as of this turn.
-    located: bool = False
     #: The past conversation for ``look_back`` (DL-094): what was said before
     #: this turn's event, read when the tool asks through the store the turn
     #: already holds (:func:`omega.lookback.past`), so the box never opens the
