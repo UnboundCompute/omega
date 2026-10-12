@@ -63,8 +63,10 @@ The defining loop is:
 ### Conversation and delegation
 
 - v1 supports one active conversation well rather than exposing a history browser. A Restore
-  Transcript action can repopulate that surface from omega's durable projected log after New Chat
-  or an app restart; it is recovery, not an archive, search surface, or separate thread system.
+  Transcript action can repopulate that surface with Mac-tray turns from omega's durable projected
+  log after New Chat or an app restart. Messages from Discord and other prompted surfaces remain
+  available to omega's shared memory but do not enter the tray transcript. Restore is recovery,
+  not an archive, search surface, or separate thread system.
 - A New Chat action clears the local conversation surface without creating a second identity,
   deleting episodes, or isolating omega from its durable history. It is unavailable while a
   draft, staged context, or turn is active so nothing is silently discarded.

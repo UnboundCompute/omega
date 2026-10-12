@@ -223,6 +223,22 @@ final class OmegaChannelClientTests: XCTestCase {
     }
 
     @MainActor
+    func testUpdateCodecCarriesTheInboundChannel() throws {
+        let update = try XCTUnwrap(OmegaChannelClient.decodeUpdate([
+            "v": 1,
+            "op": "update",
+            "seq": 42,
+            "state": "understood",
+            "for_seq": 42,
+            "kind": "message.inbound",
+            "text": "hello from Discord",
+            "channel": "discord",
+        ]))
+
+        XCTAssertEqual(update.channel, "discord")
+    }
+
+    @MainActor
     func testUpdateCodecCarriesUnknownStateAndKindForCursorAdvancement() throws {
         let base: [String: Any] = [
             "v": 1,

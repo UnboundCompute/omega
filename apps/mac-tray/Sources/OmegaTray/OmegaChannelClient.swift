@@ -703,6 +703,7 @@ final class OmegaChannelClient: TrayTransport {
             kind: kind,
             text: object["text"] as? String,
             urgency: object["urgency"] as? String,
+            channel: object["channel"] as? String,
             context: context,
             tool: object["tool"] as? String,
             ok: object["ok"] as? Bool,

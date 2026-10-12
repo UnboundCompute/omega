@@ -64,6 +64,9 @@ become a second brain or an undeclared wire protocol.
   note. Omega's normal reply provides the durable claim or schedule receipt. A dedicated composer
   control enters the mode in one click; the overflow menu is not part of the learning path. Staged
   screenshots and other context remain attached and do not disable the teaching control.
+- Keep Restore Transcript surface-local: the tray groups projected updates by their inbound turn,
+  excludes turns whose inbound channel is Discord or another prompted surface, and leaves those
+  turns in omega's durable shared history and memory.
 - Preserve indented continuation lines in learning receipts so replacement details stay attached
   to the claim they qualify, while rendering the complete receipt without truncation.
 - Accept monotonic projection sequence gaps as normal; withheld learning and scheduling episodes

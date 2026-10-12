@@ -204,6 +204,51 @@ final class TrayModelTests: XCTestCase {
     }
 
     @MainActor
+    func testRestoreTranscriptExcludesDiscordTurnsAndTheirReplies() async {
+        let (model, transport) = connectedModel()
+        transport.transcriptUpdates = [
+            .init(
+                seq: 1,
+                forSeq: 1,
+                state: "understood",
+                kind: "message.inbound",
+                text: "Mac question",
+                channel: "tray"
+            ),
+            .init(
+                seq: 2,
+                forSeq: 1,
+                state: "complete",
+                kind: "turn.completed",
+                outcome: "spoke",
+                reply: "Mac answer"
+            ),
+            .init(
+                seq: 3,
+                forSeq: 3,
+                state: "understood",
+                kind: "message.inbound",
+                text: "Discord question",
+                channel: "discord"
+            ),
+            .init(seq: 4, forSeq: 3, state: "working", kind: "tool.called", tool: "fetch"),
+            .init(
+                seq: 5,
+                forSeq: 3,
+                state: "complete",
+                kind: "turn.completed",
+                outcome: "spoke",
+                reply: "Discord answer"
+            )
+        ]
+
+        model.restoreTranscript()
+        await settleTasks()
+
+        XCTAssertEqual(model.messages.map(\.text), ["Mac question", "Mac answer"])
+    }
+
+    @MainActor
     func testFileIsAttachedBeforeItsContextCanBeSent() async throws {
         let (model, transport) = connectedModel()
         let file = FileManager.default.temporaryDirectory

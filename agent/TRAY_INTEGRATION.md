@@ -190,7 +190,7 @@ Pushed updates, after `subscribe`:
 
 ```jsonc
 {"v":1,"op":"update","seq":42,"state":"understood","for_seq":42,"at":"…","kind":"message.inbound",
- "text":"…","urgency":"normal","context":[{"id":"…","kind":"file"}]}
+ "text":"…","urgency":"normal","channel":"tray","context":[{"id":"…","kind":"file"}]}
 
 {"v":1,"op":"update","seq":43,"state":"working","for_seq":42,"at":"…","kind":"tool.called","tool":"read_file"}
 {"v":1,"op":"update","seq":44,"state":"working","for_seq":42,"at":"…","kind":"tool.returned","tool":"read_file","ok":true}
@@ -211,6 +211,10 @@ of either side.
 
 Optional fields are **omitted** rather than sent as null — except `reply`, which is
 meaningfully null and is always present on `complete`/`failed`.
+
+`channel` on `message.inbound` identifies the surface that originated the turn. Restore Transcript
+groups updates by `for_seq` and excludes any turn whose inbound channel is not `tray`; this keeps
+Discord and other prompted surfaces in omega's shared log without mixing them into the Mac UI.
 
 ---
 

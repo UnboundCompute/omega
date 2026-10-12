@@ -506,7 +506,18 @@ final class TrayViewModel: ObservableObject {
     }
 
     private func transcriptMessages(from updates: [TrayUpdate]) -> [TrayMessage] {
-        updates.compactMap { update in
+        let foreignTurnSequences = Set(updates.compactMap { update -> Int? in
+            guard update.state == "understood",
+                  update.kind == "message.inbound",
+                  let channel = update.channel,
+                  !channel.isEmpty,
+                  channel != "tray"
+            else { return nil }
+            return update.forSeq
+        })
+
+        return updates.compactMap { update in
+            guard !foreignTurnSequences.contains(update.forSeq) else { return nil }
             switch update.state {
             case "understood" where update.kind == "message.inbound":
                 let text = update.text?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""

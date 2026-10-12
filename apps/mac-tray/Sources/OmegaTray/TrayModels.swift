@@ -230,6 +230,7 @@ struct TrayUpdate: Equatable, Sendable {
     let kind: String
     let text: String?
     let urgency: String?
+    let channel: String?
     let context: [TrayUpdateContext]
     let tool: String?
     let ok: Bool?
@@ -245,6 +246,7 @@ struct TrayUpdate: Equatable, Sendable {
         kind: String,
         text: String? = nil,
         urgency: String? = nil,
+        channel: String? = nil,
         context: [TrayUpdateContext] = [],
         tool: String? = nil,
         ok: Bool? = nil,
@@ -259,6 +261,7 @@ struct TrayUpdate: Equatable, Sendable {
         self.kind = kind
         self.text = text
         self.urgency = urgency
+        self.channel = channel
         self.context = context
         self.tool = tool
         self.ok = ok
