@@ -70,3 +70,50 @@ jobs:
 
       - name: pytest
         run: .venv/bin/pytest -v
+
+  # The same suite on a far calendar, beside the job above rather than after
+  # it, so it adds a runner and not wall time. UTC+14 is the zone furthest
+  # ahead of the runner's, and OMEGA_TEST_NOW (tests/conftest.py) starts every
+  # case at an instant years out, at a local hour whose date is not the UTC
+  # one. A test that passes only on the day it was written, or only in the
+  # zone it was written in, then fails on the push that adds it.
+  clock:
+    name: pytest on a far date at UTC+14 (macOS)
+    runs-on: macos-14
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Create the virtualenv the build is pinned to
+        run: |
+          python -m venv .venv
+          .venv/bin/python -m pip install --upgrade pip
+          .venv/bin/python -m pip install "maturin>=1.7,<2.0" pytest
+          test -x .venv/bin/python3.11
+
+      - name: maturin develop
+        run: .venv/bin/maturin develop --release
+
+      - name: pytest at UTC+14 on a far date
+        env:
+          TZ: Pacific/Kiritimati
+          OMEGA_TEST_NOW: "2033-03-15T12:00:00+00:00"
+        run: .venv/bin/pytest -q -rf
