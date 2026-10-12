@@ -731,6 +731,9 @@ class Runtime:
         # before the look, so a look reads a memory already tidied. Daily under
         # its own gate, so on most polls this is a fold and a date compare.
         executor.tidy()
+        # The daily look at the topics kept up with (DL-087 #6), before the
+        # look, for tidy's reason. With nothing followed it is a fold.
+        executor.keep_up()
         # Last, and unconditional. Last because the three passes above *write
         # memory* and this one *reads* it to decide whether to speak — running it
         # first would have it judge a moment it had not yet finished perceiving.

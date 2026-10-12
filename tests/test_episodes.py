@@ -231,6 +231,17 @@ def test_every_kind_round_trips():
         ep.location_set(source="shortcut", lat=12.5, lon=77.25, accuracy_m=20.0, city="Townsville"),
         ep.place_saved(name="home", label="12 Example Street"),
         ep.place_forgotten(name="home"),
+        # DL-087 #6: a topic kept up with, a pass over it, and its drop.
+        ep.topic_followed(name="Rust 2027 edition", query="rust 2027 edition news", since=40),
+        ep.topic_update(
+            name="Rust 2027 edition",
+            items=[{"title": "Edition RFC merged", "url": "https://example.org/rfc",
+                    "digest": "0123456789abcdef"}],
+            usage=[{"role": "act", "model": "m", "calls": 1, "input": 10,
+                    "cached": 0, "output": 5, "reasoning": 0, "unmetered": 0}],
+        ),
+        ep.topic_update(name="Rust 2027 edition", items=[], for_seq=40, reason="no search"),
+        ep.topic_dropped(name="Rust 2027 edition"),
     ]
     assert {p["kind"] for p in built} == ep.KINDS, "a kind has no round-trip test"
     for payload in built:

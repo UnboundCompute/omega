@@ -38,6 +38,7 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 
 from omega import episodes, finance, grants, lessons, location, mailcursor, mcp, projects, provider
+from omega import topics as kept
 from omega.tools import (
     EXTERNAL,
     LOCAL,
@@ -237,6 +238,13 @@ def act_loop(
             # omega's own lessons and skills (DL-086): `forget`, on their
             # own message, when one stands; nothing at all otherwise.
             lessons=ctx.lessons,
+            # The topics kept up with (DL-087 #6): `topics`, on their own
+            # message, only when one is followed, the grant is live or their
+            # words ask; its `now` looks one up through the turn's own model.
+            topics=ctx.topics,
+            research=lambda name, query: kept.research(
+                ctx.complete, name, query, remote=mcp.remote()
+            ),
             # DL-090: an unprompted turn's mail is only what arrived since
             # its origin last read it; their own turn gets no cursor at all.
             mail_since=_mail_since(ctx) if unprompted(ctx) else None,

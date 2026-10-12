@@ -1,11 +1,12 @@
 """Standing grants, and the gate they sit behind (DL-085).
 
 A grant is authority the person handed over in their own message, for one of
-three closed scopes: **research** (carry its own research tasks to the end),
-**tidy** (tidy their reminders and watches) and **promises** (DL-087 #1: hold
-them to what they say they will do, with a reminder). Nothing else can be
-granted, and calendar, mail and anything that moves money are outside all
-three.
+four closed scopes: **research** (carry its own research tasks to the end),
+**tidy** (tidy their reminders and watches), **promises** (DL-087 #1: hold
+them to what they say they will do, with a reminder) and **topics** (DL-087
+#6: notice what they keep asking about and offer to keep up with it). Nothing
+else can be granted, and calendar, mail and anything that moves money are
+outside all four.
 
 Everything here is a fold over the log, like :class:`omega.derive.OpenWork`.
 The grant set is never stored beside the log and never mutated; a turn is
@@ -58,6 +59,7 @@ __all__ = [
     "RESEARCH",
     "TIDY",
     "PROMISES",
+    "TOPICS",
     "SCOPES",
     "GATE_DROP_AFTER",
     "GATED_TOOLS",
@@ -92,8 +94,9 @@ __all__ = [
 RESEARCH = "research"
 TIDY = "tidy"
 PROMISES = "promises"
+TOPICS = "topics"
 SCOPES = episodes.GRANT_SCOPES
-assert {RESEARCH, TIDY, PROMISES} == SCOPES
+assert {RESEARCH, TIDY, PROMISES, TOPICS} == SCOPES
 
 #: Yeses in a row, for one scope, before omega asks whether it may stop
 #: asking. Asks, never drops.
@@ -112,7 +115,9 @@ GATED_TOOLS = {"tidy": TIDY, "follow_up": RESEARCH}
 #: under ``promises``, while a ``remind`` they ask for in so many words runs as
 #: it always has. Kept apart from :data:`GATED_TOOLS` for exactly that reason:
 #: listing ``remind`` there would put a gate in front of every reminder.
-PROPOSED_TOOLS = {"remind": PROMISES}
+#: ``topics`` likewise (DL-087 #6): code offers to follow a subject they keep
+#: asking about under ``topics``; a follow they ask for runs ungated.
+PROPOSED_TOOLS = {"remind": PROMISES, "topics": TOPICS}
 
 # --- reversibility ----------------------------------------------------------
 
@@ -155,6 +160,7 @@ REVERSIBILITY: dict[str, str] = {
     "promise": OWN,  # closes one of their noted promises (DL-087 #1)
     "forget": OWN,  # strikes one of omega's own lessons or skills (DL-086)
     "location": OWN,  # notes or names where they are, in the log (DL-091)
+    "topics": OWN,  # follows, drops or looks up a topic (DL-087 #6)
     "write_file": OWN,  # inside the store; outside it is irreversible
     "run_code": READ,  # read-only argv; anything else is irreversible
 }
@@ -267,6 +273,8 @@ class Acted:
     def undo_words(self) -> str:
         if "restore" in self.undo:
             return f"undo(action={self.seq}) puts {self.undo['restore'].get('id')} back as it was"
+        if "drop" in self.undo:
+            return f"undo(action={self.seq}) stops keeping up with {self.undo['drop']}"
         return f"undo(action={self.seq}) stops {self.undo.get('cancel')}"
 
 
@@ -786,4 +794,7 @@ def undo_for(tool: str, args: dict[str, Any]) -> dict[str, Any]:
         # A promise's reminder (DL-087 #1): set under a known id, so taking it
         # back is cancelling that schedule.
         return {"cancel": str(args["id"])}
+    if tool == "topics" and args.get("do") == "follow" and args.get("name"):
+        # A topic followed on their yes (DL-087 #6): taken back by dropping it.
+        return {"drop": str(args["name"])}
     raise ValueError(f"{tool} is not an action a grant covers")

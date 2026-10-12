@@ -45,12 +45,14 @@ from omega import (
     location,
     machine,
     mailcursor,
+    mcp,
     notice,
     projects,
     promises,
     provider,
     tidy,
     tools,
+    topics,
     transcripts,
 )
 from omega.derive import Learned, Moments, OpenWork, Readings
@@ -235,6 +237,8 @@ class Executor:
         "_lessons",
         "_location",
         "_grants_now",
+        "_topics",
+        "_topics_now",
         "_moments",
         "_standing",
         "_online",
@@ -304,6 +308,11 @@ class Executor:
         # Where they are (DL-091), kept at the turn being handled: a fix that
         # arrives after the event is not where they were when they asked.
         self._location = location.Locations()
+        # Topics they keep asking about and the ones kept up with (DL-087 #6):
+        # one fold at the turn (what its brief lists), one at the head for the
+        # pass after each reply and the daily look.
+        self._topics = topics.Topics()
+        self._topics_now = topics.Topics()
         # A third view rather than a field on `_learned` (DL-062): what is
         # true and what happened have different lifetimes, and keeping them
         # in one fold is what would let events leak into the claim set.
@@ -1621,6 +1630,7 @@ class Executor:
         self._lessons.advance(self._queue.store, upto=pending.seq)
         self._access.advance(self._queue.store, upto=pending.seq)
         self._location.advance(self._queue.store, upto=pending.seq)
+        self._topics.advance(self._queue.store, upto=pending.seq)
         lost = self._pausing(pending.payload)
         if lost is not None:
             # DL-087 #3: what it reads from is lost and they have been told.
@@ -1661,10 +1671,12 @@ class Executor:
             lessons=self._lessons.state(),
             access=self._access.state(),
             location=self._location.state(),
+            topics=self._topics.state(),
         )
         self._queue.finish(pending.seq)
         # After the reply is durable, and never able to fail or hold it.
         self._hold_promises(pending)
+        self._notice_topics(pending)
         self._withdraw()
         return result
 
@@ -1792,6 +1804,126 @@ class Executor:
                     why=decision.why, args=decision.args,
                     undo=grants.undo_for(decision.tool, decision.args), proposal=None,
                 ))
+
+    def _notice_topics(self, pending: Pending) -> None:
+        """DL-087 #6: offer to keep up with a subject they keep asking about.
+
+        After the turn's terminal record, as :meth:`_hold_promises`. **Without
+        a live ``topics`` grant it calls nothing and writes nothing.** The
+        counting is code (:meth:`omega.topics.State.crossing`): only on the
+        message where a word first reaches three asking messages on two days
+        within a fortnight is one LEARN call made, which names the subject and
+        says whether it changes enough to follow; it fails closed and is never
+        retried. A subject already offered, followed or dropped is never
+        offered again. The offer is one tell and one ``topics`` proposal, or,
+        with the gate dropped, the follow itself, recorded with its undo.
+
+        **Never raises.**
+        """
+        try:
+            store = self._queue.store
+            view = self._topics_now.advance(store).state()
+            if not view.granted or not promises.theirs(pending.payload):
+                return
+            crossed = view.crossing(pending.seq)
+            if not crossed:
+                return
+            word, texts = crossed[0]
+            try:
+                named = topics.name_it(self._completer(), word, texts)
+            except Exception:  # noqa: BLE001 - fails closed: nothing is offered
+                return
+            if named is None or not named.follow or view.known(named.name):
+                return
+            if len(view.followed) >= topics.MAX_FOLLOWED:
+                return
+            state = self._grants_now.advance(store).state()
+            if state.live(grants.TOPICS) is None:
+                return
+            action = {
+                "tool": tools.TOPICS,
+                "why": f"keep up with {named.name}",
+                "args": {"do": "follow", "name": named.name, "query": named.query, "word": word},
+            }
+            if state.gated(grants.TOPICS):
+                tell = self._queue.append(
+                    episodes.inbound(tools.topic_text(named.name), channel="schedule")
+                )
+                self._queue.append(episodes.grant_proposed(
+                    for_seq=tell, scope=grants.TOPICS, proposes="action", actions=[action],
+                ))
+                return
+            box = tools.ToolBox(
+                store_root=store.root, append=self._queue.append,
+                for_seq=pending.seq, grants=state, topics=view,
+            )
+            decision = tools.Decision(
+                tool=tools.TOPICS, tier=tools.LOCAL, why=action["why"], args=action["args"]
+            )
+            self._queue.append(episodes.tool_called(
+                for_seq=pending.seq, tool=decision.tool, args=decision.args
+            ))
+            try:
+                result, ok = box.dispatch(decision), True
+            except Exception as exc:  # noqa: BLE001 - recorded, as act records it
+                result, ok = f"{decision.tool} raised {type(exc).__name__}: {exc}", False
+            self._queue.append(episodes.tool_returned(
+                for_seq=pending.seq, tool=decision.tool, ok=ok,
+                result=str(result) if ok else None, error=None if ok else str(result),
+            ))
+            if ok:
+                self._queue.append(episodes.grant_acted(
+                    for_seq=pending.seq, scope=grants.TOPICS, tool=decision.tool,
+                    why=decision.why, args=decision.args,
+                    undo=grants.undo_for(decision.tool, decision.args), proposal=None,
+                ))
+        except Exception:  # noqa: BLE001 - see the docstring
+            return
+
+    def keep_up(self, *, now: Optional[str] = None) -> bool:
+        """The daily look at each topic kept up with (DL-087 #6). Returns
+        whether a pass ran.
+
+        One topic per call, oldest followed first, and only one that has had
+        no pass yet on this local day, while the day's token budget lasts
+        (:data:`omega.topics.DAILY_TOKENS`). With nothing followed it is a
+        fold and nothing else: no model call, no search, no record. Each pass
+        writes one ``topic.update`` with only the items new to that topic and
+        what it spent; the next brief lists them. A pass that failed is
+        written down with why, and counts as that day's pass.
+
+        **Never raises.**
+        """
+        if not self._recovered:
+            return False
+        try:
+            view = self._topics_now.advance(self._queue.store).state()
+            if not view.followed:
+                return False
+            clock = now or episodes.now()
+            day = topics._local_day(clock)
+            if not view.budget_left(day):
+                return False
+            due = [f for f in view.oldest() if not view.passed(f.key, day)]
+            if not due:
+                return False
+            topic = due[0]
+            meter = provider.Meter(self._completer())
+            try:
+                found = topics.research(meter, topic.name, topic.query, remote=mcp.remote())
+            except Exception as exc:  # noqa: BLE001 - written down, never raised
+                reason = (str(exc) or type(exc).__name__)[: episodes.MAX_FAILURE_ERROR]
+                self._queue.append(episodes.topic_update(
+                    name=topic.name, items=[], reason=reason, usage=meter.usage(), at=clock,
+                ))
+                return True
+            self._queue.append(episodes.topic_update(
+                name=topic.name, items=view.fresh(topic.key, found),
+                usage=meter.usage(), at=clock,
+            ))
+            return True
+        except Exception:  # noqa: BLE001 - see the docstring
+            return False
 
     def _withdraw(self) -> None:
         """Write down every proposal that stopped applying (DL-087 #8): its

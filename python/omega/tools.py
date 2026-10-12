@@ -84,6 +84,7 @@ from omega import calendar as calendars, episodes, finance as finances, grants, 
 from omega import projects as worklog
 from omega import promises as pledges
 from omega import location as whereabouts
+from omega import topics as kept
 from omega.schedule import CronError, describe_cron, next_match, validate_cron, zone_label
 
 __all__ = [
@@ -125,6 +126,9 @@ __all__ = [
     "PROMISE_ASK",
     "FORGET",
     "LOCATION",
+    "TOPICS",
+    "TOPIC_ASK",
+    "topic_text",
     "promise_text",
     "asks",
     "PENDING",
@@ -211,6 +215,12 @@ FORGET = "forget"
 #: own message, in a box with the log to read and write, so every unprompted
 #: turn (a brief, a watch, a look, a tell) neither sees nor calls it.
 LOCATION = "location"
+#: Lists, follows, drops or looks up the topics omega keeps up with (DL-087
+#: #6). Outside :data:`TOOL_NAMES` for :data:`PROMISE`'s reason: offered only
+#: on their own message, and only when a topic is followed, the ``topics``
+#: grant is live, or their words ask to keep up with something, so every
+#: other turn is exactly what it was.
+TOPICS = "topics"
 PENDING = "pending"
 
 #: Ring 1's remainder, and it is closed (DL-014). Spelled as a frozenset so
@@ -467,12 +477,26 @@ def promise_text(found: Sequence[Any]) -> str:
     return tell_instruction(f"{head} {PROMISE_ASK}")
 
 
+#: What a topic tell ends with (DL-087 #6): it carries a ``topics`` proposal
+#: to keep up with what it names, so it is a question too.
+TOPIC_ASK = "Want me to keep up with it? Reply yes or no."
+
+
+def topic_text(name: str) -> str:
+    """The one offer to keep up with a subject they keep asking about."""
+    return tell_instruction(
+        f"I've noticed you keep asking about {name}. I can look once a day and "
+        f"put anything new in your morning brief. {TOPIC_ASK}"
+    )
+
+
 def asks(event: dict[str, Any]) -> bool:
     """Is this tell a question waiting on their yes or no (a follow-up that
-    proposes pausing a watch, or a promise's reminder)? Its turn is spoken
-    with the proposal's id and how to answer (DL-087 #8), and a plain "yes"
-    answers it while it is the newest thing omega asked."""
-    return is_tell(event) and told(event).endswith((FOLLOWUP_ASK, PROMISE_ASK))
+    proposes pausing a watch, a promise's reminder, or a topic to keep up
+    with)? Its turn is spoken with the proposal's id and how to answer
+    (DL-087 #8), and a plain "yes" answers it while it is the newest thing
+    omega asked."""
+    return is_tell(event) and told(event).endswith((FOLLOWUP_ASK, PROMISE_ASK, TOPIC_ASK))
 
 
 #: How every research follow-up's fire text begins (DL-085).
@@ -1298,6 +1322,9 @@ _GRANT_WORDS = {
         "promise", "commit", "hold me to", "keep me to", "my word",
         "what i say i'll", "what i said i'd", "remind me of what i",
     ),
+    grants.TOPICS: (
+        "topic", "keep up", "keep track", "keep me posted", "what i keep asking",
+    ),
 }
 _GRANT_CHANGES = ("give", "revoke", "restore_gate")
 
@@ -1555,6 +1582,14 @@ def _undo(box: "ToolBox", args: dict[str, Any]) -> str:
     if box.append is None:
         raise ToolError("nothing can be undone from here: this box has no log")
     undo = args["undo"]
+    if "drop" in undo:
+        # A topic followed under the topics grant (DL-087 #6).
+        name = undo["drop"]
+        state = box.topics
+        if state is None or pledges.normalized(name) not in state.followed:
+            return f"not keeping up with {name} any more; nothing to undo"
+        box.append(episodes.topic_dropped(name=name))
+        return f"stopped keeping up with {name}"
     if "cancel" in undo:
         sid = undo["cancel"]
         if sid not in {s.id for s in box.running}:
@@ -1625,6 +1660,139 @@ def _promise(box: "ToolBox", args: dict[str, Any]) -> str:
         box.append(episodes.schedule_cancelled(id=sid))
         return f"promise {args['promise']} marked {args['how']}; its reminder {sid} stopped"
     return f"promise {args['promise']} marked {args['how']}"
+
+
+# --- topics they keep up with (DL-087 #6) ---------------------------------------
+
+_TOPIC_DOS = ("list", "follow", "drop", "now")
+
+#: Their words that ask to keep up with something, or to stop.
+_FOLLOW_WORDS = (
+    "keep up with", "keeping up with", "keep track of", "keep me posted",
+    "keep me updated", "keep an eye on",
+)
+
+
+def _keeping_up(box: "ToolBox") -> bool:
+    """Is ``topics`` there to be called in this box's turn?"""
+    if not box.prompted:
+        return False
+    state = box.topics
+    if state is not None and (state.followed or state.granted):
+        return True
+    said = box.said.lower()
+    return any(w in said for w in _FOLLOW_WORDS)
+
+
+def _topic_clock(box: "ToolBox") -> str:
+    return box.at or _now().isoformat()
+
+
+def _one_topic(box: "ToolBox", name: str) -> Any:
+    state = box.topics
+    hits = state.find(name) if state is not None else []
+    if len(hits) != 1:
+        listing = ", ".join(f.name for f in (state.oldest() if state else [])) or "none"
+        raise ToolRejected(
+            f"{'more than one' if hits else 'no'} followed topic matches {name!r}; "
+            f"followed: {listing}"
+        )
+    return hits[0]
+
+
+def _classify_topics(box: "ToolBox", args: dict[str, Any]) -> Decision:
+    if not box.prompted:
+        raise ToolRejected(f"{TOPICS} runs only on their own message")
+    do = _text(TOPICS, args, "do").strip().lower()
+    if do not in _TOPIC_DOS:
+        raise ToolRejected(f"{TOPICS}'s 'do' is one of {list(_TOPIC_DOS)}")
+    state = box.topics
+    if do == "list":
+        return Decision(tool=TOPICS, tier=EXPLORATION, why="list the topics kept up with",
+                        args={"do": "list"})
+    name = kept._clean(_text(TOPICS, args, "name"), episodes.MAX_TOPIC_NAME + 1)
+    if do == "follow":
+        if not name or len(name) > episodes.MAX_TOPIC_NAME or not pledges.normalized(name):
+            raise ToolRejected(f"a topic's name is 1 to {episodes.MAX_TOPIC_NAME} characters")
+        query = args.get("query")
+        query = kept._clean(query, episodes.MAX_TOPIC_QUERY) if isinstance(query, str) else ""
+        if state is not None and pledges.normalized(name) in state.followed:
+            raise ToolRejected(f"already keeping up with {name}")
+        if state is not None and len(state.followed) >= kept.MAX_FOLLOWED:
+            raise ToolRejected(
+                f"already keeping up with {kept.MAX_FOLLOWED} topics, the most there "
+                "can be; ask them which to drop first"
+            )
+        return Decision(tool=TOPICS, tier=LOCAL, why=f"keep up with {name}",
+                        args={"do": "follow", "name": name, "query": query or name})
+    topic = _one_topic(box, name)
+    if do == "drop":
+        return Decision(tool=TOPICS, tier=LOCAL, why=f"stop keeping up with {topic.name}",
+                        args={"do": "drop", "name": topic.name})
+    return Decision(tool=TOPICS, tier=LOCAL, why=f"look up what is new on {topic.name}",
+                    args={"do": "now", "name": topic.name})
+
+
+def _items_words(items: Sequence[dict[str, Any]]) -> str:
+    return "\n".join(f"- {i['title']} ({i['url']})" for i in items)
+
+
+def _topics(box: "ToolBox", args: dict[str, Any]) -> str:
+    state = box.topics
+    do = args["do"]
+    if do == "list":
+        if not state or not state.followed:
+            return "not keeping up with any topic"
+        return "\n".join(
+            f"{f.name} (since {grants.since_words(f.since)}; searching {f.query!r})"
+            for f in state.oldest()
+        )
+    if box.append is None:
+        raise ToolError("topics cannot change from here: this box has no log")
+    name = str(args["name"])
+    key = pledges.normalized(name)
+    if do == "follow":
+        if state is not None and key in state.followed:
+            return f"already keeping up with {name}"
+        if state is not None and len(state.followed) >= kept.MAX_FOLLOWED:
+            raise ToolError(f"already keeping up with {kept.MAX_FOLLOWED} topics; drop one first")
+        query = str(args.get("query") or name)
+        box.append(episodes.topic_followed(name=name, query=query, since=max(box.for_seq, 1)))
+        return (
+            f"keeping up with {name}: one look a day, and anything new goes in "
+            "their morning brief"
+        )
+    if do == "drop":
+        if state is None or key not in state.followed:
+            return f"not keeping up with {name}; nothing to drop"
+        box.append(episodes.topic_dropped(name=state.followed[key].name))
+        return f"stopped keeping up with {state.followed[key].name}"
+    if state is None or key not in state.followed:
+        raise ToolError(f"not keeping up with {name}")
+    topic = state.followed[key]
+    clock = _topic_clock(box)
+    day = kept._local_day(clock)
+    if state.passed(key, day):
+        _, items = state.latest[key]
+        found = _items_words(items) if items else "nothing new then"
+        return f"already looked at {topic.name} today; what that look found:\n{found}"
+    if not state.budget_left(day):
+        raise ToolError("today's budget for keeping up with topics is spent; tomorrow's look will run")
+    if box.research is None:
+        raise ToolError("no web search is wired here, so nothing could be looked up")
+    try:
+        found_items = box.research(topic.name, topic.query)
+    except Exception as exc:  # noqa: BLE001 - written down, then said
+        reason = (str(exc) or type(exc).__name__)[: episodes.MAX_FAILURE_ERROR]
+        box.append(episodes.topic_update(
+            name=topic.name, items=[], for_seq=box.for_seq, reason=reason, at=clock
+        ))
+        raise ToolError(f"the look for {topic.name} failed: {reason}") from exc
+    new = state.fresh(key, found_items)
+    box.append(episodes.topic_update(name=topic.name, items=new, for_seq=box.for_seq, at=clock))
+    if not new:
+        return f"nothing new on {topic.name} since the last look"
+    return f"new on {topic.name}:\n{_items_words(new)}"
 
 
 # --- omega's own lessons and skills (DL-086) -----------------------------------
@@ -2866,10 +3034,11 @@ _TOOLS: dict[str, _Tool] = {
         schema=_schema(
             GRANT,
             "Take, give back or re-gate a standing grant, only when they ask in "
-            "their own message. There are three: 'research' (carry the research "
+            "their own message. There are four: 'research' (carry the research "
             "they ask for through to a report, without them asking each step), "
-            "'tidy' (tidy their watches and reminders) and 'promises' (notice "
-            "what they say they will do and offer to remind them). You still ask "
+            "'tidy' (tidy their watches and reminders), 'promises' (notice "
+            "what they say they will do and offer to remind them) and 'topics' "
+            "(notice what they keep asking about and offer to keep up with it). You still ask "
             "before each action until they agree to stop being asked. "
             "'restore_gate' is for when they want to be asked first again.",
             {
@@ -2970,6 +3139,29 @@ _PROMISE_TOOL = _Tool(
             "how": {"type": "string", "enum": list(_PROMISE_CLOSES)},
         },
         ["which", "how"],
+    ),
+)
+
+
+#: ``topics`` (DL-087 #6), registered beside Ring 1 and not in it: see
+#: :data:`TOPICS`. :meth:`ToolBox.classify` reaches it only where
+#: :func:`_keeping_up` holds.
+_TOPICS_TOOL = _Tool(
+    classify=_classify_topics,
+    dispatch=_topics,
+    schema=_schema(
+        TOPICS,
+        "The topics you keep up with for them: once a day you look for news "
+        "on each and put what is new in their morning brief. 'list' them; "
+        "'follow' one when they ask you to keep up with it (at most "
+        f"{kept.MAX_FOLLOWED}); 'drop' one when they say stop; 'now' to look "
+        "up what is new on one when they ask (once a day).",
+        {
+            "do": {"type": "string", "enum": list(_TOPIC_DOS)},
+            "name": {"type": "string", "description": "The topic, in a few words."},
+            "query": {"type": "string", "description": "For 'follow': a web search that finds its news."},
+        },
+        ["do"],
     ),
 )
 
@@ -3175,6 +3367,12 @@ class ToolBox:
     #: :class:`omega.lessons.State`, or ``None``. Only their own message,
     #: with one standing, puts ``forget`` in this box.
     lessons: Any = None
+
+    #: The topics kept up with, as of this turn (DL-087 #6): a frozen
+    #: :class:`omega.topics.State`, or ``None``. With ``research``, how
+    #: ``topics now`` looks one up: ``(name, query) -> items``.
+    topics: Any = None
+    research: Optional[Callable[[str, str], Sequence[dict[str, Any]]]] = None
     #: Where an unprompted turn's mail reads begin (DL-090): given the read's
     #: ``from`` and ``unread_only``, the moment after which mail is new to
     #: this turn's origin, folded from the log by :mod:`omega.mailcursor`.
@@ -3209,6 +3407,8 @@ class ToolBox:
             tool = _FORGET_TOOL
         if tool is None and name == LOCATION and _locating(self):
             tool = _LOCATION_TOOL
+        if tool is None and name == TOPICS and _keeping_up(self):
+            tool = _TOPICS_TOOL
         if tool is None and self.remote is not None and isinstance(arguments, dict):
             # An MCP tool, refused or cleared by the adapter: money, writes and
             # the allowlist are decided there, in code, from the name (DL-088).
@@ -3253,6 +3453,8 @@ class ToolBox:
             return _FORGET_TOOL.dispatch(self, decision.args)
         if decision.tool == LOCATION and decision.tool not in _TOOLS:
             return _LOCATION_TOOL.dispatch(self, decision.args)
+        if decision.tool == TOPICS and decision.tool not in _TOOLS:
+            return _TOPICS_TOOL.dispatch(self, decision.args)
         return _TOOLS[decision.tool].dispatch(self, decision.args)
 
     def schemas(self, hide: "frozenset[str] | set[str]" = frozenset()) -> list[dict[str, Any]]:
@@ -3265,6 +3467,8 @@ class ToolBox:
             mine.append(_FORGET_TOOL.schema)
         if _locating(self) and LOCATION not in hide:
             mine.append(_LOCATION_TOOL.schema)
+        if _keeping_up(self) and TOPICS not in hide:
+            mine.append(_TOPICS_TOOL.schema)
         return mine + (self.remote.schemas() if self.remote is not None else [])
 
 

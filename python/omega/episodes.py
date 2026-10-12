@@ -113,6 +113,18 @@ __all__ = [
     "location_set",
     "place_saved",
     "place_forgotten",
+    "TOPIC_FOLLOWED",
+    "TOPIC_DROPPED",
+    "TOPIC_UPDATE",
+    "TOPIC_KINDS",
+    "MAX_TOPIC_NAME",
+    "MAX_TOPIC_QUERY",
+    "MAX_TOPIC_TITLE",
+    "MAX_TOPIC_URL",
+    "MAX_TOPIC_ITEMS",
+    "topic_followed",
+    "topic_dropped",
+    "topic_update",
     "REPORT_TRANSCRIPT",
     "REPORT_USAGE",
     "REPORT_RECORDING",
@@ -265,10 +277,11 @@ GRANT_KINDS = frozenset(
 GRANT_WITHDRAWN = "grant.withdrawn"
 #: Ceiling on why a proposal was withdrawn. One clause, read in a brief.
 MAX_WITHDRAWN_REASON = 200
-#: The only grants there are (DL-085 #5, DL-087 #1): carry its own research
-#: tasks to the end, tidy their reminders and watches, and hold them to the
-#: promises they make in their own messages. Closed, like the tool set.
-GRANT_SCOPES = frozenset({"research", "tidy", "promises"})
+#: The only grants there are (DL-085 #5, DL-087 #1, #6): carry its own
+#: research tasks to the end, tidy their reminders and watches, hold them to
+#: the promises they make in their own messages, and offer to keep up with
+#: what they keep asking about. Closed, like the tool set.
+GRANT_SCOPES = frozenset({"research", "tidy", "promises", "topics"})
 #: What a proposal asks: to do the actions it lists, or to stop asking first.
 GRANT_PROPOSES = frozenset({"action", "drop_gate"})
 
@@ -368,6 +381,26 @@ MAX_LOCATION_CITY = 100
 MAX_PLACE_NAME = 40
 #: Metres. A fix vaguer than this is not a location.
 MAX_LOCATION_ACCURACY = 100_000
+#: Topics omega keeps up with for them (DL-087 #6). ``topic.followed`` is one
+#: topic taken on (their ``topics`` follow, or their yes to an offer);
+#: ``topic.dropped`` it let go; ``topic.update`` one research pass over it,
+#: carrying only the items no earlier update of it carried (each with the
+#: digest it is deduped by), and ``for_seq`` when a turn asked for it. Records,
+#: neither recalled nor projected: the live set is a fold (:mod:`omega.topics`)
+#: and the news reaches them in the next brief.
+TOPIC_FOLLOWED = "topic.followed"
+TOPIC_DROPPED = "topic.dropped"
+TOPIC_UPDATE = "topic.update"
+TOPIC_KINDS = frozenset({TOPIC_FOLLOWED, TOPIC_DROPPED, TOPIC_UPDATE})
+#: A topic's name is a label; its query one web search.
+MAX_TOPIC_NAME = 60
+MAX_TOPIC_QUERY = 200
+#: One item: a headline and where it is.
+MAX_TOPIC_TITLE = 200
+MAX_TOPIC_URL = 500
+#: The most items one update carries.
+MAX_TOPIC_ITEMS = 5
+_DIGEST = re.compile(r"^[0-9a-f]{16}$")
 
 #: The senses a relay may report for, by the name of the sense rather than of
 #: the file it read. Three of them end in a learning receipt; the machine sense
@@ -442,6 +475,7 @@ KINDS = frozenset(
         PROMISE_CLOSED,
         *LESSON_KINDS,
         *LOCATION_KINDS,
+        *TOPIC_KINDS,
     }
 )
 
@@ -1926,6 +1960,9 @@ _REQUIRED: dict[str, tuple[str, ...]] = {
     LOCATION_SET: ("source", "label", "lat", "lon", "accuracy_m", "city", "place", "at"),
     PLACE_SAVED: ("name", "label", "lat", "lon", "at"),
     PLACE_FORGOTTEN: ("name", "at"),
+    TOPIC_FOLLOWED: ("name", "query", "since", "at"),
+    TOPIC_DROPPED: ("name", "at"),
+    TOPIC_UPDATE: ("name", "items", "at"),
     GRANT_GIVEN: ("for_seq", "scope", "at"),
     GRANT_REVOKED: ("for_seq", "scope", "at"),
     GRANT_RESTORED: ("for_seq", "scope", "at"),
@@ -2145,6 +2182,48 @@ def review_done(
     return payload
 
 
+def topic_followed(
+    *, name: str, query: str, since: int, at: Optional[str] = None
+) -> dict[str, Any]:
+    """omega keeps up with ``name``, searching ``query``, from the message
+    ``since`` that asked for it or said yes to it (DL-087 #6)."""
+    payload = {"v": VERSION, "kind": TOPIC_FOLLOWED, "name": name, "query": query,
+               "since": since, "at": at or now()}
+    _validate(payload)
+    return payload
+
+
+def topic_dropped(*, name: str, at: Optional[str] = None) -> dict[str, Any]:
+    """omega stops keeping up with ``name`` (DL-087 #6)."""
+    payload = {"v": VERSION, "kind": TOPIC_DROPPED, "name": name, "at": at or now()}
+    _validate(payload)
+    return payload
+
+
+def topic_update(
+    *,
+    name: str,
+    items: Sequence[dict[str, Any]],
+    for_seq: Optional[int] = None,
+    reason: Optional[str] = None,
+    usage: Optional[list[dict[str, Any]]] = None,
+    at: Optional[str] = None,
+) -> dict[str, Any]:
+    """One research pass over ``name`` (DL-087 #6): the ``items`` new to it,
+    each ``{title, url, digest}``. ``for_seq`` is the turn that asked for it,
+    absent for the daily pass; ``reason`` why a pass found nothing it could
+    read. Both optional and additive, as ``usage`` is."""
+    payload: dict[str, Any] = {"v": VERSION, "kind": TOPIC_UPDATE, "name": name,
+                               "items": [dict(i) for i in items], "at": at or now()}
+    if for_seq is not None:
+        payload["for_seq"] = for_seq
+    if reason is not None:
+        payload["reason"] = reason
+    _with_usage(payload, usage)
+    _validate(payload)
+    return payload
+
+
 #: The kinds a pass ends on, and so the only ones that may carry ``usage``
 #: (DL-070): what that pass spent on the model, per role and model, as
 #: :meth:`omega.provider.Meter.usage` tallies it. Optional and additive — a
@@ -2159,6 +2238,7 @@ METERED_KINDS = frozenset(
         AUDIO_CAPTURED,
         MEMORY_TIDIED,
         PROJECT_STATE,
+        TOPIC_UPDATE,
     }
 )
 
@@ -2366,6 +2446,10 @@ def _validate(payload: dict[str, Any]) -> None:
         # No `for_seq`: a fix from the phone belongs to no turn, and one they
         # said is about them, not about the turn that wrote it down.
         _validate_location(payload)
+    elif kind in TOPIC_KINDS:
+        # No `for_seq` required: a follow or a drop is named by the topic, and
+        # an update by it too, with the turn that asked only when one did.
+        _validate_topic(payload)
     elif kind in LESSON_KINDS:
         # No `for_seq`: written by the self-review (DL-086), which names its
         # evidence by seq instead, or by `forget`, which names their message.
@@ -2555,7 +2639,12 @@ def _validate_grant(payload: dict[str, Any]) -> None:
         undo = payload["undo"]
         if not isinstance(undo, dict) or len(undo) != 1:
             raise BadPayload("undo must be one of {restore: definition} or {cancel: id}")
-        if "cancel" in undo:
+        if "drop" in undo:
+            # A topic followed under the topics grant (DL-087 #6): taken back
+            # by dropping it.
+            if not isinstance(undo["drop"], str) or not undo["drop"].strip():
+                raise BadPayload("undo.drop must be a topic's name")
+        elif "cancel" in undo:
             if not isinstance(undo["cancel"], str) or not undo["cancel"]:
                 raise BadPayload("undo.cancel must be a schedule id")
         elif "restore" in undo:
@@ -2934,6 +3023,33 @@ def _validate_location(payload: dict[str, Any]) -> None:
         raise BadPayload(f"at must be an ISO datetime: {exc}") from exc
     if stamp.tzinfo is None:
         raise BadPayload("at must carry its zone")
+
+
+def _validate_topic(payload: dict[str, Any]) -> None:
+    _require_sentence(payload, "name", cap=MAX_TOPIC_NAME)
+    kind = payload["kind"]
+    if kind == TOPIC_FOLLOWED:
+        _require_sentence(payload, "query", cap=MAX_TOPIC_QUERY)
+        _require_seq(payload, "since")
+    _require_str(payload, "at", non_empty=True)
+    if kind != TOPIC_UPDATE:
+        return
+    items = payload["items"]
+    if not isinstance(items, list) or len(items) > MAX_TOPIC_ITEMS:
+        raise BadPayload(f"items must be a list of at most {MAX_TOPIC_ITEMS}")
+    for item in items:
+        if not isinstance(item, dict) or set(item) != {"title", "url", "digest"}:
+            raise BadPayload("each item is exactly {title, url, digest}")
+        _require_sentence(item, "title", cap=MAX_TOPIC_TITLE)
+        url = item["url"]
+        if not isinstance(url, str) or not re.match(r"^https?://\S+$", url) or len(url) > MAX_TOPIC_URL:
+            raise BadPayload(f"url must be an http(s) url of at most {MAX_TOPIC_URL} characters")
+        if not isinstance(item["digest"], str) or not _DIGEST.match(item["digest"]):
+            raise BadPayload("digest must be 16 hex characters")
+    if "for_seq" in payload:
+        _require_seq(payload, "for_seq")
+    if "reason" in payload:
+        _require_sentence(payload, "reason", cap=MAX_FAILURE_ERROR)
 
 
 def _require_cites(payload: dict[str, Any]) -> None:

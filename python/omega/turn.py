@@ -138,6 +138,9 @@ NOT_RECALLED = frozenset({
     # Where they are (DL-091): never conversation, never a thing to learn. A
     # prompted turn sees it as one line, read off the fold.
     *episodes.LOCATION_KINDS,
+    # Topics kept up with (DL-087 #6): their news reaches them in the brief,
+    # read off the fold; the records are bookkeeping.
+    *episodes.TOPIC_KINDS,
 })
 
 #: **A count is not a budget** (DL-039). ``RECALL_N`` bounds how many episodes
@@ -331,6 +334,10 @@ class TurnContext:
     #: nothing, and so does every unprompted turn: a turn over a log with no
     #: location reads exactly as before.
     location: Any = None
+    #: The topics kept up with, as of this turn (DL-087 #6), a frozen
+    #: :class:`omega.topics.State`. ``None``, or one with nothing followed and
+    #: no grant, renders as nothing and offers nothing.
+    topics: Any = None
 
 
 #: Channels whose events nobody typed: omega's own look (DL-061) and the clock
@@ -715,6 +722,7 @@ def run_turn(
     lessons: Any = None,
     access: Any = None,
     location: Any = None,
+    topics: Any = None,
 ) -> TurnResult:
     """Run one turn over an already-claimed episode and record how it ended.
 
@@ -804,6 +812,7 @@ def run_turn(
         lessons=lessons,
         access=access,
         location=location,
+        topics=topics,
     )
 
     verdict: Optional[Verdict] = None
@@ -857,7 +866,7 @@ def run_turn(
         if verdict.choice == ACT_THEN_SPEAK:
             acted = act(ctx)
             if acted.blocked_on:
-                waiting = _waiting(ctx)
+                waiting = _brief_tail(ctx)
                 if waiting:
                     # A brief that stops on a "May I?" still lists them.
                     acted = replace(acted, blocked_on=f"{acted.blocked_on}\n\n{waiting}")
@@ -908,10 +917,11 @@ def run_turn(
     # this turn is about to record.
     receipt = _teach(ctx, pending, known=known, running=running, at=at)
 
-    brief = _waiting(ctx)
+    brief = _brief_tail(ctx)
     if brief:
         # DL-087 #8: every proposal still waiting on them, and each withdrawn
-        # since the last brief, listed by code so none is ever dropped.
+        # since the last brief, listed by code so none is ever dropped; and
+        # (#6) what is new on the topics kept up with.
         text = brief if text is None else f"{text}\n\n{brief}"
 
     if text is None and receipt is None:
@@ -999,6 +1009,33 @@ def _waiting(ctx: "TurnContext") -> str:
         lines[end:end] = rows
     else:
         lines[0:0] = [_WAITING, *rows]
+    return "\n".join(lines)
+
+
+def _brief_tail(ctx: "TurnContext") -> str:
+    """What code appends to a brief: :func:`_waiting`, then what is new on
+    the topics kept up with (DL-087 #6). Exactly :func:`_waiting` when no
+    topic has news."""
+    return "\n\n".join(part for part in (_waiting(ctx), _keeping(ctx)) if part)
+
+
+#: The heading a brief gives the topics with news (DL-087 #6).
+KEEPING_UP = "Keeping up with:"
+
+
+def _keeping(ctx: "TurnContext") -> str:
+    """A brief's news on the topics kept up with (DL-087 #6): only the topics
+    with something new since the brief before, each item once. Empty for any
+    other turn and for a brief with no news, so no section is ever empty."""
+    if not is_brief(ctx.event) or ctx.topics is None:
+        return ""
+    news = ctx.topics.briefing(ctx.seq)
+    if not news:
+        return ""
+    lines = [KEEPING_UP]
+    for name, items in news:
+        listed = "; ".join(f"{i['title']} ({i['url']})" for i in items)
+        lines.append(f"- {name}: {listed}")
     return "\n".join(lines)
 
 
