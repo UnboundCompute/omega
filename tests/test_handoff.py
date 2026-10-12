@@ -13,6 +13,7 @@ import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator
+from urllib.parse import urlsplit
 
 import pytest
 
@@ -48,8 +49,10 @@ def test_directions_are_a_google_maps_link() -> None:
 def test_each_service_has_its_search_page() -> None:
     assert handoff.search("amazon", "usb c cable") == "https://www.amazon.in/s?k=usb%20c%20cable"
     assert handoff.search("zomato", "biryani") == "https://www.zomato.com/search?q=biryani"
+    # A city does not make a city page: Zomato's slugs are irregular, and its
+    # own search finds the city from wherever the link is opened.
     assert handoff.search("zomato", "biryani", city="New Delhi") == (
-        "https://www.zomato.com/new-delhi/restaurants?q=biryani")
+        "https://www.zomato.com/search?q=biryani")
     assert handoff.search("district", "comedy show") == "https://www.district.in/search?q=comedy%20show"
     assert handoff.search("ixigo", origin="blr", destination="DEL", when="2026-10-25") == (
         "https://www.ixigo.com/search/result/flight?from=BLR&to=DEL&date=25102026"
@@ -59,6 +62,13 @@ def test_each_service_has_its_search_page() -> None:
                 {"origin": "BLR", "destination": "DEL", "when": "25/10/2026"}):
         with pytest.raises(handoff.HandoffError):
             handoff.search("ixigo", **bad)
+
+
+def test_a_zomato_search_never_guesses_a_city_page() -> None:
+    link = handoff.search("zomato", "dosa", city="Bengaluru")
+    assert link == "https://www.zomato.com/search?q=dosa"
+    assert "bengaluru" not in urlsplit(link).path.lower().split("/")
+    assert handoff.build("zomato", {"query": "dosa", "city": "Bengaluru"}) == link
 
 
 def test_an_item_link_is_kept_only_on_the_services_own_https_domain() -> None:

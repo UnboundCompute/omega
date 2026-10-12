@@ -4229,8 +4229,8 @@ _HANDOFF_TOOL = _Tool(
         "Hand the last step to them: a link they open, or a document they "
         "get as a file. Never pay, order or book for them: hand over the "
         "link and they finish it. 'directions' (destination, optional origin "
-        "and mode) is Google Maps; 'amazon', 'zomato' (optional city) and "
-        "'district' take a query, or the url of the item on that site; "
+        "and mode) is Google Maps; 'amazon', 'zomato' and 'district' "
+        "take a query, or the url of the item on that site; "
         "'ixigo' is flights 'from' and 'to' (airport codes) on a 'date' "
         "(YYYY-MM-DD); 'link' is any https page; 'document' stores 'text' "
         "as 'name' and gives you a marker to put in your reply.",

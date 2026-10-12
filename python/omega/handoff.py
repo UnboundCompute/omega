@@ -104,13 +104,6 @@ def directions(destination: str, origin: Optional[str] = None, mode: str = "driv
     return "https://www.google.com/maps/dir/?" + urlencode(query, quote_via=quote)
 
 
-def _slug(city: str) -> str:
-    slug = re.sub(r"[^a-z0-9]+", "-", _text(city, "city").lower()).strip("-")
-    if not slug:
-        raise HandoffError("city must have a letter or a digit in it")
-    return slug
-
-
 def _day(value: Any) -> date:
     try:
         return date.fromisoformat(_text(value, "date", 10))
@@ -133,10 +126,12 @@ def search(service: str, query: str = "", *, city: Optional[str] = None,
     if service == "amazon":
         return "https://www.amazon.in/s?" + urlencode({"k": _text(query, "query")}, quote_via=quote)
     if service == "zomato":
-        q = urlencode({"q": _text(query, "query")}, quote_via=quote)
-        if city is None:
-            return f"https://www.zomato.com/search?{q}"
-        return f"https://www.zomato.com/{_slug(city)}/restaurants?{q}"
+        # Always Zomato's own search, never a city page built from ``city``:
+        # its city slugs are irregular (``bangalore`` but not ``bengaluru``,
+        # ``ncr`` but not ``delhi``), so a guessed slug is often a 404, and
+        # Zomato finds the city from wherever the link is opened. ``city`` is
+        # still accepted so a caller passing it is not refused.
+        return "https://www.zomato.com/search?" + urlencode({"q": _text(query, "query")}, quote_via=quote)
     if service == "district":
         return "https://www.district.in/search?" + urlencode({"q": _text(query, "query")}, quote_via=quote)
     if service == "ixigo":
