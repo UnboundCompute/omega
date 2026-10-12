@@ -25,7 +25,7 @@ from typing import Any, Optional
 
 import pytest
 
-from omega import access, episodes, inbox, mailcursor, notice, provider, tools
+from omega import access, act, episodes, inbox, mailcursor, notice, provider, tools
 from omega.access import Access
 from omega.act import act_loop
 from omega.executor import Executor
@@ -499,6 +499,10 @@ def test_the_brief_lists_the_lost_mailbox_by_name(store: MemoryStore, boxes: Box
 # equivalence: no OMEGA_INBOXES, nothing changed
 # --------------------------------------------------------------------------
 
+#: The instant the golden's mail and sweep are read at: 11:30 on Monday 12
+#: Oct 2026 in Asia/Kolkata, the zone the record pins.
+GOLDEN_AT = datetime(2026, 10, 12, 6, 0, tzinfo=timezone.utc)
+
 #: Digests of :func:`_equivalence_record`, taken from the code before DL-092
 #: (and again from this code, which must match them). ``schemas`` was
 #: retaken when ``topics`` came to be offered on every prompted turn; with
@@ -562,13 +566,20 @@ def _equivalence_record(root: Path, *, clear: bool = True) -> dict[str, str]:
                 decisions.append([d.tool, d.tier, d.why, d.args])
             out["decisions"] = _digest(decisions)
 
+            # Every clock the mail and the sweep read is pinned to the one
+            # instant. An opened mail renders its date ("Mon 12 Oct 2026") and
+            # a listed one is worded against today, and `_normal` keeps both,
+            # so mail dated off the wall clock matched the golden only on the
+            # day the golden was taken.
+            mp.setattr(episodes, "now", lambda: GOLDEN_AT.isoformat())
+            mp.setattr(act, "_now", lambda: GOLDEN_AT)
             mailbox = Mailbox()
             mp.setattr(inbox, "tool_text", functools.partial(
-                inbox.tool_text, environ=ENV, connect=mailbox.connect))
+                inbox.tool_text, environ=ENV, connect=mailbox.connect, now=GOLDEN_AT))
             mp.setattr(inbox, "open_mail", functools.partial(
                 inbox.open_mail, environ=ENV, connect=mailbox.connect))
-            mailbox.arrive(1, _now() - timedelta(minutes=20), subject="lunch?")
-            mailbox.arrive(2, _now() - timedelta(minutes=200), subject="older")
+            mailbox.arrive(1, GOLDEN_AT - timedelta(minutes=20), subject="lunch?")
+            mailbox.arrive(2, GOLDEN_AT - timedelta(minutes=200), subject="older")
             opened = box.dispatch(box.classify("mail", {"id": 1}))
             out["mail"] = _digest(opened if isinstance(opened, str) else [opened.model, opened.log])
             with MemoryStore.open(root / "sweep") as store:

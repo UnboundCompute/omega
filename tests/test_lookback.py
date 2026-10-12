@@ -23,8 +23,10 @@ AT = NOW.isoformat()
 
 
 def at(month: int, day: int, hour: int = 12) -> str:
-    # Midday UTC, so the local date is the same in every zone the suite runs in.
-    return datetime(2026, month, day, hour, 0, tzinfo=timezone.utc).isoformat()
+    # Midday in the local zone, so the local date is the one named in every
+    # zone the suite runs in. Midday UTC was not: at UTC+14 it is 02:00 the
+    # next day, and CI runs the suite there on purpose.
+    return datetime(2026, month, day, hour, 0).astimezone().isoformat()
 
 
 def local_day(stamp: str) -> str:

@@ -471,6 +471,8 @@ def brief_turn(q: EventQueue, *, with_access: bool = True):
     return result
 
 
+# The date in the line is a local rendering of NOW, so the zone is pinned.
+@pytest.mark.usefixtures("pinned_zone")
 def test_the_brief_lists_each_lost_access_under_waiting_on_you(q: EventQueue) -> None:
     say(q, "hello")
     asked(q, "calendar", ok=False, error=GOOGLE_ERROR)
@@ -525,6 +527,8 @@ def test_the_fold_is_the_same_incrementally_and_from_scratch(q: EventQueue) -> N
     assert [e.origin for e in step.state().owed] == ["mcp:github"]
 
 
+# The date in the line is a local rendering of NOW, so the zone is pinned.
+@pytest.mark.usefixtures("pinned_zone")
 def test_lost_rows_join_the_proposals_under_one_heading(
     q: EventQueue, monkeypatch: pytest.MonkeyPatch
 ) -> None:

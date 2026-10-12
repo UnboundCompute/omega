@@ -173,6 +173,12 @@ def _act_messages(
     ]
 
 
+def _now() -> datetime:
+    """The wall clock an unprompted mail read is measured from, UTC. A seam,
+    so a test can pin it, as ``tools._now`` is (DL-079)."""
+    return datetime.now(timezone.utc)
+
+
 def _mail_since(ctx: TurnContext) -> Any:
     """The cursor an unprompted turn's ``inbox`` reads from (DL-090), folded
     from the log at the moment of the read, never counting this turn's own."""
@@ -182,7 +188,7 @@ def _mail_since(ctx: TurnContext) -> Any:
         # DL-092: ``mailbox`` is whose cursor; the default mailbox's is the
         # one every read before it kept.
         return mailcursor.since(
-            ctx.queue.store, where, now=datetime.now(timezone.utc),
+            ctx.queue.store, where, now=_now(),
             sender=sender, unread_only=unread_only, exclude=ctx.seq,
             mailbox=mailbox,
         )
