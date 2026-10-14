@@ -1,4 +1,5 @@
 import AppKit
+import UniformTypeIdentifiers
 import XCTest
 @testable import OmegaTray
 
@@ -646,6 +647,267 @@ final class TrayModelTests: XCTestCase {
 
         XCTAssertEqual(model.capturePermission, .granted)
         XCTAssertNil(model.localWorkState)
+    }
+
+    // MARK: Dropped files reach the core as files (the snippet bug)
+
+    @MainActor
+    func testADroppedMarkdownFileIsUploadedAsTheFileNotReadAsText() async throws {
+        let (model, transport) = connectedModel()
+        let folder = try temporaryFolder()
+        let file = folder.appendingPathComponent("roster-and-links.md")
+        try Data("# Roster: updates\n\nEach line is a person.\n".utf8).write(to: file)
+        // A provider for a file on disk offers its URL, its markdown type and a string.
+        let provider = try XCTUnwrap(NSItemProvider(contentsOf: file))
+        XCTAssertTrue(provider.canLoadObject(ofClass: NSString.self))
+
+        XCTAssertTrue(model.importProviders([provider]))
+        try await waitUntil { !transport.attachments.isEmpty && model.canSubmit }
+
+        XCTAssertEqual(transport.attachments.map(\.lastPathComponent), ["roster-and-links.md"])
+        let staged = try XCTUnwrap(model.stagedContext.first)
+        XCTAssertEqual(staged.kind, .file)
+        XCTAssertEqual(staged.title, "roster-and-links.md")
+        XCTAssertEqual(staged.attachment, transport.attachmentReference)
+    }
+
+    @MainActor
+    func testANamedDocumentOfferedAsBytesIsUploadedUnderItsName() async throws {
+        let (model, transport) = connectedModel()
+        let body = "# Visit: key questions\n\nEach question covers one site.\n"
+        let provider = NSItemProvider()
+        provider.suggestedName = "visit-questions.md"
+        provider.registerDataRepresentation(forTypeIdentifier: "net.daringfireball.markdown", visibility: .all) {
+            $0(Data(body.utf8), nil)
+            return nil
+        }
+        provider.registerObject(body as NSString, visibility: .all)
+
+        XCTAssertTrue(model.importProviders([provider]))
+        try await waitUntil { !transport.attachments.isEmpty && model.canSubmit }
+
+        let uploaded = try XCTUnwrap(transport.attachments.first)
+        XCTAssertEqual(uploaded.lastPathComponent, "visit-questions.md")
+        XCTAssertEqual(try String(contentsOf: uploaded, encoding: .utf8), body)
+        XCTAssertEqual(model.stagedContext.first?.kind, .file)
+    }
+
+    @MainActor
+    func testADroppedPathToAFileIsThatFile() async throws {
+        let (model, transport) = connectedModel()
+        let folder = try temporaryFolder()
+        let file = folder.appendingPathComponent("roster.md")
+        try Data("body".utf8).write(to: file)
+
+        XCTAssertTrue(model.importProviders([NSItemProvider(object: file.path as NSString)]))
+        try await waitUntil { !transport.attachments.isEmpty && model.canSubmit }
+
+        XCTAssertEqual(transport.attachments.map(\.standardizedFileURL), [file.standardizedFileURL])
+        XCTAssertEqual(model.stagedContext.first?.title, "roster.md")
+        // A path to nothing, or to a folder, stays text.
+        XCTAssertEqual(DroppedFiles.references(in: folder.appendingPathComponent("missing.md").path), [])
+        XCTAssertEqual(DroppedFiles.references(in: folder.path), [])
+        XCTAssertEqual(DroppedFiles.references(in: "\(file.path)\nsecond line"), [])
+    }
+
+    @MainActor
+    func testDroppedTextKeepsAllOfItsWordsAsAStoredFile() async throws {
+        let (model, transport) = connectedModel()
+        let text = "# Visit: key questions\n\n" + String(repeating: "Each question covers one site. ", count: 40)
+
+        XCTAssertTrue(model.importProviders([NSItemProvider(object: text as NSString)]))
+        try await waitUntil { !transport.attachments.isEmpty && model.canSubmit }
+
+        let staged = try XCTUnwrap(model.stagedContext.first)
+        XCTAssertEqual(staged.kind, .text)
+        XCTAssertEqual(staged.title, String(text.prefix(48)))
+        let uploaded = try XCTUnwrap(transport.attachments.first)
+        defer { try? FileManager.default.removeItem(at: uploaded) }
+        XCTAssertEqual(uploaded.pathExtension, "txt")
+        XCTAssertEqual(try String(contentsOf: uploaded, encoding: .utf8), text.trimmingCharacters(in: .whitespacesAndNewlines))
+
+        model.send()
+        await settleTasks()
+        let sent = try XCTUnwrap(transport.submissions.first?.context.first)
+        XCTAssertEqual(sent.kind, "text")
+        XCTAssertEqual(sent.blob, transport.attachmentReference.blob)
+    }
+
+    @MainActor
+    func testAFileSentWithNoWordsIsASayCarryingItsReference() async throws {
+        let (model, transport) = connectedModel()
+        let folder = try temporaryFolder()
+        let file = folder.appendingPathComponent("roster-and-links.md")
+        try Data("body".utf8).write(to: file)
+
+        model.stageFile(file)
+        XCTAssertFalse(model.canSubmit, "nothing goes until the bytes are stored")
+        try await waitUntil { model.canSubmit }
+        XCTAssertEqual(model.draft, "")
+        model.send()
+        await settleTasks()
+
+        let submission = try XCTUnwrap(transport.submissions.first)
+        XCTAssertEqual(submission.text, "")
+        let line = try OmegaChannelClient.encodeSay(submission)
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: line.dropLast()) as? [String: Any])
+        XCTAssertEqual(object["op"] as? String, "say")
+        XCTAssertEqual(object["text"] as? String, "")
+        let item = try XCTUnwrap((object["context"] as? [[String: Any]])?.first)
+        XCTAssertEqual(item["kind"] as? String, "file")
+        XCTAssertEqual(item["title"] as? String, "roster-and-links.md")
+        XCTAssertEqual(item["blob"] as? String, transport.attachmentReference.blob)
+        XCTAssertEqual(item["mime"] as? String, transport.attachmentReference.mime)
+        XCTAssertEqual(item["bytes"] as? Int, transport.attachmentReference.bytes)
+    }
+
+    // MARK: Editor drags with no file URL (each form an editor's pasteboard uses)
+
+    @MainActor
+    private func dropsAsFiles(
+        _ register: (NSItemProvider, [URL]) -> Void,
+        file names: [String] = ["a note.md", "b.txt"]
+    ) async throws -> [URL] {
+        let (model, transport) = connectedModel()
+        let folder = try temporaryFolder()
+        let files = try names.map { name -> URL in
+            let url = folder.appendingPathComponent(name)
+            try Data("body of \(name)".utf8).write(to: url)
+            return url.resolvingSymlinksInPath()
+        }
+        let provider = NSItemProvider()
+        register(provider, files)
+        XCTAssertFalse(provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier))
+        XCTAssertTrue(model.importProviders([provider]))
+        try await waitUntil { transport.attachments.count == files.count && model.canSubmit }
+        XCTAssertTrue(model.stagedContext.allSatisfy { $0.kind == .file })
+        XCTAssertEqual(model.stagedContext.map(\.title), names)
+        return transport.attachments.map { $0.resolvingSymlinksInPath() }
+    }
+
+    private func offer(_ provider: NSItemProvider, _ type: String, _ text: String) {
+        provider.registerDataRepresentation(forTypeIdentifier: type, visibility: .all) {
+            $0(Data(text.utf8), nil)
+            return nil
+        }
+    }
+
+    @MainActor
+    func testAURIListDropUploadsEveryFileItNames() async throws {
+        var expected: [URL] = []
+        let got = try await dropsAsFiles { provider, files in
+            expected = files
+            let list = "# dragged\r\n" + files.map { $0.absoluteString }.joined(separator: "\r\n")
+            XCTAssertTrue(list.contains("%20"), "percent-encoded, as a uri-list is")
+            self.offer(provider, "text/uri-list", list)
+            self.offer(provider, UTType.utf8PlainText.identifier, files.map(\.path).joined(separator: "\n"))
+        }
+        XCTAssertEqual(got, expected)
+    }
+
+    @MainActor
+    func testAFileSchemeURLOfferedAsAPlainURLIsTheFile() async throws {
+        var expected: [URL] = []
+        let got = try await dropsAsFiles({ provider, files in
+            expected = files
+            self.offer(provider, UTType.url.identifier, files[0].absoluteString)
+        }, file: ["a note.md"])
+        XCTAssertEqual(got, expected)
+    }
+
+    @MainActor
+    func testAnEditorsOwnJSONTypesNameTheirFiles() async throws {
+        var expected: [URL] = []
+        let got = try await dropsAsFiles { provider, files in
+            expected = files
+            let editors = files.map {
+                ["resource": ["$mid": 1, "fsPath": $0.path, "external": $0.absoluteString, "path": $0.path, "scheme": "file"]]
+            }
+            let json = try! JSONSerialization.data(withJSONObject: editors)
+            self.offer(provider, "codeeditors", String(decoding: json, as: UTF8.self))
+            let uris = try! JSONSerialization.data(withJSONObject: files.map(\.absoluteString))
+            self.offer(provider, "application/vnd.code.uri-list", String(decoding: uris, as: UTF8.self))
+        }
+        XCTAssertEqual(got, expected)
+    }
+
+    @MainActor
+    func testAPlainTextDropOfSeveralPathsIsThoseFiles() async throws {
+        var expected: [URL] = []
+        let got = try await dropsAsFiles { provider, files in
+            expected = files
+            self.offer(provider, UTType.utf8PlainText.identifier, files.map(\.path).joined(separator: "\n"))
+        }
+        XCTAssertEqual(got, expected)
+    }
+
+    func testTextThatOnlyMentionsAPathStaysText() throws {
+        let folder = try temporaryFolder()
+        let file = folder.appendingPathComponent("x.md")
+        try Data("x".utf8).write(to: file)
+        XCTAssertEqual(DroppedFiles.references(in: "notes\n\(file.path)\nmore notes"), [])
+        XCTAssertEqual(DroppedFiles.references(in: #"{"note": "hello"}"#), [])
+        XCTAssertEqual(DroppedFiles.references(in: "file:///nowhere/at/all.md"), [])
+    }
+
+    // MARK: A path written in the message
+
+    @MainActor
+    func testAPathWrittenInTheMessageIsSentAsTheFileWithTheWordsUnchanged() async throws {
+        let (model, transport) = connectedModel()
+        let folder = try temporaryFolder()
+        let file = folder.appendingPathComponent("My Roster.md")
+        try Data("body".utf8).write(to: file)
+        let words = "send \(file.path), to alex saying testing"
+        model.draft = words
+
+        model.send()
+        XCTAssertTrue(transport.submissions.isEmpty, "the say waits for the file to be stored")
+        try await waitUntil { !transport.submissions.isEmpty }
+
+        XCTAssertEqual(transport.attachments.map { $0.resolvingSymlinksInPath() }, [file.resolvingSymlinksInPath()])
+        let submission = try XCTUnwrap(transport.submissions.first)
+        XCTAssertEqual(submission.text, words)
+        let item = try XCTUnwrap(submission.context.first)
+        XCTAssertEqual(item.title, "My Roster.md")
+        XCTAssertEqual(item.blob, transport.attachmentReference.blob)
+        XCTAssertEqual(transport.submissions.count, 1)
+    }
+
+    func testMessagePathsResolveTildeAndSymlinksAndRefuseTheRest() throws {
+        let folder = try temporaryFolder().resolvingSymlinksInPath()
+        let file = folder.appendingPathComponent("plan.md")
+        try Data("plan".utf8).write(to: file)
+        let link = folder.appendingPathComponent("link.md")
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: file)
+        let big = folder.appendingPathComponent("big.bin")
+        FileManager.default.createFile(atPath: big.path, contents: nil)
+        let handle = try FileHandle(forWritingTo: big)
+        try handle.truncate(atOffset: UInt64(DroppedFiles.maximumMessageFileBytes + 1))
+        try handle.close()
+
+        XCTAssertEqual(DroppedFiles.inMessage("look at ~/plan.md please", home: folder.path), [file])
+        XCTAssertEqual(DroppedFiles.inMessage("the link \(link.path)", home: "/nowhere"), [file])
+        XCTAssertEqual(DroppedFiles.inMessage("(\(file.path))."), [file])
+        XCTAssertEqual(DroppedFiles.inMessage("a folder \(folder.path) and \(big.path) and /no/such/file.md"), [])
+        XCTAssertEqual(DroppedFiles.inMessage("a/\(file.path) is not a word start"), [])
+    }
+
+    private func temporaryFolder() throws -> URL {
+        let folder = FileManager.default.temporaryDirectory
+            .appendingPathComponent("omega-drop-test-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: folder) }
+        return folder
+    }
+
+    @MainActor
+    private func waitUntil(_ condition: @MainActor () -> Bool) async throws {
+        for _ in 0..<400 {
+            if condition() { return }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        XCTFail("condition never held")
     }
 
     @MainActor

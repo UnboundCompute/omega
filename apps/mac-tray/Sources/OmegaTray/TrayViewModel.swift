@@ -76,6 +76,8 @@ final class TrayViewModel: ObservableObject {
     private var eventTask: Task<Void, Never>?
     private var terminalTask: Task<Void, Never>?
     private var attachmentTasks: [UUID: Task<Void, Never>] = [:]
+    /// Send pressed while files named in the message were still being stored.
+    private var sendWhenStored = false
     private var transcriptRestoreTask: Task<Void, Never>?
     private var updatesDuringTranscriptRestore: [TrayUpdate] = []
     private var lastProcessedSeq: Int?
@@ -236,6 +238,12 @@ final class TrayViewModel: ObservableObject {
 
     func send() {
         guard canSubmit else { return }
+        if stageFilesNamedInDraft() {
+            // Sent once those files are stored, by `uploadAttachment`.
+            sendWhenStored = true
+            return
+        }
+        sendWhenStored = false
 
         let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
         let sentContext = stagedContext
@@ -622,6 +630,7 @@ final class TrayViewModel: ObservableObject {
     }
 
     func removeContext(id: UUID) {
+        sendWhenStored = false
         attachmentTasks.removeValue(forKey: id)?.cancel()
         stagedContext.removeAll { $0.id == id }
     }
@@ -641,6 +650,12 @@ final class TrayViewModel: ObservableObject {
         proactivePeek = nil
     }
 
+    /// A drop, item by item. A file always arrives as a file, uploaded with `put`: its
+    /// URL is taken before any other representation, because a text file (a `.md`, a
+    /// `.txt`) also offers itself as a string, and reading that string made the file a
+    /// 48-character snippet with no bytes behind it. A drag with no file URL (an editor's)
+    /// is searched for the files it names (`DroppedFiles`) before anything is read as
+    /// content. Text that is only text is kept whole, as a stored file (`stageText`).
     func importProviders(_ providers: [NSItemProvider]) -> Bool {
         var accepted = false
 
@@ -654,29 +669,98 @@ final class TrayViewModel: ObservableObject {
                     else { return }
                     Task { @MainActor in self?.stageFile(url) }
                 }
-            } else if provider.hasItemConformingToTypeIdentifier(UTType.url.identifier) {
+            } else if !provider.registeredTypeIdentifiers.isEmpty {
                 accepted = true
-                provider.loadItem(forTypeIdentifier: UTType.url.identifier, options: nil) { [weak self] item, _ in
-                    let url = (item as? URL) ?? (item as? String).flatMap(URL.init(string:))
-                    guard let url else { return }
-                    Task { @MainActor in self?.stageURL(url) }
-                }
-            } else if provider.canLoadObject(ofClass: NSImage.self) {
-                accepted = true
-                _ = provider.loadObject(ofClass: NSImage.self) { [weak self] object, _ in
-                    guard let image = object as? NSImage else { return }
-                    Task { @MainActor in self?.stageImage(image, title: "Dropped image", kind: .image) }
-                }
-            } else if provider.canLoadObject(ofClass: NSString.self) {
-                accepted = true
-                _ = provider.loadObject(ofClass: NSString.self) { [weak self] object, _ in
-                    guard let text = object as? String else { return }
-                    Task { @MainActor in self?.stageText(text) }
+                Task { @MainActor [weak self] in
+                    let files = await DroppedFiles.references(in: provider)
+                    guard let self else { return }
+                    if files.isEmpty {
+                        self.importContent(provider)
+                    } else {
+                        files.forEach { self.stageFile($0) }
+                    }
                 }
             }
         }
 
         return accepted
+    }
+
+    /// A dropped item that names no file: a link, a named document held as bytes, a
+    /// picture, or text.
+    private func importContent(_ provider: NSItemProvider) {
+        if provider.hasItemConformingToTypeIdentifier(UTType.url.identifier) {
+            provider.loadItem(forTypeIdentifier: UTType.url.identifier, options: nil) { [weak self] item, _ in
+                let url = (item as? URL) ?? (item as? String).flatMap(URL.init(string:))
+                guard let url else { return }
+                Task { @MainActor in self?.stageURL(url) }
+            }
+        } else if let type = Self.fileType(of: provider) {
+            // A file offered as typed bytes with a name (a document dragged out of an
+            // app that holds it) rather than as a URL: copied out before the provider
+            // deletes its temporary file, then staged as that file.
+            let name = provider.suggestedName ?? "file"
+            provider.loadFileRepresentation(forTypeIdentifier: type) { [weak self] url, _ in
+                guard let url, let copy = Self.copyOut(url, named: name, type: type) else { return }
+                Task { @MainActor in self?.stageFile(copy) }
+            }
+        } else if provider.canLoadObject(ofClass: NSImage.self) {
+            _ = provider.loadObject(ofClass: NSImage.self) { [weak self] object, _ in
+                guard let image = object as? NSImage else { return }
+                Task { @MainActor in self?.stageImage(image, title: "Dropped image", kind: .image) }
+            }
+        } else if provider.canLoadObject(ofClass: NSString.self) {
+            _ = provider.loadObject(ofClass: NSString.self) { [weak self] object, _ in
+                guard let text = object as? String else { return }
+                Task { @MainActor in self?.stageDroppedText(text) }
+            }
+        }
+    }
+
+    /// The type of a named file the provider holds as bytes, if it holds one: a
+    /// registered type more specific than plain text or a URL, on a provider that names
+    /// its item. A text selection registers only the generic string types and no name.
+    nonisolated static func fileType(of provider: NSItemProvider) -> String? {
+        guard let name = provider.suggestedName, !name.isEmpty else { return nil }
+        let generic: Set<String> = [
+            UTType.plainText.identifier, UTType.utf8PlainText.identifier,
+            UTType.utf16PlainText.identifier, UTType.text.identifier,
+            UTType.url.identifier, UTType.fileURL.identifier,
+        ]
+        return provider.registeredTypeIdentifiers.first { identifier in
+            guard !generic.contains(identifier), let type = UTType(identifier) else { return false }
+            return type.conforms(to: .data) && !type.conforms(to: .url)
+        }
+    }
+
+    nonisolated private static func copyOut(_ url: URL, named name: String, type: String) -> URL? {
+        var file = name.replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "\\", with: "_")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if file.isEmpty || file.hasPrefix(".") { file = "file\(file)" }
+        if URL(fileURLWithPath: file).pathExtension.isEmpty,
+           let ext = UTType(type)?.preferredFilenameExtension {
+            file += ".\(ext)"
+        }
+        let folder = FileManager.default.temporaryDirectory
+            .appendingPathComponent("omega-drop-\(UUID().uuidString)", isDirectory: true)
+        do {
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+            let copy = folder.appendingPathComponent(file)
+            try FileManager.default.copyItem(at: url, to: copy)
+            return copy
+        } catch {
+            return nil
+        }
+    }
+
+    private func stageDroppedText(_ text: String) {
+        let files = DroppedFiles.references(in: text)
+        if files.isEmpty {
+            stageText(text)
+        } else {
+            files.forEach { stageFile($0) }
+        }
     }
 
     func pasteFromClipboard() {
@@ -693,7 +777,10 @@ final class TrayViewModel: ObservableObject {
         }
 
         if let text = pasteboard.string(forType: .string), !text.isEmpty {
-            if let url = URL(string: text), url.scheme != nil {
+            let files = DroppedFiles.references(in: text)
+            if !files.isEmpty {
+                files.forEach { stageFile($0) }
+            } else if let url = URL(string: text), url.scheme != nil {
                 stageURL(url)
             } else {
                 stageText(text)
@@ -836,17 +923,30 @@ final class TrayViewModel: ObservableObject {
         )
     }
 
-    private func stageText(_ text: String) {
+    /// Text that is only text, kept whole: the core's context item has no field for its
+    /// words (`episodes.inbound` takes id, kind, title and a blob reference), so the text
+    /// is written to a file and uploaded with `put` like any other, and the 48-character
+    /// title is only its preview. Before, the title was all that ever left the Mac.
+    func stageText(_ text: String) {
         let normalized = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !normalized.isEmpty else { return }
-        stage(
-            StagedContext(
-                kind: .text,
-                title: String(normalized.prefix(48)),
-                detail: "Text · Not sent",
-                text: normalized
+        let title = String(normalized.prefix(48))
+        let file = FileManager.default.temporaryDirectory
+            .appendingPathComponent("omega-text-\(UUID().uuidString).txt")
+        do {
+            try Data(normalized.utf8).write(to: file, options: .atomic)
+            stage(StagedContext(kind: .text, title: title, detail: "Text · Not sent", fileURL: file, text: normalized))
+        } catch {
+            stagedContext.append(
+                StagedContext(
+                    kind: .text,
+                    title: title,
+                    detail: "Text · Not sent",
+                    text: normalized,
+                    attachmentState: .failed("The text could not be prepared for storage.")
+                )
             )
-        )
+        }
     }
 
     func stageImage(
@@ -892,6 +992,16 @@ final class TrayViewModel: ObservableObject {
         }
     }
 
+    /// A file whose path they wrote in the message (`/…`, `~/…`), staged as an attachment
+    /// so the core gets the file and not only its path; the words are sent as written.
+    /// True when something new was staged and the send must wait for it.
+    private func stageFilesNamedInDraft() -> Bool {
+        let staged = Set(stagedContext.compactMap { $0.fileURL?.standardizedFileURL.resolvingSymlinksInPath().path })
+        let named = DroppedFiles.inMessage(draft).filter { !staged.contains($0.path) }
+        named.forEach { stageFile($0) }
+        return !named.isEmpty
+    }
+
     private func stage(_ context: StagedContext) {
         stagedContext.append(context)
         guard let fileURL = context.fileURL else { return }
@@ -910,11 +1020,13 @@ final class TrayViewModel: ObservableObject {
             } catch is CancellationError {
                 return
             } catch {
+                self?.sendWhenStored = false
                 self?.updateContext(id: id) {
                     $0.attachmentState = .failed(error.localizedDescription)
                 }
             }
             self?.attachmentTasks[id] = nil
+            if let self, self.sendWhenStored, self.canSubmit { self.send() }
         }
     }
 

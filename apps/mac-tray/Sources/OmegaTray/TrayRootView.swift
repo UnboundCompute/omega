@@ -60,7 +60,7 @@ struct TrayRootView: View {
             }
         }
         .onDrop(
-            of: [UTType.fileURL, UTType.url, UTType.image, UTType.plainText],
+            of: [UTType.fileURL, UTType.url, UTType.image, UTType.plainText, UTType.data],
             isTargeted: $viewModel.isDropTargeted,
             perform: viewModel.importProviders
         )
