@@ -9,6 +9,7 @@ enum OmegaChannelError: Error, Equatable, LocalizedError {
     case lineTooLong
     case server(String)
     case conflict(String)
+    case overCap
 
     var errorDescription: String? {
         switch self {
@@ -19,6 +20,7 @@ enum OmegaChannelError: Error, Equatable, LocalizedError {
         case .lineTooLong: "Omega channel line exceeded 1 MiB"
         case .server(let detail): detail
         case .conflict(let detail): detail
+        case .overCap: "Over 25 MB, not sent"
         }
     }
 }
@@ -206,38 +208,26 @@ final class OmegaChannelClient: TrayTransport {
         }
     }
 
+    /// Sends the file's bytes with the core's chunked `put` op. `attach {path}` made the
+    /// core read a path on its own disk, which a core on another machine does not have.
     func attach(fileAt url: URL) async throws -> TrayAttachmentReference {
-        guard url.isFileURL else {
-            throw OmegaChannelError.invalidMessage("attachment path must be a file URL")
-        }
-        let line = try Self.encodeAttach(fileAt: url)
-
-        while isRunning {
-            try Task.checkCancellation()
-            try await waitUntilSubscribed()
-
-            do {
-                let (response, bufferedUpdates) = try await request(line)
-                yieldUpdates(bufferedUpdates)
-                guard Self.integer(response["v"]) == 1,
-                      response["op"] as? String == "attached",
-                      let blob = response["blob"] as? String,
-                      Self.isDigest(blob),
-                      let mime = response["mime"] as? String,
-                      !mime.isEmpty,
-                      let bytes = Self.integer(response["bytes"]),
-                      bytes >= 0
-                else {
-                    throw Self.responseError(response, expected: "attached")
-                }
-                return TrayAttachmentReference(blob: blob, mime: mime, bytes: bytes)
-            } catch OmegaChannelError.disconnected {
-                // Content-addressed ingestion is idempotent. If the response was lost,
-                // retrying the same path either stores the same bytes or returns its digest.
-                continue
+        let lines = try OmegaPutUpload.lines(
+            upload: UUID().uuidString,
+            name: OmegaPutUpload.fileName(for: url),
+            data: try OmegaPutUpload.read(fileAt: url)
+        )
+        return try await OmegaPutUpload.send(
+            lines,
+            isRunning: { [weak self] in self?.isRunning ?? false },
+            request: { [weak self] line in
+                guard let self else { throw OmegaChannelError.stopped }
+                try Task.checkCancellation()
+                try await self.waitUntilSubscribed()
+                let (response, bufferedUpdates) = try await self.request(line)
+                self.yieldUpdates(bufferedUpdates)
+                return response
             }
-        }
-        throw OmegaChannelError.stopped
+        )
     }
 
     func transcript() async throws -> [TrayUpdate] {
@@ -650,21 +640,14 @@ final class OmegaChannelClient: TrayTransport {
         return try encodeObject(object)
     }
 
-    static func encodeAttach(fileAt url: URL) throws -> Data {
-        try encodeObject([
-            "op": "attach",
-            "path": url.standardizedFileURL.path,
-        ])
-    }
-
-    private static func isDigest(_ value: String) -> Bool {
+    static func isDigest(_ value: String) -> Bool {
         value.range(
             of: #"^sha256:[0-9a-f]{64}$"#,
             options: .regularExpression
         ) != nil
     }
 
-    private static func encodeObject(_ object: [String: Any]) throws -> Data {
+    static func encodeObject(_ object: [String: Any]) throws -> Data {
         var data = try JSONSerialization.data(withJSONObject: object)
         data.append(0x0A)
         guard data.count <= OmegaJSONLineFramer.maximumLineBytes else {
@@ -714,14 +697,14 @@ final class OmegaChannelClient: TrayTransport {
         )
     }
 
-    private static func responseError(_ object: [String: Any], expected: String) -> OmegaChannelError {
+    static func responseError(_ object: [String: Any], expected: String) -> OmegaChannelError {
         if object["op"] as? String == "error" {
             return .server(object["error"] as? String ?? "Omega channel request failed")
         }
         return .invalidMessage("expected \(expected)")
     }
 
-    private static func integer(_ value: Any?) -> Int? {
+    static func integer(_ value: Any?) -> Int? {
         guard let number = value as? NSNumber,
               CFGetTypeID(number) != CFBooleanGetTypeID(),
               number.doubleValue.rounded(.towardZero) == number.doubleValue

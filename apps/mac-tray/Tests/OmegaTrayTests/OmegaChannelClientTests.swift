@@ -173,20 +173,116 @@ final class OmegaChannelClientTests: XCTestCase {
     }
 
     @MainActor
-    func testAttachmentCodecUploadsAPathAndCitesTheReturnedReference() throws {
-        let file = URL(fileURLWithPath: "/tmp/omega attachment.png")
-        let attachLine = try OmegaChannelClient.encodeAttach(fileAt: file)
-        let attach = try XCTUnwrap(
-            JSONSerialization.jsonObject(with: attachLine.dropLast()) as? [String: Any]
-        )
-        XCTAssertEqual(attach["op"] as? String, "attach")
-        XCTAssertEqual(attach["path"] as? String, file.path)
+    func testPutCodecSendsBase64ChunksAtTheirOffsets() throws {
+        let chunk = OmegaPutUpload.maximumChunkBytes
+        XCTAssertEqual(chunk, 512 * 1024)
+        let data = Data((0..<(2 * chunk + 100)).map { UInt8(truncatingIfNeeded: $0 &* 31) })
+        let lines = try OmegaPutUpload.lines(upload: "up-1", name: "omega attachment.png", data: data)
 
-        let reference = TrayAttachmentReference(
-            blob: "sha256:" + String(repeating: "b", count: 64),
-            mime: "image/png",
-            bytes: 184_320
+        XCTAssertEqual(lines.count, 3)
+        var rebuilt = Data()
+        for (index, line) in lines.enumerated() {
+            XCTAssertEqual(line.last, 0x0A)
+            XCTAssertLessThan(line.count, OmegaJSONLineFramer.maximumLineBytes)
+            let object = try XCTUnwrap(
+                JSONSerialization.jsonObject(with: line.dropLast()) as? [String: Any]
+            )
+            XCTAssertEqual(object["op"] as? String, "put")
+            XCTAssertNil(object["path"])
+            XCTAssertEqual(object["upload"] as? String, "up-1")
+            XCTAssertEqual(object["name"] as? String, "omega attachment.png")
+            XCTAssertEqual(object["offset"] as? Int, index * chunk)
+            XCTAssertEqual(object["last"] as? Bool, index == 2)
+            let bytes = try XCTUnwrap(Data(base64Encoded: try XCTUnwrap(object["data"] as? String)))
+            XCTAssertEqual(bytes.count, index == 2 ? 100 : chunk)
+            rebuilt.append(bytes)
+        }
+        XCTAssertEqual(rebuilt, data)
+
+        let empty = try OmegaPutUpload.lines(upload: "up-2", name: "empty.txt", data: Data())
+        XCTAssertEqual(empty.count, 1)
+        let only = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: empty[0].dropLast()) as? [String: Any]
         )
+        XCTAssertEqual(only["offset"] as? Int, 0)
+        XCTAssertEqual(only["data"] as? String, "")
+        XCTAssertEqual(only["last"] as? Bool, true)
+        XCTAssertEqual(OmegaPutUpload.fileName(for: URL(fileURLWithPath: "/tmp/a b.pdf")), "a b.pdf")
+    }
+
+    @MainActor
+    func testOverCapFileIsRefusedBeforeAnythingIsSent() throws {
+        XCTAssertEqual(OmegaPutUpload.maximumFileBytes, 25 * 1024 * 1024)
+        let file = FileManager.default.temporaryDirectory
+            .appendingPathComponent("omega-over-cap-\(UUID().uuidString).bin")
+        XCTAssertTrue(FileManager.default.createFile(atPath: file.path, contents: nil))
+        defer { try? FileManager.default.removeItem(at: file) }
+        let handle = try FileHandle(forWritingTo: file)
+        try handle.truncate(atOffset: UInt64(OmegaPutUpload.maximumFileBytes + 1))
+        try handle.close()
+
+        XCTAssertThrowsError(try OmegaPutUpload.read(fileAt: file)) { error in
+            XCTAssertEqual(error as? OmegaChannelError, .overCap)
+            XCTAssertEqual(error.localizedDescription, "Over 25 MB, not sent")
+        }
+        XCTAssertThrowsError(try OmegaPutUpload.lines(
+            upload: "up", name: "big.bin",
+            data: Data(count: OmegaPutUpload.maximumFileBytes + 1)
+        )) { error in
+            XCTAssertEqual(error as? OmegaChannelError, .overCap)
+        }
+
+        let handle2 = try FileHandle(forWritingTo: file)
+        try handle2.truncate(atOffset: UInt64(OmegaPutUpload.maximumFileBytes))
+        try handle2.close()
+        XCTAssertEqual(try OmegaPutUpload.read(fileAt: file).count, OmegaPutUpload.maximumFileBytes)
+    }
+
+    @MainActor
+    func testRetryAfterADroppedChunkResendsWithoutCorruptingTheFile() async throws {
+        let chunk = OmegaPutUpload.maximumChunkBytes
+        let data = Data((0..<(2 * chunk + 7)).map { UInt8(truncatingIfNeeded: $0 &* 13 &+ 5) })
+        let lines = try OmegaPutUpload.lines(upload: "up-retry", name: "notes.txt", data: data)
+        let core = FakePutCore(dropAfterWritingRequest: 2)
+
+        let reference = try await OmegaPutUpload.send(
+            lines,
+            isRunning: { true },
+            request: { try core.handle($0) }
+        )
+
+        XCTAssertEqual(core.requests, 5)
+        XCTAssertEqual(core.stored, data)
+        XCTAssertEqual(reference.blob, FakePutCore.digest)
+        XCTAssertEqual(reference.mime, "text/plain")
+        XCTAssertEqual(reference.bytes, data.count)
+    }
+
+    @MainActor
+    func testPutRefusalFromTheCoreReachesTheTrayAsItsSentence() async throws {
+        let lines = try OmegaPutUpload.lines(upload: "up", name: "a.txt", data: Data("x".utf8))
+        do {
+            _ = try await OmegaPutUpload.send(lines, isRunning: { true }, request: { _ in
+                ["v": 1, "op": "error", "error": "a file is at most 25 MB"]
+            })
+            XCTFail("expected a refusal")
+        } catch {
+            XCTAssertEqual(error as? OmegaChannelError, .server("a file is at most 25 MB"))
+        }
+    }
+
+    @MainActor
+    func testPutReferenceLandsOnTheContextItemUnchanged() async throws {
+        let core = FakePutCore(dropAfterWritingRequest: nil)
+        let data = Data(repeating: 0x42, count: 184_320)
+        let reference = try await OmegaPutUpload.send(
+            try OmegaPutUpload.lines(upload: "up-ref", name: "omega attachment.png", data: data),
+            isRunning: { true },
+            request: { try core.handle($0) }
+        )
+        XCTAssertEqual(reference, TrayAttachmentReference(
+            blob: FakePutCore.digest, mime: "image/png", bytes: 184_320
+        ))
         let context = TrayContextReference(
             id: UUID(),
             kind: "screen",
@@ -260,5 +356,53 @@ final class OmegaChannelClientTests: XCTestCase {
         ]) { _, new in new }))
         XCTAssertEqual(unknownKind.seq, 45)
         XCTAssertEqual(unknownKind.kind, "future.kind")
+    }
+}
+
+/// The core's `put` contract, in memory: each chunk is written at its offset and the file
+/// truncated after it, an offset past what arrived is refused, and the last chunk answers
+/// `attached`. It can drop the connection after writing one request, as a lost ack would.
+@MainActor
+private final class FakePutCore {
+    static let digest = "sha256:" + String(repeating: "c", count: 64)
+
+    private(set) var requests = 0
+    private(set) var stored = Data()
+    private var staged: [String: Data] = [:]
+    private var dropAfterWritingRequest: Int?
+
+    init(dropAfterWritingRequest: Int?) {
+        self.dropAfterWritingRequest = dropAfterWritingRequest
+    }
+
+    func handle(_ line: Data) throws -> [String: Any] {
+        requests += 1
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: line.dropLast()) as? [String: Any]
+        )
+        XCTAssertEqual(object["op"] as? String, "put")
+        let upload = try XCTUnwrap(object["upload"] as? String)
+        let offset = try XCTUnwrap(object["offset"] as? Int)
+        let chunk = try XCTUnwrap(Data(base64Encoded: try XCTUnwrap(object["data"] as? String)))
+        XCTAssertLessThanOrEqual(chunk.count, OmegaPutUpload.maximumChunkBytes)
+        var file = staged[upload] ?? Data()
+        guard offset <= file.count else {
+            return ["v": 1, "op": "error", "error": "chunk at \(offset) but \(file.count) bytes arrived so far"]
+        }
+        file = file.prefix(offset) + chunk
+        staged[upload] = file
+        if requests == dropAfterWritingRequest {
+            dropAfterWritingRequest = nil
+            throw OmegaChannelError.disconnected
+        }
+        guard object["last"] as? Bool == true else {
+            return ["v": 1, "op": "put", "upload": upload, "bytes": offset + chunk.count]
+        }
+        stored = file
+        staged[upload] = nil
+        let name = object["name"] as? String ?? ""
+        let mime = name.hasSuffix(".png") ? "image/png" : name.hasSuffix(".txt") ? "text/plain"
+            : "application/octet-stream"
+        return ["v": 1, "op": "attached", "blob": Self.digest, "mime": mime, "bytes": file.count]
     }
 }

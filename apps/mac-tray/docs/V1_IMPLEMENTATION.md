@@ -30,7 +30,7 @@ become a second brain or an undeclared wire protocol.
 - Stream-driven understood, working, blocked, complete, failed, spoken, and silent outcomes;
   no locally invented agent progress.
 - Stable submission ids and duplicate acknowledgements for at-most-once retry behavior.
-- Capture, file, and image ingestion through the channel's `attach` operation before submission,
+- Capture, file, and image ingestion through the channel's chunked `put` operation before submission,
   with visible storing/ready/failure states and retry without losing staged context.
 - Content-addressed attachment references (`blob`, `mime`, and `bytes`) carried atomically into the
   eventual message episode; Send remains disabled until every file-backed item is durable.
@@ -79,9 +79,11 @@ projection client: it does not persist a second transcript or implement memory, 
 judgement, task execution, or verification.
 
 File-backed attachment ingestion is complete. The tray uploads each capture, dropped file, or
-pasted image while it is staged; omega copies the bytes into `<store>/blobs`, returns their
+pasted image while it is staged, as bytes (base64 chunks of at most 512 KiB, 25 MB a file), so a
+core on another machine gets the file; omega stores the bytes in `<store>/blobs`, returns their
 content digest, and the tray sends that immutable reference with the message. Upload errors are
-visible and retryable, and cannot silently degrade into metadata-only delivery.
+visible and retryable, and cannot silently degrade into metadata-only delivery. A file over 25 MB
+is refused in the tray before any chunk is sent.
 
 Image attachments, including screen captures, reach the capable model as bounded multimodal input.
 Non-image file contents are durable and re-readable by omega but do not reach the model yet. URL
