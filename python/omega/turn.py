@@ -34,6 +34,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Optional, Sequence
 
 from omega import blobs, derive, episodes, grants as granted, learn, lessons as self_taught, notice, provider, schedule
+from omega import leave, mcp, slack
 from omega import location as whereabouts
 from omega import tasks as _tasks
 from omega import outbox
@@ -1408,6 +1409,82 @@ _REPLY_SYSTEM = (
 )
 
 
+#: Where :func:`_with_hands` adds to each prompt's "you have a body" sentence.
+_JUDGE_BODY_END = "and set a reminder. "
+_REPLY_BODY_END = "written about this person. "
+_SLACK_HAND = "post to their work Slack as them"
+#: How a configured MCP server's tools read as an ability; any other server
+#: is named by the name the person gave it.
+_SERVER_ABILITY = {
+    leave.SERVER: "find places and routes on Maps",
+    "github": "read GitHub",
+}
+
+
+def hands(ctx: "TurnContext") -> list[str]:
+    """The configured or seat-only abilities this turn's act box will hold,
+    as words for the judge and the reply (DL-101a).
+
+    Structural only, never the message's words: Slack where
+    :func:`omega.act._slack_seat` would seat it (their own message and a
+    token set), each configured MCP server with tools allowed on every turn
+    as the box is handed them, and the leave-now alarm where
+    :func:`omega.tools._leaving` could hold, from the configuration alone so
+    that judging never lists a server over the network. Empty when nothing
+    is configured, which is what keeps both prompts as they were.
+    """
+    prompted = not unprompted(ctx)
+    out: list[str] = []
+    if prompted and slack.client() is not None:
+        out.append(_SLACK_HAND)
+    servers = [s for s in mcp.servers() if s.allow]
+    out.extend(_SERVER_ABILITY.get(s.name, f"use their {s.name} tools") for s in servers)
+    if prompted and any(leave.FULL in {f"{s.name}{mcp.SEP}{t}" for t in s.allow} for s in servers):
+        out.append("tell them when to leave by live traffic")
+    return out
+
+
+def _abilities(hands_: Sequence[str]) -> str:
+    if len(hands_) == 1:
+        return hands_[0]
+    return ", ".join(hands_[:-1]) + " and " + hands_[-1]
+
+
+def _with_hands(system: str, anchor: str, extra: str) -> str:
+    assert system.count(anchor) == 1, anchor
+    return system.replace(anchor, anchor + extra, 1)
+
+
+def judge_system(ctx: "TurnContext") -> str:
+    """:data:`_JUDGE_SYSTEM`, plus what is switched on this turn and the one
+    rule that sends an ask for it to ACT; byte-identical with nothing on."""
+    on = hands(ctx)
+    if not on:
+        return _JUDGE_SYSTEM
+    reaches = [
+        "post, share or send something to Slack" if hand == _SLACK_HAND
+        else "look something up on a service named here"
+        for hand in on
+    ]
+    return _with_hands(
+        _JUDGE_SYSTEM, _JUDGE_BODY_END,
+        f"This turn you can also {_abilities(on)}. If they ask you to do "
+        f"something one of these reaches ({', '.join(dict.fromkeys(reaches))}), "
+        "choose ACT: only ACT holds the tools that do it. ",
+    )
+
+
+def reply_system(ctx: "TurnContext") -> str:
+    """:data:`_REPLY_SYSTEM`, plus what is switched on this turn;
+    byte-identical with nothing on."""
+    on = hands(ctx)
+    if not on:
+        return _REPLY_SYSTEM
+    return _with_hands(
+        _REPLY_SYSTEM, _REPLY_BODY_END, f"You can also {_abilities(on)}. "
+    )
+
+
 def _event_turn(
     ctx: TurnContext, *, images: bool, suffix: str = "", lessons: bool = False
 ) -> provider.Message:
@@ -1585,7 +1662,7 @@ def _review(
 def _judge_messages(ctx: TurnContext) -> list[provider.Message]:
     suffix = _LOOK_JUDGE_SUFFIX if is_look(ctx) else _JUDGE_SUFFIX
     return [
-        provider.system(_JUDGE_SYSTEM),
+        provider.system(judge_system(ctx)),
         _event_turn(ctx, images=False, suffix=suffix, lessons=True),
     ]
 
@@ -1596,7 +1673,7 @@ def _reply_messages(
     work = f"\n\nWork done this turn: {', '.join(acted.tools)}" if acted.tools else ""
     why = f"\n\nYou decided to speak up because: {reason}" if reason else ""
     return [
-        provider.system(_REPLY_SYSTEM),
+        provider.system(reply_system(ctx)),
         _event_turn(ctx, images=True, suffix=work + why),
     ]
 
