@@ -355,6 +355,94 @@ def test_a_file_they_did_not_send_is_not_posted(q: EventQueue, on: Client, fake:
     assert "files.getUploadURLExternal" not in fake.methods()
 
 
+def _document(q: EventQueue, tmp_path: Path, title: str = "roster.md", data: bytes = b"# Roster\n") -> dict:
+    src = tmp_path / f"src-{len(data)}-{title}"
+    src.write_bytes(data)
+    ref = BlobStore.open(q.store.root).put(src)
+    return {"id": f"tray:{ref.digest[-6:]}", "kind": "file", "title": title, "blob": ref.digest,
+            "mime": "text/markdown", "bytes": ref.bytes}
+
+
+def _uploaded(fake: FakeSlack) -> list[dict]:
+    return [p for m, _, p in fake.calls if m == "files.getUploadURLExternal"]
+
+
+def test_a_file_named_by_its_path_on_their_mac_is_the_file_they_sent(
+    q: EventQueue, on: Client, fake: FakeSlack, tmp_path: Path,
+) -> None:
+    """The model sees the path they wrote, not the stored name: a path, any
+    case, or a ``[file: …]`` note all name the file stored under its last part."""
+    item = _document(q, tmp_path)
+    other = _picture(q, tmp_path)
+    seq = say(q, "send it to #team", context=[item, other])
+    for attach in ("/Users/someone/Docs/roster.md", "~/Docs/ROSTER.md", "[file: Roster.md]",
+                   "C:\\Docs\\roster.md", "roster.md"):
+        b = box(q, on, seat=seat(on, attached=(item, other)), for_seq=seq)
+        b.dispatch(b.classify(tools.SLACK, {"do": "post", "to": "#team", "attach": attach}))
+    assert [u["filename"] for u in _uploaded(fake)] == ["roster.md"] * 5
+    with pytest.raises(tools.ToolError, match="no one file they sent is called '/Users/someone/budget.md'"):
+        b = box(q, on, seat=seat(on, attached=(item, other)))
+        b.dispatch(b.classify(tools.SLACK, {"do": "post", "to": "#team", "attach": "/Users/someone/budget.md"}))
+
+
+def test_of_two_files_by_one_name_the_newest_is_posted(
+    q: EventQueue, on: Client, fake: FakeSlack, tmp_path: Path,
+) -> None:
+    older = _document(q, tmp_path, data=b"# Roster v1\n")
+    newer = _document(q, tmp_path, data=b"# Roster v2, longer\n")
+    seq_old = say(q, "here is the roster", channel="tray", context=[older])
+    turn(q, seq_old, act=["Got it."])
+    seq = say(q, "", channel="tray", context=[newer])
+    turn(q, seq, act=[post(to="#team", attach="/Users/someone/roster.md"), "Posted."])
+    [slot] = _uploaded(fake)
+    assert slot == {"filename": "roster.md", "length": str(newer["bytes"])}
+    assert kinds(q, episodes.SLACK_POSTED)[0]["for_seq"] == seq
+
+
+def test_a_file_put_over_the_channel_with_no_words_reaches_slack(
+    q: EventQueue, on: Client, fake: FakeSlack, tmp_path: Path,
+) -> None:
+    """The tray's way: ask first, then a say with no words carrying the put
+    file; the post that names it by the Mac path uploads it."""
+    data = b"# Team: roster\n" * 300
+    ch = Channel(q, BlobStore.open(q.store.root), port=0, poll=0.005)
+    ch.start()
+    try:
+        with ChannelClient(ch.address, timeout=5.0) as c:
+            ask = c.request({"v": 1, "op": "say", "id": "s1", "text": "send this file to #team saying testing",
+                             "channel": "tray", "context": []})
+            turn(q, ask["seq"], act=["Which file?"])
+            stored = c.put("U-1", "team roster.md", data)
+            sent = c.request({"v": 1, "op": "say", "id": "s2", "text": "", "channel": "tray", "context": [
+                {"id": "6F1C0000-0000-0000-0000-000000000001", "kind": "file", "title": "team roster.md",
+                 "blob": stored["blob"], "mime": stored["mime"], "bytes": stored["bytes"]}]})
+    finally:
+        ch.stop()
+    result, fp = turn(q, sent["seq"], act=[
+        post(to="#team", attach="/Users/someone/work/team roster.md", text="testing"), "Posted."])
+    assert "[file: team roster.md]" in shown(fp)
+    [slot] = _uploaded(fake)
+    assert slot == {"filename": "team roster.md", "length": str(len(data))}
+    [rec] = kinds(q, episodes.SLACK_POSTED)
+    assert rec["what"] == "file" and rec["for_seq"] == sent["seq"]
+    assert list(result.tools) == [tools.SLACK]
+
+
+def test_a_held_file_post_finds_the_file_on_their_yes(
+    q: EventQueue, on: Client, fake: FakeSlack, tmp_path: Path, page: None,
+) -> None:
+    item = _document(q, tmp_path)
+    seq = say(q, f"read {URL} and send this to #team", context=[item])
+    result, _ = turn(q, seq, act=[call("fetch", url=URL),
+                                  post(id="c2", to="#team", attach="/Users/someone/roster.md"), "Held."])
+    assert _uploaded(fake) == []
+    pseq = [p.seq for p in q.recent(1000) if p.payload.get("kind") == episodes.GRANT_PROPOSED][0]
+    yes = say(q, f"yes p{pseq}")
+    turn(q, yes, act=["Sent."])
+    assert [u["filename"] for u in _uploaded(fake)] == ["roster.md"]
+    assert kinds(q, episodes.SLACK_POSTED)[0]["for_seq"] == yes
+
+
 def test_a_file_sent_over_the_channel_in_chunks_arrives_whole(q: EventQueue, store_dir: Path) -> None:
     """The Discord adapter's way in for a file (it has no path on this disk):
     chunked ``put``, idempotent per chunk, ending as an ``attach`` answer."""

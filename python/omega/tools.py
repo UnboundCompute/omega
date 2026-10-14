@@ -2277,6 +2277,20 @@ def _classify_slack(box: "ToolBox", args: dict[str, Any]) -> Decision:
     return Decision(tool=SLACK, tier=LOCAL, why=f"post {what} to {to} on Slack as you", args=clean)
 
 
+def _attached_names(text: str) -> set[str]:
+    """The names a file goes by, lowercased: as written, and its last path
+    part, so a path on the sender's machine (``/Users/x/notes.md``,
+    ``C:\\x\\notes.md``) names the file stored as ``notes.md``."""
+    name = text.strip().strip("[]").strip()
+    kind, sep, rest = name.partition(":")
+    if sep and kind.strip().lower() in {"file", "image", "attached"} and not rest.startswith("//"):
+        name = rest.strip()
+    name = name.strip("\"'`").strip().lower()
+    if not name:
+        return set()
+    return {name, re.split(r"[/\\]", name.rstrip("/\\"))[-1]} - {""}
+
+
 def _slack_file(box: "ToolBox", attach: str) -> tuple[str, bytes]:
     """The name and bytes ``attach`` names: a file on their recent messages
     by its name, or a stored blob by its ``sha256:`` reference (a document
@@ -2290,7 +2304,10 @@ def _slack_file(box: "ToolBox", attach: str) -> tuple[str, bytes]:
             "file",
         )
     else:
-        hits = [i for i in seat.attached if str(i.get("title") or "").strip().lower() == attach.lower()]
+        wanted = _attached_names(attach)
+        # seat.attached is newest first, so the first file by that name is
+        # the one they sent last.
+        hits = [i for i in seat.attached if wanted & _attached_names(str(i.get("title") or ""))][:1]
         if not hits and len(seat.attached) == 1:
             hits = list(seat.attached)
         digests = {str(i["blob"]) for i in hits}
