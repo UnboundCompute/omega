@@ -46,13 +46,14 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 
 from omega import episodes, finance, grants, leave, lessons, location, lookback, mailcursor, mcp, projects, provider
-from omega import tasks
+from omega import slack, tasks
 from omega import topics as kept
 from omega import watcher
 from omega.tools import (
     EXTERNAL,
     GRANT,
     LOCAL,
+    SLACK,
     NOTHING_NEW,
     Decision,
     ToolBox,
@@ -72,7 +73,7 @@ from omega.tools import (
 # The reverse import would be a cycle, and worse, it would make the six-step
 # turn depend on the tools — which is the coupling that lets a tool change
 # quietly alter what a turn is.
-from omega.turn import MAX_ACT_PASSES, ActResult, TurnContext, read_untrusted, unprompted
+from omega.turn import MAX_ACT_PASSES, UNPROMPTED_CHANNELS, ActResult, TurnContext, read_untrusted, unprompted
 from omega.turn import _event_turn  # the turn's own rendering, images and all
 
 __all__ = [
@@ -289,6 +290,10 @@ def act_loop(
             # DL-093: the leave-now alarms, folded when `leave_by` asks, and
             # only in a turn their own message started.
             leaves=(lambda: leave.fold(ctx.queue.store)) if not unprompted(ctx) else None,
+            # DL-101: their work Slack, only in a turn their own message
+            # started and only with their token set; None leaves the box as
+            # it was.
+            slack=_slack_seat(ctx),
         )
 
     # Their answer to a proposal is settled before the model is asked anything
@@ -540,13 +545,38 @@ def act_loop(
     )
 
 
+def _slack_seat(ctx: TurnContext) -> Optional[slack.Seat]:
+    """``slack`` for this turn (DL-101): their own message, a token set, the
+    files their recent messages carried, and what omega posted, folded from
+    the log when a delete asks."""
+    if unprompted(ctx):
+        return None
+    client = slack.client()
+    if client is None:
+        return None
+    theirs = [
+        p.payload for p in ctx.recalled
+        if p.payload.get("kind") == episodes.MESSAGE_INBOUND
+        and str(p.payload.get("channel", "")) not in UNPROMPTED_CHANNELS
+    ]
+    return slack.Seat(
+        client=client,
+        attached=slack.attachments(ctx.event, theirs),
+        posted=lambda: slack.posts(ctx.queue.store),
+    )
+
+
 def _outward(d: Decision) -> bool:
     """Would this call act outside omega, or change what omega may do? An
-    ``external`` call (DL-028), and giving or taking a grant (DL-085): the
-    acts a page that says "grant yourself research" is written to get. Putting
-    a gate back on only narrows what omega may do, and is not held."""
+    ``external`` call (DL-028), giving or taking a grant (DL-085): the acts a
+    page that says "grant yourself research" is written to get, and a post to
+    their Slack or taking one back (DL-101), which run straight away on a
+    clean turn. Putting a gate back on only narrows what omega may do, and is
+    not held; listing their channels reaches nothing."""
     if d.tier == EXTERNAL:
         return True
+    if d.tool == SLACK:
+        return d.args.get("do") in ("post", "delete")
     return d.tool == GRANT and d.args.get("change") in ("give", "revoke")
 
 
@@ -605,6 +635,23 @@ def _release(
         why = str(action["why"])
         if grants.is_money(tool):
             results.append(f"{why}: not run, omega never pays")
+            continue
+        if tool == SLACK:
+            # A held Slack post or delete (DL-101) is theirs to have sent
+            # anyway on a clean turn, so their yes sends it: classified again
+            # by this turn's box, which holds it only on their own message
+            # with the token still set, and run exactly as filed.
+            try:
+                decision = box.classify(tool, args)
+            except ToolRejected as exc:
+                results.append(f"{why}: not run, {exc}")
+                continue
+            _called(ctx, decision.tool, decision.args)
+            text, logged, ok = _dispatch(box, decision)
+            _returned(ctx, decision.tool, ok=ok, result=logged if ok else None, error=None if ok else text)
+            if ok:
+                ran.append(tool)
+            results.append(f"{why}: {text}")
             continue
         if tool != GRANT:
             results.append(

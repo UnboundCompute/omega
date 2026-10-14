@@ -20,9 +20,16 @@ an ordinary ``say`` under the same ``discord:<message id>`` key, marked
 ``report`` exactly as the Mac relay files one (DL-072): the unit is the digest
 of the audio, so the same file sent twice is the channel's duplicate ack. There
 is no whisper on the VM, so a failure is told to the person in the DM, never
-dropped. Anything that is not audio is refused with a plain reply: the only
-attach path the channel has reads a file *by path on the core's machine*, and
-a Discord upload is not one (never attach-by-path).
+dropped.
+
+**Files and pictures go in with the words** (DL-101), so "post this to
+#team" can carry the screenshot it is about. Each one that is not audio is
+downloaded and handed to the core in chunks over the ``put`` op (never
+attach-by-path: a Discord upload is not a file on the core's machine), and
+the ``say`` names it as a context item, an ``image`` for a picture and a
+``file`` otherwise. One that cannot be fetched, or is over
+:data:`omega.channel.MAX_PUT_IN`, stops the whole message with a plain reply:
+passing on half of it would leave the person guessing which half arrived.
 
 **Out.** It subscribes from its cursor and decides per update:
 
@@ -73,7 +80,7 @@ from typing import Any, Awaitable, Callable, Mapping, Optional
 
 from omega import blobs, episodes, handoff, listen, projection, sarvam
 from omega.relay import _sha256
-from omega.channel import DEFAULT_HOST, DEFAULT_PORT, PROTOCOL, ChannelClient, ChannelError
+from omega.channel import DEFAULT_HOST, DEFAULT_PORT, MAX_PUT_IN, PROTOCOL, ChannelClient, ChannelError
 
 __all__ = [
     "CHANNEL",
@@ -110,8 +117,8 @@ DEFAULT_STATE = "/state"
 CURSOR_FILE = "cursor"
 
 ATTACHMENTS_REFUSED = (
-    "Only audio attachments are supported here, so I didn't pass that on. "
-    "Send the words on their own, or a voice note."
+    "I couldn't take one of those files in, so I didn't pass that on. "
+    "Send it again, or send the words on their own."
 )
 #: What a transcribed voice note starts with, so the log and the model can tell
 #: spoken words (and their mishearings) from typed ones.
@@ -241,15 +248,21 @@ def report_request(
     }
 
 
-def say_request(message_id: Any, text: str) -> dict[str, Any]:
-    """The ``say`` a DM becomes. The message id is the write key."""
-    return {
+def say_request(
+    message_id: Any, text: str, context: Optional[list[dict[str, Any]]] = None
+) -> dict[str, Any]:
+    """The ``say`` a DM becomes. The message id is the write key; the files
+    that came with it (DL-101), already stored, ride as context items."""
+    request = {
         "v": PROTOCOL,
         "op": "say",
         "text": text,
         "channel": CHANNEL,
         "id": f"{CHANNEL}:{message_id}",
     }
+    if context:
+        request["context"] = context
+    return request
 
 
 class Inbound:
@@ -275,8 +288,28 @@ class Inbound:
         self._attempts = attempts
         self._note = log
 
-    def say(self, message_id: Any, text: str) -> Optional[dict[str, Any]]:
-        return self.send(say_request(message_id, text))
+    def say(
+        self, message_id: Any, text: str, context: Optional[list[dict[str, Any]]] = None
+    ) -> Optional[dict[str, Any]]:
+        return self.send(say_request(message_id, text, context))
+
+    def put(self, upload: str, name: str, data: bytes) -> Optional[dict[str, Any]]:
+        """Hand one file's bytes to the core (DL-101), with the same retries:
+        each attempt starts the upload again from its first byte."""
+        delay = BACKOFF_FIRST
+        for attempt in range(1, self._attempts + 1):
+            try:
+                client = self._connect(self._address)
+                try:
+                    return client.put(upload, name, data)
+                finally:
+                    client.close()
+            except (OSError, ChannelError, ValueError) as exc:
+                self._note(f"put attempt {attempt} failed: {type(exc).__name__}")
+                if attempt < self._attempts:
+                    self._sleep(delay)
+                    delay = min(delay * 2, BACKOFF_MAX)
+        return None
 
     def send(self, request: dict[str, Any]) -> Optional[dict[str, Any]]:
         """Any one request, with the same retries. Only ``say`` and ``report``
@@ -354,12 +387,19 @@ class Dm:
 
         attachments = list(getattr(message, "attachments", None) or [])
         audio = [a for a in attachments if is_audio(a.filename, getattr(a, "content_type", None))]
-        if len(audio) < len(attachments):
-            # The whole message, as before audio was heard: passing on half of
-            # it would leave the person guessing which half arrived.
-            self._note(f"refused a DM with {len(attachments) - len(audio)} non-audio attachment(s)")
-            await message.channel.send(ATTACHMENTS_REFUSED)
-            return
+        files = [a for a in attachments if a not in audio]
+        context: list[dict[str, Any]] = []
+        if files:
+            # Taken in before anything is said (DL-101). One that fails stops
+            # the whole message: passing on half of it would leave the person
+            # guessing which half arrived.
+            for n, attachment in enumerate(files):
+                item = await self._take(message, attachment, n)
+                if item is None:
+                    self._note(f"refused a DM: attachment {n + 1} of {len(files)} did not reach the core")
+                    await message.channel.send(ATTACHMENTS_REFUSED)
+                    return
+                context.append(item)
         # Typed words go in as typed, exactly as before audio was heard.
         text = getattr(message, "content", "") or ""
         if not text.strip():
@@ -372,8 +412,8 @@ class Dm:
             if spoken is not None:
                 text = f"{text}\n\n{spoken}" if text else spoken
             audio = audio[1:]
-        if text:
-            await self._say(message, text)
+        if text or context:
+            await self._say(message, text, context)
         for attachment in audio:
             await self._recording(message, attachment)
 
@@ -388,8 +428,45 @@ class Dm:
             return
         self._note(f"reaction filed as seq {ack['seq']}{' (duplicate)' if ack.get('duplicate') else ''}")
 
-    async def _say(self, message: Any, text: str) -> None:
-        ack = await asyncio.to_thread(self._inbound.say, message.id, text)
+    async def _take(self, message: Any, attachment: Any, n: int) -> Optional[dict[str, Any]]:
+        """One file from the DM, stored in the core (DL-101): its context
+        item, or ``None`` when it could not be fetched or handed in."""
+        title = Path(attachment.filename or "file").name or "file"
+        size = getattr(attachment, "size", None)
+        if isinstance(size, int) and size > MAX_PUT_IN:
+            return None
+        with tempfile.TemporaryDirectory(prefix="omega-discord-") as tmp:
+            path = Path(tmp) / title
+            try:
+                await self._fetch(attachment, path)
+                data = path.read_bytes()
+            except Exception as exc:  # noqa: BLE001 - told to the person, not raised
+                self._note(f"an attachment download failed ({type(exc).__name__})")
+                return None
+        if not data or len(data) > MAX_PUT_IN:
+            return None
+        answer = await asyncio.to_thread(
+            self._inbound.put, f"{CHANNEL}-{message.id}-{n}", title, data
+        )
+        if not answer or answer.get("op") != "attached":
+            return None
+        mime = (getattr(attachment, "content_type", None) or "").split(";")[0].strip() or answer["mime"]
+        return {
+            "id": f"{CHANNEL}:{message.id}:{n}",
+            "kind": "image" if mime.startswith("image/") else "file",
+            "title": title,
+            "blob": answer["blob"],
+            "mime": mime,
+            "bytes": answer["bytes"],
+        }
+
+    async def _say(
+        self, message: Any, text: str, context: Optional[list[dict[str, Any]]] = None
+    ) -> None:
+        if context:
+            ack = await asyncio.to_thread(self._inbound.say, message.id, text, context)
+        else:
+            ack = await asyncio.to_thread(self._inbound.say, message.id, text)
         if ack is None or ack.get("op") != "ack":
             self._note("a DM did not reach the core")
             await message.channel.send(CORE_UNREACHABLE)

@@ -131,8 +131,9 @@ PROPOSED_TOOLS = {"remind": PROMISES, "topics": TOPICS}
 READ = "read"
 #: Writes only omega's own log or store, and can be undone from it.
 OWN = "own"
-#: Reaches outside omega but can be taken back. No tool is here today: it is
-#: named so that the first one has a place other than "irreversible".
+#: Reaches outside omega but can be taken back. ``slack`` is the first one
+#: here (DL-101): a post reaches their work Slack, and ``slack delete`` takes
+#: back any post omega made.
 OUTWARD = "outward"
 #: Cannot be taken back, or reaches outside omega in a way it cannot. Always
 #: confirmed; never covered by a grant. Identical to DL-014's ``external``.
@@ -171,6 +172,7 @@ REVERSIBILITY: dict[str, str] = {
     "task": OWN,  # drafts, cancels or reports on a task's plan (DL-095)
     "step": OWN,  # records a driven step's terminal state (DL-095)
     "watch_page": OWN,  # sets or stops a page watch in the log (DL-096)
+    "slack": OUTWARD,  # posts as them; omega's own posts can be deleted (DL-101)
     "handoff": OWN,  # a link, or a document into the store; never a payment (DL-097)
     "write_file": OWN,  # inside the store; outside it is irreversible
     "run_code": READ,  # read-only argv; anything else is irreversible

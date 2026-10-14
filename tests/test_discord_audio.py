@@ -276,20 +276,30 @@ def test_a_failed_voice_note_is_told_and_nothing_is_said(channel: Channel, q: Ev
 # --- refusals ----------------------------------------------------------------
 
 
-def test_a_non_audio_attachment_is_refused(channel: Channel, q: EventQueue) -> None:
+def test_a_non_audio_attachment_goes_in_with_the_words(channel: Channel, q: EventQueue,
+                                                       store_dir: Path) -> None:
+    # DL-101 changed this on purpose: a picture used to be refused whole; it
+    # now reaches the core as a stored context item on the same ``say``.
     ear = Ear()
-    upload = Upload("photo.png", "image/png")
-    msg = message(upload)
+    upload = Upload("photo.png", "image/png", data=b"\x89PNG pretend")
+    msg = message(upload, content="post this to #team")
     run(dm(channel, ear), msg)
-    assert logged(q) == []
-    assert msg.channel.sent == [adapter.ATTACHMENTS_REFUSED]
-    assert "Only audio" in adapter.ATTACHMENTS_REFUSED
-    assert upload.saves == 0 and ear.calls == []
+    (said,) = logged(q)
+    assert said["text"] == "post this to #team" and ear.calls == []
+    (item,) = said["context"]
+    assert item["kind"] == "image" and item["title"] == "photo.png"
+    assert item["mime"] == "image/png" and item["bytes"] == len(upload.data)
+    assert BlobStore.open(store_dir).path_for(item["blob"]).read_bytes() == upload.data
+    assert msg.channel.sent == []
 
 
-def test_a_mixed_message_is_refused_whole(channel: Channel, q: EventQueue) -> None:
+def test_a_file_that_cannot_be_fetched_refuses_the_whole_message(channel: Channel, q: EventQueue) -> None:
+    class Broken(Upload):
+        async def save(self, path: Path) -> None:
+            raise OSError("gone")
+
     ear = Ear()
-    msg = message(Upload("standup.m4a", "audio/mp4"), Upload("photo.png", "image/png"),
+    msg = message(Upload("standup.m4a", "audio/mp4"), Broken("photo.png", "image/png"),
                   content="see attached")
     run(dm(channel, ear), msg)
     assert logged(q) == [] and ear.calls == []

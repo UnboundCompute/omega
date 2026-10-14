@@ -47,12 +47,21 @@ toward the phone: no report, a stale one or an unreadable one is ``False``.
 
 **``blob`` hands back one stored blob by digest** (DL-097), base64, so the
 Discord adapter can send a document omega made as a file.
+
+**``put`` is ``attach`` for a sender with no path on this machine** (DL-101):
+the Discord adapter runs beside the core, not on its disk, so a file or a
+screenshot sent in the DM arrives as base64 chunks, each at most
+:data:`MAX_PUT_CHUNK` bytes and :data:`MAX_PUT_IN` in all, written at their
+offset into one staging file in the blob root. A chunk sent again lands where
+it did the first time, so a retry after a lost ack is harmless; the last one
+stores the file and answers exactly as ``attach`` does.
 """
 
 from __future__ import annotations
 
 import base64
 import json
+import re
 import socket
 import threading
 from collections import deque
@@ -62,7 +71,7 @@ from typing import Any, Callable, Iterator, Optional
 
 from omega import episodes, machine, projection
 from omega.derive import Learned, Readings
-from omega.blobs import BlobError, BlobStore, is_digest
+from omega.blobs import BlobError, BlobStore, is_digest, mime_for
 from omega.memory import WriteKeyConflict
 from omega.queue import EventQueue
 
@@ -72,6 +81,8 @@ __all__ = [
     "DEFAULT_PORT",
     "MAX_LINE",
     "MAX_BLOB_OUT",
+    "MAX_PUT_CHUNK",
+    "MAX_PUT_IN",
     "LOOPBACK",
     "ChannelError",
     "Channel",
@@ -94,6 +105,15 @@ MAX_LINE = 1 << 20
 #: a handoff document (:data:`omega.handoff.MAX_DOCUMENT_BYTES`) and under
 #: what a DM takes.
 MAX_BLOB_OUT = 8 << 20
+
+#: One ``put`` chunk's bytes, before base64: its line stays under
+#: :data:`MAX_LINE`.
+MAX_PUT_CHUNK = 512 << 10
+#: The largest file ``put`` takes (DL-101): more than a phone screenshot or a
+#: document, and what one Slack post of it reads into memory at most.
+MAX_PUT_IN = 25 << 20
+#: What an upload is called, which names its staging file.
+_PUT_ID = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 #: The only addresses the server will bind. Not a default that can be widened by
 #: passing a different host — a wrong value here exposes the assistant's entire
@@ -369,6 +389,8 @@ class Channel:
                 return self._presence()
             if op == "blob":
                 return self._blob(request)
+            if op == "put":
+                return self._put(request)
             if op == "ping":
                 return {"v": PROTOCOL, "op": "pong", "head": self._queue.head()}
             return self._error(f"unknown op {op!r}")
@@ -612,6 +634,55 @@ class Channel:
             "data": base64.b64encode(data).decode("ascii"),
         }
 
+    def _put(self, request: dict[str, Any]) -> dict[str, Any]:
+        """One chunk of a file sent as bytes (DL-101); the last one stores it.
+
+        No more reach than ``attach``: a local process could write the store
+        itself. It writes one staging file, named by the upload's id inside
+        the blob root, and nothing outside it.
+        """
+        upload = request.get("upload")
+        if not isinstance(upload, str) or not _PUT_ID.match(upload):
+            raise ValueError("'upload' must be 1-64 letters, digits, '-' or '_'")
+        name = request.get("name")
+        if not isinstance(name, str) or not name.strip() or "/" in name or "\\" in name:
+            raise ValueError("'name' must be a file name")
+        offset = request.get("offset")
+        if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+            raise ValueError("'offset' must be a whole number of bytes")
+        data = request.get("data")
+        if not isinstance(data, str):
+            raise ValueError("'data' must be base64")
+        try:
+            chunk = base64.b64decode(data, validate=True)
+        except ValueError:
+            raise ValueError("'data' must be base64") from None
+        if len(chunk) > MAX_PUT_CHUNK:
+            raise ValueError(f"a chunk is at most {MAX_PUT_CHUNK} bytes")
+        if offset + len(chunk) > MAX_PUT_IN:
+            raise ValueError(f"a file is at most {MAX_PUT_IN >> 20} MB")
+        staged = self._blobs.root / f".ingest-put-{upload}"
+        size = staged.stat().st_size if staged.exists() else 0
+        if offset > size:
+            raise ValueError(f"chunk at {offset} but {size} bytes arrived so far")
+        with open(staged, "r+b" if staged.exists() else "wb") as out:
+            out.seek(offset)
+            out.write(chunk)
+            out.truncate()
+        if not request.get("last"):
+            return {"v": PROTOCOL, "op": "put", "upload": upload, "bytes": offset + len(chunk)}
+        try:
+            ref = self._blobs.put(staged)
+        finally:
+            staged.unlink(missing_ok=True)
+        return {
+            "v": PROTOCOL,
+            "op": "attached",
+            "blob": ref.digest,
+            "mime": mime_for(name),
+            "bytes": ref.bytes,
+        }
+
     def _subscribe(self, conn: _Conn, request: dict[str, Any]) -> dict[str, Any]:
         since = request.get("since", 0)
         if not isinstance(since, int) or isinstance(since, bool) or since < 0:
@@ -808,6 +879,21 @@ class ChannelClient:
 
     def blob(self, digest: str) -> dict[str, Any]:
         return self.request({"v": PROTOCOL, "op": "blob", "blob": digest})
+
+    def put(self, upload: str, name: str, data: bytes) -> dict[str, Any]:
+        """Send one file as bytes, in chunks (DL-101): the ``attached`` answer."""
+        offset = 0
+        while True:
+            chunk = data[offset: offset + MAX_PUT_CHUNK]
+            last = offset + len(chunk) >= len(data)
+            answer = self.request({
+                "v": PROTOCOL, "op": "put", "upload": upload, "name": name,
+                "offset": offset, "data": base64.b64encode(chunk).decode("ascii"),
+                "last": last,
+            })
+            if last or answer.get("op") != "put":
+                return answer
+            offset += len(chunk)
 
     def updates(self, count: int) -> Iterator[dict[str, Any]]:
         for _ in range(count):

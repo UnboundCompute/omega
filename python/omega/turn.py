@@ -169,6 +169,10 @@ NOT_RECALLED = frozenset({
     episodes.LEAVE_PINGED,
     episodes.LEAVE_CANCELLED,
     episodes.LEAVE_DONE,
+    # Sharing to Slack (DL-101): a post reaches them as the reply that
+    # carries its link, which is conversation; the records are bookkeeping a
+    # delete reads off the fold, and a failure is the turn's own tool result.
+    *episodes.SLACK_KINDS,
 })
 
 #: **A count is not a budget** (DL-039). ``RECALL_N`` bounds how many episodes

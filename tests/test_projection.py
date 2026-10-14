@@ -439,6 +439,18 @@ def test_every_m1_kind_is_accounted_for() -> None:
         ),
         episodes.MESSAGE_DELIVERED: episodes.message_delivered(for_seq=1, at=AT),
         episodes.MESSAGE_DROPPED: episodes.message_dropped(queued=[1], why="w", at=AT),
+        # DL-101: a Slack post reaches them as the reply's link, never as these.
+        episodes.SLACK_POSTED: episodes.slack_posted(
+            for_seq=1, channel="C0TEAM001", name="#team", ts="1760173200.000100",
+            permalink="https://example.slack.com/archives/C0TEAM001/p1760173200000100",
+            what="text", at=AT,
+        ),
+        episodes.SLACK_DELETED: episodes.slack_deleted(
+            for_seq=1, channel="C0TEAM001", ts="1760173200.000100", at=AT,
+        ),
+        episodes.SLACK_FAILED: episodes.slack_failed(
+            for_seq=1, do="post", to="#team", error="not_in_channel", at=AT,
+        ),
     }
     assert set(made) == set(episodes.KINDS)
     for kind, payload in made.items():

@@ -92,6 +92,8 @@ from omega import topics as kept
 from omega import handoff
 from omega import watcher as pages
 from omega import leave
+from omega import slack as slacking
+from omega.blobs import BlobStore, is_digest
 from omega.schedule import CronError, describe_cron, next_match, validate_cron, zone_label
 
 __all__ = [
@@ -133,6 +135,7 @@ __all__ = [
     "PROMISE_ASK",
     "FORGET",
     "LOCATION",
+    "SLACK",
     "TOPICS",
     "TOPIC_ASK",
     "LEAVE_BY",
@@ -266,6 +269,13 @@ WATCH_PAGE = "watch_page"
 #: hands over the link and they pay. Outside :data:`TOOL_NAMES` and offered
 #: on their own message only, for :data:`WATCH_PAGE`'s reason.
 HANDOFF = "handoff"
+#: Shares to their work Slack, as them (DL-101): posts a message or a file,
+#: deletes one omega posted, lists the channels. Outside :data:`TOOL_NAMES`
+#: for :data:`WATCH_PAGE`'s reason, and offered only where their user token
+#: is set: with ``OMEGA_SLACK_USER_TOKEN`` unset every turn is exactly what
+#: it was. It reaches outside omega, so a turn that read someone else's
+#: words holds it for their yes (DL-064, :func:`omega.act._outward`).
+SLACK = "slack"
 #: Sets, lists or stops the leave-now alarm (DL-093). Outside
 #: :data:`TOOL_NAMES` for :data:`PROMISE`'s reason: offered only on their own
 #: message and only where the Maps MCP server is configured, never on their
@@ -2208,6 +2218,154 @@ def _handoff(box: "ToolBox", args: dict[str, Any]) -> str:
         return handoff.build(args["kind"], args, store_root=box.store_root)
     except handoff.HandoffError as exc:
         raise ToolError(f"{HANDOFF}: {exc}") from None
+
+
+# --- sharing to Slack (DL-101) ------------------------------------------------------
+
+_SLACK_DOS = ("post", "delete", "channels")
+#: How many channel names one ``channels`` answer lists.
+_SLACK_LISTED = 100
+
+
+def _slacking(box: "ToolBox") -> bool:
+    """Is ``slack`` there in this box's turn? Structural only: their own
+    message, a box with the log, and a token configured."""
+    return bool(box.prompted and box.append is not None and box.slack is not None)
+
+
+def _classify_slack(box: "ToolBox", args: dict[str, Any]) -> Decision:
+    if not _slacking(box):
+        raise ToolRejected(f"{SLACK} runs only on their own message")
+    do = args.get("do")
+    if do not in _SLACK_DOS:
+        raise ToolRejected(f"{SLACK}'s 'do' is one of {list(_SLACK_DOS)}")
+    if do == "channels":
+        return Decision(tool=SLACK, tier=EXPLORATION, why="list your Slack channels", args={"do": do})
+    if do == "delete":
+        # A held delete comes back on their yes carrying the post it named.
+        which = next((v.strip() for v in (args.get(k) for k in ("which", "file", "ts"))
+                      if isinstance(v, str) and v.strip()), "")
+        post = box.slack.posted().find(which)
+        if post is None:
+            # Only omega's own record can be taken back: a message omega did
+            # not post is theirs, or someone else's, and not omega's to delete.
+            raise ToolRejected(
+                f"{SLACK}: {which or 'that'} is not a post omega made, so it is "
+                "not omega's to delete; nothing was deleted"
+            )
+        clean = {"do": do, "channel": post["channel"], "ts": post.get("ts") or "",
+                 "name": post.get("name") or ""}
+        if post.get("file"):
+            clean["file"] = post["file"]
+        return Decision(tool=SLACK, tier=LOCAL,
+                        why=f"delete your Slack post in {clean['name']}", args=clean)
+    to = _text(SLACK, args, "to").strip()
+    text = args.get("text")
+    text = text if isinstance(text, str) and text.strip() else ""
+    attach = args.get("attach")
+    attach = attach.strip() if isinstance(attach, str) else ""
+    if not text and not attach:
+        raise ToolRejected(f"{SLACK} post needs 'text', 'attach', or both")
+    if len(text) > slacking.MAX_TEXT:
+        raise ToolRejected(f"{SLACK}: that is over {slacking.MAX_TEXT} characters for one post")
+    clean = {"do": do, "to": to}
+    if text:
+        clean["text"] = text
+    if attach:
+        clean["attach"] = attach
+    what = "a file" if attach else "a message"
+    return Decision(tool=SLACK, tier=LOCAL, why=f"post {what} to {to} on Slack as you", args=clean)
+
+
+def _slack_file(box: "ToolBox", attach: str) -> tuple[str, bytes]:
+    """The name and bytes ``attach`` names: a file on their recent messages
+    by its name, or a stored blob by its ``sha256:`` reference (a document
+    omega made carries one in its marker)."""
+    seat = box.slack
+    found = re.search(r"sha256:[0-9a-f]{64}", attach)
+    if found:
+        digest = found.group(0)
+        name = attach[: found.start()].replace("[attached:", "").strip(" []") or next(
+            (str(i.get("title")) for i in seat.attached if i.get("blob") == digest and i.get("title")),
+            "file",
+        )
+    else:
+        hits = [i for i in seat.attached if str(i.get("title") or "").strip().lower() == attach.lower()]
+        if not hits and len(seat.attached) == 1:
+            hits = list(seat.attached)
+        digests = {str(i["blob"]) for i in hits}
+        if len(digests) != 1:
+            names = sorted({str(i.get("title") or "untitled") for i in seat.attached})[:5]
+            raise ToolError(
+                f"{SLACK}: no one file they sent is called {attach!r}"
+                + (f"; they sent {', '.join(names)}" if names else "; they sent no file")
+                + ". Nothing was posted."
+            )
+        digest = digests.pop()
+        name = str(hits[0].get("title") or "file")
+    store = BlobStore.open(box.store_root)
+    if not is_digest(digest) or not store.has(digest):
+        raise ToolError(f"{SLACK}: omega does not have that file ({digest}). Nothing was posted.")
+    path = store.path_for(digest)
+    if path.stat().st_size > slacking.MAX_FILE_BYTES:
+        raise ToolError(f"{SLACK}: {name} is over {slacking.MAX_FILE_BYTES >> 20} MB. Nothing was posted.")
+    return Path(name).name or "file", path.read_bytes()
+
+
+def _slack_failed(box: "ToolBox", do: str, to: str, exc: Exception) -> ToolError:
+    error = " ".join(str(exc).split()) or type(exc).__name__
+    if len(error) > episodes.MAX_FAILURE_ERROR:
+        error = error[: episodes.MAX_FAILURE_ERROR - 1].rstrip() + "…"
+    box.append(episodes.slack_failed(for_seq=box.for_seq, do=do, to=to[: episodes.MAX_SLACK_NAME],
+                                     error=error, at=box.at or None))
+    return ToolError(f"{SLACK}: {exc}")
+
+
+def _slack(box: "ToolBox", args: dict[str, Any]) -> str:
+    seat = box.slack
+    do = args["do"]
+    if do == "channels":
+        try:
+            names = seat.client.channels()
+        except slacking.SlackError as exc:
+            raise ToolError(f"{SLACK}: {exc}") from None
+        if not names:
+            return "you are in no Slack channels omega can see"
+        more = len(names) - _SLACK_LISTED
+        listed = ", ".join(names[:_SLACK_LISTED])
+        return f"channels you can post in: {listed}" + (f" and {more} more" if more > 0 else "")
+    if do == "delete":
+        post = {k: args[k] for k in ("channel", "ts", "file") if k in args}
+        try:
+            seat.client.delete(post)
+        except slacking.SlackError as exc:
+            raise _slack_failed(box, do, str(args.get("name") or ""), exc) from None
+        box.append(episodes.slack_deleted(for_seq=box.for_seq, channel=args["channel"], ts=args["ts"],
+                                          file=args.get("file"), at=box.at or None))
+        return f"deleted your Slack post in {args.get('name') or 'Slack'}"
+    to = args["to"]
+    try:
+        target = seat.client.resolve(to)
+    except slacking.Unclear as exc:
+        return str(exc)
+    except slacking.SlackError as exc:
+        raise _slack_failed(box, do, to, exc) from None
+    text = args.get("text", "")
+    try:
+        if args.get("attach"):
+            name, data = _slack_file(box, args["attach"])
+            done = seat.client.post_file(target, name, data, comment=text)
+        else:
+            done = seat.client.post_text(target, text)
+    except slacking.SlackError as exc:
+        raise _slack_failed(box, do, target.name, exc) from None
+    box.append(episodes.slack_posted(
+        for_seq=box.for_seq, channel=done["channel"], name=target.name, ts=done["ts"],
+        permalink=done["permalink"], what="file" if done.get("file") else "text",
+        file=done.get("file") or None, at=box.at or None,
+    ))
+    where = done["permalink"] or "Slack gave no link"
+    return f"posted to {target.name} on Slack as them: {where}"
 
 
 # --- page watches (DL-096) ---------------------------------------------------------
@@ -4220,6 +4378,30 @@ _STEP_TOOL = _Tool(
 )
 
 
+#: ``slack`` (DL-101), beside Ring 1 and not in it: see :data:`SLACK`.
+_SLACK_TOOL = _Tool(
+    classify=_classify_slack,
+    dispatch=_slack,
+    schema=_schema(
+        SLACK,
+        "Post to their work Slack as them, straight away: 'post' sends "
+        "'text' and/or 'attach' to 'to' (#channel, @person or a person's "
+        "name); 'attach' is the name of a file or image they sent, or a "
+        "document's sha256: reference. 'delete' takes back a post you made "
+        "('which': its link, or the last one). 'channels' lists where they "
+        "can post. Put the link it returns in your reply.",
+        {
+            "do": {"type": "string", "enum": list(_SLACK_DOS)},
+            "to": {"type": "string", "description": "#channel, @person or a name."},
+            "text": {"type": "string"},
+            "attach": {"type": "string", "description": "A file they sent, or sha256:<hex>."},
+            "which": {"type": "string", "description": "For delete: the post's link; empty is the last."},
+        },
+        ["do"],
+    ),
+)
+
+
 #: ``handoff`` (DL-097), beside Ring 1 and not in it: see :data:`HANDOFF`.
 _HANDOFF_TOOL = _Tool(
     classify=_classify_handoff,
@@ -4450,6 +4632,10 @@ class ToolBox:
     #: turn's own log. Only their own message, with this and ``append`` set,
     #: puts ``watch_page`` in the box; ``None`` leaves the box as it was.
     pages: Optional[Callable[[], Any]] = None
+    #: Their work Slack (DL-101): an :class:`omega.slack.Seat`, or ``None``.
+    #: Only their own message, with this and ``append`` set, puts ``slack``
+    #: in the box; ``None`` (no token) leaves it exactly as it was.
+    slack: Any = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "store_root", Path(self.store_root).resolve())
@@ -4485,6 +4671,8 @@ class ToolBox:
             tool = _HANDOFF_TOOL
         if tool is None and name == LEAVE_BY and _leaving(self):
             tool = _LEAVE_TOOL
+        if tool is None and name == SLACK and _slacking(self):
+            tool = _SLACK_TOOL
         if tool is None and self.remote is not None and isinstance(arguments, dict):
             # An MCP tool, refused or cleared by the adapter: money, writes and
             # the allowlist are decided there, in code, from the name (DL-088).
@@ -4543,6 +4731,10 @@ class ToolBox:
             return _HANDOFF_TOOL.dispatch(self, decision.args)
         if decision.tool == LEAVE_BY and decision.tool not in _TOOLS:
             return _LEAVE_TOOL.dispatch(self, decision.args)
+        if decision.tool == SLACK and decision.tool not in _TOOLS:
+            if not _slacking(self):
+                raise ToolRejected(f"{SLACK} runs only on their own message")
+            return _SLACK_TOOL.dispatch(self, decision.args)
         return _TOOLS[decision.tool].dispatch(self, decision.args)
 
     def schemas(self, hide: "frozenset[str] | set[str]" = frozenset()) -> list[dict[str, Any]]:
@@ -4569,6 +4761,8 @@ class ToolBox:
             mine.append(_HANDOFF_TOOL.schema)
         if _leaving(self) and LEAVE_BY not in hide:
             mine.append(_LEAVE_TOOL.schema)
+        if _slacking(self) and SLACK not in hide:
+            mine.append(_SLACK_TOOL.schema)
         names = _mailbox_names()
         if len(names) > 1:
             mine = [_inbox_schema(schema, names) for schema in mine]

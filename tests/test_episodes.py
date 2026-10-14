@@ -293,6 +293,21 @@ def test_every_kind_round_trips():
         ),
         ep.message_delivered(for_seq=41, queued=[40], at="2026-09-23T10:00:00+00:00"),
         ep.message_dropped(queued=[40], why="not sent", at="2026-09-23T10:00:00+00:00"),
+        ep.slack_posted(
+            for_seq=41, channel="C0TEAM001", name="#team", ts="1760173200.000100",
+            permalink="https://example.slack.com/archives/C0TEAM001/p1760173200000100",
+            what="text", at="2026-09-23T10:00:00+00:00",
+        ),
+        ep.slack_posted(
+            for_seq=41, channel="D0JO00001", name="@jo", ts="", what="file",
+            permalink="https://example.slack.com/files/U0ME00001/F0FILE001/plan.png",
+            file="F0FILE001", at="2026-09-23T10:00:00+00:00",
+        ),
+        ep.slack_deleted(for_seq=42, channel="C0TEAM001", ts="1760173200.000100",
+                         at="2026-09-23T10:00:00+00:00"),
+        ep.slack_failed(for_seq=43, do="post", to="#team",
+                        error="Slack has no channel by that name that you can see",
+                        at="2026-09-23T10:00:00+00:00"),
         ep.inbound(
             "a look", channel="self", queued=[40], thinking="2026-09-23 morning",
             at="2026-09-23T10:00:00+00:00",

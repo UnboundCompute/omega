@@ -177,6 +177,14 @@ __all__ = [
     "message_queued",
     "message_delivered",
     "message_dropped",
+    "SLACK_POSTED",
+    "SLACK_DELETED",
+    "SLACK_FAILED",
+    "SLACK_KINDS",
+    "SLACK_WHATS",
+    "slack_posted",
+    "slack_deleted",
+    "slack_failed",
     "REPORT_TRANSCRIPT",
     "REPORT_USAGE",
     "REPORT_RECORDING",
@@ -376,7 +384,7 @@ ACCESS_KINDS = frozenset({ACCESS_LOST, ACCESS_PAUSED, ACCESS_RESTORED})
 MAX_ACCESS_FIX = 200
 #: What an origin is: the inbox, an extra mailbox (DL-092), the Google
 #: sign-in, or one MCP server.
-_ACCESS_ORIGIN = re.compile(r"^(inbox|inbox:[a-z][a-z0-9]{0,15}|google|mcp:[a-z0-9]{1,16})$")
+_ACCESS_ORIGIN = re.compile(r"^(inbox|inbox:[a-z][a-z0-9]{0,15}|google|slack|mcp:[a-z0-9]{1,16})$")
 #: What an extra mailbox may be called (:mod:`omega.inbox`, DL-092).
 _MAILBOX_NAME = re.compile(r"^[a-z][a-z0-9]{0,15}$")
 
@@ -568,6 +576,26 @@ OUTBOX_SOURCES = frozenset({"look", "thinking", "followup", "review"})
 #: A held draft is a chat message, not a document.
 MAX_QUEUED_TEXT = 4_000
 MAX_OUTBOX_WHY = 200
+#: Sharing to their work Slack, as them (DL-101). ``slack.posted`` is one
+#: message or file that reached Slack in their name (the conversation's id and
+#: name, the message's ``ts`` or the file's id, its permalink, ``what`` it was,
+#: and the turn that posted it); ``slack.deleted`` is one of those taken back;
+#: ``slack.failed`` a post or a delete Slack refused, with why. Records: what
+#: omega posted is a fold (:func:`omega.slack.fold`), which is the only thing
+#: ``slack delete`` will take back. Neither recalled nor projected: the reply
+#: carries the permalink, and that is what reaches them.
+SLACK_POSTED = "slack.posted"
+SLACK_DELETED = "slack.deleted"
+SLACK_FAILED = "slack.failed"
+SLACK_KINDS = frozenset({SLACK_POSTED, SLACK_DELETED, SLACK_FAILED})
+SLACK_WHATS = frozenset({"text", "file"})
+_SLACK_DOS = frozenset({"post", "delete"})
+#: A Slack conversation id (C…, G…, D…) and a message ts.
+_SLACK_ROOM = re.compile(r"^[CGD][A-Z0-9]{2,30}$")
+_SLACK_TS = re.compile(r"^[0-9]{1,12}\.[0-9]{1,8}$")
+_SLACK_FILE = re.compile(r"^F[A-Z0-9]{2,30}$")
+MAX_SLACK_NAME = 200
+MAX_SLACK_LINK = 500
 
 #: The senses a relay may report for, by the name of the sense rather than of
 #: the file it read. Three of them end in a learning receipt; the machine sense
@@ -647,6 +675,7 @@ KINDS = frozenset(
         *WATCHER_KINDS,
         *LEAVE_KINDS,
         *OUTBOX_KINDS,
+        *SLACK_KINDS,
     }
 )
 
@@ -2204,6 +2233,9 @@ _REQUIRED: dict[str, tuple[str, ...]] = {
     MESSAGE_QUEUED: ("text", "source", "why", "at"),
     MESSAGE_DELIVERED: ("for_seq", "queued", "at"),
     MESSAGE_DROPPED: ("queued", "why", "at"),
+    SLACK_POSTED: ("for_seq", "channel", "name", "ts", "permalink", "what", "at"),
+    SLACK_DELETED: ("for_seq", "channel", "ts", "at"),
+    SLACK_FAILED: ("for_seq", "do", "to", "error", "at"),
     GRANT_GIVEN: ("for_seq", "scope", "at"),
     GRANT_REVOKED: ("for_seq", "scope", "at"),
     GRANT_RESTORED: ("for_seq", "scope", "at"),
@@ -2972,6 +3004,9 @@ def _validate(payload: dict[str, Any]) -> None:
         # `for_seq` only where a turn is behind it: a follow-up held before it
         # was ever told has none, and a drop is named by the drafts it drops.
         _validate_outbox(payload)
+    elif kind in SLACK_KINDS:
+        # Attached: every one is the act of the turn that asked for it.
+        _validate_slack(payload)
     elif kind in TOPIC_KINDS:
         # No `for_seq` required: a follow or a drop is named by the topic, and
         # an update by it too, with the turn that asked only when one did.
@@ -3472,7 +3507,7 @@ def _validate_access(payload: dict[str, Any]) -> None:
     origin = payload["origin"]
     if not isinstance(origin, str) or not _ACCESS_ORIGIN.match(origin):
         raise BadPayload(
-            f"origin {origin!r} is not inbox, inbox:<name>, google or mcp:<server>"
+            f"origin {origin!r} is not inbox, inbox:<name>, google, slack or mcp:<server>"
         )
     if payload["kind"] == ACCESS_LOST:
         _require_str(payload, "fix", non_empty=True)
@@ -3690,6 +3725,80 @@ def _validate_outbox(payload: dict[str, Any]) -> None:
         _require_seqs(payload, "queued")
     if kind != MESSAGE_DELIVERED:
         _require_sentence(payload, "why", cap=MAX_OUTBOX_WHY)
+
+
+def _validate_slack(payload: dict[str, Any]) -> None:
+    kind = payload["kind"]
+    _require_seq(payload, "for_seq")
+    _require_str(payload, "at", non_empty=True)
+    if kind == SLACK_FAILED:
+        if payload["do"] not in _SLACK_DOS:
+            raise BadPayload(f"do must be one of {sorted(_SLACK_DOS)}")
+        _require_sentence(payload, "to", cap=MAX_SLACK_NAME, empty=True)
+        _require_sentence(payload, "error", cap=MAX_FAILURE_ERROR)
+        return
+    channel = payload["channel"]
+    if not isinstance(channel, str) or not _SLACK_ROOM.match(channel):
+        raise BadPayload("channel must be a Slack conversation id")
+    ts = payload["ts"]
+    if not isinstance(ts, str) or (ts and not _SLACK_TS.match(ts)):
+        raise BadPayload("ts must be a Slack message ts, or empty for a file")
+    if "file" in payload and (
+        not isinstance(payload["file"], str) or not _SLACK_FILE.match(payload["file"])
+    ):
+        raise BadPayload("file must be a Slack file id")
+    if not ts and "file" not in payload:
+        raise BadPayload("a post names its message ts or its file")
+    if kind == SLACK_DELETED:
+        return
+    _require_sentence(payload, "name", cap=MAX_SLACK_NAME)
+    link = payload["permalink"]
+    if not isinstance(link, str) or len(link) > MAX_SLACK_LINK or (
+        link and not re.match(r"^https://\S+$", link)
+    ):
+        raise BadPayload(f"permalink must be empty or an https url of at most {MAX_SLACK_LINK} characters")
+    if payload["what"] not in SLACK_WHATS:
+        raise BadPayload(f"what must be one of {sorted(SLACK_WHATS)}")
+    if (payload["what"] == "file") != ("file" in payload):
+        raise BadPayload("a file post names its file, and only a file post does")
+
+
+def slack_posted(
+    *, for_seq: int, channel: str, name: str, ts: str, permalink: str, what: str,
+    file: Optional[str] = None, at: Optional[str] = None,
+) -> dict[str, Any]:
+    """One message or file that reached their work Slack as them (DL-101)."""
+    payload: dict[str, Any] = {"v": VERSION, "kind": SLACK_POSTED, "for_seq": for_seq,
+                               "channel": channel, "name": name, "ts": ts,
+                               "permalink": permalink, "what": what, "at": at or now()}
+    if file is not None:
+        payload["file"] = file
+    _validate(payload)
+    return payload
+
+
+def slack_deleted(
+    *, for_seq: int, channel: str, ts: str, file: Optional[str] = None,
+    at: Optional[str] = None,
+) -> dict[str, Any]:
+    """One of omega's own Slack posts, taken back (DL-101)."""
+    payload: dict[str, Any] = {"v": VERSION, "kind": SLACK_DELETED, "for_seq": for_seq,
+                               "channel": channel, "ts": ts, "at": at or now()}
+    if file is not None:
+        payload["file"] = file
+    _validate(payload)
+    return payload
+
+
+def slack_failed(
+    *, for_seq: int, do: str, to: str, error: str, at: Optional[str] = None,
+) -> dict[str, Any]:
+    """A post or a delete Slack refused, and why (DL-101). ``error`` is
+    omega's sentence for Slack's answer, never the token."""
+    payload = {"v": VERSION, "kind": SLACK_FAILED, "for_seq": for_seq, "do": do,
+               "to": to, "error": error, "at": at or now()}
+    _validate(payload)
+    return payload
 
 
 def message_queued(

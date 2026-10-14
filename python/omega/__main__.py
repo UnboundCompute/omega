@@ -55,6 +55,7 @@ from omega import (
     relay as relaying,
     runtime,
     sarvam,
+    slack,
     schedule as scheduling,
     transcripts,
 )
@@ -307,7 +308,7 @@ def _account_lines(environ=os.environ) -> list[str]:
         else f"inbox: not connected ({inbox.ENV_USER}/{inbox.ENV_PASSWORD} unset)",
     ] + [
         f"inbox {s.name}: reading {s.user} at {s.host} (read-only)" for s in more
-    ] + [line for line in (mcp.account_line(environ),) if line]
+    ] + [line for line in (mcp.account_line(environ), slack.account_line(environ)) if line]
 
 
 def _inbox_warn(text: str) -> None:

@@ -16,6 +16,9 @@ words that it refused the credentials, and nothing else counts:
   :data:`omega.gcal.SIGN_IN_AGAIN` (the refresh answered ``invalid_grant``);
 - ``mcp:<server>`` — a call whose adapter error says the server refused the
   credentials (HTTP 401 or 403);
+- ``slack`` — the ``slack`` tool (DL-101) whose failure carries
+  :data:`omega.slack.SLACK_FIX` (written only when Slack answered
+  ``invalid_auth``, ``token_revoked`` or the like);
 - ``inbox:<name>`` — an extra mailbox (DL-092), read from the same tools and
   the same look, whose tagged failure line carries that mailbox's own fix
   (:func:`omega.inbox.imap_fix`). The default mailbox stays ``inbox``. One
@@ -46,6 +49,7 @@ from omega import episodes
 from omega.calendar import NOT_CONFIGURED
 from omega.gcal import SIGN_IN_AGAIN
 from omega.inbox import IMAP_FIX, NOT_CONNECTED, PERSONAL, imap_fix, outcomes
+from omega.slack import ORIGIN as SLACK, SLACK_FIX
 
 if TYPE_CHECKING:  # pragma: no cover
     from omega.memory import MemoryStore
@@ -54,6 +58,7 @@ __all__ = [
     "INBOX",
     "INBOX_PREFIX",
     "GOOGLE",
+    "SLACK",
     "PROBE_EVERY_SECONDS",
     "Lost",
     "State",
@@ -92,6 +97,7 @@ PROBE_EVERY_SECONDS = 60 * 60
 _INBOX_TOOLS = frozenset({"inbox", "mail"})
 _MAIL_TOOL = "mail"
 _CALENDAR_TOOL = "calendar"
+_SLACK_TOOL = "slack"
 _SEP = "__"
 _MCP_REFUSED = "the {server} MCP server refused the credentials ("
 _MCP_ANSWERED = "(Result from the {server} MCP server"
@@ -114,6 +120,8 @@ def fix_for(origin: str) -> str:
         return imap_fix(origin[len(INBOX_PREFIX):])
     if origin == GOOGLE:
         return SIGN_IN_AGAIN
+    if origin == SLACK:
+        return SLACK_FIX
     server = origin[len(_MCP):]
     return (
         f"the {server} MCP server refused its token: replace "
@@ -134,6 +142,8 @@ def label_for(origin: str, environ: Optional[Mapping[str, str]] = None) -> str:
         return f"your {origin[len(INBOX_PREFIX):]} inbox"
     if origin == GOOGLE:
         return "your Google calendar"
+    if origin == SLACK:
+        return "your work Slack"
     return f"the {origin[len(_MCP):]} MCP server"
 
 
@@ -224,6 +234,11 @@ def classify(payload: Mapping[str, Any]) -> Optional[tuple[str, bool]]:
         if ok and _GOOGLE_PARTIAL not in text and not text.startswith(NOT_CONFIGURED):
             return GOOGLE, False
         return None
+    if tool == _SLACK_TOOL:
+        # Any answer is the token working; only its own fix is a refusal.
+        if ok:
+            return SLACK, False
+        return (SLACK, True) if SLACK_FIX in text else None
     if _SEP in tool:
         server = tool.split(_SEP, 1)[0]
         if not server:
@@ -407,6 +422,10 @@ def probe(origin: str, environ: Optional[Mapping[str, str]] = None) -> Optional[
             from omega import gcal
 
             return gcal.probe(env)
+        if origin == SLACK:
+            from omega import slack
+
+            return slack.probe(env)
         if origin.startswith(_MCP):
             from omega import mcp
 
