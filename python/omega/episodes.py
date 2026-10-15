@@ -1037,8 +1037,18 @@ def completed(
     judged: Optional[str] = None,
     at: Optional[str] = None,
     tainted: Optional[list[str]] = None,
+    proposals: Optional[list[dict[str, Any]]] = None,
+    settled: Optional[list[dict[str, Any]]] = None,
 ) -> dict[str, Any]:
     """The turn ended. A terminal record.
+
+    ``proposals`` are the questions this turn asked (DL-103), each its id and
+    a short summary of what a yes would do: the structured half of the
+    "Reply yes pN" its words carry, so a surface can offer the answer as a
+    button without reading the words. ``settled`` are the proposals this turn
+    answered, each its id and the yes or no. Both are present only when there
+    is one, so a turn that asked and answered nothing writes the bytes it
+    always did.
 
     ``tainted`` names the untrusted content the turn read (DL-064): a fetched
     URL, an MCP server, their inbox. Present only when it read some, so a
@@ -1066,6 +1076,12 @@ def completed(
         payload["judged"] = judged
     _with_tainted(payload, tainted)
     _with_usage(payload, usage)
+    # Copied, as `usage` is; anything that is not a row is left for
+    # `_validate_asked` to refuse.
+    if proposals:
+        payload["proposals"] = _rows(proposals)
+    if settled:
+        payload["settled"] = _rows(settled)
     _validate(payload)
     return payload
 
@@ -2763,6 +2779,38 @@ def _validate_tainted(payload: dict[str, Any]) -> None:
             )
 
 
+#: Ceiling on a proposal's summary on a turn record (DL-103): one line under
+#: a button, not the whole of what was asked.
+MAX_PROPOSAL_SUMMARY = 200
+_PROPOSAL_ID = re.compile(r"^p[1-9][0-9]*$")
+
+
+def _rows(items: Any) -> Any:
+    if not isinstance(items, list):
+        return items
+    return [dict(r) if isinstance(r, dict) else r for r in items]
+
+
+def _validate_asked(items: Any, name: str, keys: tuple[str, ...]) -> None:
+    """A turn's ``proposals`` or ``settled`` (DL-103): a non-empty list of
+    ``{"id": "p<seq>", ...}`` with exactly ``keys``."""
+    if not isinstance(items, list) or not items:
+        raise BadPayload(f"{name} must be a non-empty list when present")
+    for item in items:
+        if not isinstance(item, dict) or set(item) != set(keys):
+            raise BadPayload(f"each of {name} has exactly {sorted(keys)}")
+        if not isinstance(item["id"], str) or not _PROPOSAL_ID.match(item["id"]):
+            raise BadPayload(f"a proposal id in {name} is p<seq>")
+        if "summary" in item and not (
+            isinstance(item["summary"], str) and len(item["summary"]) <= MAX_PROPOSAL_SUMMARY
+        ):
+            raise BadPayload(
+                f"a proposal summary is a string of at most {MAX_PROPOSAL_SUMMARY} characters"
+            )
+        if "yes" in item and not isinstance(item["yes"], bool):
+            raise BadPayload("a settled proposal's yes is a bool")
+
+
 def _with_usage(payload: dict[str, Any], usage: Optional[list[dict[str, Any]]]) -> None:
     """Attach ``usage`` only when there is some, so a pass that never called
     the model writes the same bytes it always did."""
@@ -3074,6 +3122,10 @@ def _validate(payload: dict[str, Any]) -> None:
             raise BadPayload("outcome 'silent' cannot carry a reply")
         if not isinstance(payload["tools"], list):
             raise BadPayload("tools must be a list")
+        if "proposals" in payload:
+            _validate_asked(payload["proposals"], "proposals", ("id", "summary"))
+        if "settled" in payload:
+            _validate_asked(payload["settled"], "settled", ("id", "yes"))
 
     if kind == TURN_BLOCKED:
         _require_str(payload, "needs", non_empty=True)

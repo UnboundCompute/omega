@@ -681,6 +681,7 @@ def write_memory(
             for_seq=seq, needs=needs, usage=usage, at=at, tainted=list(tainted)
         )
     else:
+        asked, settled = _asked_and_settled(queue, seq)
         payload = episodes.completed(
             for_seq=seq,
             outcome=outcome,
@@ -691,8 +692,39 @@ def write_memory(
             judged=judged,
             at=at,
             tainted=list(tainted),
+            # Only a reply can carry a question to answer; a silent or failed
+            # turn's proposal still waits, and is asked by the next brief.
+            proposals=asked if outcome == "spoke" else None,
+            settled=settled,
         )
     return queue.append(payload, episodes.turn_write_key(seq))
+
+
+def _asked_and_settled(
+    queue: EventQueue, seq: int
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """The proposals turn ``seq`` asked and the ones it answered (DL-103),
+    read from the records it wrote, never from its words.
+
+    A proposal names the turn that asked it (``grant.proposed.for_seq``),
+    whether act filed it, the task tool did, or the executor filed it beside
+    the tell this turn speaks; an answer names the turn it came in
+    (``grant.answered.for_seq``). Both land after the turn's own event and
+    before its terminal record, so the records since ``seq`` hold them all.
+    """
+    asked: list[dict[str, Any]] = []
+    settled: list[dict[str, Any]] = []
+    for episode in queue.store.episodes_since(seq):
+        payload = episodes.decode(episode.payload)
+        if payload.get("for_seq") != seq:
+            continue
+        kind = payload.get("kind")
+        if kind == episodes.GRANT_PROPOSED:
+            proposal = granted.proposal_of(episode.seq, payload)
+            asked.append({"id": proposal.pid, "summary": granted.button_summary(proposal)})
+        elif kind == episodes.GRANT_ANSWERED:
+            settled.append({"id": granted.pid(int(payload["proposal"])), "yes": bool(payload["yes"])})
+    return asked, settled
 
 
 # --- the turn ---------------------------------------------------------------

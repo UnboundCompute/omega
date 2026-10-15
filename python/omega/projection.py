@@ -99,6 +99,10 @@ class Update:
     urgency: Optional[str] = None
     channel: Optional[str] = None
     context: list[dict[str, str]] = field(default_factory=list)
+    #: DL-103: the questions a reply asks, as structured ids, and the ones a
+    #: turn answered. Empty, they never reach the wire.
+    proposals: list[dict[str, Any]] = field(default_factory=list)
+    settled: list[dict[str, Any]] = field(default_factory=list)
 
     def wire(self) -> dict[str, Any]:
         """The JSON object a client receives. Optional fields are dropped
@@ -125,6 +129,10 @@ class Update:
             out["ok"] = self.ok
         if self.context:
             out["context"] = self.context
+        if self.proposals:
+            out["proposals"] = self.proposals
+        if self.settled:
+            out["settled"] = self.settled
         return out
 
 
@@ -348,6 +356,18 @@ def project(payload: dict[str, Any], seq: int) -> Optional[Update]:
             # a success and must never arrive looking like an empty string.
             reply=payload.get("reply"),
             error=payload.get("error"),
+            # DL-103: what the reply asks, by id, so the tray can offer the
+            # answer as a button without reading the reply's words. A reply
+            # that quotes "p7" from a mail it read carries no proposal here,
+            # because only the turn's own `grant.proposed` records put one in.
+            proposals=[
+                {"id": str(p["id"]), "summary": str(p["summary"])}
+                for p in payload.get("proposals") or []
+            ],
+            settled=[
+                {"id": str(p["id"]), "yes": bool(p["yes"])}
+                for p in payload.get("settled") or []
+            ],
         )
 
     if kind in (episodes.TOOL_CALLED, episodes.TOOL_RETURNED):

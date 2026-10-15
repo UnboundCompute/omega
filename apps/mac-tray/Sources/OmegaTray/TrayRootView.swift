@@ -322,7 +322,13 @@ private struct ExpandedTrayView: View {
                         emptyState
                     } else {
                         ForEach(viewModel.messages) { message in
-                            MessageView(message: message)
+                            MessageView(
+                                message: message,
+                                canAnswer: viewModel.canAnswerProposals,
+                                answer: { proposalID, yes in
+                                    viewModel.answer(proposalID, yes: yes, in: message.id)
+                                }
+                            )
                                 .id(message.id)
                         }
                     }
@@ -649,6 +655,8 @@ private struct ExpandedTrayView: View {
 
 private struct MessageView: View {
     let message: TrayMessage
+    var canAnswer = false
+    var answer: (String, Bool) -> Void = { _, _ in }
 
     var body: some View {
         switch message.role {
@@ -710,6 +718,13 @@ private struct MessageView: View {
                 }
                 MarkdownMessageView(source: message.text)
                     .foregroundStyle(TrayTheme.primaryText)
+                ForEach(message.proposals) { prompt in
+                    ProposalAnswerView(
+                        prompt: prompt,
+                        isEnabled: canAnswer && prompt.isAnswerable,
+                        answer: { yes in answer(prompt.id, yes) }
+                    )
+                }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .contextMenu {
@@ -728,6 +743,42 @@ private struct MessageView: View {
 
     private func copyMessage() {
         TrayClipboard.copy(message.text)
+    }
+}
+
+/// Yes and No under a reply, for one proposal the core named (DL-103). A
+/// click sends "yes pN" or "no pN", the words typing would send.
+private struct ProposalAnswerView: View {
+    let prompt: TrayProposalPrompt
+    let isEnabled: Bool
+    let answer: (Bool) -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(prompt.proposal.summary)
+                .font(.system(size: 11))
+                .foregroundStyle(TrayTheme.secondaryText)
+                .fixedSize(horizontal: false, vertical: true)
+            HStack(spacing: 8) {
+                Button("Yes") { answer(true) }
+                    .accessibilityLabel("Approve \(prompt.id): \(prompt.proposal.summary)")
+                    .help("Send yes \(prompt.id)")
+                Button("No") { answer(false) }
+                    .accessibilityLabel("Decline \(prompt.id): \(prompt.proposal.summary)")
+                    .help("Send no \(prompt.id)")
+                if let outcome = prompt.outcomeLabel {
+                    Text(outcome)
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundStyle(prompt.answer == .failed ? Color.red : TrayTheme.secondaryText)
+                }
+            }
+            .buttonStyle(QuietButtonStyle())
+            .font(.system(size: 11, weight: .medium))
+            .disabled(!isEnabled)
+        }
+        .padding(10)
+        .background(TrayTheme.raised, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .accessibilityElement(children: .contain)
     }
 }
 

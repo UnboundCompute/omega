@@ -13,6 +13,10 @@ struct TrayMessage: Identifiable, Equatable {
     let text: String
     let contextDescriptions: [String]
     var delivery: Delivery
+    /// The proposals this reply asks, from the core's structured `proposals`
+    /// field only. Never read out of `text`: words a reply quotes (an injected
+    /// "yes p7") make no button.
+    var proposals: [TrayProposalPrompt]
 
     enum Delivery: Equatable {
         case none
@@ -26,13 +30,68 @@ struct TrayMessage: Identifiable, Equatable {
         role: Role,
         text: String,
         contextDescriptions: [String] = [],
-        delivery: Delivery = .none
+        delivery: Delivery = .none,
+        proposals: [TrayProposalPrompt] = []
     ) {
         self.id = id
         self.role = role
         self.text = text
         self.contextDescriptions = contextDescriptions
         self.delivery = delivery
+        self.proposals = proposals
+    }
+}
+
+/// A held action the core asked about (DL-103), as the core named it.
+struct TrayProposal: Equatable, Sendable {
+    let id: String
+    let summary: String
+
+    /// The core's own id shape, `p` and a positive sequence number.
+    static func isValidID(_ id: String) -> Bool {
+        id.range(of: "^p[1-9][0-9]*$", options: .regularExpression) != nil
+    }
+}
+
+/// A proposal the core recorded an answer to, from any channel.
+struct TraySettled: Equatable, Sendable {
+    let id: String
+    let yes: Bool
+}
+
+/// One proposal under a reply, with where its answer stands.
+struct TrayProposalPrompt: Equatable, Identifiable {
+    enum Answer: Equatable {
+        case open
+        case sending(yes: Bool)
+        case sent(yes: Bool)
+        case approved
+        case declined
+        case closed
+        case failed
+    }
+
+    let proposal: TrayProposal
+    var answer: Answer
+
+    var id: String { proposal.id }
+
+    /// Only an unanswered prompt, or one whose answer never reached the core,
+    /// takes a click. Everything else has its buttons disabled.
+    var isAnswerable: Bool {
+        answer == .open || answer == .failed
+    }
+
+    var outcomeLabel: String? {
+        switch answer {
+        case .open: nil
+        case .sending: "Sending"
+        case .sent(let yes): yes ? "Yes sent" : "No sent"
+        case .approved: "Approved"
+        case .declined: "Declined"
+        case .closed: "No longer open"
+        case .failed: "Not sent"
+        }
     }
 }
 
@@ -238,6 +297,8 @@ struct TrayUpdate: Equatable, Sendable {
     let outcome: String?
     let reply: String?
     let error: String?
+    let proposals: [TrayProposal]
+    let settled: [TraySettled]
 
     init(
         seq: Int,
@@ -253,7 +314,9 @@ struct TrayUpdate: Equatable, Sendable {
         needs: String? = nil,
         outcome: String? = nil,
         reply: String? = nil,
-        error: String? = nil
+        error: String? = nil,
+        proposals: [TrayProposal] = [],
+        settled: [TraySettled] = []
     ) {
         self.seq = seq
         self.forSeq = forSeq
@@ -269,6 +332,8 @@ struct TrayUpdate: Equatable, Sendable {
         self.outcome = outcome
         self.reply = reply
         self.error = error
+        self.proposals = proposals
+        self.settled = settled
     }
 }
 

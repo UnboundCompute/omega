@@ -679,6 +679,25 @@ final class OmegaChannelClient: TrayTransport {
             return TrayUpdateContext(id: id, kind: kind)
         }
 
+        // DL-103: the only source of an approval button. Read from these
+        // structured fields alone, never from `reply`; an entry of the wrong
+        // shape is dropped rather than guessed at.
+        let proposals = (object["proposals"] as? [[String: Any]] ?? []).compactMap { item -> TrayProposal? in
+            guard let id = item["id"] as? String,
+                  TrayProposal.isValidID(id),
+                  let summary = item["summary"] as? String
+            else { return nil }
+            return TrayProposal(id: id, summary: summary)
+        }
+        let settled = (object["settled"] as? [[String: Any]] ?? []).compactMap { item -> TraySettled? in
+            guard let id = item["id"] as? String,
+                  TrayProposal.isValidID(id),
+                  let yes = item["yes"] as? NSNumber,
+                  CFGetTypeID(yes) == CFBooleanGetTypeID()
+            else { return nil }
+            return TraySettled(id: id, yes: yes.boolValue)
+        }
+
         return TrayUpdate(
             seq: seq,
             forSeq: forSeq,
@@ -693,7 +712,9 @@ final class OmegaChannelClient: TrayTransport {
             needs: object["needs"] as? String,
             outcome: object["outcome"] as? String,
             reply: object["reply"] as? String,
-            error: object["error"] as? String
+            error: object["error"] as? String,
+            proposals: proposals,
+            settled: settled
         )
     }
 

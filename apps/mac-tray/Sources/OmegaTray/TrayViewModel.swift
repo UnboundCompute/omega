@@ -83,6 +83,15 @@ final class TrayViewModel: ObservableObject {
     private var lastProcessedSeq: Int?
     private var pendingResumeSeq: Int?
     private var urgencyByTurn: [Int: String] = [:]
+    /// Answers the core recorded (`settled`), by proposal id, from any channel.
+    private var settledAnswers: [String: Bool] = [:]
+    /// Replies shown as a notification before they reach the conversation,
+    /// with the proposals the core sent beside them.
+    private var proactiveProposals: [(text: String, proposals: [TrayProposal])] = []
+    /// A button's own "yes pN" / "no pN" message, by the user message it shows as.
+    private var answersByMessage: [UUID: (proposalID: String, yes: Bool)] = [:]
+    /// The turn a button's answer became, by its seq.
+    private var answersByTurn: [Int: String] = [:]
     private var didStart = false
     weak var capturePresentation: CapturePresentationControlling?
     var proactivePresentation: ((String, ProactiveUrgency) -> Void)?
@@ -149,6 +158,10 @@ final class TrayViewModel: ObservableObject {
     }
 
     var canRetryLastSend: Bool { failedSend != nil }
+
+    var canAnswerProposals: Bool {
+        connectionState == .connected && !workState.isBusy
+    }
 
     var canStartNewChat: Bool {
         !messages.isEmpty
@@ -288,6 +301,35 @@ final class TrayViewModel: ObservableObject {
         )
     }
 
+    /// A Yes or No button. It sends exactly what typing would, "yes pN" or
+    /// "no pN", down the same path as `send`, so the core answers it with the
+    /// same approval rule, records and taint; nothing here decides an outcome.
+    func answer(_ proposalID: String, yes: Bool, in messageID: UUID) {
+        guard canAnswerProposals,
+              let message = messages.first(where: { $0.id == messageID }),
+              let prompt = message.proposals.first(where: { $0.id == proposalID }),
+              prompt.isAnswerable
+        else { return }
+
+        let text = "\(yes ? "yes" : "no") \(proposalID)"
+        let submission = TraySubmission(text: text, resumesSeq: pendingResumeSeq)
+        let userMessageID = UUID()
+        messages.append(.init(id: userMessageID, role: .user, text: text, delivery: .sending))
+        answersByMessage[userMessageID] = (proposalID, yes)
+        updatePrompts(proposalID) { $0.answer = .sending(yes: yes) }
+        turnState = .sending
+        failedSend = nil
+        pendingResumeSeq = nil
+
+        deliver(
+            submission,
+            messageID: userMessageID,
+            originalDraft: "",
+            originalContext: [],
+            originalComposerMode: .ask
+        )
+    }
+
     func startNewChat() {
         guard canStartNewChat else { return }
         messages.removeAll()
@@ -316,6 +358,7 @@ final class TrayViewModel: ObservableObject {
                 let unique = Dictionary(grouping: combined, by: \.seq)
                     .compactMap { $0.value.last }
                     .sorted { $0.seq < $1.seq }
+                for update in unique { recordSettled(update.settled) }
                 let restored = transcriptMessages(from: unique)
                 messages = restored.isEmpty
                     ? [.init(role: .status, text: "No earlier transcript was found.")]
@@ -350,6 +393,9 @@ final class TrayViewModel: ObservableObject {
             composerMode = .ask
         }
         updateMessage(failedSend.messageID) { $0.delivery = .sending }
+        if let answer = answersByMessage[failedSend.messageID] {
+            updatePrompts(answer.proposalID) { $0.answer = .sending(yes: answer.yes) }
+        }
         turnState = .sending
         self.failedSend = nil
         deliver(
@@ -372,6 +418,12 @@ final class TrayViewModel: ObservableObject {
             do {
                 let acknowledgement = try await transport.send(submission)
                 updateMessage(messageID) { $0.delivery = .sent }
+                if let answer = answersByMessage[messageID] {
+                    answersByTurn[acknowledgement.seq] = answer.proposalID
+                    updatePrompts(answer.proposalID) { prompt in
+                        if case .sending = prompt.answer { prompt.answer = .sent(yes: answer.yes) }
+                    }
+                }
                 activeTurn = ActiveTurn(
                     seq: acknowledgement.seq,
                     messageID: messageID,
@@ -429,6 +481,7 @@ final class TrayViewModel: ObservableObject {
 
     private func handleUpdate(_ update: TrayUpdate) {
         let belongsToActiveTurn = activeTurn?.seq == update.forSeq
+        applySettled(update.settled)
 
         switch update.state {
         case "understood":
@@ -477,12 +530,17 @@ final class TrayViewModel: ObservableObject {
             case "spoke":
                 if let reply = update.reply, !reply.isEmpty {
                     if isExpanded {
-                        messages.append(.init(role: .omega, text: reply))
-                    } else if let proactivePresentation {
-                        proactivePresentation(reply, urgency(for: update.forSeq))
+                        messages.append(.init(role: .omega, text: reply, proposals: prompts(for: update.proposals)))
                     } else {
-                        proactivePeek = reply
-                        hasUnread = true
+                        if !update.proposals.isEmpty {
+                            proactiveProposals.append((reply, update.proposals))
+                        }
+                        if let proactivePresentation {
+                            proactivePresentation(reply, urgency(for: update.forSeq))
+                        } else {
+                            proactivePeek = reply
+                            hasUnread = true
+                        }
                     }
                 }
                 turnState = .complete("Complete")
@@ -491,6 +549,13 @@ final class TrayViewModel: ObservableObject {
                 turnState = .complete("Complete — no reply needed")
             default:
                 turnState = .complete("Complete")
+            }
+            // A button's answer turn that settled nothing found the proposal
+            // already closed (answered elsewhere, expired); the core said so.
+            if let proposalID = answersByTurn.removeValue(forKey: update.forSeq) {
+                updatePrompts(proposalID) { prompt in
+                    if case .sent = prompt.answer { prompt.answer = .closed }
+                }
             }
             urgencyByTurn.removeValue(forKey: update.forSeq)
         case "failed":
@@ -538,7 +603,7 @@ final class TrayViewModel: ObservableObject {
                 )
             case "complete" where update.outcome == "spoke":
                 guard let reply = update.reply, !reply.isEmpty else { return nil }
-                return TrayMessage(role: .omega, text: reply)
+                return TrayMessage(role: .omega, text: reply, proposals: prompts(for: update.proposals))
             case "failed":
                 let detail = update.error?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
                 return TrayMessage(role: .status, text: detail.isEmpty ? "A previous turn failed." : detail)
@@ -613,6 +678,15 @@ final class TrayViewModel: ObservableObject {
         terminalTask = nil
         activeTurn = nil
         updateMessage(messageID) { $0.delivery = .failed }
+        if let answer = answersByMessage[messageID] {
+            answersByTurn = answersByTurn.filter { $0.value != answer.proposalID }
+            updatePrompts(answer.proposalID) { prompt in
+                switch prompt.answer {
+                case .sending, .sent: prompt.answer = .failed
+                default: break
+                }
+            }
+        }
         if draft.isEmpty {
             draft = originalDraft
             composerMode = originalComposerMode
@@ -645,7 +719,11 @@ final class TrayViewModel: ObservableObject {
     }
 
     func receiveProactiveMessage(_ text: String) {
-        messages.append(.init(role: .omega, text: text))
+        var proposals: [TrayProposal] = []
+        if let index = proactiveProposals.firstIndex(where: { $0.text == text }) {
+            proposals = proactiveProposals.remove(at: index).proposals
+        }
+        messages.append(.init(role: .omega, text: text, proposals: prompts(for: proposals)))
         hasUnread = false
         proactivePeek = nil
     }
@@ -887,6 +965,39 @@ final class TrayViewModel: ObservableObject {
             localWorkState = .blocked("Screen Recording permission is needed. Open System Settings to allow it.")
         }
         return granted
+    }
+
+    private func prompts(for proposals: [TrayProposal]) -> [TrayProposalPrompt] {
+        proposals.map { proposal in
+            let answer: TrayProposalPrompt.Answer = switch settledAnswers[proposal.id] {
+            case .some(true): .approved
+            case .some(false): .declined
+            case .none: .open
+            }
+            return TrayProposalPrompt(proposal: proposal, answer: answer)
+        }
+    }
+
+    private func recordSettled(_ settled: [TraySettled]) {
+        for answer in settled { settledAnswers[answer.id] = answer.yes }
+    }
+
+    /// The core recorded these answers, by a button, by typing, or on another
+    /// channel: every prompt for them is closed with that outcome.
+    private func applySettled(_ settled: [TraySettled]) {
+        recordSettled(settled)
+        for answer in settled {
+            updatePrompts(answer.id) { $0.answer = answer.yes ? .approved : .declined }
+        }
+    }
+
+    private func updatePrompts(_ proposalID: String, change: (inout TrayProposalPrompt) -> Void) {
+        for messageIndex in messages.indices {
+            for promptIndex in messages[messageIndex].proposals.indices
+            where messages[messageIndex].proposals[promptIndex].id == proposalID {
+                change(&messages[messageIndex].proposals[promptIndex])
+            }
+        }
     }
 
     private func updateMessage(_ id: UUID, change: (inout TrayMessage) -> Void) {

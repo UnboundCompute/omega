@@ -83,6 +83,8 @@ __all__ = [
     "answers",
     "Answer",
     "how_to_answer",
+    "proposal_of",
+    "button_summary",
     "briefing",
     "since_words",
     "is_old",
@@ -302,6 +304,34 @@ def pid(seq: int) -> str:
     return f"p{seq}"
 
 
+def proposal_of(seq: int, payload: dict[str, Any]) -> Proposal:
+    """The proposal a ``grant.proposed`` record at ``seq`` files."""
+    task = payload.get("task")
+    return Proposal(
+        seq=seq,
+        for_seq=int(payload["for_seq"]),
+        scope=payload["scope"],
+        proposes=payload["proposes"],
+        actions=tuple(dict(a) for a in payload["actions"]),
+        at=str(payload.get("at", "")),
+        reason=str(payload.get("reason", "")),
+        task=int(task) if isinstance(task, int) and not isinstance(task, bool) else None,
+        summary=str(payload.get("summary", "")),
+    )
+
+
+def button_summary(proposal: Proposal) -> str:
+    """One line saying what a yes to ``proposal`` would do (DL-103): the tools
+    it runs, then its words, cut to :data:`episodes.MAX_PROPOSAL_SUMMARY`.
+    Shown beside a button; the button itself is driven by the id alone."""
+    tools = list(dict.fromkeys(str(a.get("tool")) for a in proposal.actions if a.get("tool")))
+    words = proposal.words()
+    line = f"{', '.join(tools)}: {words}" if tools else words
+    line = " ".join(line.split())
+    cap = episodes.MAX_PROPOSAL_SUMMARY
+    return line if len(line) <= cap else line[: cap - 1].rstrip() + "…"
+
+
 def how_to_answer(proposal_id: str) -> str:
     """How every proposal message says it is answered (DL-087 #8)."""
     return f'Reply "yes {proposal_id}" or "no {proposal_id}".'
@@ -439,18 +469,7 @@ class Grants:
                 f"you put the {scope} gate back on",
             )
         elif kind == episodes.GRANT_PROPOSED:
-            task = payload.get("task")
-            self._pending[seq] = Proposal(
-                seq=seq,
-                for_seq=int(payload["for_seq"]),
-                scope=payload["scope"],
-                proposes=payload["proposes"],
-                actions=tuple(dict(a) for a in payload["actions"]),
-                at=str(payload.get("at", "")),
-                reason=str(payload.get("reason", "")),
-                task=int(task) if isinstance(task, int) and not isinstance(task, bool) else None,
-                summary=str(payload.get("summary", "")),
-            )
+            self._pending[seq] = proposal_of(seq, payload)
         elif kind == episodes.GRANT_ANSWERED:
             p = self._pending.pop(int(payload["proposal"]), None)
             gone = self._lapsed.pop(int(payload["proposal"]), None)
