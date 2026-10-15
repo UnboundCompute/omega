@@ -69,7 +69,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable, Iterator, Optional
 
-from omega import episodes, machine, projection
+from omega import delegate, episodes, machine, projection
 from omega.derive import Learned, Readings
 from omega.blobs import BlobError, BlobStore, is_digest, mime_for
 from omega.memory import WriteKeyConflict
@@ -209,6 +209,7 @@ class Channel:
         poll: float = 0.02,
         on_append: Optional[Callable[[int], None]] = None,
         now: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
+        desk: Optional[delegate.Desk] = None,
     ) -> None:
         if host not in LOOPBACK:
             raise ValueError(
@@ -244,6 +245,11 @@ class Channel:
         self._readings = Readings()
         self._readings_lock = threading.Lock()
         self._now = now
+        # DL-104: the Claude Code jobs, folded from the log for the Mac's
+        # worker, and the desk its polls mark it present on.
+        self._jobs = delegate.Jobs()
+        self._jobs_lock = threading.Lock()
+        self._desk = desk if desk is not None else delegate.desk()
 
     # --- lifecycle --------------------------------------------------------
 
@@ -391,6 +397,10 @@ class Channel:
                 return self._blob(request)
             if op == "put":
                 return self._put(request)
+            if op == "delegate.poll":
+                return self._delegate_poll(request)
+            if op in ("delegate.update", "delegate.result"):
+                return self._delegate_report(request, op)
             if op == "ping":
                 return {"v": PROTOCOL, "op": "pong", "head": self._queue.head()}
             return self._error(f"unknown op {op!r}")
@@ -723,6 +733,84 @@ class Channel:
             "more": next_before > 1,
             "updates": updates,
         }
+
+    def _delegate_poll(self, request: dict[str, Any]) -> dict[str, Any]:
+        """The Mac's worker asking what to do (DL-104): ``{folders}`` is what
+        its allowlist holds. Answers every command it has not yet answered.
+
+        Marks the worker present, in memory: that, and only that, is what puts
+        ``delegate`` in a turn. Nothing is written, so a worker polling every
+        few seconds adds nothing to the log.
+        """
+        folders = request.get("folders")
+        if (
+            not isinstance(folders, list) or not folders or len(folders) > 50
+            or not all(isinstance(f, str) and f.strip() for f in folders)
+        ):
+            raise ValueError("'folders' must be the worker's allowed folders")
+        self._desk.seen(self._now(), folders)
+        with self._jobs_lock:
+            self._jobs.advance(self._queue.store)
+            commands = self._jobs.pending()
+        return {"v": PROTOCOL, "op": "delegate.poll", "commands": commands}
+
+    def _delegate_report(self, request: dict[str, Any], op: str) -> dict[str, Any]:
+        """The Mac's worker reporting on one job (DL-104): what its session
+        did (``delegate.update``) or what it produced (``delegate.result``).
+
+        ``id`` is the write key, so a resend is the duplicate path, as for
+        ``report``. The record lands first and its tell after it, under a key
+        of its own: a resend after a crash between the two writes the tell it
+        missed, and never a second one.
+        """
+        rid = request.get("id")
+        if not isinstance(rid, str) or not _PUT_ID.match(rid):
+            raise ValueError("'id' must be 1 to 64 letters, digits, '-' or '_'")
+        name = request.get("job")
+        with self._jobs_lock:
+            self._jobs.advance(self._queue.store)
+            if self._jobs.by_id.get(name) is None:
+                raise ValueError(f"there is no job {name!r}")
+        session = request.get("session") or None
+        if op == "delegate.update":
+            payload = episodes.delegate_updated(
+                job=name, state=request.get("state"),  # type: ignore[arg-type]
+                session=session, detail=request.get("detail") or None,
+                cmd=request.get("cmd"), at=self._now().isoformat(),
+            )
+        else:
+            files = request.get("files") or []
+            if not isinstance(files, list):
+                raise ValueError("'files' must be a list")
+            for item in files:
+                if not isinstance(item, dict) or not self._blobs.has(str(item.get("blob"))):
+                    raise ValueError("every file must be one this channel was sent with put")
+            payload = episodes.delegate_finished(
+                job=name, text=request.get("text"),  # type: ignore[arg-type]
+                files=files, session=session, at=self._now().isoformat(),
+            )
+        write_key = f"delegate:{rid}"
+        head_before = self._queue.head()
+        try:
+            seq = self._queue.append(payload, write_key)
+            duplicate = seq <= head_before
+        except WriteKeyConflict:
+            existing = self._existing(write_key)
+            seq, duplicate, payload = existing.seq, True, dict(existing.payload)
+        with self._jobs_lock:
+            self._jobs.advance(self._queue.store)
+            job = self._jobs.by_id[name]
+        told = delegate.tell(job, payload, at=str(payload["at"]))
+        if told is not None:
+            head_before = self._queue.head()
+            try:
+                tseq = self._queue.append(told, f"delegate-tell:{rid}")
+            except WriteKeyConflict:
+                pass
+            else:
+                if tseq > head_before and self._on_append is not None:
+                    self._on_append(tseq)
+        return {"v": PROTOCOL, "op": "ack", "seq": seq, "duplicate": duplicate}
 
     def _existing(self, write_key: str) -> Any:
         """The episode already filed under this write key.

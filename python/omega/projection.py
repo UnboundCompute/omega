@@ -259,6 +259,10 @@ NOT_PROJECTED = frozenset(
         # DL-101. A Slack post reaches the person as its turn's reply, with
         # the link; the records only remember what omega posted.
         *episodes.SLACK_KINDS,
+        # DL-104. A Claude Code session reaches the person as its tells (it
+        # started, it waits on them, it finished with this); the records are
+        # the commands and the Mac's receipts for them.
+        *episodes.DELEGATE_KINDS,
         # DL-086. Omega's lessons and skills are its own working notes; a
         # review reaches the person as its turn's reply, and a strike as the
         # reply of the turn that asked for it.
@@ -356,6 +360,8 @@ def project(payload: dict[str, Any], seq: int) -> Optional[Update]:
             # a success and must never arrive looking like an empty string.
             reply=payload.get("reply"),
             error=payload.get("error"),
+            # DL-104: where a reply goes back to, when its turn named one.
+            channel=payload.get("reply_to"),
             # DL-103: what the reply asks, by id, so the tray can offer the
             # answer as a button without reading the reply's words. A reply
             # that quotes "p7" from a mail it read carries no proposal here,

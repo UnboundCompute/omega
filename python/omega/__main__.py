@@ -39,6 +39,7 @@ from omega import (
     access,
     blobs,
     calendar,
+    delegate,
     derive,
     episodes,
     finance,
@@ -487,6 +488,13 @@ def relay(
             write(f"omega relay transcribes with sarvam ({chosen.model}), whisper as fallback")
         else:
             write("omega relay transcribes with local whisper")
+        # DL-104: Claude Code sessions for the core, only in the folders this
+        # Mac's own OMEGA_DELEGATE_DIRS allows; with none, no worker at all.
+        worker = delegate.start_worker(
+            (host, port), env_path=env_path, stopping=stopping, log=write,
+        )
+        if worker is not None:
+            write(f"omega relay runs Claude Code sessions in {', '.join(map(str, delegate.roots(env_path=env_path)))}")
         (wait or sensor.run)(stopping)
         return 0
     finally:

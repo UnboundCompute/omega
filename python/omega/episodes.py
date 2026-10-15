@@ -185,6 +185,16 @@ __all__ = [
     "slack_posted",
     "slack_deleted",
     "slack_failed",
+    "DELEGATE_REQUESTED",
+    "DELEGATE_ASKED",
+    "DELEGATE_UPDATED",
+    "DELEGATE_FINISHED",
+    "DELEGATE_KINDS",
+    "DELEGATE_STATES",
+    "delegate_requested",
+    "delegate_asked",
+    "delegate_updated",
+    "delegate_finished",
     "REPORT_TRANSCRIPT",
     "REPORT_USAGE",
     "REPORT_RECORDING",
@@ -596,6 +606,38 @@ _SLACK_TS = re.compile(r"^[0-9]{1,12}\.[0-9]{1,8}$")
 _SLACK_FILE = re.compile(r"^F[A-Z0-9]{2,30}$")
 MAX_SLACK_NAME = 200
 MAX_SLACK_LINK = 500
+#: Handing work to a Claude Code session on their Mac (DL-104).
+#: ``delegate.requested`` is a start they said yes to: the job's id, its
+#: title, the brief omega wrote (with its fixed rules), the folder and
+#: whether to work in a git worktree, and the channel the result goes back
+#: to. ``delegate.asked`` is a follow-up or a stop for a job. Both are
+#: commands the Mac's worker collects on its next poll; each one's seq is
+#: the command's id, and the worker's ``delegate.updated`` naming it is the
+#: receipt. ``delegate.updated`` is what the session did (started, waiting
+#: on them, done, failed, stopped), and ``delegate.finished`` its final
+#: message and the files it left in the job's outbox, stored as blobs.
+#: Records: the job's words reach them as a tell, which is conversation;
+#: neither recalled nor projected.
+DELEGATE_REQUESTED = "delegate.requested"
+DELEGATE_ASKED = "delegate.asked"
+DELEGATE_UPDATED = "delegate.updated"
+DELEGATE_FINISHED = "delegate.finished"
+DELEGATE_KINDS = frozenset(
+    {DELEGATE_REQUESTED, DELEGATE_ASKED, DELEGATE_UPDATED, DELEGATE_FINISHED}
+)
+DELEGATE_STATES = frozenset({"started", "waiting", "done", "failed", "stopped"})
+_DELEGATE_DOS = frozenset({"followup", "stop"})
+#: A job's id: ``j<turn>-<n>``, the turn that started it and which start.
+_DELEGATE_JOB = re.compile(r"^j[0-9]{1,12}-[0-9]{1,3}$")
+#: Claude Code's background id (``d21bfd32``) or its full session id.
+_DELEGATE_SESSION = re.compile(r"^[0-9a-f][0-9a-f-]{3,63}$")
+MAX_DELEGATE_TITLE = 80
+MAX_DELEGATE_BRIEF = 12_000
+MAX_DELEGATE_FOLDER = 1_000
+MAX_DELEGATE_TEXT = 12_000
+MAX_DELEGATE_DETAIL = 500
+MAX_DELEGATE_FILES = 10
+MAX_REPLY_TO = 40
 
 #: The senses a relay may report for, by the name of the sense rather than of
 #: the file it read. Three of them end in a learning receipt; the machine sense
@@ -676,6 +718,7 @@ KINDS = frozenset(
         *LEAVE_KINDS,
         *OUTBOX_KINDS,
         *SLACK_KINDS,
+        *DELEGATE_KINDS,
     }
 )
 
@@ -904,6 +947,7 @@ def inbound(
     at: Optional[str] = None,
     mail_inboxes: Optional[dict[str, str]] = None,
     untrusted: Optional[str] = None,
+    reply_to: Optional[str] = None,
 ) -> dict[str, Any]:
     """Something arrived that omega may need to respond to.
 
@@ -986,6 +1030,10 @@ def inbound(
         # DL-096 under DL-064: a tell that carries someone else's words (a
         # watched page's change), naming whose. Absent on every other event.
         payload["untrusted"] = untrusted
+    if reply_to is not None:
+        # DL-104: a tell about work they asked for on one channel, which
+        # goes back there. Absent on every other event.
+        payload["reply_to"] = reply_to
     if queued is not None:
         # DL-098: an unprompted message routed through the outbox. On a tell,
         # the held drafts it delivers (empty for a follow-up told at once); on
@@ -1039,6 +1087,7 @@ def completed(
     tainted: Optional[list[str]] = None,
     proposals: Optional[list[dict[str, Any]]] = None,
     settled: Optional[list[dict[str, Any]]] = None,
+    reply_to: Optional[str] = None,
 ) -> dict[str, Any]:
     """The turn ended. A terminal record.
 
@@ -1082,6 +1131,9 @@ def completed(
         payload["proposals"] = _rows(proposals)
     if settled:
         payload["settled"] = _rows(settled)
+    if reply_to:
+        # DL-104: the channel a tell's reply goes back to, from its event.
+        payload["reply_to"] = reply_to
     _validate(payload)
     return payload
 
@@ -2252,6 +2304,10 @@ _REQUIRED: dict[str, tuple[str, ...]] = {
     SLACK_POSTED: ("for_seq", "channel", "name", "ts", "permalink", "what", "at"),
     SLACK_DELETED: ("for_seq", "channel", "ts", "at"),
     SLACK_FAILED: ("for_seq", "do", "to", "error", "at"),
+    DELEGATE_REQUESTED: ("for_seq", "job", "title", "brief", "folder", "worktree", "at"),
+    DELEGATE_ASKED: ("for_seq", "job", "do", "at"),
+    DELEGATE_UPDATED: ("job", "state", "at"),
+    DELEGATE_FINISHED: ("job", "text", "files", "at"),
     GRANT_GIVEN: ("for_seq", "scope", "at"),
     GRANT_REVOKED: ("for_seq", "scope", "at"),
     GRANT_RESTORED: ("for_seq", "scope", "at"),
@@ -2885,6 +2941,8 @@ def _validate(payload: dict[str, Any]) -> None:
                 raise BadPayload("machine must be a list of lines")
         if "mail_at" in payload:
             _require_str(payload, "mail_at", non_empty=True)
+        if "reply_to" in payload:
+            _require_sentence(payload, "reply_to", cap=MAX_REPLY_TO)
         if "untrusted" in payload:
             source = payload["untrusted"]
             if not isinstance(source, str) or not source or len(source) > MAX_HOLD_REASON:
@@ -3055,6 +3113,10 @@ def _validate(payload: dict[str, Any]) -> None:
     elif kind in SLACK_KINDS:
         # Attached: every one is the act of the turn that asked for it.
         _validate_slack(payload)
+    elif kind in DELEGATE_KINDS:
+        # Named by the job. A start and an ask name the turn that said yes or
+        # asked; what the Mac reports belongs to the job, not a turn.
+        _validate_delegate(payload)
     elif kind in TOPIC_KINDS:
         # No `for_seq` required: a follow or a drop is named by the topic, and
         # an update by it too, with the turn that asked only when one did.
@@ -3126,6 +3188,8 @@ def _validate(payload: dict[str, Any]) -> None:
             _validate_asked(payload["proposals"], "proposals", ("id", "summary"))
         if "settled" in payload:
             _validate_asked(payload["settled"], "settled", ("id", "yes"))
+        if "reply_to" in payload:
+            _require_sentence(payload, "reply_to", cap=MAX_REPLY_TO)
 
     if kind == TURN_BLOCKED:
         _require_str(payload, "needs", non_empty=True)
@@ -3849,6 +3913,118 @@ def slack_failed(
     omega's sentence for Slack's answer, never the token."""
     payload = {"v": VERSION, "kind": SLACK_FAILED, "for_seq": for_seq, "do": do,
                "to": to, "error": error, "at": at or now()}
+    _validate(payload)
+    return payload
+
+
+def _validate_delegate(payload: dict[str, Any]) -> None:
+    kind = payload["kind"]
+    job = payload["job"]
+    if not isinstance(job, str) or not _DELEGATE_JOB.match(job):
+        raise BadPayload("job must be a job id like j12-1")
+    _require_str(payload, "at", non_empty=True)
+    if kind in (DELEGATE_REQUESTED, DELEGATE_ASKED):
+        _require_seq(payload, "for_seq")
+    if kind == DELEGATE_REQUESTED:
+        _require_sentence(payload, "title", cap=MAX_DELEGATE_TITLE)
+        _require_sentence(payload, "brief", cap=MAX_DELEGATE_BRIEF)
+        _require_sentence(payload, "folder", cap=MAX_DELEGATE_FOLDER)
+        if not isinstance(payload["worktree"], bool):
+            raise BadPayload("worktree must be a bool")
+        if "reply_to" in payload:
+            _require_sentence(payload, "reply_to", cap=MAX_REPLY_TO)
+        return
+    if kind == DELEGATE_ASKED:
+        if payload["do"] not in _DELEGATE_DOS:
+            raise BadPayload(f"do must be one of {sorted(_DELEGATE_DOS)}")
+        if payload["do"] == "followup":
+            _require_sentence(payload, "text", cap=MAX_DELEGATE_TEXT)
+        return
+    if "session" in payload and not (
+        isinstance(payload["session"], str) and _DELEGATE_SESSION.match(payload["session"])
+    ):
+        raise BadPayload("session must be a Claude Code session id")
+    if kind == DELEGATE_UPDATED:
+        if payload["state"] not in DELEGATE_STATES:
+            raise BadPayload(f"state must be one of {sorted(DELEGATE_STATES)}")
+        if "detail" in payload:
+            _require_sentence(payload, "detail", cap=MAX_DELEGATE_DETAIL)
+        if "cmd" in payload:
+            _require_seq(payload, "cmd")
+        return
+    _require_sentence(payload, "text", cap=MAX_DELEGATE_TEXT, empty=True)
+    files = payload["files"]
+    if not isinstance(files, list) or len(files) > MAX_DELEGATE_FILES:
+        raise BadPayload(f"files must be a list of at most {MAX_DELEGATE_FILES}")
+    for item in files:
+        if not isinstance(item, dict) or set(item) != {"name", "blob", "mime", "bytes"}:
+            raise BadPayload("each file is {name, blob, mime, bytes}")
+        name = item["name"]
+        if not isinstance(name, str) or not name.strip() or "/" in name or len(name) > 200:
+            raise BadPayload("a file's name is a plain file name")
+        if not is_digest(item["blob"]):
+            raise BadPayload("a file's blob is a blob reference")
+        size = item["bytes"]
+        if isinstance(size, bool) or not isinstance(size, int) or size < 0:
+            raise BadPayload("a file's bytes is a size")
+        if not isinstance(item["mime"], str):
+            raise BadPayload("a file's mime is a string")
+
+
+def delegate_requested(
+    *, for_seq: int, job: str, title: str, brief: str, folder: str, worktree: bool,
+    reply_to: Optional[str] = None, at: Optional[str] = None,
+) -> dict[str, Any]:
+    """A Claude Code session they said yes to, for the Mac to start (DL-104)."""
+    payload: dict[str, Any] = {"v": VERSION, "kind": DELEGATE_REQUESTED, "for_seq": for_seq,
+                               "job": job, "title": title, "brief": brief, "folder": folder,
+                               "worktree": worktree, "at": at or now()}
+    if reply_to:
+        payload["reply_to"] = reply_to
+    _validate(payload)
+    return payload
+
+
+def delegate_asked(
+    *, for_seq: int, job: str, do: str, text: Optional[str] = None,
+    at: Optional[str] = None,
+) -> dict[str, Any]:
+    """A follow-up or a stop for one job, for the Mac to carry out (DL-104)."""
+    payload: dict[str, Any] = {"v": VERSION, "kind": DELEGATE_ASKED, "for_seq": for_seq,
+                               "job": job, "do": do, "at": at or now()}
+    if text is not None:
+        payload["text"] = text
+    _validate(payload)
+    return payload
+
+
+def delegate_updated(
+    *, job: str, state: str, session: Optional[str] = None, detail: Optional[str] = None,
+    cmd: Optional[int] = None, at: Optional[str] = None,
+) -> dict[str, Any]:
+    """What a job's session did, as the Mac's worker saw it (DL-104)."""
+    payload: dict[str, Any] = {"v": VERSION, "kind": DELEGATE_UPDATED, "job": job,
+                               "state": state, "at": at or now()}
+    if session:
+        payload["session"] = session
+    if detail:
+        payload["detail"] = detail
+    if cmd is not None:
+        payload["cmd"] = cmd
+    _validate(payload)
+    return payload
+
+
+def delegate_finished(
+    *, job: str, text: str, files: list[dict[str, Any]], session: Optional[str] = None,
+    at: Optional[str] = None,
+) -> dict[str, Any]:
+    """A job's session finished: its final message and its files (DL-104)."""
+    payload: dict[str, Any] = {"v": VERSION, "kind": DELEGATE_FINISHED, "job": job,
+                               "text": text, "files": [dict(f) for f in files],
+                               "at": at or now()}
+    if session:
+        payload["session"] = session
     _validate(payload)
     return payload
 

@@ -136,6 +136,7 @@ __all__ = [
     "FORGET",
     "LOCATION",
     "SLACK",
+    "DELEGATE",
     "TOPICS",
     "TOPIC_ASK",
     "LEAVE_BY",
@@ -276,6 +277,13 @@ HANDOFF = "handoff"
 #: it was. It reaches outside omega, so a turn that read someone else's
 #: words holds it for their yes (DL-064, :func:`omega.act._outward`).
 SLACK = "slack"
+#: Hands work to a live Claude Code session on their Mac (DL-104): starts one
+#: in a folder the Mac allows, reports on them, sends a finished one a
+#: follow-up, stops one. Outside :data:`TOOL_NAMES` for :data:`WATCH_PAGE`'s
+#: reason, and offered only on their own message while a worker on their Mac
+#: is polling: with none, every turn is exactly what it was. Every start is
+#: held for their yes, whatever the turn read (:func:`omega.act._always_held`).
+DELEGATE = "delegate"
 #: Sets, lists or stops the leave-now alarm (DL-093). Outside
 #: :data:`TOOL_NAMES` for :data:`PROMISE`'s reason: offered only on their own
 #: message and only where the Maps MCP server is configured, never on their
@@ -1402,6 +1410,9 @@ def untrusted_source(tool: str, args: dict[str, Any]) -> Optional[str]:
         return str(args.get("url") or "a watched page")
     if tool == WATCH_PAGE and args.get("do") == "list":
         return WATCHED_PAGES  # each watch's last error, as its server wrote it
+    if tool == DELEGATE and args.get("do") == "status":
+        # DL-104: a session's final message is Claude Code's words, not theirs.
+        return _delegate_mod().SOURCE
     if "__" in tool and tool not in TOOL_NAMES:
         return f"the {tool.split('__', 1)[0]} MCP server"
     return None
@@ -2383,6 +2394,132 @@ def _slack(box: "ToolBox", args: dict[str, Any]) -> str:
     ))
     where = done["permalink"] or "Slack gave no link"
     return f"posted to {target.name} on Slack as them: {where}"
+
+
+# --- Claude Code on their Mac (DL-104) -----------------------------------------
+
+_DELEGATE_DOS = ("start", "status", "followup", "stop")
+#: How much of a finished session's message ``status`` shows; the whole of it
+#: came to them as its own tell.
+_DELEGATE_SHOWN = 400
+
+
+def _delegate_mod() -> Any:
+    from omega import delegate  # delegate's tells import this module
+
+    return delegate
+
+
+def _delegating(box: "ToolBox") -> bool:
+    """Is ``delegate`` there in this box's turn? Structural only: their own
+    message, a box with the log, and a worker on their Mac polling."""
+    return bool(box.prompted and box.append is not None and box.delegate is not None)
+
+
+def _delegate_job(box: "ToolBox", args: dict[str, Any]) -> Any:
+    name = _text(DELEGATE, args, "job").strip()
+    job = box.delegate.jobs().by_id.get(name)
+    if job is None:
+        raise ToolRejected(f"{DELEGATE}: there is no job {name!r}; 'status' lists them")
+    return job
+
+
+def _classify_delegate(box: "ToolBox", args: dict[str, Any]) -> Decision:
+    if not _delegating(box):
+        raise ToolRejected(f"{DELEGATE} runs only on their own message, with their Mac connected")
+    do = args.get("do")
+    if do not in _DELEGATE_DOS:
+        raise ToolRejected(f"{DELEGATE}'s 'do' is one of {list(_DELEGATE_DOS)}")
+    if do == "status":
+        return Decision(tool=DELEGATE, tier=EXPLORATION, why="see your Claude Code sessions",
+                        args={"do": do})
+    if do == "start":
+        title = " ".join(_text(DELEGATE, args, "title").split())
+        task = _text(DELEGATE, args, "brief").strip()
+        folder = _text(DELEGATE, args, "folder").strip()
+        if len(title) > episodes.MAX_DELEGATE_TITLE:
+            raise ToolRejected(f"{DELEGATE}: a title is at most {episodes.MAX_DELEGATE_TITLE} characters")
+        if len(_delegate_mod().brief(task)) > episodes.MAX_DELEGATE_BRIEF:
+            raise ToolRejected(f"{DELEGATE}: that brief is too long; say it in fewer words")
+        if len(folder) > episodes.MAX_DELEGATE_FOLDER:
+            raise ToolRejected(f"{DELEGATE}: that folder name is too long")
+        worktree = args.get("worktree", False)
+        if not isinstance(worktree, bool):
+            raise ToolRejected(f"{DELEGATE}'s 'worktree' is true or false")
+        return Decision(
+            tool=DELEGATE, tier=LOCAL,
+            why=f"start Claude Code on your Mac to {title}, in {folder}",
+            args={"do": do, "title": title, "brief": task, "folder": folder, "worktree": worktree},
+        )
+    job = _delegate_job(box, args)
+    if do == "followup":
+        if job.state in ("requested", "started", "waiting"):
+            # Nothing is sent to a session mid-turn: they steer it themselves.
+            # Refused here, not held, because there is nothing to approve.
+            hint = f"open it with `claude attach {job.session}` to steer" if job.session else (
+                "wait for it to start, then ask again")
+            raise ToolRejected(f"it's still working; {hint}")
+        text = _text(DELEGATE, args, "text").strip()
+        if len(text) > episodes.MAX_DELEGATE_TEXT:
+            raise ToolRejected(f"{DELEGATE}: that follow-up is too long")
+        return Decision(tool=DELEGATE, tier=LOCAL,
+                        why=f"send Claude Code a follow-up on {job.title}",
+                        args={"do": do, "job": job.job, "text": text})
+    return Decision(tool=DELEGATE, tier=LOCAL, why=f"stop Claude Code on {job.title}",
+                    args={"do": do, "job": job.job})
+
+
+def _delegate(box: "ToolBox", args: dict[str, Any]) -> str:
+    seat = box.delegate
+    mod = _delegate_mod()
+    do = args["do"]
+    jobs = seat.jobs()
+    if do == "status":
+        folders = ", ".join(seat.desk.folders) or "none"
+        lines = [f"folders your Mac allows: {folders}"]
+        for job in jobs.by_id.values():
+            line = f"{job.job} ({job.title}, in {job.folder}): {job.state}"
+            if job.session:
+                line += f"; `claude attach {job.session}`"
+            if job.detail:
+                line += f"; {job.detail}"
+            if job.text:
+                line += f"; said: {job.text[:_DELEGATE_SHOWN]}"
+            lines.append(line)
+        if len(lines) == 1:
+            lines.append("no sessions yet")
+        return "\n".join(lines)
+    if not seat.desk.available():
+        # Said plainly, and nothing is kept for later: a session that starts
+        # hours after they asked, unseen, is not what they asked for.
+        raise ToolError(
+            f"{DELEGATE}: your Mac is not connected, so nothing was sent to Claude Code "
+            "and nothing was queued"
+        )
+    at = box.at or None
+    if do == "start":
+        job = f"j{box.for_seq}-{jobs.started_by(box.for_seq) + 1}"
+        box.append(episodes.delegate_requested(
+            for_seq=box.for_seq, job=job, title=args["title"], brief=mod.brief(args["brief"]),
+            folder=args["folder"], worktree=bool(args["worktree"]),
+            reply_to=seat.reply_to or None, at=at,
+        ))
+        return (
+            f"asked your Mac to start Claude Code on {args['title']} (job {job}); "
+            "they will hear when it starts and when it is done"
+        )
+    job = jobs.by_id[args["job"]]
+    if do == "followup":
+        if job.state != "done":
+            return f"{job.job} is {job.state}, so there is no session to follow up; start a new one"
+    elif job.state in ("failed", "stopped"):
+        return f"{job.job} is already {job.state}"
+    box.append(episodes.delegate_asked(
+        for_seq=box.for_seq, job=job.job, do=do, text=args.get("text"), at=at,
+    ))
+    if do == "stop":
+        return f"asked your Mac to stop {job.job} ({job.title})"
+    return f"sent the follow-up to {job.job}; they will hear when it is done"
 
 
 # --- page watches (DL-096) ---------------------------------------------------------
@@ -4419,6 +4556,34 @@ _SLACK_TOOL = _Tool(
 )
 
 
+#: ``delegate`` (DL-104), beside Ring 1 and not in it: see :data:`DELEGATE`.
+_DELEGATE_TOOL = _Tool(
+    classify=_classify_delegate,
+    dispatch=_delegate,
+    schema=_schema(
+        DELEGATE,
+        "Hand work to a live Claude Code session on their Mac, which they "
+        "can watch and steer. 'status' lists the folders it may work in and "
+        "every session; call it first to pick 'folder'. 'start' (after their "
+        "yes) begins one: a short 'title', a clear self-contained 'brief' of "
+        "what to make or fix and what done looks like, the 'folder' (a path "
+        "or a folder's name from status), and 'worktree' true for code work "
+        "in a git repository. 'followup' sends a finished session more "
+        "'text'; 'stop' ends one. Each takes the 'job' status names.",
+        {
+            "do": {"type": "string", "enum": list(_DELEGATE_DOS)},
+            "title": {"type": "string"},
+            "brief": {"type": "string"},
+            "folder": {"type": "string"},
+            "worktree": {"type": "boolean"},
+            "job": {"type": "string", "description": "A job id from status, like j12-1."},
+            "text": {"type": "string"},
+        },
+        ["do"],
+    ),
+)
+
+
 #: ``handoff`` (DL-097), beside Ring 1 and not in it: see :data:`HANDOFF`.
 _HANDOFF_TOOL = _Tool(
     classify=_classify_handoff,
@@ -4653,6 +4818,10 @@ class ToolBox:
     #: Only their own message, with this and ``append`` set, puts ``slack``
     #: in the box; ``None`` (no token) leaves it exactly as it was.
     slack: Any = None
+    #: Claude Code on their Mac (DL-104): an :class:`omega.delegate.Seat`, or
+    #: ``None``. Only their own message, with this and ``append`` set, puts
+    #: ``delegate`` in the box; ``None`` (no worker polling) leaves it as it was.
+    delegate: Any = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "store_root", Path(self.store_root).resolve())
@@ -4690,6 +4859,8 @@ class ToolBox:
             tool = _LEAVE_TOOL
         if tool is None and name == SLACK and _slacking(self):
             tool = _SLACK_TOOL
+        if tool is None and name == DELEGATE and _delegating(self):
+            tool = _DELEGATE_TOOL
         if tool is None and self.remote is not None and isinstance(arguments, dict):
             # An MCP tool, refused or cleared by the adapter: money, writes and
             # the allowlist are decided there, in code, from the name (DL-088).
@@ -4752,6 +4923,10 @@ class ToolBox:
             if not _slacking(self):
                 raise ToolRejected(f"{SLACK} runs only on their own message")
             return _SLACK_TOOL.dispatch(self, decision.args)
+        if decision.tool == DELEGATE and decision.tool not in _TOOLS:
+            if not _delegating(self):
+                raise ToolRejected(f"{DELEGATE} runs only on their own message, with their Mac connected")
+            return _DELEGATE_TOOL.dispatch(self, decision.args)
         return _TOOLS[decision.tool].dispatch(self, decision.args)
 
     def schemas(self, hide: "frozenset[str] | set[str]" = frozenset()) -> list[dict[str, Any]]:
@@ -4780,6 +4955,8 @@ class ToolBox:
             mine.append(_LEAVE_TOOL.schema)
         if _slacking(self) and SLACK not in hide:
             mine.append(_SLACK_TOOL.schema)
+        if _delegating(self) and DELEGATE not in hide:
+            mine.append(_DELEGATE_TOOL.schema)
         names = _mailbox_names()
         if len(names) > 1:
             mine = [_inbox_schema(schema, names) for schema in mine]

@@ -656,6 +656,11 @@ def decide(
     if came_from == CHANNEL:
         return text
     if came_from is None:
+        # A Claude Code session's result (DL-104) names where it was asked
+        # for: here it goes, there it does not, wherever they are sitting.
+        sent_to = update.get("channel")
+        if sent_to is not None:
+            return text if sent_to == CHANNEL else None
         return None if at_the_mac() else text
     return None
 

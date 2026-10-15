@@ -46,12 +46,13 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 
 from omega import episodes, finance, grants, leave, lessons, location, lookback, mailcursor, mcp, projects, provider
-from omega import slack, tasks
+from omega import delegate, slack, tasks
 from omega import topics as kept
 from omega import watcher
 from omega.tools import (
     EXTERNAL,
     GRANT,
+    DELEGATE,
     LOCAL,
     SLACK,
     NOTHING_NEW,
@@ -294,6 +295,9 @@ def act_loop(
             # started and only with their token set; None leaves the box as
             # it was.
             slack=_slack_seat(ctx),
+            # DL-104: Claude Code on their Mac, only in a turn their own
+            # message started and only while a worker there is polling.
+            delegate=_delegate_seat(ctx),
         )
 
     # Their answer to a proposal is settled before the model is asked anything
@@ -427,7 +431,9 @@ def act_loop(
                 decisions.append((call, None, str(exc)))
 
         cleared = [d for _, d, _ in decisions if d is not None]
-        held = [d for d in cleared if _outward(d)] if tainted else []
+        held = [d for d in cleared if _outward(d) or _always_held(d)] if tainted else [
+            d for d in cleared if _always_held(d)
+        ]
         if held:
             # Read, then send (DL-064): this turn has read what someone else
             # wrote, so nothing outward runs on the model's say-so. Filed for
@@ -566,6 +572,30 @@ def _slack_seat(ctx: TurnContext) -> Optional[slack.Seat]:
     )
 
 
+def _delegate_seat(ctx: TurnContext) -> Optional[delegate.Seat]:
+    """``delegate`` for this turn (DL-104): their own message, and a worker on
+    their Mac with folders allowed that polled within
+    :data:`omega.delegate.LIVE_SECONDS`. The jobs are folded from the log
+    when the tool asks; a result goes back to the channel this came in on."""
+    if unprompted(ctx) or not delegate.available():
+        return None
+    return delegate.Seat(
+        desk=delegate.desk(),
+        jobs=lambda: delegate.jobs(ctx.queue.store),
+        reply_to=str(ctx.event.get("channel") or ""),
+    )
+
+
+#: Why a start is asked about on a turn that read nothing (DL-104).
+_ALWAYS_HELD = "a Claude Code session on your Mac is always yours to approve"
+
+
+def _always_held(d: Decision) -> bool:
+    """Held for their yes on every turn, tainted or not: starting a Claude
+    Code session on their Mac (DL-104), which acts on their machine."""
+    return d.tool == DELEGATE and d.args.get("do") == "start"
+
+
 def _outward(d: Decision) -> bool:
     """Would this call act outside omega, or change what omega may do? An
     ``external`` call (DL-028), giving or taking a grant (DL-085): the acts a
@@ -577,6 +607,9 @@ def _outward(d: Decision) -> bool:
         return True
     if d.tool == SLACK:
         return d.args.get("do") in ("post", "delete")
+    if d.tool == DELEGATE:
+        # Starting a session or sending it more to do; a stop only narrows.
+        return d.args.get("do") in ("start", "followup")
     return d.tool == GRANT and d.args.get("change") in ("give", "revoke")
 
 
@@ -598,7 +631,7 @@ def _held_reason(sources: list[str]) -> str:
 def _hold(ctx: TurnContext, held: list[Decision], sources: list[str]) -> tuple[str, list[str]]:
     """File what a tainted turn wanted to do outward (DL-064) as one
     proposal, and return the question that asks it with its id."""
-    reason = _held_reason(sources)
+    reason = _held_reason(sources) if sources else _ALWAYS_HELD
     seq = ctx.queue.append(episodes.grant_proposed(
         for_seq=ctx.seq,
         scope=episodes.HOLD_SCOPE,
@@ -607,8 +640,14 @@ def _hold(ctx: TurnContext, held: list[Decision], sources: list[str]) -> tuple[s
         reason=reason,
     ))
     words = "; ".join(d.why for d in held)
+    # A Claude Code start shows the brief it would be given (DL-104): their
+    # yes is to those words, so they read them before they say it.
+    briefs = "".join(
+        f"\n\nThe brief for {d.args['title']}:\n{d.args['brief']}\n\n"
+        for d in held if _always_held(d)
+    )
     question = (
-        f"Should I {words}? I am asking first because {reason}. "
+        f"Should I {words}?{briefs or ' '}I am asking first because {reason}. "
         f"{grants.how_to_answer(grants.pid(seq))}"
     )
     return question, [grants.pid(seq)]
@@ -636,11 +675,13 @@ def _release(
         if grants.is_money(tool):
             results.append(f"{why}: not run, omega never pays")
             continue
-        if tool == SLACK:
+        if tool in (SLACK, DELEGATE):
             # A held Slack post or delete (DL-101) is theirs to have sent
             # anyway on a clean turn, so their yes sends it: classified again
             # by this turn's box, which holds it only on their own message
-            # with the token still set, and run exactly as filed.
+            # with the token still set, and run exactly as filed. A held
+            # Claude Code start or follow-up (DL-104) runs the same way, while
+            # their Mac's worker is still polling.
             try:
                 decision = box.classify(tool, args)
             except ToolRejected as exc:

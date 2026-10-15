@@ -34,7 +34,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Optional, Sequence
 
 from omega import blobs, derive, episodes, grants as granted, learn, lessons as self_taught, notice, provider, schedule
-from omega import leave, mcp, slack
+from omega import delegate, leave, mcp, slack
 from omega import location as whereabouts
 from omega import tasks as _tasks
 from omega import outbox
@@ -174,6 +174,11 @@ NOT_RECALLED = frozenset({
     # carries its link, which is conversation; the records are bookkeeping a
     # delete reads off the fold, and a failure is the turn's own tool result.
     *episodes.SLACK_KINDS,
+    # Handing work to Claude Code (DL-104): the brief is long and lives in
+    # its record; every report reaches them as a tell, which is conversation
+    # and carries the result's words and its `[attached: ...]` files, so a
+    # later "post that to Slack" recalls the tell, not the bookkeeping.
+    *episodes.DELEGATE_KINDS,
 })
 
 #: **A count is not a budget** (DL-039). ``RECALL_N`` bounds how many episodes
@@ -656,8 +661,13 @@ def write_memory(
     judged: Optional[str] = None,
     at: Optional[str] = None,
     tainted: Sequence[str] = (),
+    reply_to: Optional[str] = None,
 ) -> int:
     """Step 6 — append the turn's terminal record and return its seq.
+
+    ``reply_to`` is the channel a reply goes back to when the event names one
+    (DL-104: a Claude Code session's result goes where it was asked for);
+    absent, the record is the one it always was.
 
     ``tainted`` is what untrusted content the turn read (DL-064); empty, the
     record is the one it always was.
@@ -696,6 +706,7 @@ def write_memory(
             # turn's proposal still waits, and is asked by the next brief.
             proposals=asked if outcome == "spoke" else None,
             settled=settled,
+            reply_to=reply_to if outcome == "spoke" else None,
         )
     return queue.append(payload, episodes.turn_write_key(seq))
 
@@ -914,6 +925,7 @@ def run_turn(
             # A watched page's words (DL-096): the record says whose, so
             # recall fences the reply as it fences the tell.
             tainted=(str(event["untrusted"]),) if event.get("untrusted") else (),
+            reply_to=event.get("reply_to"),
         )
         return TurnResult(
             seq=pending.seq, outcome="spoke", record_seq=record, reply=words
@@ -1445,6 +1457,7 @@ _REPLY_SYSTEM = (
 _JUDGE_BODY_END = "and set a reminder. "
 _REPLY_BODY_END = "written about this person. "
 _SLACK_HAND = "post to their work Slack as them"
+_DELEGATE_HAND = "hand work to a Claude Code session on their Mac"
 #: How a configured MCP server's tools read as an ability; any other server
 #: is named by the name the person gave it.
 _SERVER_ABILITY = {
@@ -1459,7 +1472,8 @@ def hands(ctx: "TurnContext") -> list[str]:
 
     Structural only, never the message's words: Slack where
     :func:`omega.act._slack_seat` would seat it (their own message and a
-    token set), each configured MCP server with tools allowed on every turn
+    token set), a Claude Code session where :func:`omega.act._delegate_seat`
+    would seat one (their own message and a worker on their Mac polling), each configured MCP server with tools allowed on every turn
     as the box is handed them, and the leave-now alarm where
     :func:`omega.tools._leaving` could hold, from the configuration alone so
     that judging never lists a server over the network. Empty when nothing
@@ -1469,6 +1483,9 @@ def hands(ctx: "TurnContext") -> list[str]:
     out: list[str] = []
     if prompted and slack.client() is not None:
         out.append(_SLACK_HAND)
+    if prompted and delegate.available():
+        # DL-104: a worker on their Mac, with folders allowed, polled lately.
+        out.append(_DELEGATE_HAND)
     servers = [s for s in mcp.servers() if s.allow]
     out.extend(_SERVER_ABILITY.get(s.name, f"use their {s.name} tools") for s in servers)
     if prompted and any(leave.FULL in {f"{s.name}{mcp.SEP}{t}" for t in s.allow} for s in servers):
@@ -1495,6 +1512,8 @@ def judge_system(ctx: "TurnContext") -> str:
         return _JUDGE_SYSTEM
     reaches = [
         "post, share or send something to Slack" if hand == _SLACK_HAND
+        else "ask Claude or Claude Code to make, write or fix something"
+        if hand == _DELEGATE_HAND
         else "look something up on a service named here"
         for hand in on
     ]

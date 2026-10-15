@@ -451,6 +451,17 @@ def test_every_m1_kind_is_accounted_for() -> None:
         episodes.SLACK_FAILED: episodes.slack_failed(
             for_seq=1, do="post", to="#team", error="not_in_channel", at=AT,
         ),
+        # DL-104: a Claude Code session reaches them as its tells, never as these.
+        episodes.DELEGATE_REQUESTED: episodes.delegate_requested(
+            for_seq=1, job="j1-1", title="t", brief="b", folder="site", worktree=False, at=AT,
+        ),
+        episodes.DELEGATE_ASKED: episodes.delegate_asked(for_seq=1, job="j1-1", do="stop", at=AT),
+        episodes.DELEGATE_UPDATED: episodes.delegate_updated(
+            job="j1-1", state="started", session="d21bfd32", cmd=1, at=AT,
+        ),
+        episodes.DELEGATE_FINISHED: episodes.delegate_finished(
+            job="j1-1", text="done", files=[], at=AT,
+        ),
     }
     assert set(made) == set(episodes.KINDS)
     for kind, payload in made.items():

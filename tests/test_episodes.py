@@ -312,6 +312,24 @@ def test_every_kind_round_trips():
             "a look", channel="self", queued=[40], thinking="2026-09-23 morning",
             at="2026-09-23T10:00:00+00:00",
         ),
+        ep.delegate_requested(
+            for_seq=44, job="j44-1", title="write the launch doc", brief="Write it.\n\nRules.",
+            folder="site", worktree=True, reply_to="discord", at="2026-09-23T10:00:00+00:00",
+        ),
+        ep.delegate_asked(for_seq=45, job="j44-1", do="followup", text="Add a FAQ.",
+                          at="2026-09-23T10:00:00+00:00"),
+        ep.delegate_updated(job="j44-1", state="waiting", session="d21bfd32",
+                            detail="needs your permission", cmd=46, at="2026-09-23T10:00:00+00:00"),
+        ep.delegate_finished(
+            job="j44-1", text="Wrote launch.md.", session="d21bfd32",
+            files=[{"name": "launch.md", "blob": "sha256:" + "a" * 64, "mime": "text/markdown",
+                    "bytes": 9}],
+            at="2026-09-23T10:00:00+00:00",
+        ),
+        ep.inbound("tell", channel="schedule", reply_to="discord", untrusted="a Claude Code session on your Mac",
+                   at="2026-09-23T10:00:00+00:00"),
+        ep.completed(for_seq=47, outcome="spoke", reply="Done.", reply_to="discord",
+                     at="2026-09-23T10:00:00+00:00"),
     ]
     assert {p["kind"] for p in built} == ep.KINDS, "a kind has no round-trip test"
     for payload in built:
