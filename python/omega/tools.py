@@ -567,6 +567,10 @@ def promise_text(found: Sequence[Any]) -> str:
 #: to keep up with what it names, so it is a question too.
 TOPIC_ASK = "Want me to keep up with it? Reply yes or no."
 
+#: What an offer to start Claude Code on a recurring CI failure ends with
+#: (C6): it carries a held ``delegate start``, so it is a question too.
+DELEGATE_ASK = "Should I start it? Reply yes or no."
+
 
 def topic_text(name: str) -> str:
     """The one offer to keep up with a subject they keep asking about."""
@@ -583,7 +587,8 @@ def asks(event: dict[str, Any]) -> bool:
     (DL-087 #8), and a plain "yes" answers it while it is the newest thing
     omega asked."""
     return is_tell(event) and told(event).endswith(
-        (FOLLOWUP_ASK, PROMISE_ASK, TOPIC_ASK, TIDY_STOP_ASK, TIDY_PIN_ASK)
+        (FOLLOWUP_ASK, PROMISE_ASK, TOPIC_ASK, TIDY_STOP_ASK, TIDY_PIN_ASK,
+         DELEGATE_ASK)
     )
 
 

@@ -35,6 +35,7 @@ from typing import Any, Callable, Optional, Sequence
 from omega import (
     access,
     blobs,
+    delegate,
     episodes,
     grants,
     habits,
@@ -86,6 +87,47 @@ AUTHORED_REMINDER = (
 )
 #: How many keyed items one compose or thinking turn is shown, newest first.
 COMPOSE_ITEMS = 12
+
+#: The key an offer on a CI key is told under (C6), so it is made once.
+CI_OFFER_PREFIX = "offer:"
+CI_OFFER_REASON = "a Claude Code session on your Mac is always yours to approve"
+
+
+def ci_offer(
+    item: "ledger.Item", known: dict[str, dict[str, Any]]
+) -> Optional[tuple[str, dict[str, Any]]]:
+    """The question and the held ``delegate start`` for a recurring CI key
+    (C6), or ``None`` when its repo is not one of their projects.
+
+    Only structured fields: the repo and the workflow are read back off the
+    code-made key, the count is the ledger's, the run link is the one
+    :func:`omega.ledger.ci_of` checked. The item's ``what`` (the subject as
+    a sender wrote it) is never read here.
+    """
+    repo, _, workflow = item.key[len("ci:"):].partition("/")
+    if not repo or not workflow or repo not in known:
+        return None
+    url = item.url if isinstance(item.url, str) and item.url.startswith(
+        "https://github.com/") and f"/{repo}/actions/runs/" in item.url else None
+    task = (
+        f"The GitHub Actions workflow named `{workflow}` in the {repo} repository "
+        f"has failed {item.recurrence} times. Find out why it fails and fix it on "
+        "a new branch, without merging."
+        + (f" The latest failed run: {url}" if url else "")
+    )
+    title = f"fix the failing {workflow} CI in {repo}"[: episodes.MAX_DELEGATE_TITLE]
+    action = {
+        "tool": tools.DELEGATE,
+        "why": f"start Claude Code on your Mac to {title}, in {repo}",
+        "args": {"do": "start", "title": title, "brief": task,
+                 "folder": repo, "worktree": True},
+    }
+    ask = (
+        f"The {workflow} CI in {repo} has failed {item.recurrence} times. I could "
+        f"start Claude Code in {repo} on its own branch to fix it. The brief it "
+        f"would get:\n\n{delegate.brief(task)}\n\n{tools.DELEGATE_ASK}"
+    )
+    return ask, action
 
 #: Messages that must arrive before another reflection pass runs (DL-054).
 #:
@@ -298,6 +340,8 @@ class Executor:
         "_offered",
         "_offered_through",
         "_ledger",
+        "_ci_offered",
+        "_ci_through",
     )
 
     def __init__(
@@ -413,6 +457,10 @@ class Executor:
         # The told-ledger (C1, DL-109), kept at the log's head: what the
         # senses saw under which key, and what each key was last told.
         self._ledger = ledger.Ledger()
+        # C6: the CI keys already offered a Claude Code session, folded
+        # from the offers' own keys so a restart offers nothing twice.
+        self._ci_offered: set[str] = set()
+        self._ci_through = 0
         # Read-only: `due` and `fire` belong to the clock thread and are
         # never called from here. A second fold of the same log rather than
         # a shared object, because the clock mutates its copy on its own
@@ -1403,6 +1451,8 @@ class Executor:
                 return True
             if self._offer_tidy(moment, st):
                 return True
+            if self._offer_ci(moment, st):
+                return True
             slot: Optional[str] = None
             drafts: Sequence[outbox.Draft] = ()
             if self._pace:
@@ -2049,6 +2099,65 @@ class Executor:
                 actions=[{"tool": d.tool, "why": d.why, "args": d.args}], at=at,
             ))
             self._offered.add((args["id"], args["change"]))
+            return True
+        return False
+
+    def _offer_ci(self, moment: datetime, st: notice.Standing) -> bool:
+        """Offer, once per key, to start Claude Code on a CI failure seen
+        twice or more (C6): an offer, not a third notice of the same red.
+
+        Held for their yes on every turn, as any start is (DL-104). The brief
+        is built only from structured fields, never from the mail: the repo,
+        which must be a project omega has a ``project.state`` for (so the
+        session's folder is one of theirs), the workflow's name as code read
+        it off the subject's narrow shape, the count, and the run link code
+        checked names that very repo. The full brief is shown in the offer.
+        """
+        if not self._pace or st.outstanding:
+            return False
+        store = self._queue.store
+        for e in store.episodes_since(self._ci_through):
+            self._ci_through = e.seq
+            p = episodes.decode(e.payload)
+            if p.get("kind") == episodes.MESSAGE_INBOUND:
+                for k in p.get("keys") or ():
+                    if str(k).startswith(CI_OFFER_PREFIX):
+                        self._ci_offered.add(str(k)[len(CI_OFFER_PREFIX):])
+        state = self._ledger.advance(store).state()
+        due = [
+            i for i in state.items.values()
+            if i.key.startswith("ci:") and not i.closed and i.recurrence >= 2
+            and i.key not in self._ci_offered
+        ]
+        if not due:
+            return False
+        known = projects.latest(projects.states(store))
+        self._outbox.advance(store)
+        box = self._outbox.state()
+        if outbox.hold(box, moment, here=self._here(moment, box)) is not None:
+            return False
+        for item in sorted(due, key=lambda i: i.last_seq):
+            offer = ci_offer(item, known)
+            if offer is None:
+                # Not a project of theirs: no folder to offer, ever.
+                self._ci_offered.add(item.key)
+                continue
+            ask, action = offer
+            at = moment.isoformat()
+            seq = self._queue.append(episodes.inbound(
+                tools.tell_instruction(ask),
+                channel="schedule",
+                queued=[],
+                at=at,
+                # The workflow's name came off a mail's subject (DL-108).
+                untrusted=ledger.INBOX_SOURCE,
+                keys=self._keys(item.key, CI_OFFER_PREFIX + item.key),
+            ))
+            self._queue.append(episodes.grant_proposed(
+                for_seq=seq, scope=episodes.HOLD_SCOPE, proposes="hold",
+                actions=[action], reason=CI_OFFER_REASON, at=at,
+            ))
+            self._ci_offered.add(item.key)
             return True
         return False
 
