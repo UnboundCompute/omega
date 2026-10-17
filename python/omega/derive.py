@@ -36,7 +36,7 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Iterable, Optional
 
-from . import episodes, notice
+from . import episodes, notice, promises
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from .memory import MemoryStore
@@ -641,8 +641,11 @@ class Learned:
             # that happened, so counting the log would make a tool-heavy stretch
             # reflect several times over and a long conversation not at all —
             # exactly backwards, since the conversation is what there is to
-            # reflect *on*.
-            self._since_reflection += 1
+            # reflect *on*. Only the person's own messages (C0): fires and
+            # looks counted too, so reflection ran several times a day over
+            # a couple of real messages and read mostly omega's own words.
+            if promises.theirs(payload):
+                self._since_reflection += 1
             if self._awaiting and payload.get("channel") not in notice.UNPROMPTED_CHANNELS:
                 # A possible answer to a question omega asked (DL-087 #4): only
                 # the person's own messages, never a look or a fire. Read against

@@ -564,7 +564,7 @@ def situation(
     if held:
         lines.append("")
         lines.append(
-            "Already drafted and held for a better moment (it will reach them; "
+            "Already drafted and held for a better moment (re-checked before it goes; "
             "do not draft it again):"
         )
         for line in held:

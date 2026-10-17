@@ -439,6 +439,9 @@ def test_every_m1_kind_is_accounted_for() -> None:
         ),
         episodes.MESSAGE_DELIVERED: episodes.message_delivered(for_seq=1, at=AT),
         episodes.MESSAGE_DROPPED: episodes.message_dropped(queued=[1], why="w", at=AT),
+        episodes.THINKING_FAILED: episodes.thinking_failed(
+            slot="2026-10-11 morning", why="no entry", at=AT,
+        ),
         # DL-101: a Slack post reaches them as the reply's link, never as these.
         episodes.SLACK_POSTED: episodes.slack_posted(
             for_seq=1, channel="C0TEAM001", name="#team", ts="1760173200.000100",

@@ -16,9 +16,11 @@ the same **origin**.
 **Per origin, not one global cursor.** The origin of a turn is what caused it:
 one schedule (a watch or a brief, by its id), omega's own look, or anything
 else unprompted by its channel. A global cursor would let one path's read
-swallow mail for another: the look reads a mail, its judge stays quiet because
-a watch exists for exactly that, and the watch then never sees it. Each path
-stops repeating *itself*, which is the repetition the person sees.
+swallow mail for another: the look reads a mail and stays quiet about it, and
+a path that reads mail for a different purpose then never sees it. Each path
+stops repeating *itself*. (The look does not stay quiet on the assumption
+that some watch covers its mail: since DL-107 the look and thinking own the
+mail reads, and a standing mail watch is offered for retirement.)
 
 **Derived from the log, so it survives a restart, and it never loses mail.**
 A read counts only when its ``tool.returned`` came back ok *and* its turn

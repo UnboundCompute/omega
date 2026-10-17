@@ -171,10 +171,13 @@ __all__ = [
     "MESSAGE_QUEUED",
     "MESSAGE_DELIVERED",
     "MESSAGE_DROPPED",
+    "THINKING_FAILED",
+    "THINKING_FAILURES",
     "OUTBOX_KINDS",
     "OUTBOX_SOURCES",
     "MAX_QUEUED_TEXT",
     "message_queued",
+    "thinking_failed",
     "message_delivered",
     "message_dropped",
     "SLACK_POSTED",
@@ -579,10 +582,20 @@ _LEAVE_ID = re.compile(r"^l[1-9][0-9]*(?:-[1-9][0-9]*)?$")
 MESSAGE_QUEUED = "message.queued"
 MESSAGE_DELIVERED = "message.delivered"
 MESSAGE_DROPPED = "message.dropped"
-OUTBOX_KINDS = frozenset({MESSAGE_QUEUED, MESSAGE_DELIVERED, MESSAGE_DROPPED})
+#: A thinking slot that did not run (C4), so it never vanishes silently:
+#: ``slot`` is ``"<date> <name>"`` and ``why`` one of
+#: :data:`THINKING_FAILURES`. The slot counts as served; the next one is the
+#: retry.
+THINKING_FAILED = "thinking.failed"
+#: Why a slot did not run: omega was not there to start it in its window, the
+#: day's thinking spend was used up, or it was held back (a conversation, an
+#: outstanding turn, no network) until its window closed.
+THINKING_FAILURES = frozenset({"no entry", "spend exceeded", "deferral expired"})
+OUTBOX_KINDS = frozenset({MESSAGE_QUEUED, MESSAGE_DELIVERED, MESSAGE_DROPPED, THINKING_FAILED})
 #: What can draft a held message: a look, a thinking turn, a failure
-#: follow-up and the weekly self-review.
-OUTBOX_SOURCES = frozenset({"look", "thinking", "followup", "review"})
+#: follow-up, the weekly self-review, and the judge re-checking held drafts
+#: before they go (B4-lite).
+OUTBOX_SOURCES = frozenset({"look", "thinking", "followup", "review", "recheck"})
 #: A held draft is a chat message, not a document.
 MAX_QUEUED_TEXT = 4_000
 MAX_OUTBOX_WHY = 200
@@ -2301,6 +2314,7 @@ _REQUIRED: dict[str, tuple[str, ...]] = {
     MESSAGE_QUEUED: ("text", "source", "why", "at"),
     MESSAGE_DELIVERED: ("for_seq", "queued", "at"),
     MESSAGE_DROPPED: ("queued", "why", "at"),
+    THINKING_FAILED: ("slot", "why", "at"),
     SLACK_POSTED: ("for_seq", "channel", "name", "ts", "permalink", "what", "at"),
     SLACK_DELETED: ("for_seq", "channel", "ts", "at"),
     SLACK_FAILED: ("for_seq", "do", "to", "error", "at"),
@@ -3833,6 +3847,11 @@ def _validate_outbox(payload: dict[str, Any]) -> None:
     _require_str(payload, "at", non_empty=True)
     if "for_seq" in payload or kind == MESSAGE_DELIVERED:
         _require_seq(payload, "for_seq")
+    if kind == THINKING_FAILED:
+        _require_str(payload, "slot", non_empty=True)
+        if payload["why"] not in THINKING_FAILURES:
+            raise BadPayload(f"why {payload['why']!r} not in {sorted(THINKING_FAILURES)}")
+        return
     if kind == MESSAGE_QUEUED:
         _require_sentence(payload, "text", cap=MAX_QUEUED_TEXT)
         if payload["source"] not in OUTBOX_SOURCES:
@@ -4051,6 +4070,14 @@ def message_delivered(
     counts these."""
     payload = {"v": VERSION, "kind": MESSAGE_DELIVERED, "for_seq": for_seq,
                "queued": list(queued), "at": at or now()}
+    _validate(payload)
+    return payload
+
+
+def thinking_failed(*, slot: str, why: str, at: Optional[str] = None) -> dict[str, Any]:
+    """The thinking slot ``slot`` did not run, and why (C4)."""
+    payload = {"v": VERSION, "kind": THINKING_FAILED, "slot": slot, "why": why,
+               "at": at or now()}
     _validate(payload)
     return payload
 

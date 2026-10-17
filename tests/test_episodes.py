@@ -293,6 +293,7 @@ def test_every_kind_round_trips():
         ),
         ep.message_delivered(for_seq=41, queued=[40], at="2026-09-23T10:00:00+00:00"),
         ep.message_dropped(queued=[40], why="not sent", at="2026-09-23T10:00:00+00:00"),
+        ep.thinking_failed(slot="2026-09-23 morning", why="no entry", at="2026-09-23T10:00:00+00:00"),
         ep.slack_posted(
             for_seq=41, channel="C0TEAM001", name="#team", ts="1760173200.000100",
             permalink="https://example.slack.com/archives/C0TEAM001/p1760173200000100",

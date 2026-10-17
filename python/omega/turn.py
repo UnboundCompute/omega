@@ -52,6 +52,7 @@ from omega.tools import (
     is_research,
     is_tell,
     is_watch,
+    FENCE_END,
     fence,
     fence_open,
     must_speak,
@@ -417,13 +418,27 @@ def read_untrusted(ctx: "TurnContext") -> tuple[str, ...]:
     """
     found: list[str] = []
     marker = fence_open(INBOX_SOURCE)
-    for payload in [ctx.event, *(p.payload for p in ctx.recalled)]:
+    # A turn they started sees a recalled look's inbox block as a stub
+    # (DL-108, :func:`_stub_mail`), so that look's mail is not in its prompt
+    # and does not taint it. The look's own event, a later look, and anything
+    # read this turn still do.
+    stubbed = not unprompted(ctx)
+    for index, payload in enumerate([ctx.event, *(p.payload for p in ctx.recalled)]):
         kind = payload.get("kind")
         if (
             kind == episodes.MESSAGE_INBOUND
             and str(payload.get("channel", "")) == notice.CHANNEL
             and marker in str(payload.get("text", ""))
         ):
+            if not (stubbed and index):
+                found.append(INBOX_SOURCE)
+        elif (
+            kind == episodes.TURN_COMPLETED and _fenced_reply(payload)
+            and INBOX_SOURCE in payload["tainted"]
+        ):
+            # A look that spoke about their mail: the stub hides the mail, but
+            # its spoken words are still in this prompt and may repeat it, so
+            # the look's taint stays (DL-108 drops only what it hides).
             found.append(INBOX_SOURCE)
         elif kind == episodes.TOOL_RETURNED and payload.get("ok") and payload.get("tool") == MAIL:
             found.append(RECALLED_MAIL)
@@ -1563,7 +1578,7 @@ def _event_turn(
         f"{_location_section(ctx)}"
         f"{_learned_section(ctx.learned, at=str(ctx.event.get('at', '')))}"
         f"{self_taught.section(ctx.lessons) if lessons else ''}"
-        f"Recent history:\n{_transcript(ctx.recalled)}\n\n"
+        f"Recent history:\n{_transcript(ctx.recalled, stub_mail=not unprompted(ctx))}\n\n"
         f"{_open_section(ctx.open_work)}"
         f"{_grants_section(ctx)}"
         f"{_followups_section(ctx)}"
@@ -1902,7 +1917,7 @@ def _open_section(open_work: Sequence[derive.OpenBlock]) -> str:
     return f"You asked these and have had no answer yet:\n{body}\n\n"
 
 
-def _transcript(recalled: Sequence[Pending]) -> str:
+def _transcript(recalled: Sequence[Pending], *, stub_mail: bool = False) -> str:
     """Recall rendered newest-last. Records the loop wrote are included: a turn
     that stayed silent is part of the history, and hiding it would make the
     model re-decide the same event without knowing it already answered.
@@ -1916,9 +1931,18 @@ def _transcript(recalled: Sequence[Pending]) -> str:
     Both budgets live here rather than in the renderer's callers because this
     is the only place that sees the *whole* window; a per-line cap alone misses
     forty lines each just under it (DL-039).
+
+    Recall is where a fire is labelled as not a person (C0): the fire shown
+    to its own judge is rendered as it always was, because a reminder or a
+    brief must still be answered. ``stub_mail`` is DL-108: a turn they
+    started sees a recalled look's inbox block as one stub line.
     """
     lines = [
-        _elide(_render_event(p.payload), MAX_EVENT_CHARS, at=p.seq)
+        _elide(
+            _render_event(p.payload, recalled=True, stub_mail=stub_mail),
+            MAX_EVENT_CHARS,
+            at=p.seq,
+        )
         for p in recalled
     ]
     lines = _within(lines, MAX_RECALL_CHARS)
@@ -1973,7 +1997,9 @@ def _elide(line: str, budget: int, *, at: Optional[int] = None) -> str:
     )
 
 
-def _render_event(payload: dict[str, Any]) -> str:
+def _render_event(
+    payload: dict[str, Any], *, recalled: bool = False, stub_mail: bool = False
+) -> str:
     """One event as one line, plus a name for anything attached to it.
 
     The attachment names are appended here rather than at the one call site
@@ -1987,7 +2013,7 @@ def _render_event(payload: dict[str, Any]) -> str:
     times per turn, and a renderer that reads files turns a text prompt into
     forty stat calls.
     """
-    line = _render_payload(payload)
+    line = _render_payload(payload, recalled=recalled, stub_mail=stub_mail)
     notes = " ".join(_attachment_note(item) for item in _context_of(payload))
     return f"{line} {notes}" if notes else line
 
@@ -2020,10 +2046,51 @@ def _attachment_note(item: dict[str, Any], reason: str = "") -> str:
     return f"[{kind}: {title}{tail}]"
 
 
-def _render_payload(payload: dict[str, Any]) -> str:
+#: How a fire reads in recall (C0). Rendered as ``you:`` it was the person's
+#: word, and reflection filed omega's own watch rule as their habit.
+FIRED_LEAD = "(not a person - a schedule or task of omega's fired; nobody typed this)"
+
+#: What a recalled look's inbox block becomes in a turn they started (DL-108).
+MAIL_STUB = "[omega looked at mail]"
+
+
+def _stub_mail(text: str) -> str:
+    """``text`` with its fenced inbox block, heading and all, cut to
+    :data:`MAIL_STUB`. Cut to the *last* fence end, not the first: a sender
+    can write the end marker into a subject, and stopping there would let
+    the rest of the block through. Hiding too much here is safe; too little
+    is the injection hole DL-108 closes."""
+    start = text.find(fence_open(INBOX_SOURCE))
+    if start < 0:
+        return text
+    cut = text.rfind("\n", 0, start) + 1
+    heading = text.rfind("\n", 0, max(cut - 1, 0)) + 1
+    if "recent mail" in text[heading:cut]:
+        cut = heading
+    end = text.rfind(FENCE_END)
+    tail = text[end + len(FENCE_END):] if end > start else ""
+    return f"{text[:cut]}{MAIL_STUB}{tail}"
+
+
+def _fenced_reply(payload: dict[str, Any]) -> bool:
+    """A recorded reply that recall renders fenced: spoken, with sources."""
+    tainted = payload.get("tainted")
+    return (
+        payload.get("outcome") not in ("silent", "failed")
+        and isinstance(tainted, list)
+        and bool(tainted)
+        and bool(payload.get("reply"))
+    )
+
+
+def _render_payload(
+    payload: dict[str, Any], *, recalled: bool = False, stub_mail: bool = False
+) -> str:
     kind = payload.get("kind")
     if kind == episodes.MESSAGE_INBOUND:
         if payload.get("channel") == notice.CHANNEL:
+            if stub_mail:
+                return f"(nobody asked - you looked at what was open)\n{_stub_mail(str(payload.get('text', '')))}"
             # **Not a person talking**, and this prefix is the only thing that
             # says so (DL-061). Without it an unprompted pass renders as
             # `you: ...`, the judge is told plainly that "if the person wrote to
@@ -2033,6 +2100,11 @@ def _render_payload(payload: dict[str, Any]) -> str:
             # reading its own looks back as the person's words would build a
             # memory of things they never said.
             return f"(nobody asked - you looked at what was open)\n{payload.get('text', '')}"
+        if recalled and payload.get("channel") in UNPROMPTED_CHANNELS:
+            text = str(payload.get("text", ""))
+            if payload.get("untrusted"):
+                text = fence(str(payload["untrusted"]), text)
+            return f"{FIRED_LEAD}\n{text}"
         if payload.get("untrusted"):
             # A tell carrying a watched page's words (DL-096), fenced as
             # DL-064 fences every untrusted result.

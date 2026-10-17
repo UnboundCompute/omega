@@ -37,7 +37,7 @@ so the queue, the budget and the slots already served survive a restart.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any, Iterable, Optional, Sequence
 
 from omega import episodes, machine, notice
@@ -58,12 +58,21 @@ __all__ = [
     "HOLD_BUDGET",
     "HOLD_AWAY",
     "HOLD_CLOCK",
+    "HOLD_SPOKE",
+    "SPOKE_SECONDS",
+    "SLOT_DEFER_SECONDS",
+    "SLOT_LATE_SECONDS",
+    "RECHECK_LEAD",
     "Draft",
     "State",
     "Outbox",
     "Gate",
     "quiet",
     "slot_due",
+    "slot_start",
+    "slots_missed",
+    "conversing",
+    "recheck_text",
     "present",
     "hold",
     "thinking_left",
@@ -89,11 +98,23 @@ PRESENT_SECONDS = 10 * 60
 THINKING_DAILY_TOKENS = 60_000
 #: The thinking turn's own text is a prompt, so it is capped like one.
 MAX_THINKING_CHARS = 4_000
+#: No unprompted message goes out this soon after a message of theirs
+#: (B4-lite): a held draft delivered 30 s after they spoke reads as not
+#: listening. Also how recently they spoke for a slot to count them as
+#: mid-conversation (C4).
+SPOKE_SECONDS = 10 * 60
+#: How long a thinking slot waits for them to finish a conversation (C4).
+SLOT_DEFER_SECONDS = 15 * 60
+#: A slot not started this long after its hour did not run (C4): it is
+#: recorded as ``thinking.failed`` and the next slot is the retry. A starting
+#: guess [A], wide enough for the deferral and a slow tick.
+SLOT_LATE_SECONDS = 30 * 60
 
 HOLD_QUIET = "quiet hours (23:00-08:00)"
 HOLD_BUDGET = f"today already had its {MAX_PER_DAY} unprompted messages"
 HOLD_AWAY = "they are not here; held for when they are, or the next thinking time"
 HOLD_CLOCK = "couldn't tell the time"
+HOLD_SPOKE = "they spoke in the last 10 minutes; held so it does not cut in"
 
 
 def _local(now: datetime) -> datetime:
@@ -133,6 +154,8 @@ class State:
     spending: dict[str, int] = field(default_factory=dict)
     #: The ``at`` of the newest message they sent, on any channel.
     heard_at: Optional[str] = None
+    #: The ``at`` of the log's first episode: no slot before it was owed.
+    began: Optional[str] = None
 
     def delivered_on(self, day: str) -> int:
         return self.delivered.get(day, 0)
@@ -142,7 +165,7 @@ class Outbox:
     """The fold. Kept at the log's head by the executor, as its other views."""
 
     __slots__ = ("_through", "_drafts", "_taken", "_delivered", "_thought",
-                 "_thinking", "_spending", "_heard_at")
+                 "_thinking", "_spending", "_heard_at", "_began")
 
     def __init__(self) -> None:
         self._through = 0
@@ -154,10 +177,13 @@ class Outbox:
         self._thinking: dict[int, str] = {}
         self._spending: dict[str, int] = {}
         self._heard_at: Optional[str] = None
+        self._began: Optional[str] = None
 
     def apply(self, seq: int, payload: dict[str, Any]) -> None:
         self._through = seq
         kind = payload.get("kind")
+        if self._began is None and isinstance(payload.get("at"), str):
+            self._began = payload["at"]
         if kind == episodes.MESSAGE_INBOUND:
             channel = payload.get("channel")
             if channel not in notice.UNPROMPTED_CHANNELS:
@@ -171,6 +197,8 @@ class Outbox:
                 if day is not None:
                     self._thinking[seq] = day
             elif channel == "schedule" and isinstance(payload.get("queued"), list):
+                # (Before B4-lite held drafts went out this way, verbatim; a
+                # log written then still folds the same.)
                 # A tell that carries drafts takes them when it is written:
                 # it is delivered as written, so nothing else may send them.
                 self._taken.update(payload["queued"])
@@ -186,6 +214,9 @@ class Outbox:
                 self._delivered[day] = self._delivered.get(day, 0) + 1
         elif kind == episodes.MESSAGE_DROPPED:
             self._taken.update(payload.get("queued") or [])
+        elif kind == episodes.THINKING_FAILED:
+            # Served, as far as the clock is concerned: the next slot retries.
+            self._thought.add(str(payload["slot"]))
         elif kind == episodes.TURN_COMPLETED:
             day = self._thinking.pop(payload.get("for_seq"), None)
             if day is not None:
@@ -202,6 +233,7 @@ class Outbox:
             thought=frozenset(self._thought),
             spending=dict(self._spending),
             heard_at=self._heard_at,
+            began=self._began,
         )
 
     @classmethod
@@ -229,23 +261,66 @@ def quiet(now: datetime) -> bool:
     return hour >= QUIET_FROM_HOUR or hour < QUIET_UNTIL_HOUR
 
 
+def slot_start(slot: str) -> Optional[datetime]:
+    """When the slot ``"<date> <name>"`` begins, on their clock."""
+    day, _, name = slot.partition(" ")
+    hour = dict(SLOTS).get(name)
+    try:
+        date = datetime.fromisoformat(day)
+    except ValueError:
+        return None
+    if hour is None:
+        return None
+    return date.replace(hour=hour, minute=0, second=0, microsecond=0).astimezone()
+
+
 def slot_due(state: State, now: datetime) -> Optional[str]:
     """The thinking slot owed now, as ``"<date> <name>"``, or ``None``.
 
-    The latest slot today whose hour has come, if it has not been served. A
-    slot missed (omega was down) is served late, the same day and outside
-    quiet hours; one overtaken by the next slot is not served at all.
+    Its own clock (C4): a slot is owed from its hour until
+    :data:`SLOT_LATE_SECONDS` after it, once. Past that it is not served
+    late; :func:`slots_missed` names it, and it is recorded as failed.
     """
     if quiet(now):
         return None
     local = _local(now)
-    due = None
     for name, hour in SLOTS:
-        if local.hour >= hour:
-            due = f"{local.date().isoformat()} {name}"
-    if due is None or due in state.thought:
-        return None
-    return due
+        slot = f"{local.date().isoformat()} {name}"
+        start = slot_start(slot)
+        if start is None or slot in state.thought:
+            continue
+        if timedelta(0) <= now - start < timedelta(seconds=SLOT_LATE_SECONDS):
+            return slot
+    return None
+
+
+def slots_missed(state: State, now: datetime) -> list[str]:
+    """Slots in the last day whose window closed unserved, oldest first.
+    Only slots that began after the log did: a slot from before omega existed
+    was never owed. A log whose start cannot be read is owed nothing."""
+    since = _parse(state.began) if state.began else None
+    if since is None:
+        return []
+    local = _local(now)
+    out = []
+    for back in (1, 0):
+        day = (local - timedelta(days=back)).date().isoformat()
+        for name, _hour in SLOTS:
+            slot = f"{day} {name}"
+            start = slot_start(slot)
+            if start is None or slot in state.thought or start < since:
+                continue
+            if timedelta(seconds=SLOT_LATE_SECONDS) <= now - start < timedelta(days=1):
+                out.append(slot)
+    return out
+
+
+def conversing(heard_at: Optional[str], *, now: datetime) -> bool:
+    """Did they send a message in the last :data:`SPOKE_SECONDS`?"""
+    heard = _parse(heard_at) if heard_at else None
+    if heard is None:
+        return False
+    return 0 <= (now - heard).total_seconds() < SPOKE_SECONDS
 
 
 def present(presence: Any, heard_at: Optional[str], *, now: datetime) -> bool:
@@ -263,9 +338,11 @@ def present(presence: Any, heard_at: Optional[str], *, now: datetime) -> bool:
 def hold(state: State, now: datetime, *, here: bool, slot: bool = False) -> Optional[str]:
     """Why a non-urgent unprompted message must wait, or ``None`` to send it.
 
-    Quiet hours first, then the day's budget, then (outside a thinking slot,
-    which is its own good time) whether they are here. A day that cannot be
-    read has no budget left: this breaks closed, toward holding.
+    Quiet hours first, then the day's budget, then whether they spoke in the
+    last :data:`SPOKE_SECONDS` (B4-lite: never cut in on them), then
+    (outside a thinking slot, which is its own good time) whether they are
+    here. A day that cannot be read has no budget left: this breaks closed,
+    toward holding.
     """
     if quiet(now):
         return HOLD_QUIET
@@ -274,6 +351,8 @@ def hold(state: State, now: datetime, *, here: bool, slot: bool = False) -> Opti
         return HOLD_CLOCK
     if state.delivered_on(day) >= MAX_PER_DAY:
         return HOLD_BUDGET
+    if conversing(state.heard_at, now=now):
+        return HOLD_SPOKE
     if not slot and not here:
         return HOLD_AWAY
     return None
@@ -306,6 +385,39 @@ def held_lines(drafts: Sequence[Draft], *, now: datetime) -> list[str]:
         ago = f"{minutes} minutes ago" if minutes < 90 else f"{minutes // 60} hours ago"
         lines.append(f"{ago} ({d.source}): {_one_line(d.text)}")
     return lines
+
+
+#: How the re-check of held drafts begins (B4-lite).
+RECHECK_LEAD = "Held drafts, not sent yet."
+
+
+def recheck_text(
+    drafts: Sequence[Draft], *, said: Sequence[tuple[str, str]], now: datetime
+) -> str:
+    """The judge's re-check of held drafts before any of them goes (B4-lite).
+
+    Held drafts used to go out verbatim the moment they were here, hours
+    after a watch had told them the same thing. Now the drafts and what was
+    already said unprompted go to the judge, which sends what is still new
+    as one message, or nothing (and they are dropped)."""
+    lines = [
+        f"{RECHECK_LEAD} You wrote these earlier and held them for a better "
+        "moment. They are here now. Send only what is still true and that you "
+        "have not already told them (below), as one short message. If none of "
+        "it is still worth their attention, say SILENT and the drafts are "
+        "dropped.",
+        "",
+        "Held:",
+        *(f"- {line}" for line in held_lines(drafts, now=now)),
+        "",
+        "What you last told them, unprompted:",
+    ]
+    told = [f"- {at[:16]}: {_one_line(text)}" for at, text in said]
+    lines.extend(told or ["- nothing"])
+    text = "\n".join(lines)
+    if len(text) > MAX_THINKING_CHARS:
+        text = text[: MAX_THINKING_CHARS - 1].rstrip() + "…"
+    return text
 
 
 def thinking_text(
@@ -380,9 +492,10 @@ def settle(queue: Any, seq: int, gate: Gate, text: str) -> bool:
             at=gate.at,
         ))
         if gate.queued:
+            # Stamped when it happened, not with the turn's moment (C0).
             queue.append(episodes.message_dropped(
                 queued=list(gate.queued), why="folded into a newer held draft",
-                for_seq=seq, at=gate.at,
+                for_seq=seq,
             ))
         return True
     queue.append(episodes.message_delivered(
@@ -391,12 +504,21 @@ def settle(queue: Any, seq: int, gate: Gate, text: str) -> bool:
     return False
 
 
+#: Why a turn that was shown held drafts and stayed silent dropped them.
+DROPPED_WHY = {
+    "thinking": "the thinking turn chose not to send them",
+    "recheck": "the re-check found nothing in them still worth sending",
+}
+
+
 def dropped(queue: Any, seq: int, gate: Gate) -> None:
-    """A turn that was shown held drafts and said nothing drops them."""
+    """A turn that was shown held drafts and said nothing drops them, stamped
+    when it happened (C0): the turn's own moment hid how long it ran."""
     if gate.queued:
         queue.append(episodes.message_dropped(
-            queued=list(gate.queued), why="the thinking turn chose not to send them",
-            for_seq=seq, at=gate.at,
+            queued=list(gate.queued),
+            why=DROPPED_WHY.get(gate.source, "the turn chose not to send them"),
+            for_seq=seq,
         ))
 
 

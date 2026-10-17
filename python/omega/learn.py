@@ -165,6 +165,9 @@ class Lens:
     #: is *what is this person in the middle of*, and a lens that cannot see
     #: unfinished work would answer it by inventing.
     moments: bool = False
+    #: Whether a claim may say it is about omega's own way of working rather
+    #: than the person (C0). Such a claim is a lesson, not a claim about them.
+    self_rules: bool = False
 
 
 #: Reflecting over omega's own recent conversation (DL-054).
@@ -174,6 +177,9 @@ CONVERSATION = Lens(
         "whether it shows anything worth remembering about this person.",
     ),
     label="The conversation",
+    # The conversation has omega's own half in it, and a rule omega follows
+    # read back as their habit is the misattribution C0 closes.
+    self_rules=True,
     # No moments, and this is the lens where that is least obvious. omega keeps
     # its own conversation verbatim as `message.inbound`, so `recall` can already
     # find anything said here and a moment would be a second, worse copy of a
@@ -274,6 +280,9 @@ class Reflection:
 
     claims: list[dict[str, Any]] = field(default_factory=list)
     moments: list[dict[str, Any]] = field(default_factory=list)
+    #: Rules about omega's own way of working (C0), for `lessons`, never filed
+    #: as claims about the person. Empty unless the lens has ``self_rules``.
+    lessons: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -483,10 +492,27 @@ def reflect(
         raise NotExtracted(f"the answer was not JSON: {exc}") from exc
     if not isinstance(answer, dict):
         raise NotExtracted("the answer was not a JSON object")
+    raw_claims = answer.get("claims", [])
+    rules: list[str] = []
+    if observing.self_rules and isinstance(raw_claims, list):
+        # Split before the claim parse, so a rule about omega never counts
+        # toward, or is checked as, a claim about them.
+        mine = [c for c in raw_claims if isinstance(c, dict) and c.get("about") == "you"]
+        raw_claims = [c for c in raw_claims if not (isinstance(c, dict) and c.get("about") == "you")]
+        for item in mine[:MAX_INFERRED_PER_PASS]:
+            text = item.get("text")
+            if (
+                isinstance(text, str)
+                and text.strip()
+                and len(text.strip()) <= episodes.MAX_LESSON_TEXT
+                and "\n" not in text.strip()
+            ):
+                rules.append(text.strip())
     return Reflection(
         claims=_parse_claim_list(
-            answer.get("claims", []), known, limit=MAX_INFERRED_PER_PASS
+            raw_claims, known, limit=MAX_INFERRED_PER_PASS
         ),
+        lessons=rules,
         # Guarded by the lens and not by the answer's shape. A lens with moments
         # off was never told the field exists, so a `moments` list coming back
         # from one is the model answering a question nobody asked — dropped
@@ -556,6 +582,18 @@ def _reflection_messages(
         '  "situation"  what was going on when you noticed this',
         '  "trigger"    when the claim applies, or null',
         '  "supersedes" the id of a claim this one replaces, or null',
+        *(
+            [
+                '  "about"      "them" when it rests on something the person said',
+                '               or did; "you" when it is about how you yourself',
+                "               work (your own checks, watches, reminders, looks),",
+                "               which they did not show you. A line marked",
+                "               (not a person ...) or (nobody asked ...) is you,",
+                "               never them.",
+            ]
+            if observing.self_rules
+            else []
+        ),
         "",
         "A trigger is an object with any of these fields, combined with AND.",
         "No other field is allowed.",

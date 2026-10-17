@@ -147,6 +147,50 @@ def _trigger_key(trigger: Optional[dict[str, Any]]) -> Any:
     )
 
 
+#: Channels nobody types on (omega's look, the clock, its tasks). Named here
+#: rather than imported from `notice`, which imports this module's neighbours.
+_UNPROMPTED = frozenset({"self", "schedule", "task"})
+
+
+def misattributed(store: Any, claims: Sequence[Claim]) -> list[tuple[Claim, int]]:
+    """Inferred claims a reflection pass anchored on omega's own fire (C0),
+    each with the fire it was anchored on.
+
+    Before C0 a pass read every channel and named the log's head as its
+    cause, so omega's own watch rules came back as things it had learned
+    about the person. The class is read from structure only: an inferred
+    (``explicit=False``) claim whose ``for_seq`` or ``source_seq`` is an
+    inbound on an unprompted channel, or the turn record that answered one.
+    A claim the person taught, and one learned from a transcript or the day's
+    usage, never matches: their source is not a turn. Reflection now anchors
+    on the last person message it read, so no new claim can match either.
+    """
+    inferred = [c for c in claims if not c.explicit]
+    if not inferred:
+        return []
+    payloads = {e.seq: episodes.decode(e.payload) for e in store.episodes_since(0)}
+
+    def fire(seq: Any) -> bool:
+        p = payloads.get(seq) if isinstance(seq, int) else None
+        return bool(
+            p
+            and p.get("kind") == episodes.MESSAGE_INBOUND
+            and p.get("channel") in _UNPROMPTED
+        )
+
+    found: list[tuple[Claim, int]] = []
+    for claim in inferred:
+        anchors = [payloads.get(claim.seq, {}).get("for_seq"), claim.source_seq]
+        for seq in list(anchors):
+            record = payloads.get(seq) if isinstance(seq, int) else None
+            if record and record.get("kind") in (episodes.TURN_COMPLETED, episodes.TURN_BLOCKED):
+                anchors.append(record.get("for_seq"))
+        hit = next((a for a in anchors if fire(a)), None)
+        if hit is not None:
+            found.append((claim, hit))
+    return found
+
+
 def duplicates(claims: Sequence[Claim]) -> list[tuple[int, list[int]]]:
     """Groups of claims that are one sentence said twice, as ``(kept, folded)``.
 
@@ -199,6 +243,37 @@ def stale_due(
 
 def _content(text: str) -> set[str]:
     return {w for w in normalize(text).split() if w not in _STOP and len(w) > 2}
+
+
+#: How alike two claims' content words must be (Dice) to count as one claim
+#: said twice (C0). A starting guess [A]: exact-text dedup let paraphrases of
+#: one watch rule through three times; revise from the live misses.
+SIMILAR = 0.6
+
+
+def similarity(a: str, b: str) -> float:
+    """Dice overlap of two texts' content words, 0 to 1."""
+    x, y = _content(a), _content(b)
+    if not x or not y:
+        return 0.0
+    return 2 * len(x & y) / (len(x) + len(y))
+
+
+def novel(
+    claims: Sequence[dict[str, Any]], known: Sequence[Claim], *, threshold: float = SIMILAR
+) -> list[dict[str, Any]]:
+    """``claims`` (proposed, not yet filed) without the ones that restate a
+    known claim or an earlier one in the same batch. A claim that names what
+    it supersedes is a refinement, so it is not checked against that one."""
+    kept: list[dict[str, Any]] = []
+    for item in claims:
+        text = str(item.get("text", ""))
+        against = [c.text for c in known if c.seq != item.get("supersedes")]
+        against += [str(k["text"]) for k in kept]
+        if any(similarity(text, other) >= threshold for other in against):
+            continue
+        kept.append(item)
+    return kept
 
 
 def candidate_pairs(
@@ -370,6 +445,12 @@ def run(
     store = queue.store
     learned.advance(store)
     counts = {"merged": 0, "staled": 0, "contradictions": 0, "resolved": 0}
+
+    # First, so a misattributed claim is neither merged into nor checked
+    # against the real ones. Attached to the fire it was anchored on.
+    for claim, fire in misattributed(store, learned.claims()):
+        queue.append(episodes.claim_retracted(for_seq=fire, claim_seq=claim.seq, at=now))
+    learned.advance(store)
 
     for kept, folded in duplicates(learned.claims())[:MAX_MERGES_PER_PASS]:
         queue.append(episodes.claim_merged(kept=kept, folded=folded, at=now))

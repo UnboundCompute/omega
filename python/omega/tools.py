@@ -133,6 +133,10 @@ __all__ = [
     "UNDO",
     "PROMISE",
     "PROMISE_ASK",
+    "TIDY_PIN_ASK",
+    "TIDY_STOP_ASK",
+    "tidy_offers",
+    "clock_time_in",
     "FORGET",
     "LOCATION",
     "SLACK",
@@ -564,7 +568,9 @@ def asks(event: dict[str, Any]) -> bool:
     with)? Its turn is spoken with the proposal's id and how to answer
     (DL-087 #8), and a plain "yes" answers it while it is the newest thing
     omega asked."""
-    return is_tell(event) and told(event).endswith((FOLLOWUP_ASK, PROMISE_ASK, TOPIC_ASK))
+    return is_tell(event) and told(event).endswith(
+        (FOLLOWUP_ASK, PROMISE_ASK, TOPIC_ASK, TIDY_STOP_ASK, TIDY_PIN_ASK)
+    )
 
 
 def tasks_on() -> bool:
@@ -1665,7 +1671,7 @@ def _definition(s: Any) -> dict[str, Any]:
     }
 
 
-_TIDY_CHANGES = ("retire", "every", "reword")
+_TIDY_CHANGES = ("retire", "every", "reword", "at")
 
 
 def _classify_tidy(box: "ToolBox", args: dict[str, Any]) -> Decision:
@@ -1694,6 +1700,15 @@ def _classify_tidy(box: "ToolBox", args: dict[str, Any]) -> Decision:
             raise ToolRejected(f"'every_minutes' must be a whole number, at least {MIN_WATCH_MINUTES}")
         out["every_minutes"] = minutes
         what = f"make {sid} run every {minutes} minutes instead of every {(s.every or 0) // 60}"
+    elif change == "at":
+        # B3: a watch they asked for at a time of day, set before watches
+        # could keep one (DL-078), runs every N from when it was set and so
+        # drifts. Pinned to their clock time instead.
+        if not first.startswith(WATCH_LEAD) or s.cron:
+            raise ToolRejected("only a watch that runs every N minutes can be pinned to a time")
+        out["cron"] = _watch_cron(args.get("at"), args.get("days"), TIDY)
+        out["at"] = str(args["at"]).strip()
+        what = f"run {sid} at {out['at']} instead of every {(s.every or 0) // 60} minutes"
     elif change == "reword":
         if not first.startswith(WATCH_LEAD):
             raise ToolRejected("only a watch can be reworded")
@@ -1722,11 +1737,130 @@ def _tidy(box: "ToolBox", args: dict[str, Any]) -> str:
             id=args["id"], instruction=was["instruction"], every=args["every_minutes"] * 60,
         ))
         return f"{args['id']} now runs every {args['every_minutes']} minutes"
+    if args["change"] == "at":
+        box.append(episodes.schedule_created(
+            id=args["id"], instruction=was["instruction"], cron=args["cron"],
+        ))
+        return f"{args['id']} now runs at {args['at']}"
     box.append(episodes.schedule_created(
         id=args["id"], instruction=watch_instruction(args["what"]),
         every=was["every"], cron=was["cron"],
     ))
     return f"{args['id']} now watches {args['what']!r}"
+
+
+# --- tidy offers omega makes on its own (C2, B3) -------------------------------
+
+#: A watch on these is read by every look already (C2): the look reads their
+#: inbox hourly and their calendar each time. Word lists, a starting guess [A].
+_MAIL_WORDS = re.compile(r"\b(gmail|e-?mails?|inbox(es)?|mail)\b", re.I)
+_CALENDAR_WORDS = re.compile(r"\b(calendar|meetings?)\b", re.I)
+#: A watch for one named thing ("tell me when Asha replies") is a condition
+#: watch (DL-106): it keeps its path and is never offered for retirement.
+_CONDITION_WORDS = re.compile(
+    r"\b(repl(y|ies|ied)|respond(s|ed)?|hears? back|answers?)\b|\bfrom [A-Z]\w+"
+)
+_SUMMARY_WORDS = re.compile(r"\bsummar(y|ies|ise|ize)\b", re.I)
+#: A clock time in a watch's own words: "at 10am", "10:30", "9 pm" [A].
+_CLOCK_WORDS = re.compile(
+    r"\b(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b|\b(\d{1,2}):(\d{2})\b", re.I
+)
+
+
+#: What a tidy offer ends with (C2, B3): it carries a ``tidy`` proposal, so
+#: it is a question, answered like a follow-up's.
+TIDY_STOP_ASK = "Should I stop it? Reply yes or no."
+TIDY_PIN_ASK = "Should I move it to that time? Reply yes or no."
+
+
+def _one_line(text: str, cap: int) -> str:
+    one = " ".join(text.split())
+    return one if len(one) <= cap else one[: cap - 1].rstrip() + "…"
+
+
+def _cadence(every: int) -> str:
+    minutes = every // 60
+    if minutes and minutes % 60 == 0:
+        hours = minutes // 60
+        return "hour" if hours == 1 else f"{hours} hours"
+    return f"{minutes} minutes"
+
+
+def clock_time_in(text: str) -> Optional[str]:
+    """The one time of day ``text`` names, as ``"HH:MM"``, or ``None`` (none,
+    several that disagree, or one that is not a time)."""
+    found = set()
+    for m in _CLOCK_WORDS.finditer(text):
+        if m.group(1):
+            hour, minute, half = int(m.group(1)), int(m.group(2) or 0), m.group(3).lower()
+            if not 1 <= hour <= 12:
+                return None
+            hour = hour % 12 + (12 if half == "pm" else 0)
+        else:
+            hour, minute = int(m.group(4)), int(m.group(5))
+        if not (0 <= hour <= 23 and 0 <= minute <= 59):
+            return None
+        found.add(f"{hour:02d}:{minute:02d}")
+    return found.pop() if len(found) == 1 else None
+
+
+def tidy_offers(
+    running: Sequence[Any], *, mail: bool, calendar: bool
+) -> list[tuple[dict[str, Any], str]]:
+    """The tidy changes omega offers on its own, each as ``(tidy args, the
+    question to ask)`` (DL-107, DL-117, B3). Read off the running watches, so
+    no schedule is named in code.
+
+    - A standing "anything new" watch on mail or the calendar, which the look
+      already reads (``mail``/``calendar``: it does), is offered for
+      retirement. One that asked for a summary is worded as the change to
+      their own ask it is.
+    - A watch that runs every N minutes but names a time of day is offered
+      that time (B3), since an ``every`` drifts from when it was set.
+
+    Proposals only (DL-085): nothing changes until they say yes.
+    """
+    out: list[tuple[dict[str, Any], str]] = []
+    for s in running:
+        first = s.instruction.splitlines()[0] if s.instruction else ""
+        if not first.startswith(WATCH_LEAD) or s.cron or s.once or not s.every:
+            continue
+        what = first[len(WATCH_LEAD):]
+        source = (
+            "mail" if mail and _MAIL_WORDS.search(what)
+            else "calendar" if calendar and _CALENDAR_WORDS.search(what) else None
+        )
+        if source and not _CONDITION_WORDS.search(what):
+            named = "Gmail" if re.search(r"\bgmail\b", what, re.I) else source
+            if _SUMMARY_WORDS.search(what):
+                ask = (
+                    f"You asked for a {named} summary every {_cadence(s.every)}; "
+                    f"I'd fold it into the morning instead, since I read your "
+                    f"{source} on my own each hour anyway. {TIDY_STOP_ASK}"
+                )
+            else:
+                ask = (
+                    f"I keep a watch on your {named} every {_cadence(s.every)} "
+                    f"(\"{_one_line(what, 120)}\"), but I already read your {source} "
+                    f"on my own, so it only repeats me. {TIDY_STOP_ASK}"
+                )
+            out.append(({
+                "id": s.id, "change": "retire",
+                "why": f"the look already reads their {source}",
+            }, ask))
+            continue
+        at = clock_time_in(what)
+        if at is not None:
+            ask = (
+                f"You asked me to watch \"{_one_line(what, 120)}\" at {at}, but it "
+                f"runs every {_cadence(s.every)} from when it was set, so it "
+                f"comes at odd times. {TIDY_PIN_ASK}"
+            )
+            out.append(({
+                "id": s.id, "change": "at", "at": at,
+                "why": f"they asked for it at {at}",
+            }, ask))
+    return out
 
 
 def _classify_follow_up(box: "ToolBox", args: dict[str, Any]) -> Decision:
@@ -4227,6 +4361,7 @@ _TOOLS: dict[str, _Tool] = {
                 "change": {"type": "string", "enum": list(_TIDY_CHANGES)},
                 "every_minutes": {"type": "integer", "description": f"For 'every': the new gap, at least {MIN_WATCH_MINUTES}."},
                 "what": {"type": "string", "description": "For 'reword': what the watch should look at."},
+                "at": {"type": "string", "description": "For 'at': the 24-hour HH:MM it should run at instead."},
                 "why": {"type": "string", "description": "Why, in a few words they would recognise."},
             },
             ["id", "change", "why"],

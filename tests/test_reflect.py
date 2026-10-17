@@ -314,12 +314,13 @@ def test_an_inferred_claim_fires_on_a_later_turn(q: EventQueue) -> None:
     assert "they prefer short answers" in later
 
 
-def test_the_pass_points_its_claims_at_the_stretch_it_read(q: EventQueue) -> None:
-    """There is no turn, so ``for_seq`` names the episode the pass read up to.
+def test_the_pass_points_its_claims_at_the_last_person_message_it_read(q: EventQueue) -> None:
+    """There is no turn, so ``for_seq`` names the newest message of theirs
+    the pass read (C0), never the log's head.
 
-    Pointing it at some earlier turn would invent a cause for a conclusion
-    that came from the whole window, and `--learned` would then attribute the
-    belief to one message that may not have contributed to it.
+    The head is often omega's own record or a fire, and a claim pointed at a
+    fire reads as something learned from omega talking to itself. The cursor
+    still names everything the pass read past.
     """
     _chatter(q, executor.REFLECT_EVERY)
     teaching = _quiet(_answer(_a_claim()))
@@ -328,7 +329,12 @@ def test_the_pass_points_its_claims_at_the_stretch_it_read(q: EventQueue) -> Non
 
     seq, claim = _claims(q)[0]
     through = _reflections(q)[0][1]["through"]
-    assert claim["for_seq"] == claim["source_seq"] == through
+    last_theirs = max(
+        s for s, p in _log(q)
+        if p.get("kind") == episodes.MESSAGE_INBOUND and p.get("channel") == "tray"
+        and s <= through
+    )
+    assert claim["for_seq"] == claim["source_seq"] == last_theirs
     assert through < seq, "the cursor names what was read, not what was written"
 
 

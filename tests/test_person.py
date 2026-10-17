@@ -112,11 +112,14 @@ def test_quiet_hours_are_eleven_at_night_to_eight_in_the_morning() -> None:
     assert not outbox.quiet(local(14, 22, 59))
 
 
-def test_the_slot_owed_is_the_latest_one_today_not_yet_thought() -> None:
+def test_a_slot_is_owed_from_its_hour_for_its_window_only() -> None:
     empty = outbox.State()
     assert outbox.slot_due(empty, local(14, 8, 59)) is None
     assert outbox.slot_due(empty, local(14, 9, 0)) == "2026-10-14 morning"
-    assert outbox.slot_due(empty, local(14, 18, 59)) == "2026-10-14 morning"
+    assert outbox.slot_due(empty, local(14, 9, 29)) == "2026-10-14 morning"
+    # C4: past its window a slot is not served late; it is missed.
+    assert outbox.slot_due(empty, local(14, 9, 30)) is None
+    assert outbox.slot_due(empty, local(14, 18, 59)) is None
     assert outbox.slot_due(empty, local(14, 19, 0)) == "2026-10-14 evening"
     assert outbox.slot_due(empty, local(14, 23, 30)) is None  # quiet
     done = outbox.State(thought=frozenset({"2026-10-14 morning"}))
@@ -174,7 +177,7 @@ def test_a_look_while_they_are_here_speaks_and_is_counted(q: EventQueue) -> None
     assert d["queued"] == [] and d["for_seq"] == last_turn(q)["for_seq"]
 
 
-def test_a_held_draft_goes_out_once_when_they_come_back(q: EventQueue) -> None:
+def test_a_held_draft_is_rechecked_once_when_they_come_back(q: EventQueue) -> None:
     ex = start(q, local(14, 12))
     ex.notice(now=local(14, 12))
     ex.drain()
@@ -183,8 +186,13 @@ def test_a_held_draft_goes_out_once_when_they_come_back(q: EventQueue) -> None:
     at_the_mac(q, local(14, 14, 0))
     assert ex.notice(now=local(14, 14, 1)) is True
     ex.drain()
-    tell = kinds(q, episodes.MESSAGE_INBOUND)[-1]
-    assert tell["channel"] == "schedule" and tell["queued"] == [draft_seq]
+    # B4-lite: not a verbatim tell. The judge re-checks it against `said`.
+    recheck = kinds(q, episodes.MESSAGE_INBOUND)[-1]
+    assert recheck["channel"] == notice.CHANNEL and recheck["queued"] == [draft_seq]
+    assert recheck["text"].startswith(outbox.RECHECK_LEAD)
+    assert "thinking" not in recheck
+    assert not [p for p in kinds(q, episodes.MESSAGE_INBOUND)
+                if p["channel"] == "schedule" and p.get("queued")]
     assert last_turn(q)["outcome"] == "spoke" and last_turn(q)["reply"] == NUDGE
     assert deliveries(q)[-1]["queued"] == [draft_seq]
     # Taken: a second pass, and a restarted executor, send nothing more.
@@ -195,6 +203,37 @@ def test_a_held_draft_goes_out_once_when_they_come_back(q: EventQueue) -> None:
         p.get("queued") for p in payloads(q)[before:]
         if p["kind"] == episodes.MESSAGE_INBOUND
     )
+
+
+def test_a_recheck_that_stays_silent_drops_the_drafts_stamped_now(q: EventQueue) -> None:
+    ex = start(q, local(14, 12))
+    ex.notice(now=local(14, 12))
+    ex.drain()
+    at_the_mac(q, local(14, 14, 0))
+    ex = executor(q, fake("SILENT already told them"))
+    assert ex.notice(now=local(14, 14, 1)) is True
+    ex.drain()
+    [drop] = kinds(q, episodes.MESSAGE_DROPPED)
+    assert drop["why"] == outbox.DROPPED_WHY["recheck"]
+    # Stamped when it happened (C0), not with the recheck's moment.
+    assert drop["at"] != local(14, 14, 1).isoformat()
+    assert outbox.Outbox.rebuild(q.store).state().drafts == ()
+    assert not deliveries(q)
+
+
+def test_nothing_held_goes_out_within_ten_minutes_of_them_speaking(q: EventQueue) -> None:
+    ex = start(q, local(14, 12))
+    ex.notice(now=local(14, 12))
+    ex.drain()
+    said(q, "back now", local(14, 14, 0))
+    at_the_mac(q, local(14, 14, 0))
+    before = q.head()
+    assert ex.notice(now=local(14, 14, 9)) is False
+    assert not any(p.get("queued") is not None for p in payloads(q)[before:])
+    box = outbox.Outbox.rebuild(q.store).state()
+    assert outbox.hold(box, local(14, 14, 9), here=True) == outbox.HOLD_SPOKE
+    assert outbox.hold(box, local(14, 14, 10), here=True) is None
+    assert outbox.hold(box, local(14, 14, 9), here=True, slot=True) == outbox.HOLD_SPOKE
 
 
 def test_several_held_drafts_go_out_as_one_message() -> None:
@@ -339,6 +378,98 @@ def test_thinking_over_its_daily_spend_falls_back_to_the_look(q: EventQueue) -> 
     )
     assert not outbox.thinking_left(q2_spent, local(14, 19, 2))
     assert outbox.thinking_left(outbox.State(), local(14, 19, 2))
+
+
+# --- the slot clock (C4) -----------------------------------------------------
+
+
+def failures(q: EventQueue) -> list[dict]:
+    return kinds(q, episodes.THINKING_FAILED)
+
+
+def test_a_slot_runs_on_its_own_clock_not_the_look_gap(q: EventQueue) -> None:
+    said(q, "hello", local(14, 6))
+    ex = executor(q, fake("SILENT nothing"))
+    ex.drain()
+    # An ordinary look a minute before the slot: the look gap would hold
+    # the next look for half an hour, and used to hold the slot with it.
+    ex.notice(now=local(14, 8, 59))
+    ex.drain()
+    assert ex.notice(now=local(14, 9, 0)) is True
+    ex.drain()
+    looks = [p for p in kinds(q, episodes.MESSAGE_INBOUND) if p["channel"] == notice.CHANNEL]
+    assert [p.get("thinking") for p in looks] == [None, "2026-10-14 morning"]
+
+
+def test_a_slot_that_never_ran_is_written_down_and_not_served_late(q: EventQueue) -> None:
+    said(q, "hello", local(14, 6))
+    ex = executor(q, fake("SILENT nothing"))
+    ex.drain()
+    ex.notice(now=local(14, 11, 0))
+    ex.drain()
+    assert [(f["slot"], f["why"]) for f in failures(q)] == [("2026-10-14 morning", "no entry")]
+    looks = [p for p in kinds(q, episodes.MESSAGE_INBOUND) if p["channel"] == notice.CHANNEL]
+    assert all(p.get("thinking") is None for p in looks)
+    # Once: a second pass and a restart write nothing more for it.
+    again = executor(q, fake("SILENT nothing"))
+    again.notice(now=local(14, 12, 0))
+    again.drain()
+    assert len(failures(q)) == 1
+    ex.drain()
+    # The next boundary is the retry.
+    ex.notice(now=local(14, 19, 1))
+    assert kinds(q, episodes.MESSAGE_INBOUND)[-1].get("thinking") == "2026-10-14 evening"
+
+
+def test_no_slot_before_the_log_began_is_owed(q: EventQueue) -> None:
+    said(q, "hello", local(14, 12))
+    ex = executor(q, fake("SILENT nothing"))
+    ex.drain()
+    ex.notice(now=local(14, 13, 0))
+    assert failures(q) == []
+
+
+def test_a_slot_over_its_spend_is_written_down_and_the_look_runs(
+    q: EventQueue, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    said(q, "hello", local(14, 6))
+    ex = executor(q, fake("SILENT nothing"))
+    ex.drain()
+    monkeypatch.setattr(outbox, "THINKING_DAILY_TOKENS", 0)
+    assert ex.notice(now=local(14, 9, 2)) is True
+    assert [(f["slot"], f["why"]) for f in failures(q)] == [("2026-10-14 morning", "spend exceeded")]
+    look = kinds(q, episodes.MESSAGE_INBOUND)[-1]
+    assert look["channel"] == notice.CHANNEL and look.get("thinking") is None
+
+
+def test_a_slot_waits_for_a_conversation_then_runs(q: EventQueue) -> None:
+    said(q, "hello", local(14, 6))
+    ex = executor(q, fake("SILENT nothing"))
+    ex.drain()
+    said(q, "quick question", local(14, 9, 0))
+    ex.drain()
+    before = q.head()
+    assert ex.notice(now=local(14, 9, 3)) is False
+    assert payloads(q)[before:] == []
+    # Fifteen minutes on, it runs, mid-conversation or not.
+    said(q, "and another", local(14, 9, 12))
+    ex.drain()
+    assert ex.notice(now=local(14, 9, 15)) is True
+    assert kinds(q, episodes.MESSAGE_INBOUND)[-1].get("thinking") == "2026-10-14 morning"
+    assert failures(q) == []
+
+
+def test_a_slot_put_off_until_its_window_closed_says_so(q: EventQueue) -> None:
+    said(q, "hello", local(14, 6))
+    ex = Executor(q, complete=fake("SILENT nothing").complete, pace=True,
+                  online=lambda: False)
+    ex.recover()
+    ex.drain()
+    assert ex.notice(now=local(14, 9, 1)) is False
+    ex.notice(now=local(14, 9, 40))
+    assert [(f["slot"], f["why"]) for f in failures(q)] == [
+        ("2026-10-14 morning", "deferral expired")
+    ]
 
 
 # --- follow-ups -----------------------------------------------------------------

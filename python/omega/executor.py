@@ -93,6 +93,27 @@ REFLECT_EVERY = 20
 #: is an upper bound on episodes and not on prompt size.
 REFLECT_WINDOW = 40
 
+#: How far back a pass looks for :data:`REFLECT_WINDOW` episodes of their
+#: conversation (C0), in episodes of every kind. Fires and looks outnumber
+#: their messages, so the window is filtered out of a wider read.
+REFLECT_SCAN = REFLECT_WINDOW * 10
+
+
+def _person_window(queue: EventQueue) -> list[Pending]:
+    """The last :data:`REFLECT_WINDOW` episodes of their own conversation:
+    each message they sent (`promises.theirs`) and what omega's turn on it
+    recorded. A fire or a look, and the turn that answered it, are left out
+    (C0): read here they were omega's own rules, and were filed as theirs."""
+    theirs: set[int] = set()
+    kept: list[Pending] = []
+    for p in queue.recent(REFLECT_SCAN, skipping=NOT_RECALLED):
+        if promises.theirs(p.payload):
+            theirs.add(p.seq)
+            kept.append(p)
+        elif p.payload.get("for_seq") in theirs:
+            kept.append(p)
+    return kept[-REFLECT_WINDOW:] if any(p.seq in theirs for p in kept[-REFLECT_WINDOW:]) else []
+
 __all__ = [
     "INTERRUPTED_ERROR",
     "NotRecovered",
@@ -262,6 +283,9 @@ class Executor:
         "_probed",
         "_pace",
         "_outbox",
+        "_deferred",
+        "_offered",
+        "_offered_through",
     )
 
     def __init__(
@@ -367,6 +391,13 @@ class Executor:
         # runtime turns it on. The fold is kept at the log's head.
         self._pace = pace
         self._outbox = outbox.Outbox()
+        # Thinking slots put off this run (C4), so a slot that then closes
+        # unserved is written down as a deferral that ran out, not a no-show.
+        self._deferred: set[str] = set()
+        # Tidy changes already offered (C2, B3), as (schedule id, change),
+        # folded from the log's own proposals so a restart asks nothing twice.
+        self._offered: set[tuple[str, str]] = set()
+        self._offered_through = 0
         # Read-only: `due` and `fire` belong to the clock thread and are
         # never called from here. A second fold of the same log rather than
         # a shared object, because the clock mutates its copy on its own
@@ -659,10 +690,16 @@ class Executor:
             return False
 
         head = self._queue.head()
-        # Reports skipped for recall's reason (DL-072), and because their
-        # digests are already learned from by `work_reports` under their own
-        # lens; reflecting on them again here would file the same habit twice.
-        window = self._queue.recent(REFLECT_WINDOW, skipping=NOT_RECALLED)
+        window = _person_window(self._queue)
+        if not window:
+            # Counted messages that have since scrolled out of reach: nothing
+            # of theirs to read, so no pass and nothing to anchor one on.
+            self._queue.append(episodes.reflection_done(through=head, filed=0))
+            return True
+        # The pass is about what they said, so it is anchored on the last
+        # thing they said, never on whatever the log's head happens to be (a
+        # fire, before C0, which is how omega's own rules were filed as theirs).
+        anchor = max(p.seq for p in window if promises.theirs(p.payload))
         known = self._learned.claims()
         # Metered per pass, and the receipt says what it spent (DL-070).
         meter = provider.Meter(self._completer())
@@ -674,15 +711,19 @@ class Executor:
             )
             filed = learn.file_claims(
                 self._queue,
-                found.claims,
-                # There is no turn, so `for_seq` names the episode the pass read
-                # up to. The field is required of every attached kind and this
-                # is the honest value for it: the claim is *about* that stretch,
-                # and pointing it at some earlier turn would invent a cause.
-                for_seq=head,
-                source_seq=head,
+                # A paraphrase of something already believed is the same claim
+                # twice (C0): exact-text dedup let one rule in three times.
+                tidy.novel(found.claims, known),
+                # There is no turn, so `for_seq` names the last of their
+                # messages the pass read: the claim is *about* that stretch.
+                for_seq=anchor,
+                source_seq=anchor,
                 explicit=False,
             )
+            # A rule about omega's own way of working is a lesson (DL-086),
+            # never a claim about them (C0).
+            for rule in found.lessons:
+                self._queue.append(episodes.lesson_learned(text=rule, cites=[anchor]))
             # Filed unconditionally, not behind a check on the lens. `reflect`
             # already returns nothing here for a lens that was not offered
             # moments (DL-062), so a second guard would be a second place for
@@ -690,8 +731,8 @@ class Executor:
             learn.file_moments(
                 self._queue,
                 found.moments,
-                for_seq=head,
-                source_seq=head,
+                for_seq=anchor,
+                source_seq=anchor,
             )
         except Exception as exc:  # noqa: BLE001 - see the docstring
             reason = str(exc) or type(exc).__name__
@@ -1344,22 +1385,23 @@ class Executor:
                 return True
             if self._follow_up(moment):
                 return True
+            if self._offer_tidy(moment, st):
+                return True
             slot: Optional[str] = None
             drafts: Sequence[outbox.Draft] = ()
             if self._pace:
-                self._outbox.advance(store)
-                if self._deliver_held(moment, st):
-                    return True
+                slot, wait = self._slot(moment, st)
+                if wait:
+                    return False
                 box = self._outbox.state()
                 drafts = box.drafts
-                slot = outbox.slot_due(box, moment)
-                if slot is not None and not outbox.thinking_left(box, moment):
-                    # Over the day's thinking spend: the slot is not thought,
-                    # and the ordinary look runs in its place.
-                    slot = None
-            if not notice.may_look(
+                if slot is None and self._recheck(moment, st, box):
+                    return True
+            if slot is None and not notice.may_look(
                 st, now=moment, look_every_seconds=look_every_seconds
             ):
+                # The look's own gap. A thinking slot has its own clock (C4)
+                # and is not held to it: that gap is what made slots vanish.
                 return False
             if self._online is not None and not self._online():
                 # DL-068 #5: a look with no network is a turn that fails on its
@@ -1692,22 +1734,71 @@ class Executor:
             latest = None
         return outbox.present(latest, box.heard_at, now=moment)
 
-    def _deliver_held(self, moment: datetime, st: notice.Standing) -> bool:
-        """Send what was held, as one message, now that it may go (DL-098):
-        they are here, it is not quiet hours, and the day has budget left.
+    def _slot(
+        self, moment: datetime, st: notice.Standing
+    ) -> tuple[Optional[str], bool]:
+        """The thinking slot to run now, and whether to wait for it (C4).
 
-        A tell, delivered as written: the words were judged when they were
-        drafted. It names the drafts it carries, which takes them at once. Not
-        while a look or a thinking turn is outstanding, which may carry them.
+        Its own clock, first in the pass. A slot whose window closed unserved
+        is written down as ``thinking.failed`` (why it did not run) and the
+        next slot is the retry; one over the day's spend is written down the
+        same way and the ordinary look runs in its place. A slot is put off
+        while a turn is outstanding, while omega is offline, and for up to
+        :data:`outbox.SLOT_DEFER_SECONDS` while they are mid-conversation;
+        ``wait`` is then ``True`` and nothing else runs.
         """
+        self._outbox.advance(self._queue.store)
         box = self._outbox.state()
+        at = moment.isoformat()
+        for missed in outbox.slots_missed(box, moment):
+            why = "deferral expired" if missed in self._deferred else "no entry"
+            self._deferred.discard(missed)
+            self._queue.append(episodes.thinking_failed(slot=missed, why=why, at=at))
+        slot = outbox.slot_due(box, moment)
+        if slot is None:
+            return None, False
+        if not outbox.thinking_left(box, moment):
+            self._deferred.discard(slot)
+            self._queue.append(
+                episodes.thinking_failed(slot=slot, why="spend exceeded", at=at)
+            )
+            return None, False
+        start = outbox.slot_start(slot)
+        talking = outbox.conversing(box.heard_at, now=moment) and (
+            start is not None
+            and (moment - start).total_seconds() < outbox.SLOT_DEFER_SECONDS
+        )
+        offline = self._online is not None and not self._online()
+        if st.outstanding or talking or offline:
+            self._deferred.add(slot)
+            return None, True
+        return slot, False
+
+    def _recheck(
+        self, moment: datetime, st: notice.Standing, box: outbox.State
+    ) -> bool:
+        """Put the held drafts back in front of the judge, now that one may go
+        (B4-lite): it is not quiet hours, the day has budget, they did not
+        just speak, and they are here.
+
+        Never sent as written. Drafted hours ago, a draft can repeat what a
+        watch has told them since; the judge sees it against what was already
+        said and sends what is still new, or nothing, which drops them. Not
+        while a turn is outstanding (it may carry them), not offline (it needs
+        a model), and not twice inside :data:`outbox.SPOKE_SECONDS`, so a
+        failing model is not asked again on every idle tick.
+        """
         if not box.drafts or st.outstanding:
             return False
         if outbox.hold(box, moment, here=self._here(moment, box)) is not None:
             return False
+        if self._online is not None and not self._online():
+            return False
+        if outbox.conversing(st.looked_at, now=moment):
+            return False
         self._queue.append(episodes.inbound(
-            tools.tell_instruction(outbox.merged(box.drafts)),
-            channel="schedule",
+            outbox.recheck_text(box.drafts, said=st.said, now=moment),
+            channel=notice.CHANNEL,
             queued=[d.seq for d in box.drafts],
             at=moment.isoformat(),
         ))
@@ -1761,6 +1852,7 @@ class Executor:
         if not (look or lessons.is_review(event)):
             return None
         slot = look and isinstance(event.get("thinking"), str)
+        recheck = look and not slot and isinstance(event.get("queued"), list)
         self._outbox.advance(self._queue.store)
         box = self._outbox.state()
         try:
@@ -1773,10 +1865,73 @@ class Executor:
             why = outbox.hold(box, moment, here=self._here(moment, box), slot=slot)
         return outbox.Gate(
             hold=why,
-            source="thinking" if slot else ("look" if look else "review"),
+            source=(
+                "thinking" if slot else "recheck" if recheck
+                else "look" if look else "review"
+            ),
             at=at,
-            queued=tuple(event.get("queued") or ()) if slot else (),
+            queued=tuple(event.get("queued") or ()) if slot or recheck else (),
         )
+
+    def _offer_tidy(self, moment: datetime, st: notice.Standing) -> bool:
+        """Offer one tidy change to a watch, under the tidy grant (C2, B3):
+        retire a standing mail or calendar watch the look already covers, or
+        pin a drifting ``every`` watch to the time it names. Asked once per
+        watch and change, ever; a yes runs it (DL-085), a no leaves it.
+
+        A question, so it waits for a moment a message may go, as a follow-up
+        does, and is charged to the day like one.
+        """
+        if st.outstanding:
+            return False
+        store = self._queue.store
+        self._grants_now.advance(store)
+        state = self._grants_now.state()
+        if state.live(grants.TIDY) is None:
+            return False
+        for e in store.episodes_since(self._offered_through):
+            self._offered_through = e.seq
+            p = episodes.decode(e.payload)
+            if p.get("kind") == episodes.GRANT_PROPOSED and p.get("scope") == grants.TIDY:
+                for action in p.get("actions") or ():
+                    args = action.get("args") or {}
+                    self._offered.add((str(args.get("id")), str(args.get("change"))))
+        running = tuple(self._standing_schedules())
+        offers = [
+            (args, ask) for args, ask in tools.tidy_offers(
+                running, mail=self._inbox is not None,
+                calendar=self._calendar is not None,
+            )
+            if (args["id"], args["change"]) not in self._offered
+        ]
+        if not offers:
+            return False
+        if self._pace:
+            self._outbox.advance(store)
+            box = self._outbox.state()
+            if outbox.hold(box, moment, here=self._here(moment, box)) is not None:
+                return False
+        box_ = tools.ToolBox(store_root=store.root, running=running, grants=state)
+        for args, ask in offers:
+            try:
+                d = box_.classify(tools.TIDY, args)
+            except tools.ToolRejected:
+                self._offered.add((args["id"], args["change"]))
+                continue
+            at = moment.isoformat()
+            seq = self._queue.append(episodes.inbound(
+                tools.tell_instruction(ask),
+                channel="schedule",
+                queued=[] if self._pace else None,
+                at=at,
+            ))
+            self._queue.append(episodes.grant_proposed(
+                for_seq=seq, scope=grants.TIDY, proposes="action",
+                actions=[{"tool": d.tool, "why": d.why, "args": d.args}], at=at,
+            ))
+            self._offered.add((args["id"], args["change"]))
+            return True
+        return False
 
     def _pause_proposal(self, entry: Any) -> Optional[dict[str, Any]]:
         """Pausing a failing watch, as the ``tidy`` tool would propose it, or
