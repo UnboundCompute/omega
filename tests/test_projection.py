@@ -442,6 +442,11 @@ def test_every_m1_kind_is_accounted_for() -> None:
         episodes.THINKING_FAILED: episodes.thinking_failed(
             slot="2026-10-11 morning", why="no entry", at=AT,
         ),
+        # C1: the told-ledger is a fold; an observation reaches no surface.
+        episodes.OBSERVATION_RECORDED: episodes.observation_recorded(
+            key="ci:argus/tests", source="ci", what="CI failed: tests on argus",
+            ref="<run-1@example.test>", untrusted="their inbox", at=AT,
+        ),
         # DL-101: a Slack post reaches them as the reply's link, never as these.
         episodes.SLACK_POSTED: episodes.slack_posted(
             for_seq=1, channel="C0TEAM001", name="#team", ts="1760173200.000100",

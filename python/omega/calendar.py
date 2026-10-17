@@ -120,6 +120,11 @@ class Occurrence:
     #: True when the event named a time zone this host could not resolve, so
     #: its wall-clock times were read in the process zone instead.
     approximate: bool = False
+    #: The event's UID, for the told-ledger's key (C1). Not part of equality,
+    #: so the read's de-duplication is unchanged.
+    uid: str = field(default="", compare=False)
+    #: True when the event is one instance of a series: routine, not news.
+    recurring: bool = field(default=False, compare=False)
 
 
 @dataclass(frozen=True)
@@ -743,6 +748,8 @@ def _occurrence(ev: _Event, w: _When) -> Occurrence:
         summary=ev.summary or "(no title)",
         location=ev.location,
         approximate=ev.start.approximate,
+        uid=ev.uid or "",
+        recurring=bool(ev.rrules or ev.has_rdate or ev.recurrence_id is not None),
     )
 
 
@@ -1017,9 +1024,13 @@ def look_lines(
     environ: Mapping[str, str] = os.environ,
     get: Callable[[str], str] = get,
     hours: int = LOOK_HOURS,
+    on_occurrences: Optional[Callable[[Sequence[Occurrence]], object]] = None,
 ) -> list[str]:
     """The look's calendar block. ``[]`` means *not configured* and nothing
-    else; a failure and an empty calendar each say so in words."""
+    else; a failure and an empty calendar each say so in words.
+
+    ``on_occurrences`` is handed what the read found (the told-ledger records
+    from it); its failure never costs the look its calendar block."""
     if not connected(environ):
         return []
     now = (now or datetime.now()).astimezone()
@@ -1027,6 +1038,11 @@ def look_lines(
         window = read_window(now, now + timedelta(hours=hours), environ=environ, get=get)
     except CalendarUnavailable as exc:
         return [f"couldn't read the calendar: {exc}"]
+    if on_occurrences is not None:
+        try:
+            on_occurrences(window.occurrences)
+        except Exception:  # a ledger write must not cost the look its calendar
+            pass
     return _render(window, now, f"nothing on the calendar in the next {hours} hours")
 
 

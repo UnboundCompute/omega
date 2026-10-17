@@ -47,6 +47,7 @@ from omega import (
     habits,
     inbox,
     learn,
+    ledger,
     listen,
     location,
     machine,
@@ -314,6 +315,21 @@ def _account_lines(environ=os.environ) -> list[str]:
 
 def _inbox_warn(text: str) -> None:
     print(f"omega: inbox: {text}", file=sys.stderr)
+
+
+def _each(*writers):
+    """One reading handed to several writers, each failing on its own, so
+    the told-ledger (C1) and the finance sweep (DL-083) never cost each other
+    a reading."""
+
+    def run(found):
+        for write in writers:
+            try:
+                write(found)
+            except Exception:  # noqa: BLE001 - a sense's writer must not take down the look
+                pass
+
+    return run
 
 
 def _location_args(environ) -> dict[str, Any]:
@@ -729,7 +745,10 @@ def main(argv: Optional[list[str]] = None) -> int:
         machine=lambda: machine.describe(machine.read()),
         # DL-080: their day and their mail for the same look, both read-only
         # and both off unless the host's environment names an account.
-        calendar=lambda now: calendar.look_lines(now),
+        # C1: the non-routine events it read go into the told-ledger.
+        calendar=lambda now: calendar.look_lines(
+            now, on_occurrences=lambda found: ledger.record_events(rt.queue, found, now),
+        ),
         # DL-083: the finance sweep rides the look's one reading of the inbox
         # and appends to the log through the runtime's own queue. `rt` is
         # bound before any look can run: looks start after `rt.start()`.
@@ -737,7 +756,11 @@ def main(argv: Optional[list[str]] = None) -> int:
         # the executor read mail hourly and only what arrived since.
         inbox=lambda now, after=None: inbox.look_lines(
             now, after=after,
-            on_mails=lambda mails: finance.record(rt.queue, mails, now),
+            # C1: and the same reading opens or recurs told-ledger keys.
+            on_mails=_each(
+                lambda mails: ledger.record_mails(rt.queue, mails, now),
+                lambda mails: finance.record(rt.queue, mails, now),
+            ),
         ),
         # DL-087 #3: checks a lost sign-in again, at most hourly: an IMAP
         # login, the Google refresh, or one MCP listing. Never a write.

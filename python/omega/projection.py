@@ -256,6 +256,7 @@ NOT_PROJECTED = frozenset(
         # DL-098. A held draft reaches the person only when a turn speaks it;
         # the queue and the day budget are bookkeeping about that turn.
         *episodes.OUTBOX_KINDS,
+        *episodes.LEDGER_KINDS,
         # DL-101. A Slack post reaches the person as its turn's reply, with
         # the link; the records only remember what omega posted.
         *episodes.SLACK_KINDS,

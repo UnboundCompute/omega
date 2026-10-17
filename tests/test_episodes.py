@@ -294,6 +294,26 @@ def test_every_kind_round_trips():
         ep.message_delivered(for_seq=41, queued=[40], at="2026-09-23T10:00:00+00:00"),
         ep.message_dropped(queued=[40], why="not sent", at="2026-09-23T10:00:00+00:00"),
         ep.thinking_failed(slot="2026-09-23 morning", why="no entry", at="2026-09-23T10:00:00+00:00"),
+        ep.observation_recorded(
+            key="ci:argus/tests", source="ci", what="CI failed: tests on argus",
+            ref="<run-1@example.test>", untrusted="their inbox",
+            url="https://github.com/example/argus/actions/runs/101",
+            when="2026-09-23T09:00:00+00:00", at="2026-09-23T10:00:00+00:00",
+        ),
+        ep.observation_recorded(
+            key=None, source="bulk", what="2 newsletters/notifications",
+            refs=["mail:#7", "mail:#8"], at="2026-09-23T10:00:00+00:00",
+        ),
+        ep.observation_recorded(
+            key="cal:evt-1@2026-09-24T06:00:00+00:00", source="calendar",
+            what="Flight EX123 to Example City", deadline="2026-09-24T06:00:00+00:00",
+            at="2026-09-23T10:00:00+00:00",
+        ),
+        ep.message_delivered(for_seq=41, keys=["ci:argus/tests"], at="2026-09-23T10:00:00+00:00"),
+        ep.completed(for_seq=41, outcome="spoke", reply="CI is red again.",
+                     keys=["ci:argus/tests"], at="2026-09-23T10:00:00+00:00"),
+        ep.inbound("a compose", channel="self", keys=["ci:argus/tests"],
+                   at="2026-09-23T10:00:00+00:00"),
         ep.slack_posted(
             for_seq=41, channel="C0TEAM001", name="#team", ts="1760173200.000100",
             permalink="https://example.slack.com/archives/C0TEAM001/p1760173200000100",

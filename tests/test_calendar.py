@@ -561,3 +561,26 @@ def test_secret_never_appears_anywhere(ist) -> None:
     assert len(outputs) >= 4
     for text in outputs:
         assert "s3cr3t" not in text and "calendar.google.com" not in text, text
+
+
+def test_look_hands_its_reading_to_the_ledger_hook_with_uid_and_series(ist) -> None:
+    env = {cal.ENV: SECRET}
+    cal._CACHE.clear()
+    text = ics(
+        ev("UID:one@example.test", "SUMMARY:Dentist", "DTSTART;TZID=Asia/Kolkata:20261009T110000",
+           "DTEND;TZID=Asia/Kolkata:20261009T113000"),
+        ev("UID:wk@example.test", "SUMMARY:Standup", "DTSTART;TZID=Asia/Kolkata:20261002T120000",
+           "DTEND;TZID=Asia/Kolkata:20261002T121500", "RRULE:FREQ=WEEKLY"),
+    )
+    seen: list = []
+    lines = cal.look_lines(d(2026, 10, 9, 9), environ=env, get=_fake_get({SECRET: text}),
+                           on_occurrences=seen.extend)
+    assert len(lines) == 2
+    assert {(o.uid, o.recurring) for o in seen} == {("one@example.test", False), ("wk@example.test", True)}
+
+    def broken(_):
+        raise RuntimeError("ledger down")
+
+    cal._CACHE.clear()
+    assert cal.look_lines(d(2026, 10, 9, 9), environ=env, get=_fake_get({SECRET: text}),
+                          on_occurrences=broken) == lines

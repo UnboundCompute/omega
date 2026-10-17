@@ -150,6 +150,7 @@ NOT_RECALLED = frozenset({
     # thinking turn in their own situation text, and a delivered one is
     # already in the conversation as the reply that carried it.
     *episodes.OUTBOX_KINDS,
+    *episodes.LEDGER_KINDS,
     # Topics kept up with (DL-087 #6): their news reaches them in the brief,
     # read off the fold; the records are bookkeeping.
     *episodes.TOPIC_KINDS,

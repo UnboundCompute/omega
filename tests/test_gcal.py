@@ -328,3 +328,10 @@ def test_calendar_auth_command_reports_failure_plainly() -> None:
     out: list[str] = []
     assert calendar_auth([], environ=ENV, say=out.append, authorize=fail) == 1
     assert out == ["calendar-auth: no answer from Google sign-in in time"]
+
+
+def test_occurrence_carries_the_uid_and_whether_it_is_a_series() -> None:
+    one = gcal._occurrence(_event(iCalUID="a@example.test", id="x1"))
+    inst = gcal._occurrence(_event(id="x2_20261012", recurringEventId="x2"))
+    assert (one.uid, one.recurring) == ("a@example.test", False)
+    assert (inst.uid, inst.recurring) == ("x2_20261012", True)

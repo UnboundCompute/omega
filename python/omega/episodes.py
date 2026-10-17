@@ -180,6 +180,12 @@ __all__ = [
     "thinking_failed",
     "message_delivered",
     "message_dropped",
+    "OBSERVATION_RECORDED",
+    "LEDGER_KINDS",
+    "OBSERVATION_SOURCES",
+    "MAX_OBSERVATION_WHAT",
+    "MAX_KEYS",
+    "observation_recorded",
     "SLACK_POSTED",
     "SLACK_DELETED",
     "SLACK_FAILED",
@@ -595,9 +601,36 @@ OUTBOX_KINDS = frozenset({MESSAGE_QUEUED, MESSAGE_DELIVERED, MESSAGE_DROPPED, TH
 #: What can draft a held message: a look, a thinking turn, a failure
 #: follow-up, the weekly self-review, and the judge re-checking held drafts
 #: before they go (B4-lite).
-OUTBOX_SOURCES = frozenset({"look", "thinking", "followup", "review", "recheck"})
+OUTBOX_SOURCES = frozenset({"look", "thinking", "followup", "review", "recheck", "compose"})
 #: A held draft is a chat message, not a document.
 MAX_QUEUED_TEXT = 4_000
+#: The told-ledger (DL-109, C1). ``observation.recorded`` is one thing a sense
+#: saw that may be worth telling them: ``key`` the thread it belongs to, set by
+#: code from fields that already exist (a mail's Message-ID or ``#uid``, a
+#: calendar event's ``uid@start``, ``ci:<repo>/<workflow>`` from a CI
+#: subject, a Slack ts), ``source`` what saw it, ``what`` one code-built line,
+#: ``evidence_seq`` the episode it rests on when that is in the log, and
+#: ``deadline`` when it has one. Bulk mail is one aggregate observation with
+#: no key (``refs`` names what it covered). What was told is not a second
+#: kind: the ``keys`` field on ``message.delivered`` / ``turn.completed``
+#: says which threads a message spoke for. A record, neither recalled nor
+#: projected; the ledger is a fold (:mod:`omega.ledger`).
+OBSERVATION_RECORDED = "observation.recorded"
+LEDGER_KINDS = frozenset({OBSERVATION_RECORDED})
+#: What can see something worth a key: a person's mail, bulk mail (never a
+#: key), a CI failure, a Slack notification, travel mail, a calendar event,
+#: their own words (a reminder or watch they set), a standing watch's
+#: finding, a reminder omega wrote itself (DL-120), a machine reading.
+OBSERVATION_SOURCES = frozenset({
+    "mail", "bulk", "ci", "slack", "travel", "calendar", "words", "watch",
+    "followup", "machine",
+})
+MAX_OBSERVATION_WHAT = 500
+MAX_OBSERVATION_REFS = 200
+#: The threads one message may speak for.
+MAX_KEYS = 32
+#: A key: a lowercase family, a colon, then printable non-space ASCII.
+_LEDGER_KEY = re.compile(r"^[a-z]+:[!-~]{1,300}$")
 MAX_OUTBOX_WHY = 200
 #: Sharing to their work Slack, as them (DL-101). ``slack.posted`` is one
 #: message or file that reached Slack in their name (the conversation's id and
@@ -730,6 +763,7 @@ KINDS = frozenset(
         *WATCHER_KINDS,
         *LEAVE_KINDS,
         *OUTBOX_KINDS,
+        *LEDGER_KINDS,
         *SLACK_KINDS,
         *DELEGATE_KINDS,
     }
@@ -961,6 +995,7 @@ def inbound(
     mail_inboxes: Optional[dict[str, str]] = None,
     untrusted: Optional[str] = None,
     reply_to: Optional[str] = None,
+    keys: Optional[Sequence[str]] = None,
 ) -> dict[str, Any]:
     """Something arrived that omega may need to respond to.
 
@@ -1055,6 +1090,10 @@ def inbound(
     if thinking is not None:
         # DL-098: the thinking-time slot this look serves, "<date> morning".
         payload["thinking"] = thinking
+    if keys:
+        # C1: the told-ledger threads this unprompted event speaks for.
+        # Absent on every other event.
+        payload["keys"] = list(dict.fromkeys(keys))
     _validate(payload)
     return payload
 
@@ -1101,6 +1140,7 @@ def completed(
     proposals: Optional[list[dict[str, Any]]] = None,
     settled: Optional[list[dict[str, Any]]] = None,
     reply_to: Optional[str] = None,
+    keys: Optional[Sequence[str]] = None,
 ) -> dict[str, Any]:
     """The turn ended. A terminal record.
 
@@ -1147,6 +1187,9 @@ def completed(
     if reply_to:
         # DL-104: the channel a tell's reply goes back to, from its event.
         payload["reply_to"] = reply_to
+    if keys:
+        # C1: the told-ledger threads a spoken reply told them about.
+        payload["keys"] = list(dict.fromkeys(keys))
     _validate(payload)
     return payload
 
@@ -2314,6 +2357,7 @@ _REQUIRED: dict[str, tuple[str, ...]] = {
     MESSAGE_QUEUED: ("text", "source", "why", "at"),
     MESSAGE_DELIVERED: ("for_seq", "queued", "at"),
     MESSAGE_DROPPED: ("queued", "why", "at"),
+    OBSERVATION_RECORDED: ("key", "source", "what", "evidence_seq", "at"),
     THINKING_FAILED: ("slot", "why", "at"),
     SLACK_POSTED: ("for_seq", "channel", "name", "ts", "permalink", "what", "at"),
     SLACK_DELETED: ("for_seq", "channel", "ts", "at"),
@@ -2973,6 +3017,8 @@ def _validate(payload: dict[str, Any]) -> None:
                 raise BadPayload("mail_inboxes must map extra mailbox names to stamps")
         if "queued" in payload:
             _require_seqs(payload, "queued")
+        if "keys" in payload:
+            _validate_keys(payload)
         if "thinking" in payload:
             _require_str(payload, "thinking", non_empty=True)
         if "schedule_slot" in payload:
@@ -3124,6 +3170,9 @@ def _validate(payload: dict[str, Any]) -> None:
         # `for_seq` only where a turn is behind it: a follow-up held before it
         # was ever told has none, and a drop is named by the drafts it drops.
         _validate_outbox(payload)
+    elif kind in LEDGER_KINDS:
+        # Named by its key: a sense saw it, and no turn is behind it.
+        _validate_observation(payload)
     elif kind in SLACK_KINDS:
         # Attached: every one is the act of the turn that asked for it.
         _validate_slack(payload)
@@ -3181,6 +3230,8 @@ def _validate(payload: dict[str, Any]) -> None:
 
     if kind in (TURN_COMPLETED, TURN_BLOCKED) and "tainted" in payload:
         _validate_tainted(payload)
+    if kind in (TURN_COMPLETED, MESSAGE_DELIVERED, MESSAGE_QUEUED) and "keys" in payload:
+        _validate_keys(payload)
 
     if kind == TURN_COMPLETED:
         if "judged" in payload:
@@ -4053,6 +4104,7 @@ def delegate_finished(
 def message_queued(
     *, text: str, source: str, why: str, for_seq: Optional[int] = None,
     tainted: Sequence[str] = (), at: Optional[str] = None,
+    keys: Sequence[str] = (),
 ) -> dict[str, Any]:
     """omega drafted an unprompted message and holds it for a better moment
     (DL-098): quiet hours, over the day's budget, or they are not here.
@@ -4065,20 +4117,104 @@ def message_queued(
     if for_seq is not None:
         payload["for_seq"] = for_seq
     _with_tainted(payload, list(tainted))
+    if keys:
+        # C1: the threads the draft speaks for, so the re-check can drop one
+        # whose threads were told since (or closed).
+        payload["keys"] = list(dict.fromkeys(keys))
     _validate(payload)
     return payload
 
 
 def message_delivered(
-    *, for_seq: int, queued: Sequence[int] = (), at: Optional[str] = None
+    *, for_seq: int, queued: Sequence[int] = (), at: Optional[str] = None,
+    keys: Sequence[str] = (),
 ) -> dict[str, Any]:
     """One non-urgent unprompted message reached them (DL-098): the turn
     ``for_seq`` spoke it, carrying the held drafts ``queued``. The day budget
-    counts these."""
-    payload = {"v": VERSION, "kind": MESSAGE_DELIVERED, "for_seq": for_seq,
-               "queued": list(queued), "at": at or now()}
+    counts these. ``keys`` (C1) are the told-ledger threads it spoke for;
+    absent when it spoke for none, which the ledger counts as unkeyed."""
+    payload: dict[str, Any] = {"v": VERSION, "kind": MESSAGE_DELIVERED, "for_seq": for_seq,
+                               "queued": list(queued), "at": at or now()}
+    if keys:
+        payload["keys"] = list(dict.fromkeys(keys))
     _validate(payload)
     return payload
+
+
+def observation_recorded(
+    *, key: Optional[str], source: str, what: str, evidence_seq: Optional[int] = None,
+    deadline: Optional[str] = None, ref: Optional[str] = None,
+    refs: Optional[Sequence[str]] = None, untrusted: Optional[str] = None,
+    url: Optional[str] = None, when: Optional[str] = None, at: Optional[str] = None,
+) -> dict[str, Any]:
+    """One thing a sense saw (C1, DL-109), on the thread ``key``.
+
+    ``ref`` is the one item it is (a Message-ID, ``uid@start``), so the same
+    mail read on the next look is not a second observation and a second CI
+    failure on the same workflow is a recurrence. ``untrusted`` names whose
+    words ``what`` repeats (DL-064): a subject line is the sender's. ``url``
+    is a link a code parser took from the item (a CI run), ``when`` when the
+    item itself happened (a mail's date)."""
+    payload: dict[str, Any] = {"v": VERSION, "kind": OBSERVATION_RECORDED, "key": key,
+                               "source": source, "what": what,
+                               "evidence_seq": evidence_seq, "at": at or now()}
+    for name, value in (("deadline", deadline), ("ref", ref), ("untrusted", untrusted),
+                        ("url", url), ("when", when)):
+        if value is not None:
+            payload[name] = value
+    if refs is not None:
+        payload["refs"] = list(refs)
+    _validate(payload)
+    return payload
+
+
+def _validate_keys(payload: dict[str, Any]) -> None:
+    keys = payload["keys"]
+    if (
+        not isinstance(keys, list) or not keys or len(keys) > MAX_KEYS
+        or not all(isinstance(k, str) and _LEDGER_KEY.match(k) for k in keys)
+    ):
+        raise BadPayload(f"keys must be 1 to {MAX_KEYS} ledger keys")
+
+
+def _validate_observation(payload: dict[str, Any]) -> None:
+    _require_str(payload, "at", non_empty=True)
+    source = payload["source"]
+    if source not in OBSERVATION_SOURCES:
+        raise BadPayload(f"source {source!r} not in {sorted(OBSERVATION_SOURCES)}")
+    key = payload["key"]
+    if source == "bulk":
+        # Bulk mail is never a thread of its own (C1's admission rule).
+        if key is not None:
+            raise BadPayload("bulk mail is one aggregate observation and never a key")
+        refs = payload.get("refs")
+        if (
+            not isinstance(refs, list) or not refs or len(refs) > MAX_OBSERVATION_REFS
+            or not all(isinstance(r, str) and r and len(r) <= 300 for r in refs)
+        ):
+            raise BadPayload(f"a bulk observation names 1 to {MAX_OBSERVATION_REFS} refs")
+    elif not isinstance(key, str) or not _LEDGER_KEY.match(key):
+        raise BadPayload("key must be a ledger key")
+    elif "refs" in payload:
+        raise BadPayload("only a bulk observation carries refs")
+    _require_sentence(payload, "what", cap=MAX_OBSERVATION_WHAT)
+    if payload["evidence_seq"] is not None:
+        _require_seq(payload, "evidence_seq")
+    for name in ("deadline", "when"):
+        if name in payload:
+            _require_str(payload, name, non_empty=True)
+            try:
+                datetime.fromisoformat(payload[name])
+            except ValueError as exc:
+                raise BadPayload(f"{name} must be an ISO-8601 moment") from exc
+    if "ref" in payload:
+        _require_sentence(payload, "ref", cap=300)
+    if "untrusted" in payload:
+        _require_sentence(payload, "untrusted", cap=MAX_HOLD_REASON)
+    if "url" in payload:
+        url = payload["url"]
+        if not isinstance(url, str) or len(url) > 300 or not re.match(r"^https://[!-~]+$", url):
+            raise BadPayload("url must be an https link of at most 300 characters")
 
 
 def thinking_failed(*, slot: str, why: str, at: Optional[str] = None) -> dict[str, Any]:

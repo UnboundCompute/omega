@@ -266,7 +266,17 @@ def _occurrence(item: object) -> Optional[Occurrence]:
         all_day=start[1],
         summary=_clean(summary, MAX_SUMMARY) if isinstance(summary, str) and summary.strip() else "(no title)",
         location=_clean(location, MAX_LOCATION) if isinstance(location, str) else "",
+        uid=_uid(item),
+        recurring=isinstance(item.get("recurringEventId"), str) or bool(item.get("recurrence")),
     )
+
+
+def _uid(item: dict) -> str:
+    for name in ("iCalUID", "id"):
+        value = item.get(name)
+        if isinstance(value, str) and value.strip():
+            return value.strip()[:300]
+    return ""
 
 
 _EVENTS: dict[tuple[str, datetime, datetime], tuple[float, tuple[Occurrence, ...]]] = {}
