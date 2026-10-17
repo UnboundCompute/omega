@@ -390,9 +390,13 @@ def held_lines(drafts: Sequence[Draft], *, now: datetime) -> list[str]:
     return lines
 
 
-def carried_taint(drafts: Sequence[Draft]) -> Optional[str]:
+def carried_taint(
+    drafts: Sequence[Draft], *, said: Sequence[str] = ()
+) -> Optional[str]:
     """The ``untrusted`` source of an event that shows these drafts, or
-    ``None`` when every one was written clean (DL-064, DL-108).
+    ``None`` when every one was written clean (DL-064, DL-108). ``said`` is
+    the taint of the replies the same event shows as already told them
+    (:func:`omega.notice.said_taint`), which repeat mail the same way.
 
     A draft a look wrote after reading their mail may repeat the mail word
     for word, and the event that carries it back (a re-check, a look or a
@@ -400,7 +404,7 @@ def carried_taint(drafts: Sequence[Draft]) -> Optional[str]:
     :func:`omega.turn.read_untrusted` to find. Naming the drafts' sources on
     that event taints the turn it starts and every turn that recalls it, as
     a watched page's tell already does."""
-    sources = list(dict.fromkeys(t for d in drafts for t in d.tainted))
+    sources = list(dict.fromkeys([*(t for d in drafts for t in d.tainted), *said]))
     if not sources:
         return None
     joined = ", ".join(sources)

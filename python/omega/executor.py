@@ -1480,8 +1480,11 @@ class Executor:
                     thinking=slot,
                     at=moment.isoformat(),
                     mail_inboxes=mail_more or None,
-                    # The held drafts it lists may repeat mail (DL-108).
-                    untrusted=outbox.carried_taint(drafts),
+                    # The held drafts it lists, and what it was already
+                    # told, may repeat mail (DL-108).
+                    untrusted=outbox.carried_taint(
+                        drafts, said=notice.said_taint(st, now=moment)
+                    ),
                 )
             )
             for origin in paused:
@@ -1804,8 +1807,9 @@ class Executor:
             queued=[d.seq for d in box.drafts],
             at=moment.isoformat(),
             # A draft a look wrote off their mail carries that mail's taint
-            # into the re-check, and into every turn that recalls it (DL-108).
-            untrusted=outbox.carried_taint(box.drafts),
+            # into the re-check, and into every turn that recalls it (DL-108);
+            # so does a reply in "what you last told them" drawn from mail.
+            untrusted=outbox.carried_taint(box.drafts, said=notice.said_taint(st)),
         ))
         return True
 

@@ -167,6 +167,13 @@ class Standing:
     #: something it is asked to remember.
     said: tuple[tuple[str, str], ...] = ()
 
+    #: What the turn behind each :attr:`said` reply had read (its record's
+    #: ``tainted``), in the same order. A reply drawn from their mail may
+    #: repeat a sender's words, and a look or re-check that shows it again
+    #: carries those words outside any inbox fence (DL-108,
+    #: :func:`said_taint`).
+    said_tainted: tuple[tuple[str, ...], ...] = ()
+
     #: ``(key, at, line)`` for each machine line flagged at the newest look
     #: that carried readings: the look at which that flag *started*, and the
     #: line as it read then (DL-076). This is what lets a look tell a flag
@@ -210,6 +217,7 @@ def standing(store: "MemoryStore") -> Standing:
     # Every unprompted inbound (look or clock fire), for the novelty memory.
     unprompted: dict[int, str] = {}
     said: list[tuple[str, str]] = []
+    said_tainted: list[tuple[str, ...]] = []
     completed: set[int] = set()
     looked_at: Optional[str] = None
     heard_at: Optional[str] = None
@@ -266,6 +274,11 @@ def standing(store: "MemoryStore") -> Standing:
             ):
                 said.append((unprompted[for_seq], reply.strip()))
                 del said[:-SAID_KEPT]
+                read = payload.get("tainted")
+                said_tainted.append(
+                    tuple(str(t) for t in read) if isinstance(read, list) else ()
+                )
+                del said_tainted[:-SAID_KEPT]
             if for_seq in mine:
                 completed.add(for_seq)
                 if payload.get("outcome") == "failed":
@@ -297,6 +310,7 @@ def standing(store: "MemoryStore") -> Standing:
         through=through,
         outstanding=len(set(mine) - completed),
         said=tuple(said),
+        said_tainted=tuple(said_tainted),
         flagged_since=tuple((k, a, l) for k, (a, l) in flagged.items()),
         machine_known=machine_known,
         failed_looks=failed_looks,
@@ -383,6 +397,31 @@ def may_look(
 def _clock(now: datetime) -> str:
     local = now.astimezone()
     return local.strftime("%A %d %B, %H:%M")
+
+
+def _said_recent(now: datetime, at: str) -> bool:
+    """Is a reply said at ``at`` recent enough for :func:`situation` to show?"""
+    try:
+        then = datetime.fromisoformat(at)
+    except (TypeError, ValueError):
+        return False
+    if then.tzinfo is None:
+        then = then.replace(tzinfo=timezone.utc)
+    return (now - then).total_seconds() <= SAID_WITHIN_SECONDS
+
+
+def said_taint(st: Standing, *, now: Optional[datetime] = None) -> tuple[str, ...]:
+    """The sources behind the :attr:`Standing.said` replies an event shows.
+
+    With ``now``, only the replies :func:`situation` shows at ``now``; without
+    it, every kept one, as :func:`omega.outbox.recheck_text` shows them. Empty
+    when every reply shown came from a clean turn, so a clean look stays
+    byte-for-byte what it was."""
+    found: list[str] = []
+    for (at, _), read in zip(st.said, st.said_tainted):
+        if now is None or (_since(now, at) is not None and _said_recent(now, at)):
+            found.extend(read)
+    return tuple(dict.fromkeys(found))
 
 
 def _since(now: datetime, at: Optional[str]) -> Optional[str]:
@@ -539,15 +578,7 @@ def situation(
     recent = []
     for at, text in said:
         ago = _since(now, at)
-        if ago is None:
-            continue
-        try:
-            then = datetime.fromisoformat(at)
-        except (TypeError, ValueError):
-            continue
-        if then.tzinfo is None:
-            then = then.replace(tzinfo=timezone.utc)
-        if (now - then).total_seconds() <= SAID_WITHIN_SECONDS:
+        if ago is not None and _said_recent(now, at):
             recent.append((ago, text))
     if recent:
         lines.append("")

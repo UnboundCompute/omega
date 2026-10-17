@@ -224,6 +224,29 @@ def test_a_recheck_of_a_draft_written_off_mail_names_that_taint(q: EventQueue) -
     assert last_turn(q)["tainted"] == [tools.INBOX_SOURCE]
 
 
+def test_a_recheck_showing_a_reply_drawn_from_mail_names_that_taint(q: EventQueue) -> None:
+    start(q, local(14, 12))
+    # Yesterday evening a look that read their mail told them something; the
+    # re-check lists it under "what you last told them", outside any fence.
+    look = q.append(episodes.inbound(
+        "a synthetic look", channel=notice.CHANNEL, at=local(13, 20).isoformat(),
+    ))
+    q.append(episodes.completed(
+        for_seq=look, outcome="spoke", reply="A synthetic sender wants an answer.",
+        tainted=[tools.INBOX_SOURCE], at=local(13, 20).isoformat(),
+    ))
+    q.append(episodes.message_queued(
+        text=NUDGE, source="look", why=outbox.HOLD_AWAY, at=local(14, 12).isoformat(),
+    ))
+    at_the_mac(q, local(14, 14, 0))
+    ex = executor(q)
+    assert ex.notice(now=local(14, 14, 1)) is True
+    recheck = kinds(q, episodes.MESSAGE_INBOUND)[-1]
+    assert recheck["text"].startswith(outbox.RECHECK_LEAD)
+    assert "A synthetic sender wants an answer." in recheck["text"]
+    assert recheck["untrusted"] == tools.INBOX_SOURCE
+
+
 def test_a_recheck_that_stays_silent_drops_the_drafts_stamped_now(q: EventQueue) -> None:
     ex = start(q, local(14, 12))
     ex.notice(now=local(14, 12))
