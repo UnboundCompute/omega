@@ -73,6 +73,7 @@ __all__ = [
     "slots_missed",
     "conversing",
     "recheck_text",
+    "carried_taint",
     "present",
     "hold",
     "thinking_left",
@@ -139,6 +140,8 @@ class Draft:
     text: str
     source: str
     at: str
+    #: What untrusted content the turn that wrote it had read (DL-064).
+    tainted: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -205,7 +208,7 @@ class Outbox:
         elif kind == episodes.MESSAGE_QUEUED:
             self._drafts[seq] = Draft(
                 seq=seq, text=str(payload["text"]), source=str(payload["source"]),
-                at=str(payload["at"]),
+                at=str(payload["at"]), tainted=tuple(payload.get("tainted") or ()),
             )
         elif kind == episodes.MESSAGE_DELIVERED:
             self._taken.update(payload.get("queued") or [])
@@ -387,6 +390,24 @@ def held_lines(drafts: Sequence[Draft], *, now: datetime) -> list[str]:
     return lines
 
 
+def carried_taint(drafts: Sequence[Draft]) -> Optional[str]:
+    """The ``untrusted`` source of an event that shows these drafts, or
+    ``None`` when every one was written clean (DL-064, DL-108).
+
+    A draft a look wrote after reading their mail may repeat the mail word
+    for word, and the event that carries it back (a re-check, a look or a
+    thinking turn listing what is held) has no inbox fence for
+    :func:`omega.turn.read_untrusted` to find. Naming the drafts' sources on
+    that event taints the turn it starts and every turn that recalls it, as
+    a watched page's tell already does."""
+    sources = list(dict.fromkeys(t for d in drafts for t in d.tainted))
+    if not sources:
+        return None
+    joined = ", ".join(sources)
+    cap = episodes.MAX_HOLD_REASON
+    return joined if len(joined) <= cap else joined[: cap - 1].rstrip() + "…"
+
+
 #: How the re-check of held drafts begins (B4-lite).
 RECHECK_LEAD = "Held drafts, not sent yet."
 
@@ -476,7 +497,9 @@ class Gate:
     queued: tuple[int, ...] = ()
 
 
-def settle(queue: Any, seq: int, gate: Gate, text: str) -> bool:
+def settle(
+    queue: Any, seq: int, gate: Gate, text: str, *, tainted: Sequence[str] = ()
+) -> bool:
     """Write down what happens to a turn that would speak; ``True`` if held.
 
     Held: its words become a draft, and the drafts it was shown are folded
@@ -489,7 +512,7 @@ def settle(queue: Any, seq: int, gate: Gate, text: str) -> bool:
             return True
         queue.append(episodes.message_queued(
             text=_clip(text), source=gate.source, why=gate.hold, for_seq=seq,
-            at=gate.at,
+            tainted=tainted, at=gate.at,
         ))
         if gate.queued:
             # Stamped when it happened, not with the turn's moment (C0).

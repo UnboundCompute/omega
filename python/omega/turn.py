@@ -442,8 +442,11 @@ def read_untrusted(ctx: "TurnContext") -> tuple[str, ...]:
             found.append(INBOX_SOURCE)
         elif kind == episodes.TOOL_RETURNED and payload.get("ok") and payload.get("tool") == MAIL:
             found.append(RECALLED_MAIL)
-        elif kind == episodes.MESSAGE_INBOUND and payload.get("untrusted"):
-            # A tell carrying a watched page's words (DL-096), as it says.
+        if kind == episodes.MESSAGE_INBOUND and payload.get("untrusted"):
+            # A tell carrying a watched page's words (DL-096), as it says, or
+            # one of omega's own events showing drafts written off untrusted
+            # words (:func:`omega.outbox.carried_taint`). Never stubbed: a
+            # look's held drafts sit outside its inbox block.
             found.append(str(payload["untrusted"]))
     return tuple(dict.fromkeys(found))
 
@@ -932,14 +935,17 @@ def run_turn(
                     words[: -len(_REPLY_YES_NO)]
                     + f" {granted.how_to_answer(asked)}"
                 )
-        if gate is not None and outbox.settle(queue, pending.seq, gate, words):
+        carried = (str(event["untrusted"]),) if event.get("untrusted") else ()
+        if gate is not None and outbox.settle(
+            queue, pending.seq, gate, words, tainted=carried
+        ):
             record = write_memory(queue, seq=pending.seq, outcome="silent", at=at)
             return TurnResult(seq=pending.seq, outcome="silent", record_seq=record)
         record = write_memory(
             queue, seq=pending.seq, outcome="spoke", reply_text=words, at=at,
             # A watched page's words (DL-096): the record says whose, so
             # recall fences the reply as it fences the tell.
-            tainted=(str(event["untrusted"]),) if event.get("untrusted") else (),
+            tainted=carried,
             reply_to=event.get("reply_to"),
         )
         return TurnResult(
@@ -1140,7 +1146,9 @@ def run_turn(
         )
         text = f"{text}\n\n{words}"
 
-    if gate is not None and outbox.settle(queue, pending.seq, gate, text):
+    if gate is not None and outbox.settle(
+        queue, pending.seq, gate, text, tainted=tainted()
+    ):
         # DL-098: not now. The words wait as a draft for a better moment;
         # the turn itself ends quiet, with what the judge said kept.
         record = write_memory(

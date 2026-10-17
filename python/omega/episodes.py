@@ -3856,6 +3856,8 @@ def _validate_outbox(payload: dict[str, Any]) -> None:
         _require_sentence(payload, "text", cap=MAX_QUEUED_TEXT)
         if payload["source"] not in OUTBOX_SOURCES:
             raise BadPayload(f"source {payload['source']!r} not in {sorted(OUTBOX_SOURCES)}")
+        if "tainted" in payload:
+            _validate_tainted(payload)
     else:
         _require_seqs(payload, "queued")
     if kind != MESSAGE_DELIVERED:
@@ -4050,14 +4052,19 @@ def delegate_finished(
 
 def message_queued(
     *, text: str, source: str, why: str, for_seq: Optional[int] = None,
-    at: Optional[str] = None,
+    tainted: Sequence[str] = (), at: Optional[str] = None,
 ) -> dict[str, Any]:
     """omega drafted an unprompted message and holds it for a better moment
-    (DL-098): quiet hours, over the day's budget, or they are not here."""
+    (DL-098): quiet hours, over the day's budget, or they are not here.
+
+    ``tainted`` is the untrusted content the drafting turn had read (DL-064):
+    the draft's words may repeat it, so whatever later carries the draft is
+    tainted by it too. Absent on a draft written clean."""
     payload: dict[str, Any] = {"v": VERSION, "kind": MESSAGE_QUEUED, "text": text,
                                "source": source, "why": why, "at": at or now()}
     if for_seq is not None:
         payload["for_seq"] = for_seq
+    _with_tainted(payload, list(tainted))
     _validate(payload)
     return payload
 

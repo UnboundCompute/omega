@@ -191,6 +191,8 @@ def test_a_held_draft_is_rechecked_once_when_they_come_back(q: EventQueue) -> No
     assert recheck["channel"] == notice.CHANNEL and recheck["queued"] == [draft_seq]
     assert recheck["text"].startswith(outbox.RECHECK_LEAD)
     assert "thinking" not in recheck
+    # Written clean, the draft leaves its re-check untainted (DL-108).
+    assert "untrusted" not in recheck
     assert not [p for p in kinds(q, episodes.MESSAGE_INBOUND)
                 if p["channel"] == "schedule" and p.get("queued")]
     assert last_turn(q)["outcome"] == "spoke" and last_turn(q)["reply"] == NUDGE
@@ -203,6 +205,23 @@ def test_a_held_draft_is_rechecked_once_when_they_come_back(q: EventQueue) -> No
         p.get("queued") for p in payloads(q)[before:]
         if p["kind"] == episodes.MESSAGE_INBOUND
     )
+
+
+def test_a_recheck_of_a_draft_written_off_mail_names_that_taint(q: EventQueue) -> None:
+    start(q, local(14, 12))
+    q.append(episodes.message_queued(
+        text="A synthetic mail looked urgent.", source="look",
+        why=outbox.HOLD_AWAY, tainted=[tools.INBOX_SOURCE],
+        at=local(14, 12).isoformat(),
+    ))
+    at_the_mac(q, local(14, 14, 0))
+    ex = executor(q)
+    assert ex.notice(now=local(14, 14, 1)) is True
+    recheck = kinds(q, episodes.MESSAGE_INBOUND)[-1]
+    assert recheck["text"].startswith(outbox.RECHECK_LEAD)
+    assert recheck["untrusted"] == tools.INBOX_SOURCE
+    ex.drain()
+    assert last_turn(q)["tainted"] == [tools.INBOX_SOURCE]
 
 
 def test_a_recheck_that_stays_silent_drops_the_drafts_stamped_now(q: EventQueue) -> None:
