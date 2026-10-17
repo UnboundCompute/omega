@@ -279,6 +279,9 @@ class Runtime:
         # person's accounts inside every test. Each takes the look's clock.
         calendar: Optional[Callable[[datetime], Sequence[str]]] = None,
         inbox: Optional[Callable[[datetime], Sequence[str]]] = None,
+        # C2: the calendar as occurrences between two moments, for the T-minus
+        # sense. ``None`` for the same reason as the calendar above.
+        events: Optional[Callable[[datetime, datetime], Sequence[Any]]] = None,
         # DL-087 #3: asks whether a lost sign-in works again. ``None`` for the
         # same reason: a default would log into their accounts from a test.
         probe: Optional[Callable[[str], Optional[bool]]] = None,
@@ -330,6 +333,7 @@ class Runtime:
         self._online = online
         self._machine = machine
         self._calendar = calendar
+        self._events = events
         self._inbox = inbox
         self._probe = probe
         self._inbox_names = tuple(inbox_names)
@@ -413,6 +417,7 @@ class Runtime:
                 probe=self._probe,
                 inbox_names=self._inbox_names,
                 pace=self._pace,
+                events=self._events,
             )
             self._report = self._executor.recover()
             self._thread = threading.Thread(
@@ -756,6 +761,9 @@ class Runtime:
         # The leave-now alarms (DL-093): code only, one Maps call when one is
         # due. With no alarm set it is a fold.
         executor.leave_now()
+        # The calendar T-minus sense (C2): code only, a calendar read every
+        # few minutes and a tell when a meeting or a flight is due one.
+        executor.calendar_tminus()
         # Last, and unconditional. Last because the three passes above *write
         # memory* and this one *reads* it to decide whether to speak — running it
         # first would have it judge a moment it had not yet finished perceiving.

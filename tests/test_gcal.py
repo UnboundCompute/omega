@@ -335,3 +335,15 @@ def test_occurrence_carries_the_uid_and_whether_it_is_a_series() -> None:
     inst = gcal._occurrence(_event(id="x2_20261012", recurringEventId="x2"))
     assert (one.uid, one.recurring) == ("a@example.test", False)
     assert (inst.uid, inst.recurring) == ("x2_20261012", True)
+
+
+def test_a_moved_instance_says_when_it_was_due() -> None:
+    """C2: ``originalStartTime`` is asked for, and a moved one is marked."""
+    assert "originalStartTime" in gcal.FIELDS and "recurringEventId" in gcal.FIELDS
+    moved = gcal._occurrence(_event(
+        recurringEventId="x2", originalStartTime={"dateTime": "2026-10-12T09:00:00+05:30"}))
+    kept = gcal._occurrence(_event(
+        recurringEventId="x2", originalStartTime={"dateTime": "2026-10-12T09:30:00+05:30"}))
+    assert moved is not None and moved.moved_from is not None
+    assert moved.moved_from.isoformat() == "2026-10-12T09:00:00+05:30"
+    assert kept is not None and kept.moved_from is None

@@ -526,6 +526,9 @@ final class TrayViewModel: ObservableObject {
             urgencyByTurn.removeValue(forKey: update.forSeq)
         case "complete":
             finishActiveTurn(for: update.forSeq)
+            // C2: a deadline tell's reply names its own urgency; its inbound
+            // never crossed (unprompted), so nothing else set it.
+            if let urgency = update.urgency { urgencyByTurn[update.forSeq] = urgency }
             switch update.outcome {
             case "spoke":
                 if let reply = update.reply, !reply.isEmpty {

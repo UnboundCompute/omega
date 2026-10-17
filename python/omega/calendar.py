@@ -125,6 +125,9 @@ class Occurrence:
     uid: str = field(default="", compare=False)
     #: True when the event is one instance of a series: routine, not news.
     recurring: bool = field(default=False, compare=False)
+    #: When this instance of a series was due before it was moved (C2): a
+    #: changed routine event is warned, an unchanged one is not.
+    moved_from: Optional[datetime] = field(default=None, compare=False)
 
 
 @dataclass(frozen=True)
@@ -750,6 +753,10 @@ def _occurrence(ev: _Event, w: _When) -> Occurrence:
         approximate=ev.start.approximate,
         uid=ev.uid or "",
         recurring=bool(ev.rrules or ev.has_rdate or ev.recurrence_id is not None),
+        moved_from=(
+            ev.recurrence_id.aware
+            if ev.recurrence_id is not None and ev.recurrence_id.aware != w.aware else None
+        ),
     )
 
 

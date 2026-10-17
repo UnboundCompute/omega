@@ -250,6 +250,9 @@ def test_recurrence_id_moves_and_cancels(ist) -> None:
     ]
     only_12th = window(text, d(2026, 10, 12), d(2026, 10, 13)).occurrences
     assert [o.start for o in only_12th] == [d(2026, 10, 12, 9, 30)]
+    # C2: a moved instance says when it was due, so its warning can say so.
+    moved = [o.moved_from for o in window(text, d(2026, 10, 1), d(2026, 10, 31)).occurrences]
+    assert moved == [None, d(2026, 10, 6, 9, 30), None, d(2026, 10, 9, 9, 30)]
 
 
 def test_dst_change_keeps_local_wall_clock(ist) -> None:

@@ -687,11 +687,13 @@ def write_memory(
     tainted: Sequence[str] = (),
     reply_to: Optional[str] = None,
     keys: Sequence[str] = (),
+    urgency: Optional[str] = None,
 ) -> int:
     """Step 6 — append the turn's terminal record and return its seq.
 
     ``keys`` are the told-ledger threads a reply spoke for (C1); only a turn
-    that spoke carries them.
+    that spoke carries them, and ``urgency`` likewise (C2: ``"timely"`` on a
+    deadline tell's delivery).
 
     ``reply_to`` is the channel a reply goes back to when the event names one
     (DL-104: a Claude Code session's result goes where it was asked for);
@@ -736,6 +738,7 @@ def write_memory(
             settled=settled,
             reply_to=reply_to if outcome == "spoke" else None,
             keys=list(keys) if outcome == "spoke" and keys else None,
+            urgency=urgency if outcome == "spoke" else None,
         )
     return queue.append(payload, episodes.turn_write_key(seq))
 
@@ -979,6 +982,9 @@ def run_turn(
             tainted=carried,
             reply_to=event.get("reply_to"),
             keys=keys,
+            # C2: a deadline tell (a meeting about to start, a flight) is
+            # delivered as timely; every other tell as it always was.
+            urgency="timely" if event.get("urgency") == "timely" else None,
         )
         return TurnResult(
             seq=pending.seq, outcome="spoke", record_seq=record, reply=words

@@ -1141,8 +1141,13 @@ def completed(
     settled: Optional[list[dict[str, Any]]] = None,
     reply_to: Optional[str] = None,
     keys: Optional[Sequence[str]] = None,
+    urgency: Optional[str] = None,
 ) -> dict[str, Any]:
     """The turn ended. A terminal record.
+
+    ``urgency`` is ``"timely"`` on the reply to a deadline tell (C2: a
+    meeting about to start, a flight), and absent otherwise, so every other
+    record writes the bytes it always did.
 
     ``proposals`` are the questions this turn asked (DL-103), each its id and
     a short summary of what a yes would do: the structured half of the
@@ -1190,6 +1195,8 @@ def completed(
     if keys:
         # C1: the told-ledger threads a spoken reply told them about.
         payload["keys"] = list(dict.fromkeys(keys))
+    if urgency is not None:
+        payload["urgency"] = urgency
     _validate(payload)
     return payload
 
@@ -3255,6 +3262,10 @@ def _validate(payload: dict[str, Any]) -> None:
             _validate_asked(payload["settled"], "settled", ("id", "yes"))
         if "reply_to" in payload:
             _require_sentence(payload, "reply_to", cap=MAX_REPLY_TO)
+        if "urgency" in payload and payload["urgency"] not in _URGENCIES:
+            raise BadPayload(
+                f"urgency {payload['urgency']!r} not in {sorted(_URGENCIES)}"
+            )
 
     if kind == TURN_BLOCKED:
         _require_str(payload, "needs", non_empty=True)

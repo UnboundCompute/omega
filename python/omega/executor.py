@@ -26,6 +26,7 @@ append and never a second path into the loop.
 from __future__ import annotations
 
 import inspect
+import re
 import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -56,6 +57,7 @@ from omega import (
     provider,
     tasks,
     tidy,
+    tminus,
     tools,
     topics,
     transcripts,
@@ -297,6 +299,20 @@ def _sense(
         return (f"couldn't read the {name}: {type(exc).__name__}",)
 
 
+#: An in-channel steer (C2): "stop the LinkedIn ones", "no more Acme
+#: alerts". What it names is matched against their running watches' words.
+_STEER = re.compile(
+    r"^\s*(?:please\s+)?(?:stop|no more|mute|enough of)\s+"
+    r"(?:sending me\s+|telling me about\s+)?(?:the|those|these|all|my)?\s*"
+    r"(?P<what>.+?)\s*(?P<tail>ones?|alerts?|e?mails?|messages?|updates?|notifications?|"
+    r"pings?|watch(?:es)?)?(?:,?\s*please)?[.!]*\s*$",
+    re.I,
+)
+#: Words a steer says that name no watch.
+_STEER_FILLER = frozenset({"the", "those", "these", "all", "any", "more", "about", "from",
+                           "ones", "one", "stuff", "things", "watch", "watches"})
+
+
 class Executor:
     """The one consumer. Claims, runs, records, releases — in that order."""
 
@@ -342,6 +358,9 @@ class Executor:
         "_ledger",
         "_ci_offered",
         "_ci_through",
+        "_events",
+        "_events_read",
+        "_events_at",
     )
 
     def __init__(
@@ -357,6 +376,7 @@ class Executor:
         probe: Optional[Callable[[str], Optional[bool]]] = None,
         inbox_names: Sequence[str] = (),
         pace: bool = False,
+        events: Optional[Callable[[datetime, datetime], Sequence[Any]]] = None,
     ) -> None:
         self._queue = queue
         self._complete = complete
@@ -461,6 +481,12 @@ class Executor:
         # from the offers' own keys so a restart offers nothing twice.
         self._ci_offered: set[str] = set()
         self._ci_through = 0
+        # C2: the calendar read as occurrences, for the T-minus sense, and
+        # its last read, so the calendar is read every few minutes while the
+        # timing is checked on every pass.
+        self._events = events
+        self._events_read: tuple[Any, ...] = ()
+        self._events_at: Optional[datetime] = None
         # Read-only: `due` and `fire` belong to the clock thread and are
         # never called from here. A second fold of the same log rather than
         # a shared object, because the clock mutates its copy on its own
@@ -1937,6 +1963,7 @@ class Executor:
             tasks=[f"task {k}: {v}" for k, v in sorted(g.tasks.items())],
             held=outbox.held_lines(held, now=moment),
             items=ledger.lines(waiting, now=moment),
+            routine=tminus.routine_today(self._events_read, moment),
         )
         if self._briefs_in(slot):
             text = f"{tools.brief_instruction()}\n\n{text}"
@@ -2259,6 +2286,11 @@ class Executor:
             )
             self._queue.finish(pending.seq)
             return TurnResult(seq=pending.seq, outcome="silent", record_seq=record)
+        steered = self._steer(pending)
+        if steered is not None:
+            self._queue.finish(pending.seq)
+            self._withdraw()
+            return steered
         # DL-095 gate-leak: the store head before the turn, so what the turn
         # wrote with this event's for_seq can be told from what stood before it.
         head_before = self._queue.store.head()
@@ -2349,6 +2381,105 @@ class Executor:
                 ))
                 return AUTHORED_REMINDER
         return None
+
+    def _steer(self, pending: Pending) -> Optional[TurnResult]:
+        """An in-channel steer, answered in code (C2): "stop the LinkedIn
+        ones" names the running watches it means, and becomes the tidy
+        change that retires them, under the tidy grant (DL-085) as an offer
+        is: asked first with its id while the gate is on, done and written
+        down with its undo once they dropped it. Their answer to the routine
+        meetings question (DL-110) is acknowledged here too; the ledger keeps it.
+
+        ``None`` runs the ordinary turn: no pace, not a message of theirs,
+        no steer in it, no watch or more than three that it names, or no
+        tidy grant to do it under.
+        """
+        event = pending.payload
+        if not self._pace or event.get("kind", episodes.MESSAGE_INBOUND) != episodes.MESSAGE_INBOUND:
+            return None
+        if event.get("channel") in notice.UNPROMPTED_CHANNELS or event.get("untrusted"):
+            return None
+        text = str(event.get("text", ""))
+        if ledger.ROUTINE_OFF.search(text) or ledger.ROUTINE_ON.search(text):
+            on = not ledger.ROUTINE_OFF.search(text)
+            words = (
+                "Done: I will warn you 30 minutes before routine meetings too."
+                if on else
+                "Done: routine meetings get no warning of their own; they stay in your brief."
+            )
+            return self._steered(pending, words)
+        found = _STEER.match(text)
+        if found is None or not (found["tail"] or len(found["what"].split()) <= 2):
+            # "stop working on the report" is not a steer; "stop the Acme
+            # ones" and "mute Acme" are.
+            return None
+        wanted = {w for w in re.findall(r"[a-z0-9]{3,}", found["what"].lower())} - _STEER_FILLER
+        if not wanted:
+            return None
+        running = tuple(self._standing_schedules())
+        hits = [
+            s for s in running
+            if s.instruction.startswith(tools.WATCH_LEAD)
+            and wanted & set(re.findall(r"[a-z0-9]{3,}", s.instruction.splitlines()[0].lower()))
+        ]
+        if not 1 <= len(hits) <= 3:
+            return None
+        state = self._grants.state()
+        box = tools.ToolBox(
+            store_root=self._queue.store.root, running=running, grants=state,
+            append=self._queue.append,
+        )
+        why = f"you asked me to stop the {found['what'].strip()} ones"
+        try:
+            decisions = [
+                box.classify(tools.TIDY, {"id": s.id, "change": "retire", "why": why})
+                for s in hits
+            ]
+        except tools.ToolRejected:
+            return None  # no tidy grant: the ordinary turn answers them
+        if state.gated(grants.TIDY):
+            seq = self._queue.append(episodes.grant_proposed(
+                for_seq=pending.seq, scope=grants.TIDY, proposes="action",
+                actions=[{"tool": d.tool, "why": d.why, "args": d.args} for d in decisions],
+            ))
+            words = (
+                f"Should I {'; '.join(d.why for d in decisions)}? "
+                f"{grants.how_to_answer(grants.pid(seq))}"
+            )
+            return self._steered(pending, words)
+        done = []
+        for d in decisions:
+            self._queue.append(episodes.tool_called(for_seq=pending.seq, tool=d.tool, args=d.args))
+            try:
+                result = str(box.dispatch(d))
+            except tools.ToolError as exc:
+                self._queue.append(episodes.tool_returned(
+                    for_seq=pending.seq, tool=d.tool, ok=False, error=str(exc) or "failed"))
+                continue
+            self._queue.append(episodes.tool_returned(
+                for_seq=pending.seq, tool=d.tool, ok=True, result=result))
+            self._queue.append(episodes.grant_acted(
+                for_seq=pending.seq, scope=grants.TIDY, tool=d.tool, why=d.why,
+                args=d.args, undo=grants.undo_for(d.tool, d.args),
+            ))
+            done.append(d.why.split(", because ", 1)[0])
+        words = (
+            f"Done: {'; '.join(done)}." if done
+            else "That watch changed since I looked, so nothing was done."
+        )
+        return self._steered(pending, words, tools_used=(tools.TIDY,) * len(decisions))
+
+    def _steered(
+        self, pending: Pending, words: str, *, tools_used: tuple[str, ...] = (),
+    ) -> TurnResult:
+        record = write_memory(
+            self._queue, seq=pending.seq, outcome="spoke", reply_text=words,
+            tools=tools_used, reply_to=pending.payload.get("reply_to"),
+        )
+        return TurnResult(
+            seq=pending.seq, outcome="spoke", record_seq=record, reply=words,
+            tools=tools_used,
+        )
 
     def _cancelled_since(self, sid: str, seq: int) -> bool:
         """Was schedule ``sid`` cancelled after the fire at ``seq``, and not
@@ -2924,10 +3055,80 @@ class Executor:
     def _leave_tell(self, alarm: "leave.Alarm", how: str, eta: int, text: str, at: str) -> None:
         self._queue.append(episodes.inbound(
             tools.tell_instruction(text), channel="schedule", at=at,
+            # C2: leaving now is a deadline; its delivery is timely.
+            urgency="timely",
             keys=self._keys(ledger.key("leave", alarm.id)),
         ))
         self._queue.append(episodes.leave_pinged(id=alarm.id, how=how, eta_min=eta, at=at))
         self._leaves.advance(self._queue.store)
+
+    def calendar_tminus(self, *, now: Optional[str] = None) -> bool:
+        """The calendar T-minus sense (C2, DL-110), on every sense pass.
+        Returns whether anything was written.
+
+        Code and nothing else: no model call. The calendar is read every
+        :data:`omega.tminus.READ_SECONDS` over the next
+        :data:`omega.tminus.HORIZON`, and on every pass each occurrence
+        :func:`omega.tminus.due` names is told once, as a deadline tell
+        (exempt from the day budget, DL-106) delivered ``timely``, under
+        its ``tminus:`` key and its calendar key. A key any event already
+        named is never told again, so a restart or a tell still waiting in
+        the queue does not double it. The first routine meeting it sees
+        brings the one question about routine warnings (DL-110), asked as a
+        follow-up is, at a moment one may go.
+
+        Under pace only, because the keys are what stop a repeat; while
+        Google access is lost nothing is read. **Never raises.**
+        """
+        if not self._recovered or not self._pace or self._events is None:
+            return False
+        try:
+            moment = datetime.fromisoformat(now or episodes.now())
+            if moment.tzinfo is None:
+                moment = moment.replace(tzinfo=timezone.utc)
+            if access.GOOGLE in self._access_now.advance(self._queue.store).state().lost:
+                return False
+            if self._events_at is None or not (
+                timedelta(0) <= moment - self._events_at
+                < timedelta(seconds=tminus.READ_SECONDS)
+            ):
+                self._events_read = tuple(self._events(moment, moment + tminus.HORIZON))
+                self._events_at = moment
+            found = self._events_read
+            state = self._ledger.advance(self._queue.store).state()
+            at = moment.isoformat()
+            wrote = False
+            for o in found:
+                try:
+                    k = tminus.due(o, moment, found, routine_warnings=state.routine_warnings)
+                    mine = tminus.key(o)
+                    if k is None or mine in state.named:
+                        continue
+                    self._queue.append(episodes.inbound(
+                        tools.tell_instruction(tminus.text(o, moment, found)),
+                        channel="schedule", urgency="timely", at=at,
+                        keys=self._keys(mine, ledger.calendar_key(o)),
+                    ))
+                    wrote = True
+                except Exception:  # noqa: BLE001 - one event never stops another
+                    continue
+            routine = next((o for o in found if tminus.kind(o) == "routine"), None)
+            if routine is not None and tminus.ASK_KEY not in state.named \
+                    and not state.routine_warnings:
+                self._outbox.advance(self._queue.store)
+                box = self._outbox.state()
+                if outbox.hold(box, moment, here=self._here(moment, box)) is None:
+                    self._queue.append(episodes.inbound(
+                        tools.tell_instruction(tminus.ask_text(routine)),
+                        channel="schedule", queued=[], at=at,
+                        keys=self._keys(tminus.ASK_KEY),
+                    ))
+                    wrote = True
+            if wrote:
+                self._ledger.advance(self._queue.store)
+            return wrote
+        except Exception:  # noqa: BLE001 - see the docstring
+            return False
 
     def _withdraw(self) -> None:
         """Write down every proposal that stopped applying (DL-087 #8): its

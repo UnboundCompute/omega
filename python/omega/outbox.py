@@ -467,11 +467,14 @@ def thinking_text(
     tasks: Sequence[str] = (),
     held: Sequence[str] = (),
     items: Sequence[str] = (),
+    routine: Sequence[str] = (),
 ) -> str:
     """The thinking turn's text: the ordinary look's situation, under a
     header saying what this look is for, with what is open over all of it.
     ``items`` are the told-ledger's keyed items new since they were last told
-    or weighed (C3), which this turn decides on."""
+    or weighed (C3), which this turn decides on. ``routine`` are their
+    routine meetings still to come today (DL-110), which get no warning of
+    their own and so are folded in here when they help."""
     name = slot.rsplit(" ", 1)[-1]
     lines = [
         f"Thinking time ({name}). Twice a day you go over everything open and "
@@ -489,6 +492,8 @@ def thinking_text(
         ("Sign-ins you lost:", lost),
         ("Research under way for them:", tasks),
         ("Already drafted and held for a better moment:", held),
+        ("Their routine meetings still to come today (no warning of their own; "
+         "fold them in if it helps):", routine),
     ):
         if items:
             lines.append("")

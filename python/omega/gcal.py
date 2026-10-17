@@ -82,8 +82,8 @@ EVENTS_URL = "https://www.googleapis.com/calendar/v3/calendars/primary/events"
 #: Only what a line needs. ``attendees(self,responseStatus)`` is enough to see
 #: their own answer without reading anyone else's address.
 FIELDS = (
-    "nextPageToken,items(status,summary,location,start,end,"
-    "attendees(self,responseStatus))"
+    "nextPageToken,items(id,iCalUID,recurringEventId,originalStartTime,"
+    "status,summary,location,start,end,attendees(self,responseStatus))"
 )
 
 #: A window is asked for on these boundaries, so looks a minute apart share
@@ -268,7 +268,14 @@ def _occurrence(item: object) -> Optional[Occurrence]:
         location=_clean(location, MAX_LOCATION) if isinstance(location, str) else "",
         uid=_uid(item),
         recurring=isinstance(item.get("recurringEventId"), str) or bool(item.get("recurrence")),
+        moved_from=_moved(item, start[0]),
     )
+
+
+def _moved(item: dict, start: datetime) -> Optional[datetime]:
+    """When a moved instance of a series was first due (C2), else ``None``."""
+    was = _instant(item.get("originalStartTime"))
+    return was[0] if was is not None and was[0] != start else None
 
 
 def _uid(item: dict) -> str:

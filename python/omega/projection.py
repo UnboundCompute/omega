@@ -363,6 +363,8 @@ def project(payload: dict[str, Any], seq: int) -> Optional[Update]:
             error=payload.get("error"),
             # DL-104: where a reply goes back to, when its turn named one.
             channel=payload.get("reply_to"),
+            # C2: a deadline tell's reply is timely; absent on every other.
+            urgency=payload.get("urgency"),
             # DL-103: what the reply asks, by id, so the tray can offer the
             # answer as a button without reading the reply's words. A reply
             # that quotes "p7" from a mail it read carries no proposal here,

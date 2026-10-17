@@ -749,6 +749,11 @@ def main(argv: Optional[list[str]] = None) -> int:
         calendar=lambda now: calendar.look_lines(
             now, on_occurrences=lambda found: ledger.record_events(rt.queue, found, now),
         ),
+        # C2: the same calendar as occurrences, for the T-minus sense; read
+        # through the same caches, and nothing when no calendar is set.
+        events=lambda start, end: (
+            calendar.read_window(start, end).occurrences if calendar.connected() else ()
+        ),
         # DL-083: the finance sweep rides the look's one reading of the inbox
         # and appends to the log through the runtime's own queue. `rt` is
         # bound before any look can run: looks start after `rt.start()`.

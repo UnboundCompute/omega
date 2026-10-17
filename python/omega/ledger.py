@@ -78,6 +78,14 @@ _PROMISE_REMINDER = re.compile(r"^pr[1-9][0-9]*$")
 _MODEL_REMINDER = re.compile(r"^r([1-9][0-9]*)-")
 _UNPROMPTED = frozenset({"self", "schedule", "task"})
 
+#: Their answer to the one question about routine meetings (DL-110), in their
+#: own words on a channel they write on. The latest one stands.
+_ROUTINE = r"(?:routine|recurring|regular|standups?|stand-ups?)"
+ROUTINE_ON = re.compile(rf"\bwarn me (?:before|about) (?:my |the )?{_ROUTINE}", re.I)
+ROUTINE_OFF = re.compile(
+    rf"\b(?:stop|no more|don'?t send|do not send) (?:the |my )?{_ROUTINE}"
+    r"(?: meetings?)? warnings?\b", re.I)
+
 # --- keys, from code ------------------------------------------------------------
 
 _PRINTABLE = re.compile(r"^[!-~]{1,280}$")
@@ -347,6 +355,11 @@ class State:
     unkeyed: int = 0
     #: Keys told again with nothing observed since they were last told.
     repeats: int = 0
+    #: Every key an event has named, told or still waiting to be: what a sense
+    #: that tells once (C2's T-minus, its one question) checks before telling.
+    named: frozenset = frozenset()
+    #: Whether they asked to be warned before routine meetings too (DL-110).
+    routine_warnings: bool = False
 
     def has_ref(self, key: Optional[str], ref: str) -> bool:
         if key is None:
@@ -480,7 +493,8 @@ class Ledger:
     """The fold. Kept at the log's head by the executor, as its other views."""
 
     __slots__ = ("_through", "_items", "_bulk", "_unprompted", "_inbound_keys",
-                 "_fires", "_sends", "_unkeyed", "_repeats", "_counted", "_taint")
+                 "_fires", "_sends", "_unkeyed", "_repeats", "_counted", "_taint",
+                 "_routine")
 
     def __init__(self) -> None:
         self._through = 0
@@ -496,6 +510,7 @@ class Ledger:
         # unprompted turn seq -> what untrusted content it read, so a reminder
         # it set carries that taint when it comes due (DL-120, DL-064).
         self._taint: dict[int, tuple[str, ...]] = {}
+        self._routine = False
 
     def _item(self, key: str, source: str, what: str, seq: int, at: str) -> Item:
         item = self._items.get(key)
@@ -550,6 +565,12 @@ class Ledger:
         elif kind == episodes.MESSAGE_INBOUND:
             if payload.get("channel") in _UNPROMPTED:
                 self._unprompted.add(seq)
+            elif not payload.get("untrusted"):
+                text = str(payload.get("text", ""))
+                if ROUTINE_OFF.search(text):
+                    self._routine = False
+                elif ROUTINE_ON.search(text):
+                    self._routine = True
             if payload.get("keys"):
                 self._inbound_keys[seq] = tuple(payload["keys"])
             if payload.get("schedule_id"):
@@ -606,6 +627,8 @@ class Ledger:
             sends=self._sends,
             unkeyed=self._unkeyed,
             repeats=self._repeats,
+            named=frozenset(k for ks in self._inbound_keys.values() for k in ks),
+            routine_warnings=self._routine,
         )
 
     def authored(self, sid: str) -> bool:
