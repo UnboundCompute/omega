@@ -46,6 +46,7 @@ from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any, Iterable, Optional, Sequence
 
 from omega import episodes, machine, notice
+from omega.tools import BRIEF_LEAD
 from omega.topics import spent
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -169,6 +170,10 @@ class State:
     heard_at: Optional[str] = None
     #: The ``at`` of the log's first episode: no slot before it was owed.
     began: Optional[str] = None
+    #: Local days whose brief went out or was held as a draft (DL-114).
+    briefed: frozenset[str] = frozenset()
+    #: Local day -> the ``at`` of the last thinking turn that carried the brief.
+    brief_tried: dict[str, str] = field(default_factory=dict)
 
     def delivered_on(self, day: str) -> int:
         return self.delivered.get(day, 0)
@@ -178,7 +183,8 @@ class Outbox:
     """The fold. Kept at the log's head by the executor, as its other views."""
 
     __slots__ = ("_through", "_drafts", "_taken", "_delivered", "_thought",
-                 "_thinking", "_spending", "_heard_at", "_began")
+                 "_thinking", "_spending", "_heard_at", "_began", "_briefing",
+                 "_briefed", "_brief_tried")
 
     def __init__(self) -> None:
         self._through = 0
@@ -191,6 +197,10 @@ class Outbox:
         self._spending: dict[str, int] = {}
         self._heard_at: Optional[str] = None
         self._began: Optional[str] = None
+        # brief-carrying thinking inbound seq -> its local day (gap 0a).
+        self._briefing: dict[int, str] = {}
+        self._briefed: set[str] = set()
+        self._brief_tried: dict[str, str] = {}
 
     def apply(self, seq: int, payload: dict[str, Any]) -> None:
         self._through = seq
@@ -209,6 +219,9 @@ class Outbox:
                 day = notice.local_date(str(payload.get("at", "")))
                 if day is not None:
                     self._thinking[seq] = day
+                    if str(payload.get("text", "")).startswith(BRIEF_LEAD):
+                        self._briefing[seq] = day
+                        self._brief_tried[day] = str(payload.get("at", ""))
             elif channel == "schedule" and isinstance(payload.get("queued"), list):
                 # (Before B4-lite held drafts went out this way, verbatim; a
                 # log written then still folds the same.)
@@ -216,12 +229,16 @@ class Outbox:
                 # it is delivered as written, so nothing else may send them.
                 self._taken.update(payload["queued"])
         elif kind == episodes.MESSAGE_QUEUED:
+            if payload.get("for_seq") in self._briefing:
+                self._briefed.add(self._briefing[payload["for_seq"]])
             self._drafts[seq] = Draft(
                 seq=seq, text=str(payload["text"]), source=str(payload["source"]),
                 at=str(payload["at"]), tainted=tuple(payload.get("tainted") or ()),
                 keys=tuple(payload.get("keys") or ()),
             )
         elif kind == episodes.MESSAGE_DELIVERED:
+            if payload.get("for_seq") in self._briefing:
+                self._briefed.add(self._briefing[payload["for_seq"]])
             self._taken.update(payload.get("queued") or [])
             day = notice.local_date(str(payload.get("at", "")))
             if day is not None:
@@ -248,6 +265,8 @@ class Outbox:
             spending=dict(self._spending),
             heard_at=self._heard_at,
             began=self._began,
+            briefed=frozenset(self._briefed),
+            brief_tried=dict(self._brief_tried),
         )
 
     @classmethod
@@ -370,6 +389,28 @@ def hold(state: State, now: datetime, *, here: bool, slot: bool = False) -> Opti
     if not slot and not here:
         return HOLD_AWAY
     return None
+
+
+#: How long after a brief-carrying turn that did not get the brief out omega
+#: waits before trying it again (gap 0a): the next hour, not the next tick.
+BRIEF_RETRY_SECONDS = 60 * 60
+
+
+def brief_owed(state: State, now: datetime) -> Optional[str]:
+    """Today's brief, as the slot ``"<date> brief"``, when the morning slot
+    that carries it has been served (run, or written down as failed) and
+    neither delivered nor held the brief (gap 0a); ``None`` otherwise. Only
+    while a brief stands, which the caller knows. Not in quiet hours, and not
+    within :data:`BRIEF_RETRY_SECONDS` of the last try."""
+    if quiet(now):
+        return None
+    day = notice.local_date(now.isoformat())
+    if day is None or day in state.briefed or f"{day} morning" not in state.thought:
+        return None
+    tried = _parse(state.brief_tried.get(day)) if state.brief_tried.get(day) else None
+    if tried is not None and (now - tried).total_seconds() < BRIEF_RETRY_SECONDS:
+        return None
+    return f"{day} brief"
 
 
 def thinking_left(state: State, now: datetime) -> bool:

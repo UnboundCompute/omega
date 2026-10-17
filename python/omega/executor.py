@@ -87,6 +87,20 @@ BRIEF_FOLDED = "brief: the morning thinking slot is the brief (DL-114)"
 AUTHORED_REMINDER = (
     "follow-up: a reminder omega set itself, written down for the composer (DL-120)"
 )
+WATCH_BY_CODE = (
+    "watch: what it watches is mail or the calendar, which the look already "
+    "reads; code matched it against what the senses saw (gap 0b)"
+)
+#: A standing watch whose whole scope is their mail or calendar: the look
+#: already reads both into the told-ledger, so code can write what it
+#: matched without a model turn. A watch that also names the web, a page or
+#: a feed still needs one (DL-089).
+_WATCH_SCOPE = re.compile(
+    r"\b(?:e-?mails?|mail|inbox|calendar|meetings?|invites?|events?)\b", re.I)
+_WATCH_ELSEWHERE = re.compile(
+    r"\b(?:web|site|page|news|price|prices|feed|search|online|linkedin|twitter|"
+    r"reddit|github|jobs?|posts?|listing|listings|url|https?)\b", re.I)
+_WATCH_SOURCES = {"mail": ("mail", "travel"), "calendar": ("calendar",)}
 #: How many keyed items one compose or thinking turn is shown, newest first.
 COMPOSE_ITEMS = 12
 
@@ -1485,6 +1499,8 @@ class Executor:
                 slot, wait = self._slot(moment, st)
                 if wait:
                     return False
+                if slot is None:
+                    slot = self._brief_owed(moment, st)
                 box = self._drop_stale(self._outbox.state(), moment)
                 drafts = box.drafts
                 if slot is None and self._recheck(moment, st, box):
@@ -1973,10 +1989,40 @@ class Executor:
 
     def _briefs_in(self, slot: str) -> bool:
         """Is this the slot that carries the brief (DL-114)? The morning one,
-        while a brief schedule stands."""
-        return slot.endswith(" morning") and any(
+        while a brief schedule stands; a retry of today's (gap 0a); and the
+        evening one on a day whose brief has not gone out yet."""
+        if slot.endswith(" brief"):
+            return True
+        if not any(
             s.instruction.startswith(tools.BRIEF_LEAD) for s in self._standing_schedules()
+        ):
+            return False
+        if slot.endswith(" morning"):
+            return True
+        day = slot.partition(" ")[0]
+        box = self._outbox.advance(self._queue.store).state()
+        return slot.endswith(" evening") and f"{day} morning" in box.thought and (
+            day not in box.briefed
         )
+
+    def _brief_owed(self, moment: datetime, st: notice.Standing) -> Optional[str]:
+        """Today's brief, again, when the morning slot that carries it did not
+        get it out (gap 0a): the slot failed (no entry, spend, deferral) or
+        its turn failed. Retried at most hourly, from the next idle moment,
+        and folded into the evening slot if it comes first; never in quiet
+        hours, while a turn is outstanding, or offline. Not held to the day's
+        thinking spend: it is a promise, not a thought. Only for a brief that
+        stood before this morning's slot began, so one set at 14:00 starts
+        tomorrow."""
+        if st.outstanding or (self._online is not None and not self._online()):
+            return None
+        start = outbox.slot_start(f"{notice.local_date(moment.isoformat())} morning")
+        if start is None or not any(
+            s.instruction.startswith(tools.BRIEF_LEAD) and s.created_at <= start
+            for s in self._standing_schedules()
+        ):
+            return None
+        return outbox.brief_owed(self._outbox.advance(self._queue.store).state(), moment)
 
     def _waiting(self, moment: datetime) -> list["ledger.Item"]:
         """The keyed items the composer may tell them now (C3), newest
@@ -2366,6 +2412,9 @@ class Executor:
             return SENSE_LOOK
         if channel == "schedule" and tools.is_brief(event):
             return BRIEF_FOLDED
+        if sid and tools.is_watch(event) and not tools.is_condition_watch(event):
+            if self._watch_by_code(pending, sid):
+                return WATCH_BY_CODE
         if tools.is_reminder(event) and sid:
             self._ledger.advance(self._queue.store)
             if self._ledger.authored(sid):
@@ -2381,6 +2430,45 @@ class Executor:
                 ))
                 return AUTHORED_REMINDER
         return None
+
+    def _watch_by_code(self, pending: Pending, sid: str) -> bool:
+        """A standing watch the senses already cover, answered in code (gap
+        0b): its scope is their mail or calendar only, and that sense is
+        wired. Each item the look recorded whose words share one of the
+        watch's is written down under the watch's key, once per item, with
+        the item's taint; the composer tells it. ``False`` runs the model
+        turn as before."""
+        what = str(pending.payload.get("text", ""))[len(tools.WATCH_LEAD):].split("\n", 1)[0]
+        if not _WATCH_SCOPE.search(what) or _WATCH_ELSEWHERE.search(what):
+            return False
+        sources: list[str] = []
+        if self._inbox is not None and re.search(r"mail|inbox", what, re.I):
+            sources += _WATCH_SOURCES["mail"]
+        if self._calendar is not None and re.search(r"calendar|meeting|invite|event", what, re.I):
+            sources += _WATCH_SOURCES["calendar"]
+        if not sources:
+            return False
+        wanted = ledger._words(what) - {
+            "email", "emails", "inbox", "meeting", "meetings", "invite", "invites",
+            "event", "events", "tell", "know", "anything", "something", "watch",
+        }
+        if not wanted:
+            return False
+        mine = ledger.key("watch", sid)
+        state = self._ledger.advance(self._queue.store).state()
+        for item in sorted(state.items.values(), key=lambda i: i.last_seq):
+            if item.closed or item.source not in sources or state.has_ref(mine, item.key):
+                continue
+            if not wanted & ledger._words(item.what):
+                continue
+            self._queue.append(episodes.observation_recorded(
+                key=mine, source="watch",
+                what=ledger._clip(f"{what}: {item.what}", episodes.MAX_OBSERVATION_WHAT),
+                evidence_seq=item.last_seq, ref=item.key,
+                untrusted=outbox.carried_taint((), said=item.untrusted),
+                deadline=item.deadline, when=item.when,
+            ))
+        return True
 
     def _steer(self, pending: Pending) -> Optional[TurnResult]:
         """An in-channel steer, answered in code (C2): "stop the LinkedIn

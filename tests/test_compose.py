@@ -126,6 +126,95 @@ def test_with_a_brief_standing_the_morning_slot_is_the_brief(q: EventQueue) -> N
     assert not tools.is_brief(kinds(q, episodes.MESSAGE_INBOUND)[-1])
 
 
+def _brief(q: EventQueue, when: datetime) -> None:
+    q.append(episodes.schedule_created(
+        id="b1-abcd", instruction=tools.brief_instruction(), cron="0 8 *",
+        at=when.isoformat(),
+    ))
+
+
+def test_a_failed_morning_slot_still_gets_the_brief_out_the_same_day(q: EventQueue) -> None:
+    """Gap 0a: omega was not there for the 09:00 slot, so it is written down
+    as failed; the brief is still owed and goes out at the next moment."""
+    q.append(episodes.inbound("hello", channel="tray", at=local(14, 6).isoformat()))
+    _brief(q, local(14, 6, 5))
+    ex = executor(q)
+    ex.drain()
+    assert ex.notice(now=local(14, 10, 0)) is True
+    [failed] = kinds(q, episodes.THINKING_FAILED)
+    assert failed["slot"] == "2026-10-14 morning" and failed["why"] == "no entry"
+    retry = kinds(q, episodes.MESSAGE_INBOUND)[-1]
+    assert retry["thinking"] == "2026-10-14 brief" and tools.is_brief(retry)
+    ex.drain()
+    assert last_turn(q)["outcome"] == "spoke"
+    assert kinds(q, episodes.MESSAGE_DELIVERED)[-1]["for_seq"] == last_turn(q)["for_seq"]
+    # Out once: the next idle moment and the evening slot are not briefs.
+    before = len(kinds(q, episodes.MESSAGE_INBOUND))
+    ex.notice(now=local(14, 12, 0))
+    assert all(not tools.is_brief(p) for p in kinds(q, episodes.MESSAGE_INBOUND)[before:])
+    ex.notice(now=local(14, 19, 5))
+    assert not tools.is_brief(kinds(q, episodes.MESSAGE_INBOUND)[-1])
+
+
+def test_a_brief_over_the_spend_is_still_owed(q: EventQueue) -> None:
+    q.append(episodes.inbound("hello", channel="tray", at=local(14, 6).isoformat()))
+    _brief(q, local(14, 6, 5))
+    ex = executor(q)
+    ex.drain()
+    box = outbox.State(thought=frozenset({"2026-10-14 morning"}))
+    assert outbox.brief_owed(box, local(14, 9, 40)) == "2026-10-14 brief"
+    assert outbox.brief_owed(
+        outbox.State(thought=box.thought, briefed=frozenset({"2026-10-14"})), local(14, 9, 40)
+    ) is None
+    # Quiet hours never carry it; the next morning's brief is the next one.
+    assert outbox.brief_owed(box, local(14, 23, 30)) is None
+
+
+def test_a_brief_whose_turn_failed_is_tried_again_after_an_hour(q: EventQueue) -> None:
+    q.append(episodes.inbound("hello", channel="tray", at=local(14, 6).isoformat()))
+    _brief(q, local(14, 6, 5))
+
+    def broken(role, messages):
+        raise provider.ProviderError("synthetic outage")
+
+    ex = executor(q, provider.FakeProvider({provider.JUDGE: broken, provider.ACT: broken}))
+    ex.drain()
+    ex.notice(now=local(14, 9, 5))
+    ex.drain()
+    assert last_turn(q)["outcome"] == "failed"
+    # Not again inside the hour.
+    n = len(kinds(q, episodes.MESSAGE_INBOUND))
+    ex.notice(now=local(14, 9, 30))
+    assert all(not tools.is_brief(p) for p in kinds(q, episodes.MESSAGE_INBOUND)[n:])
+    ex2 = executor(q)
+    ex2.notice(now=local(14, 10, 10))
+    retry = kinds(q, episodes.MESSAGE_INBOUND)[-1]
+    assert retry["thinking"] == "2026-10-14 brief"
+    ex2.drain()
+    assert last_turn(q)["outcome"] == "spoke"
+
+
+def test_an_owed_brief_rides_the_evening_slot(q: EventQueue) -> None:
+    q.append(episodes.inbound("hello", channel="tray", at=local(14, 6).isoformat()))
+    _brief(q, local(14, 6, 5))
+    q.append(episodes.thinking_failed(slot="2026-10-14 morning", why="no entry",
+                                      at=local(14, 9, 31).isoformat()))
+    ex = executor(q)
+    ex.drain()
+    ex.notice(now=local(14, 19, 5))
+    slot = kinds(q, episodes.MESSAGE_INBOUND)[-1]
+    assert slot["thinking"] == "2026-10-14 evening" and tools.is_brief(slot)
+
+
+def test_a_brief_set_after_the_morning_slot_starts_tomorrow(q: EventQueue) -> None:
+    q.append(episodes.inbound("hello", channel="tray", at=local(14, 6).isoformat()))
+    _brief(q, local(14, 14))
+    ex = executor(q)
+    ex.drain()
+    ex.notice(now=local(14, 15))
+    assert all(not tools.is_brief(p) for p in kinds(q, episodes.MESSAGE_INBOUND))
+
+
 def test_the_briefs_own_fire_is_folded_into_the_slot_without_a_model_call(
     q: EventQueue,
 ) -> None:
@@ -273,6 +362,41 @@ def test_a_standing_watch_is_a_sense_and_writes_what_it_found(q: EventQueue) -> 
     assert obs["key"] == "watch:w1-abcd" and obs["what"] == WORDS
     assert obs["evidence_seq"] == fired
     assert not kinds(q, episodes.MESSAGE_QUEUED)
+
+
+def test_a_mail_watch_is_answered_from_what_the_look_recorded(q: EventQueue) -> None:
+    """Gap 0b: a watch over their mail needs no model turn; the look already
+    read the mail into the ledger, and code matches the watch's words."""
+    calls: list[str] = []
+    ex = Executor(q, complete=fake(calls=calls).complete, pace=True,
+                  inbox=lambda now: ())
+    ex.recover()
+    noted(q, local(14, 11), key="mail:synthetic-1@example.test", source="mail",
+          what="mail from Landlord Synthetic: deposit returned",
+          untrusted=ledger.INBOX_SOURCE)
+    noted(q, local(14, 11), key="mail:synthetic-2@example.test", source="mail",
+          what="mail from Shop Synthetic: your order shipped",
+          untrusted=ledger.INBOX_SOURCE)
+    text = tools.watch_instruction("mail about the deposit")
+    fire(q, text, "w3-abcd", local(14, 12))
+    ex.drain()
+    assert calls == []
+    from omega.executor import WATCH_BY_CODE
+    assert last_turn(q)["judged"] == WATCH_BY_CODE
+    [obs] = [o for o in kinds(q, episodes.OBSERVATION_RECORDED) if o["key"] == "watch:w3-abcd"]
+    assert "deposit returned" in obs["what"] and obs["untrusted"] == ledger.INBOX_SOURCE
+    # Once per item: the next fire writes nothing new.
+    fire(q, text, "w3-abcd", local(14, 13))
+    ex.drain()
+    assert len([o for o in kinds(q, episodes.OBSERVATION_RECORDED)
+                if o["key"] == "watch:w3-abcd"]) == 1
+
+
+def test_a_mail_watch_with_no_inbox_wired_still_runs_the_model(q: EventQueue) -> None:
+    ex = executor(q)
+    fire(q, tools.watch_instruction("mail about the deposit"), "w3-abcd", local(14, 12))
+    ex.drain()
+    assert last_turn(q)["judged"] == SENSED
 
 
 def test_a_condition_watch_speaks_once_then_not_again_without_news(q: EventQueue) -> None:
