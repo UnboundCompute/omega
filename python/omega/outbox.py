@@ -65,6 +65,10 @@ __all__ = [
     "HOLD_AWAY",
     "HOLD_CLOCK",
     "HOLD_SPOKE",
+    "HOLD_BACKOFF",
+    "BACKOFF_AFTER",
+    "BACKOFF_BASE_SECONDS",
+    "backoff_seconds",
     "SPOKE_SECONDS",
     "SLOT_DEFER_SECONDS",
     "SLOT_LATE_SECONDS",
@@ -128,6 +132,23 @@ HOLD_BUDGET = f"today already had its {MAX_PER_DAY} unprompted messages"
 HOLD_AWAY = "they are not here; held for when they are, or the next thinking time"
 HOLD_CLOCK = "couldn't tell the time"
 HOLD_SPOKE = "they spoke in the last 10 minutes; held so it does not cut in"
+HOLD_BACKOFF = "they have not answered the last ones; waiting longer before the next"
+
+#: M3′'s doubling backoff on unanswered messages: once this many unprompted
+#: messages in a row went unanswered, the next waits
+#: :data:`BACKOFF_BASE_SECONDS` after the last, doubling with each further
+#: one, to :data:`BACKOFF_MAX_SECONDS`. Anything they send resets it. An
+#: engaged person still gets the day's two [A].
+BACKOFF_AFTER = 2
+BACKOFF_BASE_SECONDS = 24 * 3600
+BACKOFF_MAX_SECONDS = 7 * 24 * 3600
+
+
+def backoff_seconds(unanswered: int) -> int:
+    """How long after the last unanswered message the next one waits."""
+    if unanswered < BACKOFF_AFTER:
+        return 0
+    return min(BACKOFF_BASE_SECONDS * 2 ** (unanswered - BACKOFF_AFTER), BACKOFF_MAX_SECONDS)
 
 
 def _local(now: datetime) -> datetime:
@@ -177,6 +198,10 @@ class State:
     briefed: frozenset[str] = frozenset()
     #: Local day -> the ``at`` of the last thinking turn that carried the brief.
     brief_tried: dict[str, str] = field(default_factory=dict)
+    #: Unprompted messages delivered since they last wrote, and the ``at``
+    #: of the newest (M3′'s backoff).
+    unanswered: int = 0
+    last_sent_at: Optional[str] = None
 
     def delivered_on(self, day: str) -> int:
         return self.delivered.get(day, 0)
@@ -187,7 +212,7 @@ class Outbox:
 
     __slots__ = ("_through", "_drafts", "_taken", "_delivered", "_thought",
                  "_thinking", "_spending", "_heard_at", "_began", "_briefing",
-                 "_briefed", "_brief_tried")
+                 "_briefed", "_brief_tried", "_unanswered", "_last_sent_at")
 
     def __init__(self) -> None:
         self._through = 0
@@ -204,6 +229,8 @@ class Outbox:
         self._briefing: dict[int, str] = {}
         self._briefed: set[str] = set()
         self._brief_tried: dict[str, str] = {}
+        self._unanswered = 0
+        self._last_sent_at: Optional[str] = None
 
     def apply(self, seq: int, payload: dict[str, Any]) -> None:
         self._through = seq
@@ -216,6 +243,7 @@ class Outbox:
                 at = payload.get("at")
                 if isinstance(at, str):
                     self._heard_at = at
+                self._unanswered = 0
             slot = payload.get("thinking")
             if channel == notice.CHANNEL and isinstance(slot, str):
                 self._thought.add(slot)
@@ -246,6 +274,9 @@ class Outbox:
             day = notice.local_date(str(payload.get("at", "")))
             if day is not None:
                 self._delivered[day] = self._delivered.get(day, 0) + 1
+            self._unanswered += 1
+            if isinstance(payload.get("at"), str):
+                self._last_sent_at = payload["at"]
         elif kind == episodes.MESSAGE_DROPPED:
             self._taken.update(payload.get("queued") or [])
         elif kind == episodes.THINKING_FAILED:
@@ -270,6 +301,8 @@ class Outbox:
             began=self._began,
             briefed=frozenset(self._briefed),
             brief_tried=dict(self._brief_tried),
+            unanswered=self._unanswered,
+            last_sent_at=self._last_sent_at,
         )
 
     @classmethod
@@ -385,11 +418,14 @@ def present(presence: Any, heard_at: Optional[str], *, now: datetime) -> bool:
     return 0 <= age < PRESENT_SECONDS
 
 
-def hold(state: State, now: datetime, *, here: bool, slot: bool = False) -> Optional[str]:
+def hold(
+    state: State, now: datetime, *, here: bool, slot: bool = False, brief: bool = False
+) -> Optional[str]:
     """Why a non-urgent unprompted message must wait, or ``None`` to send it.
 
-    Quiet hours first, then the day's budget, then whether they spoke in the
-    last :data:`SPOKE_SECONDS` (B4-lite: never cut in on them), then
+    Quiet hours first, then the day's budget, then the backoff on unanswered
+    messages (M3′; never the brief they asked for), then whether they spoke
+    in the last :data:`SPOKE_SECONDS` (B4-lite: never cut in on them), then
     (outside a thinking slot, which is its own good time) whether they are
     here. A day that cannot be read has no budget left: this breaks closed,
     toward holding.
@@ -401,6 +437,10 @@ def hold(state: State, now: datetime, *, here: bool, slot: bool = False) -> Opti
         return HOLD_CLOCK
     if state.delivered_on(day) >= MAX_PER_DAY:
         return HOLD_BUDGET
+    wait = 0 if brief else backoff_seconds(state.unanswered)
+    last = _parse(state.last_sent_at) if wait and state.last_sent_at else None
+    if last is not None and (now - last).total_seconds() < wait:
+        return HOLD_BACKOFF
     if conversing(state.heard_at, now=now):
         return HOLD_SPOKE
     if not slot and not here:

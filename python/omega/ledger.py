@@ -64,6 +64,9 @@ __all__ = [
     "normalized",
     "covers",
     "omega_authored",
+    "connect",
+    "plan_of",
+    "tender",
 ]
 
 #: A reminder due this soon takes the items it covers (C3) [A].
@@ -73,6 +76,13 @@ REMINDER_ABSORB_SECONDS = 6 * 3600
 FRESH_SECONDS = 24 * 3600
 #: Silence after which their next message is a return (C4 continuity).
 RETURN_SECONDS = 48 * 3600
+#: How many open items one message of theirs may bring into the reply (C5).
+MAX_CONNECTED = 3
+#: How long after a key's ``follow_up_due`` its one follow-up may still go
+#: (M3′): past this, asking how it went is stale and nothing asks.
+FOLLOW_UP_WINDOW_SECONDS = 48 * 3600
+#: When a flight's one follow-up may go: this long after it lands [A].
+FLIGHT_FOLLOW_UP_SECONDS = 2 * 3600
 #: Whose words an observation's ``what`` repeats, when it repeats a mail's.
 INBOX_SOURCE = "their inbox"
 _REMINDER_LEAD = "Reminder you promised them: "
@@ -228,28 +238,34 @@ def mail_observations(
         when = m.date.isoformat() if getattr(m, "date", None) is not None else None
         ci = ci_of(m)
         ts = None if ci else slack_ts(m)
+        sort: Optional[str] = None
+        people: list[str] = []
         if ci is not None:
-            key, source = ci.key, "ci"
+            key, source, sort = ci.key, "ci", "ci"
             what = f"CI failed: {ci.workflow} on {ci.owner}/{ci.repo}"
         elif ts is not None:
             addr = parseaddr(str(m.sender))[1].lower() or "slack"
             key, source = f"slack:{_safe(addr)}:{ts}", "slack"
             what = f"Slack, via mail: {m.subject or '(no subject)'}"
         elif is_travel(m):
-            key, source = ref, "travel"
+            key, source, sort = ref, "travel", "trip"
             what = f"travel mail from {_who(m.sender)}: {m.subject or '(no subject)'}"
         elif getattr(m, "bulk", False):
             if not seen.has_ref(None, ref):
                 bulk.append(ref)
             continue
         else:
-            key, source = ref, "mail"
+            key, source, sort = ref, "mail", "mail"
             what = f"mail from {_who(m.sender)}: {m.subject or '(no subject)'}"
+            name = parseaddr(str(getattr(m, "sender", "") or ""))[0]
+            if name.strip():
+                people = [_clip(name, 80)]
         if seen.has_ref(key, ref):
             continue
         out.append(episodes.observation_recorded(
             key=key, source=source, what=_clip(what), ref=ref, untrusted=INBOX_SOURCE,
             url=ci.url if ci is not None else None, when=when, at=at,
+            thread_kind=sort, people=people or None,
         ))
     if bulk:
         bulk = bulk[: 200]
@@ -274,9 +290,17 @@ def event_observations(occurrences: Sequence[Any], seen: "State", now: datetime)
         when = o.start.astimezone().strftime("%a %d %b %H:%M") if not o.all_day else (
             o.start.astimezone().strftime("%a %d %b, all day"))
         what = f"{o.summary} ({when})" + (f" at {o.location}" if o.location else "")
+        flight = not o.all_day and bool(_FLIGHT.search(str(o.summary)))
         out.append(episodes.observation_recorded(
             key=key, source="calendar", what=_clip(what), ref=key,
             deadline=o.start.isoformat(), when=o.start.isoformat(), at=now.isoformat(),
+            thread_kind="flight" if flight else "event", next_expected=o.start.isoformat(),
+            # A flight is asked about once after it lands (M3′); a meeting is
+            # not, or every meeting would end in a "how did it go?".
+            follow_up_due=(
+                (o.end + timedelta(seconds=FLIGHT_FOLLOW_UP_SECONDS)).isoformat()
+                if flight else None
+            ),
         ))
     return out
 
@@ -332,6 +356,13 @@ class Item:
     told_text: Optional[str] = None
     considered_seq: int = 0
     closed: bool = False
+    #: The lifecycle fields (M3′), as the newest observation set them.
+    thread_kind: Optional[str] = None
+    people: tuple = ()
+    follow_up_due: Optional[str] = None
+    next_expected: Optional[str] = None
+    #: The send that asked how it went, once its follow-up was due.
+    followed_seq: int = 0
 
     @property
     def recurrence(self) -> int:
@@ -365,6 +396,9 @@ class State:
     #: Their messages that came after two days or more of silence, by seq,
     #: with how many days it was (C4 continuity).
     returns: dict = field(default_factory=dict)
+    #: Sends that named a key whose one follow-up had already gone (M3′'s
+    #: violation count: it must stay 0).
+    refollowed: int = 0
 
     def has_ref(self, key: Optional[str], ref: str) -> bool:
         if key is None:
@@ -413,6 +447,23 @@ class State:
             if seen is None or (now - seen).total_seconds() > fresh_seconds:
                 continue
             if self.absorbed(item, now, within=within) is not None:
+                continue
+            out.append(item)
+        return sorted(out, key=lambda i: i.last_seq)
+
+    def follow_ups(self, now: datetime, *,
+                   window: int = FOLLOW_UP_WINDOW_SECONDS) -> list[Item]:
+        """Open keys whose one follow-up is due now and has not gone (M3′):
+        due, inside the window, never followed up, and not a tender topic
+        unless it was they who raised it (their own words). Oldest first."""
+        out = []
+        for item in self.items.values():
+            due = _parse(item.follow_up_due)
+            if item.closed or item.reminder or item.followed_seq or due is None:
+                continue
+            if not 0 <= (now - due).total_seconds() <= window:
+                continue
+            if item.source != "words" and tender(item.what):
                 continue
             out.append(item)
         return sorted(out, key=lambda i: i.last_seq)
@@ -470,6 +521,109 @@ def _words(text: str) -> set[str]:
     return {w for w in normalized(text).split() if len(w) >= 4 and w not in _STOP and not w.isdigit()}
 
 
+#: Words that say nothing about which thread a message of theirs is on, on
+#: top of :data:`_STOP`: a chat word shared with a subject line is not a
+#: connection (C5's irrelevant-injection guard) [A].
+_CHAT_STOP = frozenset(
+    "back been could does doing done going good great home know look looking "
+    "much okay please really right said should still sure thanks thank think "
+    "want week well work would yeah year days hours morning evening night "
+    "event meeting update"
+    .split()
+)
+
+
+def _salient(text: str) -> set[str]:
+    return _words(text) - _CHAT_STOP
+
+
+def _terms(item: Item) -> tuple[set[str], set[str]]:
+    """An item's codes and salient words: its line, and the people it names."""
+    text = " ".join((item.what, *item.people))
+    return _codes(text), _salient(text)
+
+
+def connect(state: State, text: str, *, limit: int = MAX_CONNECTED) -> list[Item]:
+    """The open items one message of theirs is about (C5): a shared flight or
+    booking code, a shared name, place or project word. Code only, no model
+    and no embeddings; at most ``limit``, best first, and none when nothing
+    matches (abstain). Never a reminder of theirs, which tells itself."""
+    codes, words = _codes(text), _salient(text)
+    if not (codes or words):
+        return []
+    scored = []
+    for item in state.items.values():
+        if item.closed or item.reminder:
+            continue
+        their_codes, their_words = _terms(item)
+        score = 3 * len(codes & their_codes) + len(words & their_words)
+        if score:
+            scored.append((score, item.last_seq, item))
+    scored.sort(key=lambda t: (-t[0], -t[1]))
+    return [item for _, _, item in scored[:limit]]
+
+
+def shared(item: Item, text: str) -> list[str]:
+    """The codes and salient words ``text`` shares with ``item``, sorted."""
+    their_codes, their_words = _terms(item)
+    return sorted((_codes(text) & their_codes) | (_salient(text) & their_words))
+
+
+def mentioned(item: Item, text: str) -> bool:
+    """Does ``text`` (a reply) speak of ``item``: a shared code or salient
+    word? What decides whether a reply's connection is ledgered (D8)."""
+    return bool(shared(item, text))
+
+
+#: Topics a follow-up never raises unless they did (M3′): asking "how did it
+#: go?" about a funeral read off a mail is the creepy kind of attentive [A].
+_TENDER = re.compile(
+    r"\b(funeral|memorial|hospital|surgery|operation|diagnos\w*|biopsy|therapy|"
+    r"therapist|counsell?ing|grief|griev\w*|passed away|died|death|breakup|break-up|"
+    r"divorce|cancer|chemo\w*|miscarriage|rehab|sick|illness|ill)\b",
+    re.I,
+)
+
+
+def tender(text: str) -> bool:
+    return bool(_TENDER.search(text or ""))
+
+
+_FLIGHT = re.compile(r"\bflight\b|\u2708", re.I)
+_DAYS = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
+#: A plan in their own words (M3′): "I have an interview tomorrow", "I'm
+#: flying to Testville on Friday". Narrow on purpose: a miss costs a
+#: follow-up, a false hit costs a strange question [A].
+_PLAN = re.compile(
+    r"\b(?:i have|i've got|i got|i'?m|i am)\s+(?:got\s+)?"
+    r"(?P<what>(?:an?|my|the)\s+[a-z][a-z' -]{2,40}?|(?:flying|going|off|heading|driving)\s+to\s+[a-z][a-z' -]{1,40}?)"
+    r"\s+(?P<day>today|tonight|tomorrow|this (?:morning|afternoon|evening)|on (?:"
+    + "|".join(_DAYS) + r"))\b",
+    re.I,
+)
+
+
+def plan_of(text: str, at: str) -> Optional[tuple[str, str]]:
+    """``(what, follow_up_due)`` for a plan they stated, or ``None``. The
+    follow-up is due at 10:00 local the day after the plan's day."""
+    m = _PLAN.search(text or "")
+    moment = _parse(at)
+    if m is None or moment is None:
+        return None
+    local = moment.astimezone()
+    day = m.group("day").lower()
+    if day == "tomorrow":
+        on = local.date() + timedelta(days=1)
+    elif day.startswith("on "):
+        ahead = (_DAYS.index(day[3:]) - local.weekday()) % 7
+        on = local.date() + timedelta(days=ahead)
+    else:
+        on = local.date()
+    due = datetime.combine(on + timedelta(days=1), datetime.min.time(), local.tzinfo).replace(hour=10)
+    what = _clip(f"they said: {m.group('what').strip()} {day}", 200)
+    return what, due.isoformat()
+
+
 def covers(reminder: Item, item: Item) -> bool:
     """Does this reminder speak for this item? A shared flight or booking
     code, or a deadline within the absorb window after the reminder's with a
@@ -499,7 +653,7 @@ class Ledger:
 
     __slots__ = ("_through", "_items", "_bulk", "_unprompted", "_inbound_keys",
                  "_fires", "_sends", "_unkeyed", "_repeats", "_counted", "_taint",
-                 "_routine", "_heard_at", "_returns")
+                 "_routine", "_heard_at", "_returns", "_refollowed")
 
     def __init__(self) -> None:
         self._through = 0
@@ -518,6 +672,7 @@ class Ledger:
         self._routine = False
         self._heard_at: Optional[datetime] = None
         self._returns: dict[int, int] = {}
+        self._refollowed = 0
 
     def _item(self, key: str, source: str, what: str, seq: int, at: str) -> Item:
         item = self._items.get(key)
@@ -547,6 +702,11 @@ class Ledger:
                 item.refs.add(str(payload["ref"]))
             if payload.get("untrusted"):
                 item.untrusted = tuple(dict.fromkeys((*item.untrusted, str(payload["untrusted"]))))
+            for name in ("thread_kind", "follow_up_due", "next_expected"):
+                if payload.get(name) is not None:
+                    setattr(item, name, str(payload[name]))
+            if payload.get("people"):
+                item.people = tuple(str(p) for p in payload["people"])
         elif kind == episodes.SCHEDULE_CREATED:
             sid = str(payload.get("id", ""))
             text = str(payload.get("instruction", ""))
@@ -586,6 +746,16 @@ class Ledger:
                     self._routine = False
                 elif ROUTINE_ON.search(text):
                     self._routine = True
+                plan = plan_of(text, str(payload.get("at", "")))
+                if plan is not None:
+                    # Their own words open a key (M3′) with its one
+                    # follow-up. Weighed as it is opened: what they just told
+                    # omega is not news to tell them back.
+                    what, due = plan
+                    item = self._item(f"words:{seq}", "words", what, seq, str(payload.get("at", "")))
+                    item.thread_kind, item.follow_up_due = "plan", due
+                    item.considered_seq = seq
+                    item.refs.add(f"said@{seq}")
             if payload.get("keys"):
                 self._inbound_keys[seq] = tuple(payload["keys"])
             if payload.get("schedule_id"):
@@ -636,6 +806,7 @@ class Ledger:
                 if not keys:
                     self._unkeyed += 1
             reply = payload.get("reply")
+            said_at = _parse(payload.get("at"))
             for k in keys:
                 item = self._items.get(k)
                 if item is None:
@@ -643,6 +814,13 @@ class Ledger:
                     item.last_seq = 0
                 elif item.told_seq and item.last_seq <= item.told_seq:
                     self._repeats += 1
+                due = _parse(item.follow_up_due)
+                if due is not None and said_at is not None and said_at >= due:
+                    # Its one follow-up (M3′): any later one is counted.
+                    if item.followed_seq:
+                        self._refollowed += 1
+                    else:
+                        item.followed_seq = for_seq
                 item.told_seq = for_seq
                 item.told_at = str(payload.get("at", ""))
                 item.told_text = str(reply)[:1000] if isinstance(reply, str) else None
@@ -659,6 +837,7 @@ class Ledger:
             named=frozenset(k for ks in self._inbound_keys.values() for k in ks),
             routine_warnings=self._routine,
             returns=dict(self._returns),
+            refollowed=self._refollowed,
         )
 
     def authored(self, sid: str) -> bool:
@@ -708,6 +887,9 @@ def lines(items: Sequence[Item], *, now: datetime) -> list[str]:
             notes.append(f"last told {i.told_at[:16]}")
         if i.deadline:
             notes.append(f"at {i.deadline[:16]}")
+        due = _parse(i.follow_up_due)
+        if due is not None and due <= now and not i.followed_seq:
+            notes.append("its one follow-up: ask once how it went, then let it be")
         tail = f" ({'; '.join(notes)})" if notes else ""
         out.append(f"[{i.key}] {i.what}{tail}")
     return out
