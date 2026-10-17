@@ -643,6 +643,11 @@ OBSERVATION_SOURCES = frozenset({
 })
 MAX_OBSERVATION_WHAT = 500
 MAX_OBSERVATION_REFS = 200
+#: What sort of thread an observation is on (M3′'s lifecycle fields): named
+#: ``thread_kind`` because ``kind`` is the episode's own.
+THREAD_KINDS = frozenset({"flight", "event", "trip", "ci", "mail", "plan"})
+#: The people one observation names, each a short display name.
+MAX_OBSERVATION_PEOPLE = 5
 #: The threads one message may speak for.
 MAX_KEYS = 32
 #: A key: a lowercase family, a colon, then printable non-space ASCII.
@@ -4180,6 +4185,8 @@ def observation_recorded(
     deadline: Optional[str] = None, ref: Optional[str] = None,
     refs: Optional[Sequence[str]] = None, untrusted: Optional[str] = None,
     url: Optional[str] = None, when: Optional[str] = None, at: Optional[str] = None,
+    thread_kind: Optional[str] = None, people: Optional[Sequence[str]] = None,
+    follow_up_due: Optional[str] = None, next_expected: Optional[str] = None,
 ) -> dict[str, Any]:
     """One thing a sense saw (C1, DL-109), on the thread ``key``.
 
@@ -4188,16 +4195,25 @@ def observation_recorded(
     failure on the same workflow is a recurrence. ``untrusted`` names whose
     words ``what`` repeats (DL-064): a subject line is the sender's. ``url``
     is a link a code parser took from the item (a CI run), ``when`` when the
-    item itself happened (a mail's date)."""
+    item itself happened (a mail's date).
+
+    The lifecycle fields (M3′), each optional and set by code: ``thread_kind``
+    (one of :data:`THREAD_KINDS`), ``people`` (display names it names),
+    ``next_expected`` (when the thing itself is next due, a flight's
+    departure) and ``follow_up_due`` (from when one follow-up may ask how it
+    went)."""
     payload: dict[str, Any] = {"v": VERSION, "kind": OBSERVATION_RECORDED, "key": key,
                                "source": source, "what": what,
                                "evidence_seq": evidence_seq, "at": at or now()}
     for name, value in (("deadline", deadline), ("ref", ref), ("untrusted", untrusted),
-                        ("url", url), ("when", when)):
+                        ("url", url), ("when", when), ("thread_kind", thread_kind),
+                        ("follow_up_due", follow_up_due), ("next_expected", next_expected)):
         if value is not None:
             payload[name] = value
     if refs is not None:
         payload["refs"] = list(refs)
+    if people:
+        payload["people"] = list(people)
     _validate(payload)
     return payload
 
@@ -4234,13 +4250,22 @@ def _validate_observation(payload: dict[str, Any]) -> None:
     _require_sentence(payload, "what", cap=MAX_OBSERVATION_WHAT)
     if payload["evidence_seq"] is not None:
         _require_seq(payload, "evidence_seq")
-    for name in ("deadline", "when"):
+    for name in ("deadline", "when", "follow_up_due", "next_expected"):
         if name in payload:
             _require_str(payload, name, non_empty=True)
             try:
                 datetime.fromisoformat(payload[name])
             except ValueError as exc:
                 raise BadPayload(f"{name} must be an ISO-8601 moment") from exc
+    if "thread_kind" in payload and payload["thread_kind"] not in THREAD_KINDS:
+        raise BadPayload(f"thread_kind must be one of {sorted(THREAD_KINDS)}")
+    if "people" in payload:
+        people = payload["people"]
+        if (
+            not isinstance(people, list) or not people or len(people) > MAX_OBSERVATION_PEOPLE
+            or not all(isinstance(x, str) and x.strip() and len(x) <= 80 for x in people)
+        ):
+            raise BadPayload(f"people must be 1 to {MAX_OBSERVATION_PEOPLE} names of at most 80 characters")
     if "ref" in payload:
         _require_sentence(payload, "ref", cap=300)
     if "untrusted" in payload:

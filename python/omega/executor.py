@@ -2044,7 +2044,11 @@ class Executor:
             state = self._ledger.advance(self._queue.store).state()
         except Exception:  # noqa: BLE001 - a sense never kills the look
             return []
-        return state.waiting(moment)[-COMPOSE_ITEMS:]
+        waiting = state.waiting(moment)
+        # M3′: a key whose one follow-up is due waits too, told or not.
+        have = {i.key for i in waiting}
+        due = [i for i in state.follow_ups(moment) if i.key not in have]
+        return sorted([*waiting, *due], key=lambda i: i.last_seq)[-COMPOSE_ITEMS:]
 
     def _observe_machines(
         self, lines: Sequence[str], st: notice.Standing, moment: datetime
@@ -2115,7 +2119,10 @@ class Executor:
         if moment is None or moment.tzinfo is None:
             why: Optional[str] = outbox.HOLD_CLOCK
         else:
-            why = outbox.hold(box, moment, here=self._here(moment, box), slot=slot)
+            why = outbox.hold(
+                box, moment, here=self._here(moment, box), slot=slot,
+                brief=slot and str(event.get("text", "")).startswith(tools.BRIEF_LEAD),
+            )
         compose = look and not slot and not recheck and bool(event.get("keys"))
         return outbox.Gate(
             hold=why,
@@ -2346,6 +2353,25 @@ class Executor:
         )[:COMPOSE_ITEMS]
         return {"resume": items, "resume_days": days} if items else {}
 
+    def _connected(self, pending: Pending) -> dict[str, Any]:
+        """C5: the open items their message is about, matched by code (at
+        most three, none when nothing matches), and not the ones a return
+        already shows; nothing on a turn they did not write."""
+        event = pending.payload
+        if not self._pace or event.get("kind", episodes.MESSAGE_INBOUND) != episodes.MESSAGE_INBOUND:
+            return {}
+        if event.get("channel") in notice.UNPROMPTED_CHANNELS or event.get("untrusted"):
+            return {}
+        state = self._ledger.advance(self._queue.store).state()
+        resumed = set() if state.returns.get(pending.seq) is None else {
+            i.key for i in state.items.values() if not i.closed and not i.reminder
+        }
+        found = [
+            i for i in ledger.connect(state, str(event.get("text", "")))
+            if i.key not in resumed and i.key != f"words:{pending.seq}"
+        ]
+        return {"connected": found} if found else {}
+
     def _pause_proposal(self, entry: Any) -> Optional[dict[str, Any]]:
         """Pausing a failing watch, as the ``tidy`` tool would propose it, or
         ``None`` when there is no tidy grant or no such watch running. The
@@ -2489,6 +2515,7 @@ class Executor:
             **self._told(pending),
             **self._thinking(pending),
             **self._resumed(pending),
+            **self._connected(pending),
         )
         self._queue.finish(pending.seq)
         # After the reply is durable, and never able to fail or hold it.

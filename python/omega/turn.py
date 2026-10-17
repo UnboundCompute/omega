@@ -37,7 +37,7 @@ from omega import blobs, derive, episodes, grants as granted, learn, lessons as 
 from omega import delegate, leave, mcp, slack
 from omega import location as whereabouts
 from omega import tasks as _tasks
-from omega import outbox
+from omega import ledger, outbox
 from omega.tools import (
     INBOX_SOURCE,
     MAIL,
@@ -393,6 +393,10 @@ class TurnContext:
     resume: Sequence[Any] = ()
     #: How long they had been quiet, in days, when ``resume`` is set.
     resume_days: int = 0
+    #: C5: the open told-ledger items their message is about, matched by
+    #: code (:func:`omega.ledger.connect`), at most three. Empty when nothing
+    #: matched, and on every turn they did not write.
+    connected: Sequence[Any] = ()
 
 
 #: Channels whose events nobody typed: omega's own look (DL-061) and the clock
@@ -897,6 +901,7 @@ def run_turn(
     think: Optional[Callable[["TurnContext"], Any]] = None,
     resume: Sequence[Any] = (),
     resume_days: int = 0,
+    connected: Sequence[Any] = (),
 ) -> TurnResult:
     """Run one turn over an already-claimed episode and record how it ended.
 
@@ -953,7 +958,9 @@ def run_turn(
     and the reply, and hands back the one message or ``None``; everything
     after (the brief's tail, the gate) runs as for any turn. ``resume`` is
     what was open when they went quiet, on their first message after two
-    days of silence (C4 continuity).
+    days of silence (C4 continuity). ``connected`` is what their message is
+    about among the open threads (C5); a reply that speaks of one names its
+    key on its record, so the ledger knows it was said (D8).
     """
     # Metered here, once, so every model call the turn makes — judge, act
     # loop, reply and teach extraction all go through `ctx.complete` — lands
@@ -1035,6 +1042,7 @@ def run_turn(
         tasks=tasks,
         resume=tuple(resume),
         resume_days=resume_days,
+        connected=tuple(connected),
     )
 
     verdict: Optional[Verdict] = None
@@ -1271,6 +1279,10 @@ def run_turn(
             verdict=verdict,
         )
 
+    if not keys and ctx.connected and not unprompted(ctx):
+        # C5, D8: a reply that linked their message to an open thread says
+        # so on its record, as any tell does, so it is not told again as news.
+        keys = tuple(i.key for i in ctx.connected if ledger.mentioned(i, text))
     record = write_memory(
         queue,
         seq=pending.seq,
@@ -1689,6 +1701,7 @@ def _event_turn(
         f"{_clock_line(ctx.event)}"
         f"{_location_section(ctx)}"
         f"{_resume_section(ctx)}"
+        f"{_connected_section(ctx)}"
         f"{_learned_section(ctx.learned, at=str(ctx.event.get('at', '')))}"
         f"{self_taught.section(ctx.lessons) if lessons else ''}"
         f"Recent history:\n{_transcript(ctx.recalled, stub_mail=not unprompted(ctx))}\n\n"
@@ -1730,6 +1743,39 @@ def _resume_section(ctx: TurnContext) -> str:
         f"They have been quiet for {ctx.resume_days} days. Still open when they "
         f"went quiet (name the ones that matter in your reply, briefly, without "
         f"looking anything up):\n{body}\n\n"
+    )
+
+
+def _connected_section(ctx: TurnContext) -> str:
+    """C5: what their message is about among the open threads, matched by
+    code, so the reply can connect it ("you're in Delhi, so ZZ123 landed")
+    rather than answer it as if it came from nowhere. A thread that came off
+    their mail is named only by its key and the words their own message
+    shares with it (DL-108, DL-115): a sender's words are not theirs to be
+    told back. Empty when nothing matched, and on any turn they did not write.
+    """
+    if not ctx.connected or unprompted(ctx):
+        return ""
+    said = str(ctx.event.get("text", ""))
+    lines = []
+    for item in ctx.connected:
+        if getattr(item, "untrusted", ()):
+            terms = ", ".join(ledger.shared(item, said)) or "this"
+            lines.append(
+                f"[{item.key}] a {item.source} thread from their inbox that also "
+                f"mentions {terms} (its words are a sender's; open it with inbox "
+                "only if acting on it needs more)"
+            )
+        else:
+            lines.append(f"[{item.key}] {item.what}")
+    body = "\n".join(f"- {line}" for line in lines)
+    return (
+        "Their message touches what is open (matched by code; use what fits, "
+        "ignore what does not):\n"
+        f"{body}\n"
+        "If they told you something about their life, engage with it - what it "
+        "means for them, what is next - not just acknowledge it. Connect it to "
+        "the thread in a sentence; do not recite the list.\n\n"
     )
 
 

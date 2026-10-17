@@ -440,6 +440,9 @@ def test_over_budget_the_thinking_message_is_carried_to_tomorrow(q: EventQueue) 
     day = local(14, 12).isoformat()
     for n in range(outbox.MAX_PER_DAY):
         q.append(episodes.message_delivered(for_seq=1, at=day))
+    # They answered, so M3' backoff on unanswered messages does not apply.
+    said(q, "thanks", local(14, 13))
+    ex.drain()
     q.append(episodes.message_queued(
         text="An older draft.", source="look", why=outbox.HOLD_AWAY, at=day,
     ))
@@ -790,3 +793,14 @@ def test_a_leave_ping_in_quiet_hours_is_identical_with_the_outbox_on(
     assert on == off
     assert not [p for p in on if p["kind"] in episodes.OUTBOX_KINDS]
     assert [p["outcome"] for p in on if p["kind"] == episodes.TURN_COMPLETED][-1] == "spoke"
+
+
+def test_backoff_holds_unanswered_messages_but_never_the_brief() -> None:
+    # M3': two unanswered unprompted messages an hour ago hold the next one,
+    # but the morning brief they asked for still goes (DL-080).
+    sent = local(15, 8)
+    box = outbox.State(unanswered=outbox.BACKOFF_AFTER, last_sent_at=sent.isoformat())
+    now = local(15, 9, 3)
+    assert outbox.hold(box, now, here=True, slot=True) == outbox.HOLD_BACKOFF
+    assert outbox.hold(box, now, here=True, slot=True, brief=True) is None
+    assert outbox.hold(box, sent + timedelta(days=1, minutes=1), here=True, slot=True) is None
