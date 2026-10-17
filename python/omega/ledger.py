@@ -71,6 +71,8 @@ REMINDER_ABSORB_SECONDS = 6 * 3600
 #: How old an item may be and still be offered to the composer: the look reads
 #: a few days of mail, and a mail from three days ago is not news.
 FRESH_SECONDS = 24 * 3600
+#: Silence after which their next message is a return (C4 continuity).
+RETURN_SECONDS = 48 * 3600
 #: Whose words an observation's ``what`` repeats, when it repeats a mail's.
 INBOX_SOURCE = "their inbox"
 _REMINDER_LEAD = "Reminder you promised them: "
@@ -360,6 +362,9 @@ class State:
     named: frozenset = frozenset()
     #: Whether they asked to be warned before routine meetings too (DL-110).
     routine_warnings: bool = False
+    #: Their messages that came after two days or more of silence, by seq,
+    #: with how many days it was (C4 continuity).
+    returns: dict = field(default_factory=dict)
 
     def has_ref(self, key: Optional[str], ref: str) -> bool:
         if key is None:
@@ -494,7 +499,7 @@ class Ledger:
 
     __slots__ = ("_through", "_items", "_bulk", "_unprompted", "_inbound_keys",
                  "_fires", "_sends", "_unkeyed", "_repeats", "_counted", "_taint",
-                 "_routine")
+                 "_routine", "_heard_at", "_returns")
 
     def __init__(self) -> None:
         self._through = 0
@@ -511,6 +516,8 @@ class Ledger:
         # it set carries that taint when it comes due (DL-120, DL-064).
         self._taint: dict[int, tuple[str, ...]] = {}
         self._routine = False
+        self._heard_at: Optional[datetime] = None
+        self._returns: dict[int, int] = {}
 
     def _item(self, key: str, source: str, what: str, seq: int, at: str) -> Item:
         item = self._items.get(key)
@@ -565,7 +572,15 @@ class Ledger:
         elif kind == episodes.MESSAGE_INBOUND:
             if payload.get("channel") in _UNPROMPTED:
                 self._unprompted.add(seq)
-            elif not payload.get("untrusted"):
+            else:
+                heard = _parse(payload.get("at"))
+                if heard is not None:
+                    if self._heard_at is not None:
+                        gap = (heard - self._heard_at).total_seconds()
+                        if gap >= RETURN_SECONDS:
+                            self._returns[seq] = int(gap // 86400)
+                    self._heard_at = heard
+            if payload.get("channel") not in _UNPROMPTED and not payload.get("untrusted"):
                 text = str(payload.get("text", ""))
                 if ROUTINE_OFF.search(text):
                     self._routine = False
@@ -575,6 +590,20 @@ class Ledger:
                 self._inbound_keys[seq] = tuple(payload["keys"])
             if payload.get("schedule_id"):
                 self._fires[seq] = str(payload["schedule_id"])
+        elif kind == episodes.JOURNAL_WRITTEN:
+            # A thinking slot decided about every key it was shown (C4): let
+            # go closes it until something new is observed on it; any other
+            # decision weighs it. A fold code filled in for a key the model
+            # never decided about weighs nothing, so the key still waits to
+            # be composed. Never a reminder of theirs (DL-075).
+            for_seq = int(payload.get("for_seq") or seq)
+            for d in payload.get("decisions") or ():
+                item = self._items.get(str(d.get("key")))
+                if item is None or item.reminder or d.get("by") != "model":
+                    continue
+                item.considered_seq = max(item.considered_seq, for_seq)
+                if d.get("decision") == "let_go":
+                    item.closed = True
         elif kind == episodes.MESSAGE_QUEUED:
             for k in payload.get("keys") or ():
                 item = self._items.get(k)
@@ -629,6 +658,7 @@ class Ledger:
             repeats=self._repeats,
             named=frozenset(k for ks in self._inbound_keys.values() for k in ks),
             routine_warnings=self._routine,
+            returns=dict(self._returns),
         )
 
     def authored(self, sid: str) -> bool:

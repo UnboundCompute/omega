@@ -386,6 +386,13 @@ class TurnContext:
     #: ``None``, or one with nothing running, renders as nothing in the brief
     #: and offers nothing, so a log with no tasks reads exactly as before.
     tasks: Any = None
+    #: Continuity (C4, M2): the open told-ledger items, when this message of
+    #: theirs comes after :data:`RESUME_SILENCE_SECONDS` or more of silence, so
+    #: the reply can name what was open without a ``look_back`` call. Empty on
+    #: every other turn, which then reads exactly as before.
+    resume: Sequence[Any] = ()
+    #: How long they had been quiet, in days, when ``resume`` is set.
+    resume_days: int = 0
 
 
 #: Channels whose events nobody typed: omega's own look (DL-061) and the clock
@@ -471,6 +478,10 @@ def _judged(verdict: Optional["Verdict"]) -> Optional[str]:
     if verdict is None or not isinstance(verdict.raw, str) or not verdict.raw.strip():
         return None
     return " ".join(verdict.raw.split())[:300]
+
+
+#: How a thinking slot's turn ended its thinking (C4, M2), on its act result.
+THOUGHT = "thought: a thinking slot, journalled"
 
 
 #: Why a turn the told-ledger kept quiet ended silent (C3, DL-106).
@@ -883,6 +894,9 @@ def run_turn(
     keys: Sequence[str] = (),
     sense: Optional[Callable[[str, tuple[str, ...]], None]] = None,
     repeat: Optional[Callable[[Sequence[str], str], bool]] = None,
+    think: Optional[Callable[["TurnContext"], Any]] = None,
+    resume: Sequence[Any] = (),
+    resume_days: int = 0,
 ) -> TurnResult:
     """Run one turn over an already-claimed episode and record how it ended.
 
@@ -933,6 +947,13 @@ def run_turn(
     an observation, and the turn ends quiet. ``repeat`` is asked last, with
     the keys and the words: ``True`` means it would say again what it already
     told them with nothing new, and the turn ends quiet instead.
+
+    ``think`` makes the turn a thinking slot (C4, M2,
+    :func:`omega.thinking.think`): it stands in for the judge, the act loop
+    and the reply, and hands back the one message or ``None``; everything
+    after (the brief's tail, the gate) runs as for any turn. ``resume`` is
+    what was open when they went quiet, on their first message after two
+    days of silence (C4 continuity).
     """
     # Metered here, once, so every model call the turn makes — judge, act
     # loop, reply and teach extraction all go through `ctx.complete` — lands
@@ -1012,6 +1033,8 @@ def run_turn(
         location=location,
         topics=topics,
         tasks=tasks,
+        resume=tuple(resume),
+        resume_days=resume_days,
     )
 
     verdict: Optional[Verdict] = None
@@ -1024,85 +1047,95 @@ def run_turn(
         return tuple(dict.fromkeys((*held, *acted.tainted)))
 
     try:
-        verdict = judge(ctx)
-        if verdict.choice != ACT_THEN_SPEAK and not unprompted(ctx) and granted.answers(
-            ctx.grants, ctx.event, ctx.open_work
-        ):
-            # Their yes or no to a proposal (DL-085 #3). The act step is where
-            # an answer is settled, so it must run whatever the judge saw.
-            verdict = Verdict(choice=ACT_THEN_SPEAK, raw=verdict.raw)
-        elif verdict.choice != ACT_THEN_SPEAK and is_research(ctx.event):
-            # A research follow-up carries their task on: like a brief, it
-            # has looking to do, and a judge that let it lapse would drop the
-            # task with nobody told (DL-085 #5).
-            verdict = Verdict(choice=ACT_THEN_SPEAK, raw=verdict.raw)
-        elif (
-            verdict.choice == STAY_SILENT
-            and ctx.event.get("kind") == episodes.WORK_FINISHED
-        ):
-            # Work that finished was asked for, so it is told. It used to read
-            # as their message, which had the same effect; now that it does
-            # not (see `unprompted`), it says so here.
-            verdict = Verdict(choice=SPEAK, raw=verdict.raw)
-        elif verdict.choice == STAY_SILENT and is_reminder(ctx.event):
-            # A reminder coming due is a promise, and the prompt saying "never
-            # SILENT" was not enough: live, the judge chose silence on a 6pm
-            # walk reminder and nobody heard it (DL-075). Code keeps the promise
-            # the prompt only asked for; SPEAK, because a judge that saw nothing
-            # to do saw nothing to look up. ``raw`` keeps what it said.
-            verdict = Verdict(choice=SPEAK, raw=verdict.raw)
-        elif verdict.choice == STAY_SILENT and not unprompted(ctx):
-            # Their own message never ends silent (DL-084 #2). The prompt says
-            # so; live, "keep checking ... and let me know" was still answered
-            # with nothing, twice. SPEAK, as for a reminder; ``raw`` keeps
-            # what the judge said.
-            verdict = Verdict(choice=SPEAK, raw=verdict.raw)
-        elif verdict.choice != ACT_THEN_SPEAK and is_brief(ctx.event):
-            # A brief is the same promise with looking built in (DL-080): a
-            # brief that only spoke would brief them from nothing, so any
-            # verdict but ACT becomes ACT.
-            verdict = Verdict(choice=ACT_THEN_SPEAK, raw=verdict.raw)
-        elif verdict.choice != ACT_THEN_SPEAK and is_watch(ctx.event):
-            # A watch is a promise to look (DL-089). Live, calendar and inbox
-            # watches were judged a bare SILENT in 1-2s with no tool call, so
-            # they never opened what they were watching. Any verdict but ACT
-            # becomes ACT, as for a brief; the watch may still end quiet, but
-            # only after it has looked. ``raw`` keeps what the judge said.
-            verdict = Verdict(choice=ACT_THEN_SPEAK, raw=verdict.raw)
-        elif verdict.choice != ACT_THEN_SPEAK and _tasks.obligation_of(ctx.event) is not None:
-            # A driven task step carries an obligation (DL-095): it must do the
-            # step and end by calling `step`. A judge that let it speak would
-            # be the DL-040 gate-leak — work that owed a gated action ending in
-            # prose. ACT, so the step's own tool is reached; the executor still
-            # checks afterwards that it was called.
-            verdict = Verdict(choice=ACT_THEN_SPEAK, raw=verdict.raw)
-        if verdict.choice == ACT_THEN_SPEAK:
-            acted = act(ctx)
-            if acted.blocked_on:
-                waiting = _brief_tail(ctx)
-                if waiting:
-                    # A brief that stops on a "May I?" still lists them.
-                    acted = replace(acted, blocked_on=f"{acted.blocked_on}\n\n{waiting}")
-                record = write_memory(
-                    queue,
-                    seq=pending.seq,
-                    outcome="blocked",
-                    needs=acted.blocked_on,
-                    usage=meter.usage(),
-                    at=at,
-                    tainted=tainted(),
-                )
-                return TurnResult(
-                    seq=pending.seq,
-                    outcome="blocked",
-                    record_seq=record,
-                    tools=tuple(acted.tools),
-                    needs=acted.blocked_on,
-                    verdict=verdict,
-                )
-            if acted.error:
-                raise RuntimeError(acted.error)
-        text = reply(ctx, verdict, acted)
+        if think is not None:
+            thought = think(ctx)
+            acted = ActResult(tools=tuple(thought.tools), tainted=tuple(thought.tainted),
+                              stop_reason=THOUGHT)
+            text = thought.text
+            if thought.keys:
+                keys = tuple(thought.keys)
+                if gate is not None:
+                    gate = replace(gate, keys=keys)
+        else:
+            verdict = judge(ctx)
+            if verdict.choice != ACT_THEN_SPEAK and not unprompted(ctx) and granted.answers(
+                ctx.grants, ctx.event, ctx.open_work
+            ):
+                # Their yes or no to a proposal (DL-085 #3). The act step is where
+                # an answer is settled, so it must run whatever the judge saw.
+                verdict = Verdict(choice=ACT_THEN_SPEAK, raw=verdict.raw)
+            elif verdict.choice != ACT_THEN_SPEAK and is_research(ctx.event):
+                # A research follow-up carries their task on: like a brief, it
+                # has looking to do, and a judge that let it lapse would drop the
+                # task with nobody told (DL-085 #5).
+                verdict = Verdict(choice=ACT_THEN_SPEAK, raw=verdict.raw)
+            elif (
+                verdict.choice == STAY_SILENT
+                and ctx.event.get("kind") == episodes.WORK_FINISHED
+            ):
+                # Work that finished was asked for, so it is told. It used to read
+                # as their message, which had the same effect; now that it does
+                # not (see `unprompted`), it says so here.
+                verdict = Verdict(choice=SPEAK, raw=verdict.raw)
+            elif verdict.choice == STAY_SILENT and is_reminder(ctx.event):
+                # A reminder coming due is a promise, and the prompt saying "never
+                # SILENT" was not enough: live, the judge chose silence on a 6pm
+                # walk reminder and nobody heard it (DL-075). Code keeps the promise
+                # the prompt only asked for; SPEAK, because a judge that saw nothing
+                # to do saw nothing to look up. ``raw`` keeps what it said.
+                verdict = Verdict(choice=SPEAK, raw=verdict.raw)
+            elif verdict.choice == STAY_SILENT and not unprompted(ctx):
+                # Their own message never ends silent (DL-084 #2). The prompt says
+                # so; live, "keep checking ... and let me know" was still answered
+                # with nothing, twice. SPEAK, as for a reminder; ``raw`` keeps
+                # what the judge said.
+                verdict = Verdict(choice=SPEAK, raw=verdict.raw)
+            elif verdict.choice != ACT_THEN_SPEAK and is_brief(ctx.event):
+                # A brief is the same promise with looking built in (DL-080): a
+                # brief that only spoke would brief them from nothing, so any
+                # verdict but ACT becomes ACT.
+                verdict = Verdict(choice=ACT_THEN_SPEAK, raw=verdict.raw)
+            elif verdict.choice != ACT_THEN_SPEAK and is_watch(ctx.event):
+                # A watch is a promise to look (DL-089). Live, calendar and inbox
+                # watches were judged a bare SILENT in 1-2s with no tool call, so
+                # they never opened what they were watching. Any verdict but ACT
+                # becomes ACT, as for a brief; the watch may still end quiet, but
+                # only after it has looked. ``raw`` keeps what the judge said.
+                verdict = Verdict(choice=ACT_THEN_SPEAK, raw=verdict.raw)
+            elif verdict.choice != ACT_THEN_SPEAK and _tasks.obligation_of(ctx.event) is not None:
+                # A driven task step carries an obligation (DL-095): it must do the
+                # step and end by calling `step`. A judge that let it speak would
+                # be the DL-040 gate-leak — work that owed a gated action ending in
+                # prose. ACT, so the step's own tool is reached; the executor still
+                # checks afterwards that it was called.
+                verdict = Verdict(choice=ACT_THEN_SPEAK, raw=verdict.raw)
+            if verdict.choice == ACT_THEN_SPEAK:
+                acted = act(ctx)
+                if acted.blocked_on:
+                    waiting = _brief_tail(ctx)
+                    if waiting:
+                        # A brief that stops on a "May I?" still lists them.
+                        acted = replace(acted, blocked_on=f"{acted.blocked_on}\n\n{waiting}")
+                    record = write_memory(
+                        queue,
+                        seq=pending.seq,
+                        outcome="blocked",
+                        needs=acted.blocked_on,
+                        usage=meter.usage(),
+                        at=at,
+                        tainted=tainted(),
+                    )
+                    return TurnResult(
+                        seq=pending.seq,
+                        outcome="blocked",
+                        record_seq=record,
+                        tools=tuple(acted.tools),
+                        needs=acted.blocked_on,
+                        verdict=verdict,
+                    )
+                if acted.error:
+                    raise RuntimeError(acted.error)
+            text = reply(ctx, verdict, acted)
     except Exception as exc:  # noqa: BLE001 - see the docstring: every path records
         error = f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
         record = write_memory(
@@ -1655,6 +1688,7 @@ def _event_turn(
     text = (
         f"{_clock_line(ctx.event)}"
         f"{_location_section(ctx)}"
+        f"{_resume_section(ctx)}"
         f"{_learned_section(ctx.learned, at=str(ctx.event.get('at', '')))}"
         f"{self_taught.section(ctx.lessons) if lessons else ''}"
         f"Recent history:\n{_transcript(ctx.recalled, stub_mail=not unprompted(ctx))}\n\n"
@@ -1668,6 +1702,35 @@ def _event_turn(
     if not parts:
         return provider.user(text)
     return provider.user([provider.text_part(text), *parts])
+
+
+#: Silence after which their next message is a return (C4, M2 continuity).
+RESUME_SILENCE_SECONDS = 48 * 3600
+
+
+def _resume_section(ctx: TurnContext) -> str:
+    """What was open when they went quiet (C4 continuity), on the first
+    message after :data:`RESUME_SILENCE_SECONDS`. An item that came off their
+    mail is named by its key and source only (DL-108's stub form): its words
+    are a sender's, and this turn is theirs, so it is neither shown them nor
+    tainted by them. Empty on every other turn."""
+    if not ctx.resume or unprompted(ctx):
+        return ""
+    lines = []
+    for item in ctx.resume:
+        if getattr(item, "untrusted", ()):
+            lines.append(
+                f"[{item.key}] a {item.source} thread from their inbox "
+                "(its words are a sender's; open it with inbox to say more)"
+            )
+        else:
+            lines.append(f"[{item.key}] {item.what}")
+    body = "\n".join(f"- {line}" for line in lines)
+    return (
+        f"They have been quiet for {ctx.resume_days} days. Still open when they "
+        f"went quiet (name the ones that matter in your reply, briefly, without "
+        f"looking anything up):\n{body}\n\n"
+    )
 
 
 def _location_section(ctx: TurnContext) -> str:

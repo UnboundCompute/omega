@@ -289,6 +289,15 @@ def fresh(fix: Fix, now: datetime) -> bool:
     return (now - fix.at).total_seconds() <= FRESH_SECONDS
 
 
+def coarse(state: Optional[State]) -> str:
+    """Roughly where they are, for thinking time only (D8): the latest fix's
+    city, or failing that its place or label; never coordinates."""
+    fix = state.current if state else None
+    if fix is None:
+        return ""
+    return (fix.city or fix.place or fix.label or "").strip()
+
+
 def context_line(state: Optional[State], at: Any) -> str:
     """The one line a prompted turn gets, or ``""`` when there is no fix.
 

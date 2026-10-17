@@ -10,7 +10,7 @@ from datetime import datetime, timedelta
 
 import pytest
 
-from omega import episodes, ledger, notice, outbox, provider, tools
+from omega import episodes, ledger, notice, outbox, provider, thinking, tools
 from omega.executor import (
     AUTHORED_REMINDER,
     BRIEF_FOLDED,
@@ -53,6 +53,12 @@ def fake(words: str = WORDS, verdict: str = "NUDGE worth saying",
         return verdict
 
     def act(role, messages):
+        if thinking.SYSTEM[:40] in str(messages[0]):
+            # A thinking slot (C4) is the act role alone, silent where the
+            # judge would have been.
+            if calls is not None:
+                calls.append("think")
+            return verdict if verdict.upper().startswith("SILENT") else words
         if calls is not None:
             calls.append("act")
         return words

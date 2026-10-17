@@ -149,6 +149,7 @@ __all__ = [
     "asks",
     "PENDING",
     "LOOK_BACK",
+    "JOURNAL",
     "TASK",
     "STEP",
     "tasks_on",
@@ -253,6 +254,10 @@ TOPICS = "topics"
 #: the read half of DL-014's *read its own memory*, as ``recall`` is, over the
 #: episodes rather than the claims.
 LOOK_BACK = "look_back"
+#: Reads omega's thinking journal back to them (C4, DL-118): readable on
+#: request, never pushed. Outside :data:`TOOL_NAMES` for :data:`PROMISE`'s
+#: reason: offered only on their own message, in a box handed the journal.
+JOURNAL = "journal"
 #: Drafts, cancels or reports on a task's plan (DL-095). Outside
 #: :data:`TOOL_NAMES` for :data:`PROMISE`'s reason: offered only on their own
 #: message and only when ``OMEGA_TASKS`` is on, so with the flag off — the
@@ -1435,6 +1440,9 @@ def untrusted_source(tool: str, args: dict[str, Any]) -> Optional[str]:
         return str(args.get("url") or "a watched page")
     if tool == WATCH_PAGE and args.get("do") == "list":
         return WATCHED_PAGES  # each watch's last error, as its server wrote it
+    if tool == JOURNAL:
+        # An entry can repeat what a mail said (DL-108): read as such, always.
+        return _journal_mod().SOURCE
     if tool == DELEGATE and args.get("do") == "status":
         # DL-104: a session's final message is Claude Code's words, not theirs.
         return _delegate_mod().SOURCE
@@ -3168,6 +3176,42 @@ def _look_back(box: "ToolBox", args: dict[str, Any]) -> str:
     ))
 
 
+# --- the thinking journal (DL-118) -----------------------------------------------
+
+#: How many entries one ``journal`` answer may list.
+_JOURNAL_MAX = 14
+
+
+def _journal_mod() -> Any:
+    from omega import journal
+
+    return journal
+
+
+def _journaling(box: "ToolBox") -> bool:
+    """Is ``journal`` there? Their own message, in a box handed the journal."""
+    return bool(box.prompted and box.journal is not None)
+
+
+def _classify_journal(box: "ToolBox", args: dict[str, Any]) -> Decision:
+    limit = args.get("limit")
+    if not _given(limit):
+        limit = 3
+    elif isinstance(limit, bool) or not isinstance(limit, (int, float)):
+        raise ToolRejected(f"{JOURNAL}'s 'limit' must be a number")
+    limit = int(limit)
+    if not (1 <= limit <= _JOURNAL_MAX):
+        raise ToolRejected(f"{JOURNAL}'s 'limit' must be 1 to {_JOURNAL_MAX}, not {limit}")
+    return Decision(tool=JOURNAL, tier=EXPLORATION,
+                    why="read your thinking journal back", args={"limit": limit})
+
+
+def _journal(box: "ToolBox", args: dict[str, Any]) -> str:
+    if box.journal is None:
+        raise ToolError("the journal cannot be read from this turn")
+    return _cap(_journal_mod().tool_text(box.journal(), limit=int(args.get("limit") or 3)))
+
+
 # --- where they are (DL-091) -----------------------------------------------------
 
 _LOCATION_ACTIONS = ("here", "where", "save", "forget", "places", "history")
@@ -4554,6 +4598,23 @@ _LOOK_BACK_TOOL = _Tool(
 )
 
 
+#: ``journal`` (DL-118), beside Ring 1 and not in it: see :data:`JOURNAL`.
+_JOURNAL_TOOL = _Tool(
+    classify=_classify_journal,
+    dispatch=_journal,
+    schema=_schema(
+        JOURNAL,
+        "Read back your own thinking journal: what each thinking time noticed, "
+        "the questions it asked itself, its insights with the records they "
+        "rest on, and what it decided about each open thread. Only when they "
+        "ask what you have been thinking or why you said or did not say "
+        "something; newest last.",
+        {"limit": {"type": "integer", "description": f"Entries, 1 to {_JOURNAL_MAX}; default 3."}},
+        [],
+    ),
+)
+
+
 #: ``location`` (DL-091), registered beside Ring 1 and not in it: see
 #: :data:`LOCATION`. :meth:`ToolBox.classify` reaches it only where
 #: :func:`_locating` holds.
@@ -4948,6 +5009,9 @@ class ToolBox:
     #: already holds (:func:`omega.lookback.past`), so the box never opens the
     #: log. ``None`` leaves the box exactly as it was.
     history: Optional[Callable[[], Sequence[Any]]] = None
+    #: The thinking journal for ``journal`` (DL-118), read when the tool asks.
+    #: Only their own message with this set puts it in the box.
+    journal: Optional[Callable[[], Sequence[Any]]] = None
     #: The leave-now alarms (DL-093): the :class:`omega.leave.State` folded
     #: from the turn's own log, read only when ``leave_by`` is called. Only
     #: their own message, with this and ``append`` set and the Maps MCP server
@@ -5001,6 +5065,8 @@ class ToolBox:
             tool = _TOPICS_TOOL
         if tool is None and name == LOOK_BACK and _looking_back(self):
             tool = _LOOK_BACK_TOOL
+        if tool is None and name == JOURNAL and _journaling(self):
+            tool = _JOURNAL_TOOL
         if tool is None and name == TASK and _tasking(self):
             tool = _TASK_TOOL
         if tool is None and name == STEP and _stepping(self):
@@ -5063,6 +5129,8 @@ class ToolBox:
             return _TOPICS_TOOL.dispatch(self, decision.args)
         if decision.tool == LOOK_BACK and decision.tool not in _TOOLS:
             return _LOOK_BACK_TOOL.dispatch(self, decision.args)
+        if decision.tool == JOURNAL and decision.tool not in _TOOLS:
+            return _JOURNAL_TOOL.dispatch(self, decision.args)
         if decision.tool == TASK and decision.tool not in _TOOLS:
             return _TASK_TOOL.dispatch(self, decision.args)
         if decision.tool == STEP and decision.tool not in _TOOLS:
@@ -5097,6 +5165,8 @@ class ToolBox:
             mine.append(_TOPICS_TOOL.schema)
         if _looking_back(self) and LOOK_BACK not in hide:
             mine.append(_LOOK_BACK_TOOL.schema)
+        if _journaling(self) and JOURNAL not in hide:
+            mine.append(_JOURNAL_TOOL.schema)
         if _tasking(self) and TASK not in hide:
             mine.append(_TASK_TOOL.schema)
         if _stepping(self) and STEP not in hide:

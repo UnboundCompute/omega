@@ -41,6 +41,7 @@ from omega import (
     grants,
     habits,
     inbox as inboxes,
+    journal,
     learn,
     leave,
     ledger,
@@ -107,6 +108,9 @@ COMPOSE_ITEMS = 12
 #: The key an offer on a CI key is told under (C6), so it is made once.
 CI_OFFER_PREFIX = "offer:"
 CI_OFFER_REASON = "a Claude Code session on your Mac is always yours to approve"
+#: Why a thinking slot's other offers (C4) wait for their yes: thinking time
+#: may only read, so anything it would do is asked first.
+THINK_OFFER_REASON = "thinking time only reads; anything it offers is yours to approve"
 
 
 def ci_offer(
@@ -372,6 +376,9 @@ class Executor:
         "_ledger",
         "_ci_offered",
         "_ci_through",
+        "_ci_titles",
+        "_handed",
+        "_journal",
         "_events",
         "_events_read",
         "_events_at",
@@ -495,6 +502,12 @@ class Executor:
         # from the offers' own keys so a restart offers nothing twice.
         self._ci_offered: set[str] = set()
         self._ci_through = 0
+        # ... and the starts and directions a thinking slot offered (C4),
+        # by the delegate's title and the handoff's destination.
+        self._ci_titles: set[str] = set()
+        self._handed: set[str] = set()
+        # The thinking journal (C4, M2), kept at the log's head.
+        self._journal = journal.Journal()
         # C2: the calendar read as occurrences, for the T-minus sense, and
         # its last read, so the calendar is read every few minutes while the
         # timing is checked on every pass.
@@ -2189,13 +2202,7 @@ class Executor:
         if not self._pace or st.outstanding:
             return False
         store = self._queue.store
-        for e in store.episodes_since(self._ci_through):
-            self._ci_through = e.seq
-            p = episodes.decode(e.payload)
-            if p.get("kind") == episodes.MESSAGE_INBOUND:
-                for k in p.get("keys") or ():
-                    if str(k).startswith(CI_OFFER_PREFIX):
-                        self._ci_offered.add(str(k)[len(CI_OFFER_PREFIX):])
+        self._offers_seen()
         state = self._ledger.advance(store).state()
         due = [
             i for i in state.items.values()
@@ -2216,6 +2223,10 @@ class Executor:
                 self._ci_offered.add(item.key)
                 continue
             ask, action = offer
+            if action["args"]["title"] in self._ci_titles:
+                # A thinking slot already offered it (C4).
+                self._ci_offered.add(item.key)
+                continue
             at = moment.isoformat()
             seq = self._queue.append(episodes.inbound(
                 tools.tell_instruction(ask),
@@ -2233,6 +2244,107 @@ class Executor:
             self._ci_offered.add(item.key)
             return True
         return False
+
+    def _offers_seen(self) -> None:
+        """Fold what has been offered (C6, C4) from the log: the CI keys a
+        tell offered, and the delegate titles and handoff destinations any
+        held offer named, so a restart offers nothing twice."""
+        for e in self._queue.store.episodes_since(self._ci_through):
+            self._ci_through = e.seq
+            p = episodes.decode(e.payload)
+            if p.get("kind") == episodes.MESSAGE_INBOUND:
+                for k in p.get("keys") or ():
+                    if str(k).startswith(CI_OFFER_PREFIX):
+                        self._ci_offered.add(str(k)[len(CI_OFFER_PREFIX):])
+            elif p.get("kind") == episodes.GRANT_PROPOSED and p.get("reason") in (
+                CI_OFFER_REASON, THINK_OFFER_REASON,
+            ):
+                for a in p.get("actions") or ():
+                    args = a.get("args") or {}
+                    if a.get("tool") == tools.DELEGATE:
+                        self._ci_titles.add(str(args.get("title")))
+                    elif a.get("tool") == tools.HANDOFF:
+                        self._handed.add(str(args.get("destination")))
+
+    def _think_offer(self, item: "ledger.Item", tool: str, for_seq: int) -> Optional[str]:
+        """File one offer a thinking slot named (C4, C6), held for their yes,
+        and return how it is asked; ``None`` when there is nothing to offer.
+        Built only from structured fields: a CI key's repo and workflow
+        (:func:`ci_offer`), or a calendar key's place. Each once, ever."""
+        self._offers_seen()
+        if tool == tools.DELEGATE and item.key.startswith("ci:"):
+            if item.key in self._ci_offered:
+                return None
+            offer = ci_offer(item, projects.latest(projects.states(self._queue.store)))
+            if offer is None or offer[1]["args"]["title"] in self._ci_titles:
+                return None
+            ask, action = offer
+            reason = CI_OFFER_REASON
+            self._ci_offered.add(item.key)
+            self._ci_titles.add(action["args"]["title"])
+        elif tool == tools.HANDOFF and item.key.startswith("cal:") and " at " in item.what:
+            place = item.what.rsplit(" at ", 1)[1].strip()[:200]
+            if not place or place in self._handed:
+                return None
+            action = {"tool": tools.HANDOFF, "why": f"hand you directions to {place}",
+                      "args": {"kind": "directions", "destination": place}}
+            ask = f"Want directions to {place}?"
+            reason = THINK_OFFER_REASON
+            self._handed.add(place)
+        else:
+            return None
+        pid = self._queue.append(episodes.grant_proposed(
+            for_seq=for_seq, scope=episodes.HOLD_SCOPE, proposes="hold",
+            actions=[action], reason=reason,
+        ))
+        if ask.endswith(" Reply yes or no."):
+            ask = ask[: -len(" Reply yes or no.")]
+        return f"{ask} {grants.how_to_answer(grants.pid(pid))}"
+
+    def _thinking(self, pending: Pending) -> dict[str, Any]:
+        """``think`` for a thinking slot's turn under pace (C4, M2), or
+        nothing: every other turn runs as before."""
+        event = pending.payload
+        slot = event.get("thinking")
+        if not self._pace or event.get("channel") != notice.CHANNEL or not isinstance(slot, str):
+            return {}
+        store = self._queue.store
+        state = self._ledger.advance(store).state()
+        try:
+            moment = datetime.fromisoformat(str(event.get("at")))
+        except ValueError:
+            moment = datetime.now(timezone.utc)
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=timezone.utc)
+        entries = journal.recent(self._journal.advance(store).entries(), now=moment,
+                                 week=outbox.is_review(slot))
+        from omega import thinking
+
+        kwargs = dict(
+            slot=slot, items=thinking.shown_items(state), entries=entries,
+            where=location.coarse(self._location.state()),
+            brief=str(event.get("text", "")).startswith(tools.BRIEF_LEAD),
+            offer=self._think_offer,
+        )
+        return {"think": lambda ctx: thinking.think(ctx, **kwargs)}
+
+    def _resumed(self, pending: Pending) -> dict[str, Any]:
+        """What was open when they went quiet, on their first message after
+        two days of silence (C4 continuity); nothing on every other turn."""
+        event = pending.payload
+        if not self._pace or event.get("kind", episodes.MESSAGE_INBOUND) != episodes.MESSAGE_INBOUND:
+            return {}
+        if event.get("channel") in notice.UNPROMPTED_CHANNELS:
+            return {}
+        state = self._ledger.advance(self._queue.store).state()
+        days = state.returns.get(pending.seq)
+        if days is None:
+            return {}
+        items = sorted(
+            (i for i in state.items.values() if not i.closed and not i.reminder),
+            key=lambda i: i.last_seq, reverse=True,
+        )[:COMPOSE_ITEMS]
+        return {"resume": items, "resume_days": days} if items else {}
 
     def _pause_proposal(self, entry: Any) -> Optional[dict[str, Any]]:
         """Pausing a failing watch, as the ``tidy`` tool would propose it, or
@@ -2375,6 +2487,8 @@ class Executor:
             tasks=self._tasks.state(),
             gate=self._gate(pending.payload) if self._pace else None,
             **self._told(pending),
+            **self._thinking(pending),
+            **self._resumed(pending),
         )
         self._queue.finish(pending.seq)
         # After the reply is durable, and never able to fail or hold it.

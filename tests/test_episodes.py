@@ -294,6 +294,15 @@ def test_every_kind_round_trips():
         ep.message_delivered(for_seq=41, queued=[40], at="2026-09-23T10:00:00+00:00"),
         ep.message_dropped(queued=[40], why="not sent", at="2026-09-23T10:00:00+00:00"),
         ep.thinking_failed(slot="2026-09-23 morning", why="no entry", at="2026-09-23T10:00:00+00:00"),
+        ep.journal_written(
+            for_seq=41, slot="2026-09-23 morning", changed="the build failed again",
+            questions=["is it the same failure?"],
+            insights=[{"text": "it recurs on main", "seqs": [40, 41]}],
+            decisions=[{"key": "ci:demo/build", "decision": "fold", "why": "told already",
+                        "by": "model"}],
+            considered=["ci:demo/build"], outcome="silent", why="told already",
+            fabricated=1, tainted=("their inbox",), at="2026-09-23T10:00:00+00:00",
+        ),
         ep.observation_recorded(
             key="ci:argus/tests", source="ci", what="CI failed: tests on argus",
             ref="<run-1@example.test>", untrusted="their inbox",

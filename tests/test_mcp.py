@@ -493,7 +493,7 @@ def test_without_configuration_the_act_loop_offers_what_it_always_did(
     # DL-094: look_back rides every turn that can read the log, last of Ring 1.
     look_back = ToolBox(store_root=q.store.root, history=list).schemas()[-1]
     # DL-096 and DL-097 deliberately append ``watch_page`` and ``handoff``
-    # to every prompted turn.
+    # to every prompted turn; DL-118 the journal, right after look_back.
     assert offered == schemas(hidden(ToolBox(store_root=q.store.root, prompted=True))) + [
-        look_back, tools._WATCH_PAGE_TOOL.schema, tools._HANDOFF_TOOL.schema] + hosted()
+        look_back, tools._JOURNAL_TOOL.schema, tools._WATCH_PAGE_TOOL.schema, tools._HANDOFF_TOOL.schema] + hosted()
     assert _REMOTE_RULES not in fp.calls_for(provider.ACT)[0][0]["content"]

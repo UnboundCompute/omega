@@ -18,7 +18,9 @@ from typing import Iterable
 
 import pytest
 
-from omega import calendar, delegate, episodes, inbox, ledger, notice, outbox, provider, tools
+from omega import (
+    calendar, delegate, episodes, inbox, ledger, notice, outbox, provider, thinking, tools,
+)
 from omega.delegate import Desk
 from omega.executor import CI_OFFER_PREFIX, Executor
 from omega.memory import MemoryStore
@@ -54,7 +56,8 @@ def scripted() -> provider.FakeProvider:
     """Speaks when there is something to say, else stays silent: keyed
     items in front of it, or a reminder actually firing (not merely listed
     under the standing schedules, which every look shows). Only the new
-    event is read, never the recalled history above it."""
+    event is read, never the recalled history above it. A thinking slot is
+    answered by the act role alone, on the same rule."""
 
     def judge(role, messages):
         text = str(messages[-1]).rsplit("New event:", 1)[-1]
@@ -63,6 +66,11 @@ def scripted() -> provider.FakeProvider:
         return "SILENT nothing new"
 
     def act(role, messages):
+        # A thinking slot (C4) answers itself; it speaks on the same rule.
+        if str(messages[0]).find(thinking.SYSTEM[:40]) >= 0:
+            text = str(messages[-1]).rsplit("New event:", 1)[-1]
+            if outbox.KEYED_HEADING not in text:
+                return "SILENT nothing new"
         return "Synthetic: a short note about what is new."
 
     return provider.FakeProvider({provider.JUDGE: judge, provider.ACT: act})

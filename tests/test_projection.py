@@ -442,6 +442,11 @@ def test_every_m1_kind_is_accounted_for() -> None:
         episodes.THINKING_FAILED: episodes.thinking_failed(
             slot="2026-10-11 morning", why="no entry", at=AT,
         ),
+        # C4: the journal is read back by its own tool, never projected.
+        episodes.JOURNAL_WRITTEN: episodes.journal_written(
+            for_seq=1, slot="2026-10-11 morning", changed="", questions=[], insights=[],
+            decisions=[], considered=[], outcome="silent", why="nothing new", at=AT,
+        ),
         # C1: the told-ledger is a fold; an observation reaches no surface.
         episodes.OBSERVATION_RECORDED: episodes.observation_recorded(
             key="ci:argus/tests", source="ci", what="CI failed: tests on argus",

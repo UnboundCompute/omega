@@ -257,6 +257,9 @@ NOT_PROJECTED = frozenset(
         # the queue and the day budget are bookkeeping about that turn.
         *episodes.OUTBOX_KINDS,
         *episodes.LEDGER_KINDS,
+        # C4, DL-118. The journal is read back only when they ask, through
+        # its own tool; it is never pushed to a surface.
+        episodes.JOURNAL_WRITTEN,
         # DL-101. A Slack post reaches the person as its turn's reply, with
         # the link; the records only remember what omega posted.
         *episodes.SLACK_KINDS,

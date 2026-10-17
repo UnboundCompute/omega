@@ -46,7 +46,7 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 
 from omega import episodes, finance, grants, leave, lessons, location, lookback, mailcursor, mcp, projects, provider
-from omega import delegate, slack, tasks
+from omega import delegate, journal, slack, tasks
 from omega import topics as kept
 from omega import watcher
 from omega.tools import (
@@ -218,6 +218,81 @@ def _blocked_on(decisions: list[Decision]) -> str:
     return f"I want to do these, and each needs your go:\n{joined}"
 
 
+def build_box(ctx: TurnContext) -> ToolBox:
+    """The turn's whole tool box, from the store the queue already writes to.
+    A thinking slot (C4) builds the same box and offers it a read-only part."""
+    # The claims come from the turn, not from the store (DL-060): this
+    # process holds the log's lock, so a box that opened it to answer
+    # `recall` would wait on itself.
+    return ToolBox(
+        store_root=ctx.queue.store.root,
+        remembered=tuple(ctx.known),
+        append=ctx.queue.append,
+        for_seq=ctx.seq,
+        running=tuple(ctx.running),
+        # Held mail opens only in a turn their own message started (DL-082).
+        prompted=not unprompted(ctx),
+        # The finance ledger is the log (DL-083), read when asked.
+        ledger=lambda: finance.ledger(ctx.queue.store),
+        # Where each coding project was left (DL-087 #7), also the log.
+        project_states=lambda: projects.states(ctx.queue.store),
+        at=str(ctx.event.get("at", "")),
+        # Other people's MCP servers, when configured (DL-088); None leaves
+        # the offer exactly as it was.
+        remote=mcp.remote(),
+        # Standing grants (DL-085), as of this turn, and the words that
+        # may give one: only their own message's.
+        grants=ctx.grants,
+        said=str(ctx.event.get("text", "")) if not unprompted(ctx) else "",
+        task=research_task(ctx.event),
+        # Research tasks this brief says could not be finished (DL-087
+        # #2): the brief may carry them on, through the gate as ever.
+        retry=_retry(ctx),
+        promises=ctx.promises,
+        # omega's own lessons and skills (DL-086): `forget`, on their
+        # own message, when one stands; nothing at all otherwise.
+        lessons=ctx.lessons,
+        # The topics kept up with (DL-087 #6): `topics`, on their own
+        # message, only when one is followed, the grant is live or their
+        # words ask; its `now` looks one up through the turn's own model.
+        topics=ctx.topics,
+        research=lambda name, query: kept.research(
+            ctx.complete, name, query, remote=mcp.remote()
+        ),
+        # DL-090: an unprompted turn's mail is only what arrived since
+        # its origin last read it; their own turn gets no cursor at all.
+        mail_since=_mail_since(ctx) if unprompted(ctx) else None,
+        # DL-091: where they are, folded from the log when the tool asks,
+        # and only in a turn their own message started.
+        locations=(lambda: location.fold(ctx.queue.store)) if not unprompted(ctx) else None,
+        # DL-094: the whole past conversation, read through the store the
+        # turn holds, on every turn kind (as `recall` is offered).
+        history=lambda: lookback.past(ctx.queue.store, before=ctx.seq),
+        # DL-118: the thinking journal, read back on their own message only.
+        journal=(lambda: journal.entries(ctx.queue.store)) if not unprompted(ctx) else None,
+        # The task engine (DL-095): the tasks as of this turn, so `task`
+        # can report and cancel; `task_run` is the step obligation this
+        # turn carries, if any, which is what puts `step` in the box. Both
+        # are inert unless OMEGA_TASKS is on, so the box is otherwise as it
+        # was.
+        tasks=getattr(ctx, "tasks", None),
+        task_run=tasks.obligation_of(ctx.event),
+        # DL-096: page watches, folded from the log when the tool asks,
+        # and only in a turn their own message started.
+        pages=(lambda: watcher.fold(ctx.queue.store)) if not unprompted(ctx) else None,
+        # DL-093: the leave-now alarms, folded when `leave_by` asks, and
+        # only in a turn their own message started.
+        leaves=(lambda: leave.fold(ctx.queue.store)) if not unprompted(ctx) else None,
+        # DL-101: their work Slack, only in a turn their own message
+        # started and only with their token set; None leaves the box as
+        # it was.
+        slack=_slack_seat(ctx),
+        # DL-104: Claude Code on their Mac, only in a turn their own
+        # message started and only while a worker there is polling.
+        delegate=_delegate_seat(ctx),
+    )
+
+
 def act_loop(
     ctx: TurnContext,
     *,
@@ -231,74 +306,7 @@ def act_loop(
     directory the log lives in and nothing has to be configured twice.
     """
     if box is None:
-        # The claims come from the turn, not from the store (DL-060): this
-        # process holds the log's lock, so a box that opened it to answer
-        # `recall` would wait on itself.
-        box = ToolBox(
-            store_root=ctx.queue.store.root,
-            remembered=tuple(ctx.known),
-            append=ctx.queue.append,
-            for_seq=ctx.seq,
-            running=tuple(ctx.running),
-            # Held mail opens only in a turn their own message started (DL-082).
-            prompted=not unprompted(ctx),
-            # The finance ledger is the log (DL-083), read when asked.
-            ledger=lambda: finance.ledger(ctx.queue.store),
-            # Where each coding project was left (DL-087 #7), also the log.
-            project_states=lambda: projects.states(ctx.queue.store),
-            at=str(ctx.event.get("at", "")),
-            # Other people's MCP servers, when configured (DL-088); None leaves
-            # the offer exactly as it was.
-            remote=mcp.remote(),
-            # Standing grants (DL-085), as of this turn, and the words that
-            # may give one: only their own message's.
-            grants=ctx.grants,
-            said=str(ctx.event.get("text", "")) if not unprompted(ctx) else "",
-            task=research_task(ctx.event),
-            # Research tasks this brief says could not be finished (DL-087
-            # #2): the brief may carry them on, through the gate as ever.
-            retry=_retry(ctx),
-            promises=ctx.promises,
-            # omega's own lessons and skills (DL-086): `forget`, on their
-            # own message, when one stands; nothing at all otherwise.
-            lessons=ctx.lessons,
-            # The topics kept up with (DL-087 #6): `topics`, on their own
-            # message, only when one is followed, the grant is live or their
-            # words ask; its `now` looks one up through the turn's own model.
-            topics=ctx.topics,
-            research=lambda name, query: kept.research(
-                ctx.complete, name, query, remote=mcp.remote()
-            ),
-            # DL-090: an unprompted turn's mail is only what arrived since
-            # its origin last read it; their own turn gets no cursor at all.
-            mail_since=_mail_since(ctx) if unprompted(ctx) else None,
-            # DL-091: where they are, folded from the log when the tool asks,
-            # and only in a turn their own message started.
-            locations=(lambda: location.fold(ctx.queue.store)) if not unprompted(ctx) else None,
-            # DL-094: the whole past conversation, read through the store the
-            # turn holds, on every turn kind (as `recall` is offered).
-            history=lambda: lookback.past(ctx.queue.store, before=ctx.seq),
-            # The task engine (DL-095): the tasks as of this turn, so `task`
-            # can report and cancel; `task_run` is the step obligation this
-            # turn carries, if any, which is what puts `step` in the box. Both
-            # are inert unless OMEGA_TASKS is on, so the box is otherwise as it
-            # was.
-            tasks=getattr(ctx, "tasks", None),
-            task_run=tasks.obligation_of(ctx.event),
-            # DL-096: page watches, folded from the log when the tool asks,
-            # and only in a turn their own message started.
-            pages=(lambda: watcher.fold(ctx.queue.store)) if not unprompted(ctx) else None,
-            # DL-093: the leave-now alarms, folded when `leave_by` asks, and
-            # only in a turn their own message started.
-            leaves=(lambda: leave.fold(ctx.queue.store)) if not unprompted(ctx) else None,
-            # DL-101: their work Slack, only in a turn their own message
-            # started and only with their token set; None leaves the box as
-            # it was.
-            slack=_slack_seat(ctx),
-            # DL-104: Claude Code on their Mac, only in a turn their own
-            # message started and only while a worker there is polling.
-            delegate=_delegate_seat(ctx),
-        )
+        box = build_box(ctx)
 
     # Their answer to a proposal is settled before the model is asked anything
     # (DL-085 #3): a yes runs exactly what was proposed, and nothing the model

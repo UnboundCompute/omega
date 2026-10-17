@@ -277,6 +277,8 @@ def test_with_nothing_recorded_the_tool_is_offered_on_every_turn_of_theirs(q: Ev
             if s.get("function", {}).get("name") not in (tools.LOCATION, tools.TOPICS)] == schemas(
         hidden(ToolBox(store_root=q.store.root, prompted=True))) + [
         ToolBox(store_root=q.store.root, history=list).schemas()[-1],
+        # DL-118: the journal is readable on their turns, right after look_back.
+        tools._JOURNAL_TOOL.schema,
         # DL-096 and DL-097 deliberately append ``watch_page`` and ``handoff``
         # to every prompted turn.
         tools._WATCH_PAGE_TOOL.schema, tools._HANDOFF_TOOL.schema] + hosted()

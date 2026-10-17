@@ -98,6 +98,9 @@ QUIET_FROM_HOUR = 23
 QUIET_UNTIL_HOUR = 8
 #: Thinking time, by name and local hour.
 SLOTS = (("morning", 9), ("evening", 19))
+#: The Sunday review (C4): a third slot, on Sundays only, that is shown the
+#: week's journal rather than the last few entries.
+REVIEW = ("review", 17)
 #: Non-urgent unprompted messages a day ("once or twice a day is fine").
 MAX_PER_DAY = 2
 #: How recently a sign of them counts as "here": a presence report from the
@@ -297,7 +300,7 @@ def quiet(now: datetime) -> bool:
 def slot_start(slot: str) -> Optional[datetime]:
     """When the slot ``"<date> <name>"`` begins, on their clock."""
     day, _, name = slot.partition(" ")
-    hour = dict(SLOTS).get(name)
+    hour = dict((*SLOTS, REVIEW)).get(name)
     try:
         date = datetime.fromisoformat(day)
     except ValueError:
@@ -305,6 +308,20 @@ def slot_start(slot: str) -> Optional[datetime]:
     if hour is None:
         return None
     return date.replace(hour=hour, minute=0, second=0, microsecond=0).astimezone()
+
+
+def slots_on(day: str) -> tuple[tuple[str, int], ...]:
+    """The slots of local date ``day``: the two daily, and on a Sunday the
+    review too."""
+    try:
+        sunday = datetime.fromisoformat(day).weekday() == 6
+    except ValueError:
+        return SLOTS
+    return (*SLOTS, REVIEW) if sunday else SLOTS
+
+
+def is_review(slot: str) -> bool:
+    return slot.endswith(f" {REVIEW[0]}")
 
 
 def slot_due(state: State, now: datetime) -> Optional[str]:
@@ -317,7 +334,7 @@ def slot_due(state: State, now: datetime) -> Optional[str]:
     if quiet(now):
         return None
     local = _local(now)
-    for name, hour in SLOTS:
+    for name, hour in slots_on(local.date().isoformat()):
         slot = f"{local.date().isoformat()} {name}"
         start = slot_start(slot)
         if start is None or slot in state.thought:
@@ -338,7 +355,7 @@ def slots_missed(state: State, now: datetime) -> list[str]:
     out = []
     for back in (1, 0):
         day = (local - timedelta(days=back)).date().isoformat()
-        for name, _hour in SLOTS:
+        for name, _hour in slots_on(day):
             slot = f"{day} {name}"
             start = slot_start(slot)
             if start is None or slot in state.thought or start < since:

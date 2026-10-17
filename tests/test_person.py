@@ -13,7 +13,9 @@ from typing import Any
 
 import pytest
 
-from omega import episodes, followups, lessons, notice, outbox, projection, provider, tools
+from omega import (
+    episodes, followups, lessons, notice, outbox, projection, provider, thinking, tools,
+)
 from omega.executor import Executor
 from omega.turn import SENSE_LOOK
 from omega.memory import MemoryStore
@@ -53,6 +55,13 @@ def fake(verdict: str = "NUDGE the battery is low", words: str = NUDGE,
         return verdict
 
     def act(role, messages):
+        if thinking.SYSTEM[:40] in str(messages[0]):
+            # A thinking slot (C4) is the act role alone: it sees what the
+            # judge saw and stays silent where the judge would have.
+            if seen is not None:
+                seen.append(str(messages))
+            if verdict.upper().startswith("SILENT"):
+                return verdict
         return words
 
     return provider.FakeProvider({provider.JUDGE: judge, provider.ACT: act})
@@ -390,9 +399,12 @@ def test_thinking_time_is_a_look_over_everything_open(q: EventQueue) -> None:
     assert len(look["text"]) <= outbox.MAX_THINKING_CHARS
     seen.clear()
     ex.drain()
-    # The ordinary look judge (DL-076), not a new loop.
-    assert "Do they need a nudge right now?" in seen[0]
+    # C4: the slot is its own thinking pass (no look judge), and journalled.
+    assert thinking.SYSTEM[:40] in seen[0]
+    assert "Do they need a nudge right now?" not in seen[0]
     assert last_turn(q)["outcome"] == "silent"
+    [entry] = kinds(q, episodes.JOURNAL_WRITTEN)
+    assert entry["slot"] == "2026-10-14 morning" and entry["outcome"] == "silent"
     [drop] = kinds(q, episodes.MESSAGE_DROPPED)
     assert drop["queued"] == [draft]
     assert outbox.Outbox.rebuild(q.store).state().drafts == ()

@@ -596,8 +596,24 @@ THINKING_FAILED = "thinking.failed"
 #: Why a slot did not run: omega was not there to start it in its window, the
 #: day's thinking spend was used up, or it was held back (a conversation, an
 #: outstanding turn, no network) until its window closed.
-THINKING_FAILURES = frozenset({"no entry", "spend exceeded", "deferral expired"})
+THINKING_FAILURES = frozenset({
+    "no entry", "spend exceeded", "deferral expired", "slot spend cap",
+})
 OUTBOX_KINDS = frozenset({MESSAGE_QUEUED, MESSAGE_DELIVERED, MESSAGE_DROPPED, THINKING_FAILED})
+#: What one thinking slot thought (C4, M2): ``changed`` since the last entry,
+#: at most :data:`MAX_JOURNAL_QUESTIONS` ``questions``, ``insights`` that each
+#: cite the seqs they rest on, a ``decisions`` entry for every open key it was
+#: shown (act / ask / fold / let_go, with ``why`` and ``by`` the model or
+#: code's default), and its ``outcome``: a message, or a silence whose ``why``
+#: is the suppression log (DL-013) over ``considered``. ``fabricated`` counts
+#: citations code dropped because the slot was never shown them. Append-only:
+#: an entry is never rewritten, and it is never pushed to them (DL-118).
+JOURNAL_WRITTEN = "journal.written"
+JOURNAL_DECISIONS = frozenset({"act", "ask", "fold", "let_go"})
+JOURNAL_OUTCOMES = frozenset({"message", "silent"})
+MAX_JOURNAL_QUESTIONS = 3
+MAX_JOURNAL_INSIGHTS = 8
+MAX_JOURNAL_TEXT = 1_000
 #: What can draft a held message: a look, a thinking turn, a failure
 #: follow-up, the weekly self-review, and the judge re-checking held drafts
 #: before they go (B4-lite).
@@ -764,6 +780,7 @@ KINDS = frozenset(
         *LEAVE_KINDS,
         *OUTBOX_KINDS,
         *LEDGER_KINDS,
+        JOURNAL_WRITTEN,
         *SLACK_KINDS,
         *DELEGATE_KINDS,
     }
@@ -2366,6 +2383,10 @@ _REQUIRED: dict[str, tuple[str, ...]] = {
     MESSAGE_DROPPED: ("queued", "why", "at"),
     OBSERVATION_RECORDED: ("key", "source", "what", "evidence_seq", "at"),
     THINKING_FAILED: ("slot", "why", "at"),
+    JOURNAL_WRITTEN: (
+        "for_seq", "slot", "changed", "questions", "insights", "decisions",
+        "considered", "outcome", "why", "fabricated", "at",
+    ),
     SLACK_POSTED: ("for_seq", "channel", "name", "ts", "permalink", "what", "at"),
     SLACK_DELETED: ("for_seq", "channel", "ts", "at"),
     SLACK_FAILED: ("for_seq", "do", "to", "error", "at"),
@@ -3177,6 +3198,8 @@ def _validate(payload: dict[str, Any]) -> None:
         # `for_seq` only where a turn is behind it: a follow-up held before it
         # was ever told has none, and a drop is named by the drafts it drops.
         _validate_outbox(payload)
+    elif kind == JOURNAL_WRITTEN:
+        _validate_journal(payload)
     elif kind in LEDGER_KINDS:
         # Named by its key: a sense saw it, and no turn is behind it.
         _validate_observation(payload)
@@ -4226,6 +4249,75 @@ def _validate_observation(payload: dict[str, Any]) -> None:
         url = payload["url"]
         if not isinstance(url, str) or len(url) > 300 or not re.match(r"^https://[!-~]+$", url):
             raise BadPayload("url must be an https link of at most 300 characters")
+
+
+def _validate_journal(payload: dict[str, Any]) -> None:
+    _require_seq(payload, "for_seq")
+    _require_str(payload, "at", non_empty=True)
+    _require_sentence(payload, "slot", cap=100)
+    _require_sentence(payload, "changed", cap=MAX_JOURNAL_TEXT, empty=True)
+    questions = payload["questions"]
+    if (not isinstance(questions, list) or len(questions) > MAX_JOURNAL_QUESTIONS
+            or not all(isinstance(x, str) and x.strip() and len(x) <= MAX_JOURNAL_TEXT
+                       for x in questions)):
+        raise BadPayload(f"questions must be at most {MAX_JOURNAL_QUESTIONS} sentences")
+    insights = payload["insights"]
+    if not isinstance(insights, list) or len(insights) > MAX_JOURNAL_INSIGHTS:
+        raise BadPayload(f"insights must be a list of at most {MAX_JOURNAL_INSIGHTS}")
+    for insight in insights:
+        if not isinstance(insight, dict) or set(insight) != {"text", "seqs"}:
+            raise BadPayload("each insight is exactly {text, seqs}")
+        _require_sentence(insight, "text", cap=MAX_JOURNAL_TEXT)
+        _require_seqs(insight, "seqs")
+        if not insight["seqs"]:
+            raise BadPayload("an insight cites at least one seq")
+    decisions = payload["decisions"]
+    if not isinstance(decisions, list) or len(decisions) > MAX_KEYS:
+        raise BadPayload(f"decisions must be a list of at most {MAX_KEYS}")
+    for d in decisions:
+        if not isinstance(d, dict) or set(d) != {"key", "decision", "why", "by"}:
+            raise BadPayload("each decision is exactly {key, decision, why, by}")
+        if not isinstance(d["key"], str) or not _LEDGER_KEY.match(d["key"]):
+            raise BadPayload("a decision names a ledger key")
+        if d["decision"] not in JOURNAL_DECISIONS:
+            raise BadPayload(f"decision must be one of {sorted(JOURNAL_DECISIONS)}")
+        if d["by"] not in ("model", "code"):
+            raise BadPayload("by is model or code")
+        _require_sentence(d, "why", cap=MAX_OUTBOX_WHY)
+    considered = payload["considered"]
+    if not isinstance(considered, list) or len(considered) > MAX_KEYS or not all(
+        isinstance(k, str) and _LEDGER_KEY.match(k) for k in considered
+    ):
+        raise BadPayload(f"considered must be at most {MAX_KEYS} ledger keys")
+    if payload["outcome"] not in JOURNAL_OUTCOMES:
+        raise BadPayload(f"outcome must be one of {sorted(JOURNAL_OUTCOMES)}")
+    _require_sentence(payload, "why", cap=MAX_JOURNAL_TEXT,
+                      empty=payload["outcome"] == "message")
+    fabricated = payload["fabricated"]
+    if not isinstance(fabricated, int) or isinstance(fabricated, bool) or fabricated < 0:
+        raise BadPayload("fabricated is a count")
+    if "tainted" in payload:
+        _validate_tainted(payload)
+
+
+def journal_written(
+    *, for_seq: int, slot: str, changed: str, questions: Sequence[str],
+    insights: Sequence[dict[str, Any]], decisions: Sequence[dict[str, Any]],
+    considered: Sequence[str], outcome: str, why: str, fabricated: int = 0,
+    tainted: Sequence[str] = (), at: Optional[str] = None,
+) -> dict[str, Any]:
+    """One thinking slot's journal entry (C4, M2). Append-only."""
+    payload: dict[str, Any] = {
+        "v": VERSION, "kind": JOURNAL_WRITTEN, "for_seq": for_seq, "slot": slot,
+        "changed": changed, "questions": list(questions),
+        "insights": [dict(i) for i in insights],
+        "decisions": [dict(d) for d in decisions], "considered": list(considered),
+        "outcome": outcome, "why": why, "fabricated": fabricated, "at": at or now(),
+    }
+    if tainted:
+        payload["tainted"] = list(tainted)
+    _validate(payload)
+    return payload
 
 
 def thinking_failed(*, slot: str, why: str, at: Optional[str] = None) -> dict[str, Any]:
