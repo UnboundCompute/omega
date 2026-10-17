@@ -16,8 +16,11 @@ What each line measures (AGENT.md, M0' gated invariants):
 - ``at fires on time``: fires of cron schedules within 2 min of their minute.
 - ``thinking on its slot``: thinking turns started within 15 min of 09:00 or
   19:00, out of slots started plus slots written down as failed.
-- ``claims anchored on omega``: new inferred claims whose cause is a fire or a
-  look (should be 0), out of inferred claims filed.
+- ``claims anchored on omega``: new inferred claims a conversation reflection
+  pass anchored on a fire or a look (should be 0), out of inferred claims
+  filed. A transcript, usage or audio claim anchored on a look's record is not
+  counted: those passes anchor on the head because no turn is behind them
+  (``tidy.conversation_claims``), the same test tidy retracts by.
 - ``reflections without a person``: passes with no new person message since
   the previous pass (should be 0), out of passes.
 - ``verbatim held-draft tells``: schedule tells carrying held drafts (should
@@ -33,7 +36,7 @@ from typing import Any, Optional
 
 sys.path.insert(0, "python")
 
-from omega import episodes, memory, notice, outbox, promises  # noqa: E402
+from omega import episodes, memory, notice, outbox, promises, tidy  # noqa: E402
 
 
 def _at(payload: dict[str, Any]) -> Optional[datetime]:
@@ -66,14 +69,7 @@ def measure(store: memory.MemoryStore, since: Optional[str]) -> list[str]:
     deliveries = early = 0
     heard: Optional[datetime] = None
 
-    def fire(seq: Any) -> bool:
-        p = by_seq.get(seq) if isinstance(seq, int) else None
-        if p and p.get("kind") in (episodes.TURN_COMPLETED, episodes.TURN_BLOCKED):
-            p = by_seq.get(p.get("for_seq"))
-        return bool(
-            p and p.get("kind") == episodes.MESSAGE_INBOUND
-            and p.get("channel") in notice.UNPROMPTED_CHANNELS
-        )
+    reflected = tidy.conversation_claims(log)
 
     for seq, p in log:
         kind = p.get("kind")
@@ -111,7 +107,9 @@ def measure(store: memory.MemoryStore, since: Optional[str]) -> list[str]:
             failed += 1
         elif kind == episodes.CLAIM_EXTRACTED and p.get("explicit") is False:
             inferred += 1
-            anchored += fire(p.get("for_seq")) or fire(p.get("source_seq"))
+            anchored += seq in reflected and tidy.fire_anchor(
+                by_seq, p.get("for_seq"), p.get("source_seq")
+            ) is not None
         elif kind == episodes.REFLECTION_DONE:
             passes += 1
             empty_passes += not person_since_pass

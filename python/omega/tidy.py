@@ -152,6 +152,40 @@ def _trigger_key(trigger: Optional[dict[str, Any]]) -> Any:
 _UNPROMPTED = frozenset({"self", "schedule", "task"})
 
 
+# The receipt each learning pass closes its claims with. A claim belongs to
+# the first of these written after it: the executor is the single writer, and
+# every pass files its claims, then its moments and lessons, then its receipt.
+_RECEIPTS = (
+    episodes.REFLECTION_DONE,
+    episodes.TRANSCRIPT_INGESTED,
+    episodes.USAGE_DIGESTED,
+    episodes.AUDIO_CAPTURED,
+)
+
+
+def conversation_claims(log: Sequence[tuple[int, dict[str, Any]]]) -> set[int]:
+    """Seqs of the claims a conversation reflection pass filed.
+
+    Read off the receipt that closed the claim's pass: ``reflection.done``
+    for the CONVERSATION lens, a transcript, usage or audio receipt for the
+    digest lenses. The digest lenses anchor on the log's head because no turn
+    is behind them, so after a look that head is the look's own record — an
+    anchor that says nothing about whose words taught the claim. A claim no
+    receipt closed (a crash mid-pass) belongs to no pass and is left out.
+    """
+    found: set[int] = set()
+    pending: list[int] = []
+    for seq, payload in log:
+        kind = payload.get("kind")
+        if kind == episodes.CLAIM_EXTRACTED:
+            pending.append(seq)
+        elif kind in _RECEIPTS:
+            if kind == episodes.REFLECTION_DONE:
+                found.update(pending)
+            pending = []
+    return found
+
+
 def misattributed(store: Any, claims: Sequence[Claim]) -> list[tuple[Claim, int]]:
     """Inferred claims a reflection pass anchored on omega's own fire (C0),
     each with the fire it was anchored on.
@@ -159,36 +193,43 @@ def misattributed(store: Any, claims: Sequence[Claim]) -> list[tuple[Claim, int]
     Before C0 a pass read every channel and named the log's head as its
     cause, so omega's own watch rules came back as things it had learned
     about the person. The class is read from structure only: an inferred
-    (``explicit=False``) claim whose ``for_seq`` or ``source_seq`` is an
+    (``explicit=False``) claim a conversation reflection pass filed
+    (:func:`conversation_claims`) whose ``for_seq`` or ``source_seq`` is an
     inbound on an unprompted channel, or the turn record that answered one.
-    A claim the person taught, and one learned from a transcript or the day's
-    usage, never matches: their source is not a turn. Reflection now anchors
-    on the last person message it read, so no new claim can match either.
+    A claim the person taught is explicit and never matches. A claim learned
+    from a transcript, a recording or the day's usage never matches either,
+    even when the head it was anchored on was a look's record: its pass
+    closed with a digest receipt, not ``reflection.done``. Reflection now
+    anchors on the last person message it read, so no new claim can match.
     """
     inferred = [c for c in claims if not c.explicit]
     if not inferred:
         return []
-    payloads = {e.seq: episodes.decode(e.payload) for e in store.episodes_since(0)}
+    log = [(e.seq, episodes.decode(e.payload)) for e in store.episodes_since(0)]
+    payloads = dict(log)
+    reflected = conversation_claims(log)
+    return [
+        (claim, hit)
+        for claim in inferred
+        if claim.seq in reflected
+        and (hit := fire_anchor(payloads, payloads.get(claim.seq, {}).get("for_seq"),
+                                claim.source_seq)) is not None
+    ]
 
-    def fire(seq: Any) -> bool:
+
+def fire_anchor(payloads: dict[int, dict[str, Any]], *seqs: Any) -> Optional[int]:
+    """The unprompted inbound the first of ``seqs`` names, directly or
+    through the turn record that answered it, else ``None``."""
+    anchors = list(seqs)
+    for seq in seqs:
+        record = payloads.get(seq) if isinstance(seq, int) else None
+        if record and record.get("kind") in (episodes.TURN_COMPLETED, episodes.TURN_BLOCKED):
+            anchors.append(record.get("for_seq"))
+    for seq in anchors:
         p = payloads.get(seq) if isinstance(seq, int) else None
-        return bool(
-            p
-            and p.get("kind") == episodes.MESSAGE_INBOUND
-            and p.get("channel") in _UNPROMPTED
-        )
-
-    found: list[tuple[Claim, int]] = []
-    for claim in inferred:
-        anchors = [payloads.get(claim.seq, {}).get("for_seq"), claim.source_seq]
-        for seq in list(anchors):
-            record = payloads.get(seq) if isinstance(seq, int) else None
-            if record and record.get("kind") in (episodes.TURN_COMPLETED, episodes.TURN_BLOCKED):
-                anchors.append(record.get("for_seq"))
-        hit = next((a for a in anchors if fire(a)), None)
-        if hit is not None:
-            found.append((claim, hit))
-    return found
+        if p and p.get("kind") == episodes.MESSAGE_INBOUND and p.get("channel") in _UNPROMPTED:
+            return seq
+    return None
 
 
 def duplicates(claims: Sequence[Claim]) -> list[tuple[int, list[int]]]:

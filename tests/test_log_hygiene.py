@@ -150,11 +150,13 @@ def test_a_claim_anchored_on_a_fire_is_retracted_and_a_person_one_stays(q: Event
         for_seq=fire, text="checks the build page hourly", source_seq=fire,
         situation="reflecting", explicit=False, at=AT,
     ))
+    q.append(episodes.reflection_done(through=bad, filed=1, at=AT))
     said = _say(q, "I am off on Fridays")
     good = q.append(episodes.claim_extracted(
         for_seq=said, text="is off on Fridays", source_seq=said,
         situation="reflecting", explicit=False, at=AT,
     ))
+    q.append(episodes.reflection_done(through=good, filed=1, at=AT))
     taught_on_a_fire = q.append(episodes.claim_extracted(
         for_seq=fire, text="likes tea", source_seq=fire,
         situation="taught", explicit=True, at=AT,
@@ -168,3 +170,39 @@ def test_a_claim_anchored_on_a_fire_is_retracted_and_a_person_one_stays(q: Event
     assert [p["claim_seq"] for _, p in _kinds(q, episodes.CLAIM_RETRACTED)] == [bad]
     live = {c.seq for c in derive.Learned.rebuild(q.store).claims()}
     assert bad not in live and {good, taught_on_a_fire} <= live
+
+
+def test_a_digest_claim_filed_after_a_look_survives_tidy(q: EventQueue) -> None:
+    # The WORK, DAY and heard lenses anchor on the head, and after a look the
+    # head is the look's own record. Their receipt, not their anchor, says
+    # whose words they came from, so they stay; a conversation pass's claim
+    # on the same anchor is the misfiled class and goes.
+    _say(q, "morning")
+    look = q.append(episodes.inbound("(look) nothing new", channel="self", at=AT))
+    record = q.append(episodes.completed(for_seq=look, outcome="silent", at=AT))
+    work = q.append(episodes.claim_extracted(
+        for_seq=record, text="works on the parser in the evenings", source_seq=record,
+        situation="watching a coding session", explicit=False, at=AT,
+    ))
+    q.append(episodes.transcript_ingested(
+        session="s-synthetic", source="claude-code", project="demo", filed=1, at=AT,
+    ))
+    day = q.append(episodes.claim_extracted(
+        for_seq=record, text="opens the editor before mail", source_seq=record,
+        situation="reading the day's usage", explicit=False, at=AT,
+    ))
+    q.append(episodes.usage_digested(day="2026-09-22", source="mac", filed=1, at=AT))
+    reflected = q.append(episodes.claim_extracted(
+        for_seq=record, text="checks for anything new hourly", source_seq=record,
+        situation="reflecting", explicit=False, at=AT,
+    ))
+    q.append(episodes.reflection_done(through=reflected, filed=1, at=AT))
+
+    learned = derive.Learned.rebuild(q.store)
+    assert [(c.seq, f) for c, f in tidy.misattributed(q.store, learned.claims())] == [
+        (reflected, look)
+    ]
+    tidy.run(q, learned, provider.FakeProvider({}).complete, now=AT)
+    assert [p["claim_seq"] for _, p in _kinds(q, episodes.CLAIM_RETRACTED)] == [reflected]
+    live = {c.seq for c in derive.Learned.rebuild(q.store).claims()}
+    assert {work, day} <= live and reflected not in live
