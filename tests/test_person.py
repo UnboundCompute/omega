@@ -15,6 +15,7 @@ import pytest
 
 from omega import episodes, followups, lessons, notice, outbox, projection, provider, tools
 from omega.executor import Executor
+from omega.turn import SENSE_LOOK
 from omega.memory import MemoryStore
 from omega.queue import EventQueue
 
@@ -97,6 +98,19 @@ def start(q: EventQueue, when: datetime) -> Executor:
     return ex
 
 
+KEY = "ci:demo/build"
+
+
+def noted(q: EventQueue, when: datetime, key: str = KEY,
+          what: str = "Synthetic CI: build failed on main") -> int:
+    """Something a sense wrote down for the composer (C3): under pace a look
+    only speaks when it has a keyed item to compose from."""
+    return q.append(episodes.observation_recorded(
+        key=key, source="ci", what=what, ref=f"{key}@{when.isoformat()}",
+        at=when.isoformat(),
+    ))
+
+
 def deliveries(q: EventQueue) -> list[dict]:
     return kinds(q, episodes.MESSAGE_DELIVERED)
 
@@ -151,36 +165,66 @@ def test_present_is_the_mac_or_a_recent_message_and_unknown_is_away() -> None:
 # --- holding a look -----------------------------------------------------------
 
 
-def test_a_look_while_they_are_away_is_held_not_spoken(q: EventQueue) -> None:
+def test_a_plain_look_is_a_sense_and_never_speaks(q: EventQueue) -> None:
     ex = start(q, local(14, 12))
+    at_the_mac(q, local(14, 11, 58))
     assert ex.notice(now=local(14, 12)) is True
+    look = kinds(q, episodes.MESSAGE_INBOUND)[-1]
+    assert "keys" not in look and not look["text"].startswith(outbox.COMPOSE_LEAD)
     ex.drain()
     done = last_turn(q)
-    assert done["outcome"] == "silent" and done["reply"] is None
-    assert done["judged"] == "NUDGE the battery is low"
-    [draft] = kinds(q, episodes.MESSAGE_QUEUED)
-    assert draft["text"] == NUDGE and draft["source"] == "look"
-    assert draft["why"] == outbox.HOLD_AWAY
-    assert not deliveries(q)
-    # Nothing crosses to a surface: the silent turn and the draft both stay home.
-    assert [projection.project(p, 1) for p in payloads(q) if p["kind"] in episodes.OUTBOX_KINDS] == [None]
+    assert done["outcome"] == "silent" and done["judged"] == SENSE_LOOK
+    assert not kinds(q, episodes.MESSAGE_QUEUED) and not deliveries(q)
+
+
+def test_a_keyed_item_waits_while_they_are_away_then_is_composed(q: EventQueue) -> None:
+    ex = start(q, local(14, 12))
+    noted(q, local(14, 11, 50))
+    assert ex.notice(now=local(14, 12)) is True
+    look = kinds(q, episodes.MESSAGE_INBOUND)[-1]
+    # C3: the composer speaks at a presence moment; away, the look stays a sense.
+    assert "keys" not in look
+    ex.drain()
+    assert last_turn(q)["judged"] == SENSE_LOOK
+    assert not kinds(q, episodes.MESSAGE_QUEUED) and not deliveries(q)
+    at_the_mac(q, local(14, 13, 0))
+    ex.notice(now=local(14, 13, 1))
+    assert kinds(q, episodes.MESSAGE_INBOUND)[-1]["keys"] == [KEY]
+    ex.drain()
+    assert last_turn(q)["outcome"] == "spoke" and len(deliveries(q)) == 1
+
+
+def held(q: EventQueue, when: datetime, key: str = KEY) -> int:
+    """A composed draft already held for them (a slot over budget, say)."""
+    noted(q, when - timedelta(minutes=5), key=key)
+    return q.append(episodes.message_queued(
+        text=NUDGE, source="compose", why=outbox.HOLD_AWAY, keys=[key],
+        at=when.isoformat(),
+    ))
 
 
 def test_a_look_while_they_are_here_speaks_and_is_counted(q: EventQueue) -> None:
     ex = start(q, local(14, 12))
+    noted(q, local(14, 11, 50))
     at_the_mac(q, local(14, 11, 58))
     ex.notice(now=local(14, 12))
+    look = kinds(q, episodes.MESSAGE_INBOUND)[-1]
+    assert look["text"].startswith(outbox.COMPOSE_LEAD) and look["keys"] == [KEY]
+    assert "Synthetic CI: build failed on main" in look["text"]
     ex.drain()
-    assert last_turn(q)["outcome"] == "spoke"
+    assert last_turn(q)["outcome"] == "spoke" and last_turn(q)["keys"] == [KEY]
     assert last_turn(q)["reply"] == NUDGE
     [d] = deliveries(q)
     assert d["queued"] == [] and d["for_seq"] == last_turn(q)["for_seq"]
+    assert d["keys"] == [KEY]
+    # Told: nothing new on it, so the next look has nothing to compose.
+    ex.notice(now=local(14, 12, 30))
+    assert "keys" not in kinds(q, episodes.MESSAGE_INBOUND)[-1]
 
 
 def test_a_held_draft_is_rechecked_once_when_they_come_back(q: EventQueue) -> None:
     ex = start(q, local(14, 12))
-    ex.notice(now=local(14, 12))
-    ex.drain()
+    held(q, local(14, 12))
     [draft_seq] = [e.seq for e in q.store.episodes_since(0)
                    if episodes.decode(e.payload)["kind"] == episodes.MESSAGE_QUEUED]
     at_the_mac(q, local(14, 14, 0))
@@ -249,8 +293,7 @@ def test_a_recheck_showing_a_reply_drawn_from_mail_names_that_taint(q: EventQueu
 
 def test_a_recheck_that_stays_silent_drops_the_drafts_stamped_now(q: EventQueue) -> None:
     ex = start(q, local(14, 12))
-    ex.notice(now=local(14, 12))
-    ex.drain()
+    held(q, local(14, 12))
     at_the_mac(q, local(14, 14, 0))
     ex = executor(q, fake("SILENT already told them"))
     assert ex.notice(now=local(14, 14, 1)) is True
@@ -265,8 +308,7 @@ def test_a_recheck_that_stays_silent_drops_the_drafts_stamped_now(q: EventQueue)
 
 def test_nothing_held_goes_out_within_ten_minutes_of_them_speaking(q: EventQueue) -> None:
     ex = start(q, local(14, 12))
-    ex.notice(now=local(14, 12))
-    ex.drain()
+    held(q, local(14, 12))
     said(q, "back now", local(14, 14, 0))
     at_the_mac(q, local(14, 14, 0))
     before = q.head()
@@ -288,8 +330,7 @@ def test_several_held_drafts_go_out_as_one_message() -> None:
 
 def test_nothing_is_delivered_in_quiet_hours_even_with_them_here(q: EventQueue) -> None:
     ex = start(q, local(14, 12))
-    ex.notice(now=local(14, 12))
-    ex.drain()
+    held(q, local(14, 12))
     at_the_mac(q, local(14, 23, 30))
     before = q.head()
     ex.notice(now=local(14, 23, 31))
@@ -302,24 +343,28 @@ def test_nothing_is_delivered_in_quiet_hours_even_with_them_here(q: EventQueue) 
 def test_the_day_budget_survives_a_restart(q: EventQueue) -> None:
     ex = start(q, local(14, 10))
     for hour in (10, 12):
+        noted(q, local(14, hour, 0), key=f"ci:demo/build-{hour}")
         at_the_mac(q, local(14, hour, 0))
         ex.notice(now=local(14, hour, 1))
         ex.drain()
     assert len(deliveries(q)) == 2
     # A new process over the same log: the third is held, here or not.
     ex2 = executor(q)
+    noted(q, local(14, 15, 0), key="ci:demo/build-15")
     at_the_mac(q, local(14, 15, 0))
     ex2.notice(now=local(14, 15, 1))
     ex2.drain()
     assert last_turn(q)["outcome"] == "silent"
-    assert kinds(q, episodes.MESSAGE_QUEUED)[-1]["why"] == outbox.HOLD_BUDGET
+    # Over budget nothing is composed: the item waits in the ledger instead.
+    assert "keys" not in kinds(q, episodes.MESSAGE_INBOUND)[-1]
     assert len(deliveries(q)) == 2
-    # Tomorrow has its own budget, and the held draft goes out then.
+    # Tomorrow has its own budget, and the waiting item is told then.
     at_the_mac(q, local(15, 12, 0))
     thought(q, local(15, 12))
     ex2.notice(now=local(15, 12, 1))
     ex2.drain()
-    assert len(deliveries(q)) == 3 and deliveries(q)[-1]["queued"]
+    assert len(deliveries(q)) == 3
+    assert deliveries(q)[-1]["keys"] == ["ci:demo/build-15"]
 
 
 # --- thinking time --------------------------------------------------------------
@@ -593,14 +638,22 @@ def test_exempt_events_get_no_gate(q: EventQueue) -> None:
 
 
 def _strip(ps: list[dict]) -> list[dict]:
-    """The terminal records' wall-clock stamp (`_handle` passes none) aside."""
+    """The terminal records' wall-clock stamp (`_handle` passes none) aside,
+    and the told-ledger's keys (C3), which pace adds and nothing else reads
+    as behaviour: what is said, when, and to whom must be the same."""
     out = []
     for p in ps:
         p = dict(p)
+        p.pop("keys", None)
         if p["kind"] == episodes.TURN_COMPLETED:
             p.pop("at")
         out.append(p)
     return out
+
+
+def _keys(store_dir) -> set[str]:
+    with MemoryStore.open(store_dir) as s:
+        return {k for e in s.episodes_since(0) for k in episodes.decode(e.payload).get("keys") or ()}
 
 
 def _exempt_run(store_dir, pace: bool) -> list[dict]:
@@ -629,6 +682,8 @@ def test_exempt_paths_are_byte_identical_with_the_outbox_on(tmp_path) -> None:
     off = _exempt_run(tmp_path / "a", pace=False)
     on = _exempt_run(tmp_path / "b", pace=True)
     assert on == off
+    # The keys are there under pace: the reminder named its own (DL-075 path).
+    assert _keys(tmp_path / "b") >= {"reminder:r1-abcd"}
     assert not [p for p in on if p["kind"] in episodes.OUTBOX_KINDS]
     assert [p["outcome"] for p in on if p["kind"] == episodes.TURN_COMPLETED] == [
         "spoke", "spoke", "spoke",
@@ -717,6 +772,7 @@ def test_a_leave_ping_in_quiet_hours_is_identical_with_the_outbox_on(
     (tmp_path / "b").mkdir()
     off = _leave_run(tmp_path / "a", pace=False)
     on = _leave_run(tmp_path / "b", pace=True)
+    assert "leave:l1" in _keys(tmp_path / "b") and not _keys(tmp_path / "a")
     [ping] = [p for p in on if p["kind"] == episodes.LEAVE_PINGED]
     assert outbox.quiet(datetime.fromisoformat(ping["at"]))
     assert on == off

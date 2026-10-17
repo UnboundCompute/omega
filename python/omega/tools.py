@@ -389,6 +389,15 @@ def is_watch(event: dict[str, Any]) -> bool:
     ).startswith(WATCH_LEAD)
 
 
+def is_condition_watch(event: dict[str, Any]) -> bool:
+    """A watch for one thing they named ("tell me when Asha replies"), which
+    keeps its immediate path (DL-106); every other watch is a sense."""
+    if not is_watch(event):
+        return False
+    what = str(event.get("text", ""))[len(WATCH_LEAD):].split("\n", 1)[0]
+    return bool(_CONDITION_WORDS.search(what))
+
+
 #: How every reminder's fire text begins, and so how a turn knows it is one.
 REMINDER_LEAD = "Reminder you promised them: "
 
@@ -441,10 +450,15 @@ def brief_instruction() -> str:
 
 
 def is_brief(event: dict[str, Any]) -> bool:
-    """Is this event a brief coming due (DL-080)? Read as a reminder is."""
-    return event.get("channel") == "schedule" and str(
-        event.get("text", "")
-    ).startswith(BRIEF_LEAD)
+    """Is this event a brief coming due (DL-080)? Read as a reminder is.
+    Since DL-114 the brief is also the morning thinking slot: a thinking
+    inbound whose text starts with the brief's lead is the brief."""
+    if not str(event.get("text", "")).startswith(BRIEF_LEAD):
+        return False
+    channel = event.get("channel")
+    return channel == "schedule" or (
+        channel == "self" and isinstance(event.get("thinking"), str)
+    )
 
 
 #: How every message omega sends about itself begins (DL-084 #1, #4): a promise

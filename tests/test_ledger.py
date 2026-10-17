@@ -305,12 +305,22 @@ def test_stale_draft() -> None:
 
 
 def test_omega_authored_reminders() -> None:
+    def made(sid: str) -> dict:
+        return episodes.schedule_created(
+            id=sid, instruction=tools.remind_instruction("x"), every=60, once=True,
+        )
+
     view = Ledger.fold(enumerate([
         episodes.inbound("look", channel="self"),   # 1: omega's own turn
         episodes.inbound("remind me", channel="cli"),  # 2: theirs
+        made("r1-abc"), made("r2-abc"),
+        # 5: a fire whose seq the id below happens to name; set before it.
+        episodes.inbound("a fire", channel="schedule", schedule_id="r5-abc"),
     ], start=1))
     assert view.authored("r1-abc")
     assert not view.authored("r2-abc")
+    assert not view.authored("r5-abc")   # not set at all after seq 5
+    assert not view.authored("r1-zzz")   # never set: no reminder to own
     assert not view.authored("pr1")      # a promise reminder is set on their yes
     assert not view.authored("weekly")
 

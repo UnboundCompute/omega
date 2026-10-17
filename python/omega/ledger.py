@@ -91,6 +91,12 @@ def _safe(part: str) -> str:
     return "h" + hashlib.sha256(part.encode("utf-8", "replace")).hexdigest()[:16]
 
 
+def key(prefix: str, part: Any) -> str:
+    """A key for something omega itself tells (``outage:look``,
+    ``access:google``, ``watch:w12-ab``): a fixed prefix and a safe part."""
+    return f"{prefix}:{_safe(str(part)) or 'x'}"
+
+
 def mail_key(mail: Any, box: str = "personal") -> str:
     """``mail:<Message-ID>``, or ``mail:<box>#<uid>`` when it has none."""
     mid = str(getattr(mail, "message_id", "") or "").strip()
@@ -474,7 +480,7 @@ class Ledger:
     """The fold. Kept at the log's head by the executor, as its other views."""
 
     __slots__ = ("_through", "_items", "_bulk", "_unprompted", "_inbound_keys",
-                 "_fires", "_sends", "_unkeyed", "_repeats", "_counted")
+                 "_fires", "_sends", "_unkeyed", "_repeats", "_counted", "_taint")
 
     def __init__(self) -> None:
         self._through = 0
@@ -487,6 +493,9 @@ class Ledger:
         self._unkeyed = 0
         self._repeats = 0
         self._counted: set[int] = set()
+        # unprompted turn seq -> what untrusted content it read, so a reminder
+        # it set carries that taint when it comes due (DL-120, DL-064).
+        self._taint: dict[int, tuple[str, ...]] = {}
 
     def _item(self, key: str, source: str, what: str, seq: int, at: str) -> Item:
         item = self._items.get(key)
@@ -554,6 +563,8 @@ class Ledger:
             for_seq = payload.get("for_seq")
             if not isinstance(for_seq, int):
                 return
+            if for_seq in self._unprompted and payload.get("tainted"):
+                self._taint[for_seq] = tuple(str(t) for t in payload["tainted"])
             failed = kind == episodes.TURN_COMPLETED and payload.get("outcome") == "failed"
             sid = self._fires.get(for_seq)
             if sid is not None and not failed:
@@ -598,7 +609,21 @@ class Ledger:
         )
 
     def authored(self, sid: str) -> bool:
-        return omega_authored(sid, self._unprompted)
+        """Did omega set reminder ``sid`` on its own (DL-120)? Its id names an
+        unprompted turn, and that turn came before the reminder was set: a
+        fire whose own seq happens to match the id is not its author."""
+        m = _MODEL_REMINDER.match(sid)
+        item = self._items.get(f"reminder:{_safe(sid)}")
+        return (
+            m is not None and item is not None
+            and int(m.group(1)) < item.first_seq
+            and omega_authored(sid, self._unprompted)
+        )
+
+    def authored_taint(self, sid: str) -> tuple[str, ...]:
+        """What the unprompted turn that set reminder ``sid`` had read."""
+        m = _MODEL_REMINDER.match(sid)
+        return self._taint.get(int(m.group(1)), ()) if m else ()
 
     @classmethod
     def fold(cls, decoded: Iterable[tuple[int, dict[str, Any]]]) -> "Ledger":

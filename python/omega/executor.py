@@ -41,6 +41,7 @@ from omega import (
     inbox as inboxes,
     learn,
     leave,
+    ledger,
     lessons,
     listen,
     location,
@@ -67,6 +68,7 @@ from omega.queue import EVENT_KINDS, EventQueue, Pending
 from omega.schedule import Schedule, Scheduler
 from omega.turn import (
     NOT_RECALLED,
+    SENSE_LOOK,
     ActResult,
     TurnContext,
     TurnResult,
@@ -75,6 +77,15 @@ from omega.turn import (
     run_turn,
     write_memory,
 )
+
+#: Why a turn the told-ledger closed before it ran ended quiet (C3).
+CANCELLED_IN_FLIGHT = "cancelled: its schedule was cancelled while the fire waited (C3)"
+BRIEF_FOLDED = "brief: the morning thinking slot is the brief (DL-114)"
+AUTHORED_REMINDER = (
+    "follow-up: a reminder omega set itself, written down for the composer (DL-120)"
+)
+#: How many keyed items one compose or thinking turn is shown, newest first.
+COMPOSE_ITEMS = 12
 
 #: Messages that must arrive before another reflection pass runs (DL-054).
 #:
@@ -286,6 +297,7 @@ class Executor:
         "_deferred",
         "_offered",
         "_offered_through",
+        "_ledger",
     )
 
     def __init__(
@@ -398,6 +410,9 @@ class Executor:
         # folded from the log's own proposals so a restart asks nothing twice.
         self._offered: set[tuple[str, str]] = set()
         self._offered_through = 0
+        # The told-ledger (C1, DL-109), kept at the log's head: what the
+        # senses saw under which key, and what each key was last told.
+        self._ledger = ledger.Ledger()
         # Read-only: `due` and `fire` belong to the clock thread and are
         # never called from here. A second fold of the same log rather than
         # a shared object, because the clock mutates its copy on its own
@@ -1378,6 +1393,7 @@ class Executor:
                         tools.outage_text(st.failed_looks, st.look_error or ""),
                         channel="schedule",
                         at=moment.isoformat(),
+                        keys=self._keys(ledger.key("outage", "look")),
                     )
                 )
                 return True
@@ -1393,7 +1409,7 @@ class Executor:
                 slot, wait = self._slot(moment, st)
                 if wait:
                     return False
-                box = self._outbox.state()
+                box = self._drop_stale(self._outbox.state(), moment)
                 drafts = box.drafts
                 if slot is None and self._recheck(moment, st, box):
                     return True
@@ -1463,8 +1479,28 @@ class Executor:
                 inbox=inbox_lines,
                 held=() if slot else outbox.held_lines(drafts, now=moment),
             )
-            if slot is not None:
-                text = self._thinking_text(slot, text, drafts, moment)
+            keys: Optional[list[str]] = None
+            said = notice.said_taint(st, now=moment)
+            if self._pace:
+                # C3: the look is a sense. What code flagged on the machine is
+                # written down; the composer speaks, in a thinking slot or at
+                # a presence moment, from the keyed items still waiting. A
+                # look with nothing to compose is closed quiet when handled.
+                self._observe_machines(machine_lines, st, moment)
+                waiting = self._waiting(moment)
+                if slot is not None:
+                    text = self._thinking_text(slot, text, drafts, moment, waiting)
+                elif waiting and outbox.hold(
+                    box, moment, here=self._here(moment, box)
+                ) is None:
+                    text = outbox.compose_text(
+                        ledger.lines(waiting, now=moment), situation=text
+                    )
+                else:
+                    waiting = []
+                keys = self._keys(*(i.key for i in waiting))
+                # The items repeat their senders' words (DL-064, DL-108).
+                said = [*said, *ledger.taint(waiting)]
             # Stamped with ``moment``, not left to default to wall-clock now.
             # ``notice.standing`` charges a spoken nudge to the day of the *look*
             # (notice.py), so the look's own stamp is the day budget's ledger
@@ -1482,9 +1518,8 @@ class Executor:
                     mail_inboxes=mail_more or None,
                     # The held drafts it lists, and what it was already
                     # told, may repeat mail (DL-108).
-                    untrusted=outbox.carried_taint(
-                        drafts, said=notice.said_taint(st, now=moment)
-                    ),
+                    untrusted=outbox.carried_taint(drafts, said=said),
+                    keys=keys,
                 )
             )
             for origin in paused:
@@ -1541,6 +1576,7 @@ class Executor:
             tools.tell_instruction(access.lost_words(origin)),
             channel="schedule",
             at=at,
+            keys=self._keys(ledger.key("access", origin)),
         ))
         self._queue.append(episodes.access_lost(
             origin=origin, fix=access.fix_for(origin), at=at,
@@ -1553,6 +1589,7 @@ class Executor:
             tools.tell_instruction(access.restored_words(origin)),
             channel="schedule",
             at=at,
+            keys=self._keys(ledger.key("access", origin)),
         ))
         self._probed.pop(origin, None)
         self._access_now.advance(self._queue.store)
@@ -1705,6 +1742,7 @@ class Executor:
                 self._queue.append(episodes.message_queued(
                     text=tools.followup_text(e)[len(tools.TELL_LEAD):].strip(),
                     source="followup", why=why, at=at,
+                    keys=self._keys(ledger.key("failure", e.subject)) or (),
                 ))
                 self._queue.append(episodes.failure_told(
                     subject=e.subject, kind=e.kind, count=e.count,
@@ -1717,6 +1755,7 @@ class Executor:
             channel="schedule",
             queued=[] if self._pace else None,
             at=at,
+            keys=self._keys(ledger.key("failure", e.subject)),
         ))
         if proposal is not None:
             self._queue.append(episodes.grant_proposed(
@@ -1810,14 +1849,20 @@ class Executor:
             # into the re-check, and into every turn that recalls it (DL-108);
             # so does a reply in "what you last told them" drawn from mail.
             untrusted=outbox.carried_taint(box.drafts, said=notice.said_taint(st)),
+            keys=self._keys(*(k for d in box.drafts for k in d.keys)),
         ))
         return True
 
     def _thinking_text(
-        self, slot: str, situation: str, held: Sequence[outbox.Draft], moment: datetime
+        self, slot: str, situation: str, held: Sequence[outbox.Draft], moment: datetime,
+        waiting: Sequence["ledger.Item"] = (),
     ) -> str:
         """The thinking turn's text (DL-098): the look's situation, with what
-        is open over all of it. Each fold is read at the log's head."""
+        is open over all of it. Each fold is read at the log's head.
+
+        With a brief standing, the morning slot is the brief (DL-114): its
+        text leads with the brief's instruction, so the turn is a brief in
+        every fold that asks, and the brief's own fire is closed quiet."""
         store = self._queue.store
         self._promises_now.advance(store)
         self._followups.advance(store)
@@ -1828,7 +1873,7 @@ class Executor:
         t = self._topics_now.state()
         g = self._grants_now.state()
         a = self._access_now.state()
-        return outbox.thinking_text(
+        text = outbox.thinking_text(
             slot,
             situation=situation,
             promises=[x.words() for x in p.oldest()],
@@ -1841,7 +1886,70 @@ class Executor:
             lost=[f"{x.label}: {x.fix}" for x in a.lost.values()],
             tasks=[f"task {k}: {v}" for k, v in sorted(g.tasks.items())],
             held=outbox.held_lines(held, now=moment),
+            items=ledger.lines(waiting, now=moment),
         )
+        if self._briefs_in(slot):
+            text = f"{tools.brief_instruction()}\n\n{text}"
+            if len(text) > outbox.MAX_THINKING_CHARS:
+                text = text[: outbox.MAX_THINKING_CHARS - 1].rstrip() + "…"
+        return text
+
+    def _briefs_in(self, slot: str) -> bool:
+        """Is this the slot that carries the brief (DL-114)? The morning one,
+        while a brief schedule stands."""
+        return slot.endswith(" morning") and any(
+            s.instruction.startswith(tools.BRIEF_LEAD) for s in self._standing_schedules()
+        )
+
+    def _waiting(self, moment: datetime) -> list["ledger.Item"]:
+        """The keyed items the composer may tell them now (C3), newest
+        :data:`COMPOSE_ITEMS`; a fold that fails offers nothing."""
+        try:
+            state = self._ledger.advance(self._queue.store).state()
+        except Exception:  # noqa: BLE001 - a sense never kills the look
+            return []
+        return state.waiting(moment)[-COMPOSE_ITEMS:]
+
+    def _observe_machines(
+        self, lines: Sequence[str], st: notice.Standing, moment: datetime
+    ) -> None:
+        """A machine reading code newly flagged, as an observation (C3): the
+        look no longer speaks of it itself."""
+        known = {key for key, _, _ in st.flagged_since}
+        at = moment.isoformat()
+        for line in lines:
+            if not (isinstance(line, str) and notice.is_flagged(line)):
+                continue
+            about = notice.machine_key(line)
+            if about in known:
+                continue
+            self._queue.append(episodes.observation_recorded(
+                key=ledger.key("machine", "-".join(about.lower().split())),
+                source="machine", what=ledger._clip(line, episodes.MAX_OBSERVATION_WHAT),
+                ref=f"{about}@{at}"[:300], at=at,
+            ))
+
+    def _drop_stale(self, box: outbox.State, moment: datetime) -> outbox.State:
+        """Drop, with why, each held draft whose keys were all told since it
+        was drafted, closed, or are left to a reminder due soon (C3)."""
+        keyed = [d for d in box.drafts if d.keys]
+        if not keyed:
+            return box
+        state = self._ledger.advance(self._queue.store).state()
+        dropped = False
+        for d in keyed:
+            why = state.stale(d.keys, d.seq)
+            items = [state.get(k) for k in d.keys]
+            if why is None and all(
+                i is not None and state.absorbed(i, moment) is not None for i in items
+            ):
+                why = "a reminder due soon will tell them this"
+            if why is not None:
+                self._queue.append(episodes.message_dropped(
+                    queued=[d.seq], why=why, at=moment.isoformat(),
+                ))
+                dropped = True
+        return self._outbox.advance(self._queue.store).state() if dropped else box
 
     def _gate(self, event: dict[str, Any]) -> Optional[outbox.Gate]:
         """The outbox's decision for this turn (DL-098), or ``None`` for a turn
@@ -1872,11 +1980,12 @@ class Executor:
             why: Optional[str] = outbox.HOLD_CLOCK
         else:
             why = outbox.hold(box, moment, here=self._here(moment, box), slot=slot)
+        compose = look and not slot and not recheck and bool(event.get("keys"))
         return outbox.Gate(
             hold=why,
             source=(
                 "thinking" if slot else "recheck" if recheck
-                else "look" if look else "review"
+                else "compose" if compose else "look" if look else "review"
             ),
             at=at,
             queued=tuple(event.get("queued") or ()) if slot or recheck else (),
@@ -1933,6 +2042,7 @@ class Executor:
                 channel="schedule",
                 queued=[] if self._pace else None,
                 at=at,
+                keys=self._keys(ledger.key("tidy", f"{args['id']}:{args['change']}")),
             ))
             self._queue.append(episodes.grant_proposed(
                 for_seq=seq, scope=grants.TIDY, proposes="action",
@@ -2031,6 +2141,15 @@ class Executor:
             record = write_memory(self._queue, seq=pending.seq, outcome="silent")
             self._queue.finish(pending.seq)
             return TurnResult(seq=pending.seq, outcome="silent", record_seq=record)
+        quiet = self._quiet(pending)
+        if quiet is not None:
+            # C3, DL-106/114/120: a turn the told-ledger closes before it
+            # runs. Written down, closed quiet, no model call.
+            record = write_memory(
+                self._queue, seq=pending.seq, outcome="silent", judged=quiet
+            )
+            self._queue.finish(pending.seq)
+            return TurnResult(seq=pending.seq, outcome="silent", record_seq=record)
         # DL-095 gate-leak: the store head before the turn, so what the turn
         # wrote with this event's for_seq can be told from what stood before it.
         head_before = self._queue.store.head()
@@ -2068,6 +2187,7 @@ class Executor:
             topics=self._topics.state(),
             tasks=self._tasks.state(),
             gate=self._gate(pending.payload) if self._pace else None,
+            **self._told(pending),
         )
         self._queue.finish(pending.seq)
         # After the reply is durable, and never able to fail or hold it.
@@ -2076,6 +2196,99 @@ class Executor:
         self._discharge_obligation(pending, result, head_before)
         self._withdraw()
         return result
+
+    def _quiet(self, pending: Pending) -> Optional[str]:
+        """Why this event's turn ends before it runs, or ``None`` to run it.
+
+        Always: a fire whose schedule was cancelled while it waited (C3, B7);
+        it is not what they want any more. Under pace (C3): a plain look,
+        which is a sense; the brief's fire, which the morning slot carries
+        (DL-114); and a reminder omega set itself, which becomes a keyed
+        follow-up for the composer instead of a message (DL-120). A reminder
+        they set is never closed here (DL-075).
+        """
+        event = pending.payload
+        if event.get("kind", episodes.MESSAGE_INBOUND) != episodes.MESSAGE_INBOUND:
+            return None
+        channel = event.get("channel")
+        sid = str(event.get("schedule_id") or "")
+        if channel == "schedule" and sid and self._cancelled_since(sid, pending.seq):
+            return CANCELLED_IN_FLIGHT
+        if not self._pace:
+            return None
+        if (
+            channel == notice.CHANNEL
+            and not isinstance(event.get("thinking"), str)
+            and not isinstance(event.get("queued"), list)
+            and not event.get("keys")
+        ):
+            return SENSE_LOOK
+        if channel == "schedule" and tools.is_brief(event):
+            return BRIEF_FOLDED
+        if tools.is_reminder(event) and sid:
+            self._ledger.advance(self._queue.store)
+            if self._ledger.authored(sid):
+                what = str(event.get("text", ""))[len(tools.REMINDER_LEAD):].split("\n", 1)[0]
+                taint = self._ledger.authored_taint(sid)
+                self._queue.append(episodes.observation_recorded(
+                    key=ledger.key("followup", sid), source="followup",
+                    what=ledger._clip(what or "a follow-up you set yourself",
+                                      episodes.MAX_OBSERVATION_WHAT),
+                    evidence_seq=pending.seq, ref=str(pending.seq),
+                    untrusted=outbox.carried_taint((), said=taint),
+                    deadline=str(event.get("at")) if event.get("at") else None,
+                ))
+                return AUTHORED_REMINDER
+        return None
+
+    def _cancelled_since(self, sid: str, seq: int) -> bool:
+        """Was schedule ``sid`` cancelled after the fire at ``seq``, and not
+        set again since?"""
+        cancelled = False
+        for e in self._queue.store.episodes_since(seq):
+            p = episodes.decode(e.payload)
+            if p.get("id") != sid:
+                continue
+            if p.get("kind") == episodes.SCHEDULE_CANCELLED:
+                cancelled = True
+            elif p.get("kind") == episodes.SCHEDULE_CREATED:
+                cancelled = False
+        return cancelled
+
+    def _told(self, pending: Pending) -> dict[str, Any]:
+        """The told-ledger's say in this turn (C3, DL-106), as ``run_turn``
+        arguments; empty without pace, so the turn runs as before.
+
+        A reminder they set speaks for its own key and every key it covers,
+        and nothing stops it (DL-075). A condition watch keeps its immediate
+        path, behind the ledger: it names its key and does not say the same
+        thing twice. A standing watch is a sense: what it found is written
+        down for the composer. A keyed tell does not repeat itself.
+        """
+        event = pending.payload
+        if not self._pace or event.get("kind", episodes.MESSAGE_INBOUND) != episodes.MESSAGE_INBOUND:
+            return {}
+        sid = str(event.get("schedule_id") or "")
+        state = self._ledger.advance(self._queue.store).state()
+        if tools.is_reminder(event) and sid:
+            mine = ledger.key("reminder", sid)
+            item = state.get(mine)
+            covered = state.covered_by(item) if item is not None else []
+            return {"keys": [mine, *covered][: episodes.MAX_KEYS]}
+        if tools.is_condition_watch(event) and sid:
+            return {"keys": [ledger.key("watch", sid)], "repeat": state.repeats_told}
+        if tools.is_watch(event) and sid:
+            def sense(text: str, tainted: tuple[str, ...]) -> None:
+                self._queue.append(episodes.observation_recorded(
+                    key=ledger.key("watch", sid), source="watch",
+                    what=ledger._clip(text, episodes.MAX_OBSERVATION_WHAT),
+                    evidence_seq=pending.seq, ref=str(pending.seq),
+                    untrusted=outbox.carried_taint((), said=tainted),
+                ))
+            return {"sense": sense}
+        if tools.is_tell(event) and event.get("keys"):
+            return {"repeat": state.repeats_told}
+        return {}
 
     def _hold_promises(self, pending: Pending) -> None:
         """DL-087 #1: note the promises in their own message, and offer (or,
@@ -2166,9 +2379,10 @@ class Executor:
         if state.gated(grants.PROMISES):
             # Asked, as every action under a grant is until they say stop:
             # one tell naming them all, and one proposal their yes runs.
-            tell = self._queue.append(
-                episodes.inbound(tools.promise_text(due), channel="schedule")
-            )
+            tell = self._queue.append(episodes.inbound(
+                tools.promise_text(due), channel="schedule",
+                keys=self._keys(*(ledger.key("promise", p.seq) for p in due)),
+            ))
             self._queue.append(episodes.grant_proposed(
                 for_seq=tell, scope=grants.PROMISES, proposes="action", actions=actions,
             ))
@@ -2465,7 +2679,7 @@ class Executor:
             for w in view.oldest():
                 if watcher.expired(w, moment):
                     self._queue.append(episodes.watcher_stopped(id=w.id, reason="expired", at=clock))
-                    self._tell(watcher.expiry_words(w), clock)
+                    self._tell(watcher.expiry_words(w), clock, key=ledger.key("page", w.id))
                     return True
             lost = self._access_now.advance(self._queue.store).state().lost
             due = [
@@ -2481,7 +2695,8 @@ class Executor:
             self._queue.append(done.checked)
             if done.alert is not None:
                 # The page's words, so the tell names whose (DL-064).
-                self._tell(done.alert["text"], clock, untrusted=watcher.source_of(w))
+                self._tell(done.alert["text"], clock, untrusted=watcher.source_of(w),
+                           key=ledger.key("page", w.id))
                 self._queue.append(done.alert)
             elif not done.ok:
                 failing = watcher.failing_alert(
@@ -2489,17 +2704,26 @@ class Executor:
                 )
                 if failing is not None:
                     # Carries the read's error, which the server wrote.
-                    self._tell(failing["text"], clock, untrusted=watcher.source_of(w))
+                    self._tell(failing["text"], clock, untrusted=watcher.source_of(w),
+                               key=ledger.key("page", w.id))
                     self._queue.append(failing)
             return True
         except Exception:  # noqa: BLE001 - see the docstring
             return False
 
-    def _tell(self, words: str, at: str, *, untrusted: Optional[str] = None) -> None:
+    def _tell(
+        self, words: str, at: str, *, untrusted: Optional[str] = None,
+        key: Optional[str] = None,
+    ) -> None:
         self._queue.append(episodes.inbound(
             tools.tell_instruction(words), channel="schedule", at=at,
-            untrusted=untrusted,
+            untrusted=untrusted, keys=self._keys(key) if key else None,
         ))
+
+    def _keys(self, *keys: str) -> Optional[list[str]]:
+        """The told-ledger keys an event names (C1), under pace only, so
+        an executor built without it writes the log it always wrote."""
+        return list(dict.fromkeys(keys))[: episodes.MAX_KEYS] if self._pace and keys else None
 
     def leave_now(self, *, now: Optional[str] = None) -> bool:
         """The leave-now alarms (DL-093), on every sense pass. Returns whether
@@ -2591,6 +2815,7 @@ class Executor:
     def _leave_tell(self, alarm: "leave.Alarm", how: str, eta: int, text: str, at: str) -> None:
         self._queue.append(episodes.inbound(
             tools.tell_instruction(text), channel="schedule", at=at,
+            keys=self._keys(ledger.key("leave", alarm.id)),
         ))
         self._queue.append(episodes.leave_pinged(id=alarm.id, how=how, eta_min=eta, at=at))
         self._leaves.advance(self._queue.store)

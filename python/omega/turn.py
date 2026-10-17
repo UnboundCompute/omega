@@ -473,6 +473,11 @@ def _judged(verdict: Optional["Verdict"]) -> Optional[str]:
     return " ".join(verdict.raw.split())[:300]
 
 
+#: Why a turn the told-ledger kept quiet ended silent (C3, DL-106).
+SENSED = "sense: written down as an observation for the composer, not said (DL-106)"
+REPEATED = "repeat: already told them this, with nothing new since (C3)"
+SENSE_LOOK = "sense: the look writes observations; the composer speaks (C3)"
+
 #: The error a turn fails with when it said "nothing new" having looked at
 #: nothing (DL-089 #2).
 UNLOOKED = "answered nothing new without looking"
@@ -681,8 +686,12 @@ def write_memory(
     at: Optional[str] = None,
     tainted: Sequence[str] = (),
     reply_to: Optional[str] = None,
+    keys: Sequence[str] = (),
 ) -> int:
     """Step 6 — append the turn's terminal record and return its seq.
+
+    ``keys`` are the told-ledger threads a reply spoke for (C1); only a turn
+    that spoke carries them.
 
     ``reply_to`` is the channel a reply goes back to when the event names one
     (DL-104: a Claude Code session's result goes where it was asked for);
@@ -726,6 +735,7 @@ def write_memory(
             proposals=asked if outcome == "spoke" else None,
             settled=settled,
             reply_to=reply_to if outcome == "spoke" else None,
+            keys=list(keys) if outcome == "spoke" and keys else None,
         )
     return queue.append(payload, episodes.turn_write_key(seq))
 
@@ -867,6 +877,9 @@ def run_turn(
     topics: Any = None,
     tasks: Any = None,
     gate: Any = None,
+    keys: Sequence[str] = (),
+    sense: Optional[Callable[[str, tuple[str, ...]], None]] = None,
+    repeat: Optional[Callable[[Sequence[str], str], bool]] = None,
 ) -> TurnResult:
     """Run one turn over an already-claimed episode and record how it ended.
 
@@ -909,6 +922,14 @@ def run_turn(
     (DL-098, :class:`omega.outbox.Gate`), or ``None`` for every other turn,
     which then runs exactly as before. A turn it holds ends silent with its
     words written down as a draft; one it lets speak is counted.
+
+    The told-ledger's three (C1, C3, DL-106), all off by default: ``keys``
+    are the threads this turn speaks for (else the event's own), written on
+    its delivery and its record. ``sense`` makes the turn a sense: what it
+    would have said is handed over (with what it read) to be written down as
+    an observation, and the turn ends quiet. ``repeat`` is asked last, with
+    the keys and the words: ``True`` means it would say again what it already
+    told them with nothing new, and the turn ends quiet instead.
     """
     # Metered here, once, so every model call the turn makes — judge, act
     # loop, reply and teach extraction all go through `ctx.complete` — lands
@@ -919,6 +940,9 @@ def run_turn(
     # counted on the meter so the record says it happened.
     complete = provider.retry_blips(meter, on_retry=meter.retried)
     event = perceive(pending)
+    keys = tuple(keys) or tuple(event.get("keys") or ())
+    if gate is not None and keys and not getattr(gate, "keys", ()):
+        gate = replace(gate, keys=keys)
     if is_tell(event):
         # DL-084 #1, #4: omega telling them about itself — a promise it could
         # not keep, or an outage. Delivered as written, with no model call:
@@ -937,6 +961,12 @@ def run_turn(
                     + f" {granted.how_to_answer(asked)}"
                 )
         carried = (str(event["untrusted"]),) if event.get("untrusted") else ()
+        if repeat is not None and repeat(keys, words):
+            record = write_memory(
+                queue, seq=pending.seq, outcome="silent", at=at, judged=REPEATED,
+                tainted=carried,
+            )
+            return TurnResult(seq=pending.seq, outcome="silent", record_seq=record)
         if gate is not None and outbox.settle(
             queue, pending.seq, gate, words, tainted=carried
         ):
@@ -948,6 +978,7 @@ def run_turn(
             # recall fences the reply as it fences the tell.
             tainted=carried,
             reply_to=event.get("reply_to"),
+            keys=keys,
         )
         return TurnResult(
             seq=pending.seq, outcome="spoke", record_seq=record, reply=words
@@ -1147,6 +1178,38 @@ def run_turn(
         )
         text = f"{text}\n\n{words}"
 
+    quiet = (
+        SENSED if sense is not None
+        else REPEATED if repeat is not None and repeat(keys, text)
+        else None
+    )
+    if quiet is not None:
+        # DL-106: a standing watch is a sense, and writes down what it saw
+        # for the composer; C3: words that would repeat a told key with
+        # nothing new are not said. Either way the turn ends quiet, with the
+        # reason on its record.
+        if sense is not None:
+            sense(text, tainted())
+        if gate is not None:
+            outbox.dropped(queue, pending.seq, gate)
+        record = write_memory(
+            queue,
+            seq=pending.seq,
+            outcome="silent",
+            tools=acted.tools,
+            usage=meter.usage(),
+            judged=quiet,
+            at=at,
+            tainted=tainted(),
+        )
+        return TurnResult(
+            seq=pending.seq,
+            outcome="silent",
+            record_seq=record,
+            tools=tuple(acted.tools),
+            verdict=verdict,
+        )
+
     if gate is not None and outbox.settle(
         queue, pending.seq, gate, text, tainted=tainted()
     ):
@@ -1179,6 +1242,7 @@ def run_turn(
         judged=_judged(verdict),
         at=at,
         tainted=tainted(),
+        keys=keys,
     )
     return TurnResult(
         seq=pending.seq,

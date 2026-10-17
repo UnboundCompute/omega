@@ -24,10 +24,15 @@ thinking turn, which sends what still matters as one message, or nothing,
 and drops the rest. Over the budget, the thinking turn's own message is held
 too, and so carried to tomorrow.
 
-What is exempt never comes through here, and is byte-for-byte what it was:
-things they asked for at a time (reminders, briefs, watches, research
-follow-ups and reports), and omega telling them it cannot do what it was
-asked (a lost sign-in, an outage, a promise it could not keep).
+What is exempt from the budget and the moment (DL-106, M1a): a reminder
+they set (DL-075), a deadline warning (leave-now), a watch for a condition
+they named, research follow-ups and reports they asked for, and omega telling
+them it cannot do what it was asked (a lost sign-in, an outage). Exempt from
+the budget is never exempt from the told-ledger (:mod:`omega.ledger`): each
+of those names its keys, and one that would say again what it said, with
+nothing new, ends quiet. Standing "anything new" watches no longer speak at
+all (they are senses), and the brief is the morning thinking slot (DL-114),
+so both count inside the day's two.
 
 Everything is a fold over ``message.queued`` / ``message.delivered`` /
 ``message.dropped`` and the inbounds that carry ``queued`` or ``thinking``,
@@ -63,6 +68,9 @@ __all__ = [
     "SLOT_DEFER_SECONDS",
     "SLOT_LATE_SECONDS",
     "RECHECK_LEAD",
+    "COMPOSE_LEAD",
+    "KEYED_HEADING",
+    "compose_text",
     "Draft",
     "State",
     "Outbox",
@@ -142,6 +150,8 @@ class Draft:
     at: str
     #: What untrusted content the turn that wrote it had read (DL-064).
     tainted: tuple[str, ...] = ()
+    #: The told-ledger keys it speaks for (C1); empty when it named none.
+    keys: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -209,6 +219,7 @@ class Outbox:
             self._drafts[seq] = Draft(
                 seq=seq, text=str(payload["text"]), source=str(payload["source"]),
                 at=str(payload["at"]), tainted=tuple(payload.get("tainted") or ()),
+                keys=tuple(payload.get("keys") or ()),
             )
         elif kind == episodes.MESSAGE_DELIVERED:
             self._taken.update(payload.get("queued") or [])
@@ -455,9 +466,12 @@ def thinking_text(
     lost: Sequence[str] = (),
     tasks: Sequence[str] = (),
     held: Sequence[str] = (),
+    items: Sequence[str] = (),
 ) -> str:
     """The thinking turn's text: the ordinary look's situation, under a
-    header saying what this look is for, with what is open over all of it."""
+    header saying what this look is for, with what is open over all of it.
+    ``items`` are the told-ledger's keyed items new since they were last told
+    or weighed (C3), which this turn decides on."""
     name = slot.rsplit(" ", 1)[-1]
     lines = [
         f"Thinking time ({name}). Twice a day you go over everything open and "
@@ -468,6 +482,7 @@ def thinking_text(
         "dropped.",
     ]
     for heading, items in (
+        (KEYED_HEADING, items),
         ("Promises they made that are still open (theirs to keep):", promises),
         ("Things of yours that keep failing:", failing),
         ("Topics you keep up with for them:", topics),
@@ -480,6 +495,37 @@ def thinking_text(
             lines.append(heading)
             lines.extend(f"- {_one_line(i)}" for i in items)
     lines.append("")
+    text = "\n".join(lines) + "\n" + situation
+    if len(text) > MAX_THINKING_CHARS:
+        text = text[: MAX_THINKING_CHARS - 1].rstrip() + "…"
+    return text
+
+
+#: How the keyed items are headed, in a thinking turn and a compose (C3).
+KEYED_HEADING = (
+    "New since you last told them, by key (for each: tell, ask, fold into the "
+    "one message, or let go):"
+)
+#: How a compose begins (C3): the presence-moment composer.
+COMPOSE_LEAD = "Compose."
+
+
+def compose_text(items: Sequence[str], *, situation: str) -> str:
+    """The composer's turn at a presence moment (C3): they are here, the day
+    has room, and keyed items came in since they were last told. One short
+    message, or nothing."""
+    lines = [
+        f"{COMPOSE_LEAD} They are here and you may send one message now. The "
+        "items below came in since you last told them or last weighed them. "
+        "Tell them what needs them, as one short message, most pressing first, "
+        "and leave out what does not. Never repeat what an item says you "
+        "already told them unless it changed. If none of it is worth their "
+        "attention now, say SILENT.",
+        "",
+        KEYED_HEADING,
+        *(f"- {_one_line(i)}" for i in items),
+        "",
+    ]
     text = "\n".join(lines) + "\n" + situation
     if len(text) > MAX_THINKING_CHARS:
         text = text[: MAX_THINKING_CHARS - 1].rstrip() + "…"
@@ -499,6 +545,9 @@ class Gate:
     source: str
     at: str
     queued: tuple[int, ...] = ()
+    #: The told-ledger keys the turn speaks for (C1), written on its draft or
+    #: its delivery.
+    keys: tuple[str, ...] = ()
 
 
 def settle(
@@ -516,7 +565,7 @@ def settle(
             return True
         queue.append(episodes.message_queued(
             text=_clip(text), source=gate.source, why=gate.hold, for_seq=seq,
-            tainted=tainted, at=gate.at,
+            tainted=tainted, at=gate.at, keys=list(gate.keys),
         ))
         if gate.queued:
             # Stamped when it happened, not with the turn's moment (C0).
@@ -526,7 +575,7 @@ def settle(
             ))
         return True
     queue.append(episodes.message_delivered(
-        for_seq=seq, queued=list(gate.queued), at=gate.at,
+        for_seq=seq, queued=list(gate.queued), at=gate.at, keys=list(gate.keys),
     ))
     return False
 
