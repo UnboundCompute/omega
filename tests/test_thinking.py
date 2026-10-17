@@ -410,6 +410,8 @@ def test_spend_report_reads_tokens_and_the_decision_mix(q: EventQueue) -> None:
     import pathlib
 
     path = pathlib.Path(__file__).resolve().parents[1] / "bench" / "spend.py"
+    if not path.exists():  # the image leaves bench/ out (.dockerignore)
+        pytest.skip("bench/ is not in this tree")
     spec = importlib.util.spec_from_file_location("spend", path)
     spend = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(spend)
