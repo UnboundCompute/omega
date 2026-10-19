@@ -107,6 +107,8 @@ SLOTS = (("morning", 9), ("evening", 19))
 REVIEW = ("review", 17)
 #: Non-urgent unprompted messages a day ("once or twice a day is fine").
 MAX_PER_DAY = 2
+#: How far past the day's cap an urgent one may go (DL-121 A3): one a day.
+URGENT_EXTRA = 1
 #: How recently a sign of them counts as "here": a presence report from the
 #: Mac (DL-072/073), or a message of theirs on any channel.
 PRESENT_SECONDS = 10 * 60
@@ -419,7 +421,8 @@ def present(presence: Any, heard_at: Optional[str], *, now: datetime) -> bool:
 
 
 def hold(
-    state: State, now: datetime, *, here: bool, slot: bool = False, brief: bool = False
+    state: State, now: datetime, *, here: bool, slot: bool = False, brief: bool = False,
+    urgent: bool = False,
 ) -> Optional[str]:
     """Why a non-urgent unprompted message must wait, or ``None`` to send it.
 
@@ -428,14 +431,15 @@ def hold(
     in the last :data:`SPOKE_SECONDS` (B4-lite: never cut in on them), then
     (outside a thinking slot, which is its own good time) whether they are
     here. A day that cannot be read has no budget left: this breaks closed,
-    toward holding.
+    toward holding. An ``urgent`` one (DL-121 A3) has :data:`URGENT_EXTRA`
+    more in the day: past the cap by one at most, and every other rule holds.
     """
     if quiet(now):
         return HOLD_QUIET
     day = notice.local_date(now.isoformat())
     if day is None:
         return HOLD_CLOCK
-    if state.delivered_on(day) >= MAX_PER_DAY:
+    if state.delivered_on(day) >= MAX_PER_DAY + (URGENT_EXTRA if urgent else 0):
         return HOLD_BUDGET
     wait = 0 if brief else backoff_seconds(state.unanswered)
     last = _parse(state.last_sent_at) if wait and state.last_sent_at else None
@@ -651,6 +655,20 @@ class Gate:
     #: The told-ledger keys the turn speaks for (C1), written on its draft or
     #: its delivery.
     keys: tuple[str, ...] = ()
+    #: Past the day's cap only for urgency (DL-121 A3): ``over`` is the hold
+    #: it would have had, and it applies unless the turn speaks for one of
+    #: the ``urgent`` keys.
+    over: Optional[str] = None
+    urgent: tuple[str, ...] = ()
+
+    @property
+    def held(self) -> Optional[str]:
+        """Why it waits, now that the keys it speaks for are known."""
+        if self.hold:
+            return self.hold
+        if self.over and not set(self.keys) & set(self.urgent):
+            return self.over
+        return None
 
 
 def settle(
@@ -663,11 +681,12 @@ def settle(
     the turn's terminal record, so a crash between the two over-counts the
     budget, which is the direction that sends less.
     """
-    if gate.hold:
+    why = gate.held
+    if why:
         if not text.strip():
             return True
         queue.append(episodes.message_queued(
-            text=_clip(text), source=gate.source, why=gate.hold, for_seq=seq,
+            text=_clip(text), source=gate.source, why=why, for_seq=seq,
             tainted=tainted, at=gate.at, keys=list(gate.keys),
         ))
         if gate.queued:

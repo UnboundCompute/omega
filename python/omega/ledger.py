@@ -76,6 +76,11 @@ REMINDER_ABSORB_SECONDS = 6 * 3600
 FRESH_SECONDS = 24 * 3600
 #: Silence after which their next message is a return (C4 continuity).
 RETURN_SECONDS = 48 * 3600
+#: What is decided in a thinking slot and never composed between them
+#: (DL-121 #6): a project they touched.
+SLOT_ONLY_SOURCES = frozenset({"project"})
+#: How long they are quiet before omega may check in, once a day (DL-121 #7).
+CHECKIN_SECONDS = 48 * 3600
 #: How many open items one message of theirs may bring into the reply (C5).
 MAX_CONNECTED = 3
 #: How long after a key's ``follow_up_due`` its one follow-up may still go
@@ -218,6 +223,73 @@ def _who(sender: str) -> str:
     return _clip(name or addr or "unknown sender", 80)
 
 
+# --- how pressing a thread is (DL-121 A3) -----------------------------------------
+
+#: A sign-in or account-safety alert. Sender domains that only send these,
+#: or a subject that says so; never an OTP, which is held mail (DL-082).
+_SECURITY_SENDERS = ("accounts.google.com",)
+_SECURITY = re.compile(
+    r"\b(security alert|critical security|new sign-?in|sign-?in attempt|"
+    r"suspicious (?:sign-?in|activity|login)|unusual (?:sign-?in|activity|login)|"
+    r"password (?:was |has been )?(?:changed|reset)|someone (?:has )?(?:your password|signed in))\b",
+    re.I,
+)
+#: Never a message of its own: folded into a brief (job alerts, newsletters,
+#: settlements), forwarded or not.
+_NOISE = re.compile(
+    r"\b(job alerts?|jobs? (?:for you|matching|you may)|new jobs?\b|jobs? at\b|"
+    r"newsletters?|weekly digest|settlements?|class action)",
+    re.I,
+)
+_NOISE_SENDERS = re.compile(r"^(?:jobs?|jobalerts?|job-alerts?|newsletters?|digest)[-_.@]", re.I)
+#: A deadline or an exam/recruitment portal's mail.
+_DEADLINE = re.compile(
+    r"\b(admit card|hall ticket|exam(?:ination)?s?|recruitment|interview|shortlist(?:ed)?|"
+    r"results? (?:declared|announced|out|published)|application (?:status|deadline)|"
+    r"deadline|last date|due (?:date|by|on|today|tomorrow))\b",
+    re.I,
+)
+#: A machine's address, not a person writing.
+_MACHINE_SENDER = re.compile(
+    r"^(?:no-?reply|do-?not-?reply|notifications?|alerts?|mailer(?:-daemon)?|info|support|"
+    r"updates?|news|hello|team|accounts?|billing|service)\b",
+    re.I,
+)
+
+
+def security(subject: str, sender: str = "") -> bool:
+    """Is this a sign-in or account-safety alert?"""
+    domain = parseaddr(str(sender or ""))[1].lower().rpartition("@")[2]
+    return domain in _SECURITY_SENDERS or bool(_SECURITY.search(subject or ""))
+
+
+def urgency_of(subject: str, sender: str = "", *, person: bool = False) -> str:
+    """``urgent``, ``normal`` or ``noise`` (DL-121 A3). Code only, in this
+    order: a security alert, then noise, then a deadline or portal, then a
+    real person's mail; everything else is normal."""
+    addr = parseaddr(str(sender or ""))[1].lower()
+    text = str(subject or "")
+    if security(text, sender):
+        return "urgent"
+    if _NOISE.search(text) or _NOISE_SENDERS.match(addr):
+        return "noise"
+    if _DEADLINE.search(text):
+        return "urgent"
+    if person and addr and not _MACHINE_SENDER.match(addr.partition("@")[0]):
+        return "urgent"
+    return "normal"
+
+
+def urgency(item: "Item") -> str:
+    """An item's class: as its newest observation set it, or, for one
+    recorded before DL-121, read again from its line."""
+    if item.urgency:
+        return item.urgency
+    if item.source == "mail":
+        return urgency_of(item.what.partition(": ")[2])
+    return "normal"
+
+
 # --- what the senses write ------------------------------------------------------
 
 
@@ -240,6 +312,9 @@ def mail_observations(
         ts = None if ci else slack_ts(m)
         sort: Optional[str] = None
         people: list[str] = []
+        subject = str(getattr(m, "subject", "") or "")
+        level = "normal"
+        alert = security(subject, str(getattr(m, "sender", "") or ""))
         if ci is not None:
             key, source, sort = ci.key, "ci", "ci"
             what = f"CI failed: {ci.workflow} on {ci.owner}/{ci.repo}"
@@ -250,7 +325,9 @@ def mail_observations(
         elif is_travel(m):
             key, source, sort = ref, "travel", "trip"
             what = f"travel mail from {_who(m.sender)}: {m.subject or '(no subject)'}"
-        elif getattr(m, "bulk", False):
+        elif getattr(m, "bulk", False) and not alert:
+            # A security alert is let through bulk (DL-121 A3): it is the one
+            # machine mail that cannot wait for the brief.
             if not seen.has_ref(None, ref):
                 bulk.append(ref)
             continue
@@ -260,12 +337,16 @@ def mail_observations(
             name = parseaddr(str(getattr(m, "sender", "") or ""))[0]
             if name.strip():
                 people = [_clip(name, 80)]
+            level = urgency_of(
+                subject, str(getattr(m, "sender", "") or ""),
+                person=not getattr(m, "bulk", False),
+            )
         if seen.has_ref(key, ref):
             continue
         out.append(episodes.observation_recorded(
             key=key, source=source, what=_clip(what), ref=ref, untrusted=INBOX_SOURCE,
             url=ci.url if ci is not None else None, when=when, at=at,
-            thread_kind=sort, people=people or None,
+            thread_kind=sort, people=people or None, urgency=level,
         ))
     if bulk:
         bulk = bulk[: 200]
@@ -363,6 +444,8 @@ class Item:
     next_expected: Optional[str] = None
     #: The send that asked how it went, once its follow-up was due.
     followed_seq: int = 0
+    #: How pressing it is (DL-121 A3), as the newest observation set it.
+    urgency: Optional[str] = None
 
     @property
     def recurrence(self) -> int:
@@ -399,6 +482,21 @@ class State:
     #: Sends that named a key whose one follow-up had already gone (M3′'s
     #: violation count: it must stay 0).
     refollowed: int = 0
+    #: When they last wrote (any channel of theirs), and whether they said
+    #: "not now" / "stop" to check-ins (DL-121 #7).
+    heard_at: Optional[str] = None
+    checkins_off: bool = False
+
+    def checkin_due(self, now: datetime, *, quiet: int = CHECKIN_SECONDS) -> Optional[str]:
+        """The key of today's check-in when one may open (DL-121 #7): they
+        have been quiet ``quiet`` seconds or more, they never said "not now",
+        and today has none yet. ``None`` otherwise, and when they have never
+        written at all."""
+        heard = _parse(self.heard_at)
+        if heard is None or self.checkins_off or (now - heard).total_seconds() < quiet:
+            return None
+        k = f"checkin:{now.astimezone().date().isoformat()}"
+        return None if k in self.items else k
 
     def has_ref(self, key: Optional[str], ref: str) -> bool:
         if key is None:
@@ -435,13 +533,21 @@ class State:
         ]
 
     def waiting(self, now: datetime, *, fresh_seconds: int = FRESH_SECONDS,
-                within: int = REMINDER_ABSORB_SECONDS) -> list[Item]:
+                within: int = REMINDER_ABSORB_SECONDS, slot: bool = False,
+                brief: bool = False) -> list[Item]:
         """What the composer may tell them: open, new since told or weighed,
         recent, not a reminder of theirs (it tells itself), and not absorbed
-        by one due soon. Oldest first."""
+        by one due soon. Oldest first.
+
+        Noise (DL-121 A3) waits only for a brief, and a project they touched
+        (#6) only for a thinking slot: neither is ever a message of its own."""
         out = []
         for item in self.items.values():
             if item.reminder or not item.fresh:
+                continue
+            if urgency(item) == "noise" and not brief:
+                continue
+            if item.source in SLOT_ONLY_SOURCES and not slot:
                 continue
             seen = _parse(item.when) or _parse(item.last_at)
             if seen is None or (now - seen).total_seconds() > fresh_seconds:
@@ -603,25 +709,94 @@ _PLAN = re.compile(
 )
 
 
-def plan_of(text: str, at: str) -> Optional[tuple[str, str]]:
-    """``(what, follow_up_due)`` for a plan they stated, or ``None``. The
-    follow-up is due at 10:00 local the day after the plan's day."""
-    m = _PLAN.search(text or "")
-    moment = _parse(at)
-    if m is None or moment is None:
-        return None
-    local = moment.astimezone()
-    day = m.group("day").lower()
-    if day == "tomorrow":
+#: Anything else they discuss that has an outcome still to come (DL-121 #7):
+#: a result they are waiting on, something they applied for or sent off, a
+#: deadline of theirs. Still their own words, still one follow-up.
+_OUTCOME = re.compile(
+    r"\b(?:i(?:'ll| will) (?:find out|hear back|hear|know|get (?:the |my )?results?)|"
+    r"(?:i'?m|i am) (?:waiting|hoping) (?:to hear|for (?:the |my )?(?:results?|reply|answer|offer|decision))|"
+    r"i(?:'ve| have)? (?:just )?(?:applied|interviewed|submitted|sent (?:in|off)|signed up|registered)|"
+    r"(?:the |my )?results? (?:are|is|come|comes|will be) (?:out|declared|announced)|"
+    r"(?:my|the) (?:deadline|exam|interview|test|appointment|viva|presentation|demo) (?:is|are)|"
+    r"(?:i have|i've got|i need) to (?:submit|finish|file|send|hand in))"
+    r"[^.!?\n]{0,80}",
+    re.I,
+)
+_WHEN = re.compile(
+    r"\b(today|tonight|tomorrow|next week|this week|on (?:" + "|".join(_DAYS) + r"))\b", re.I,
+)
+#: With no day named, how long before its one follow-up may ask.
+OUTCOME_FOLLOW_UP_DAYS = 3
+
+
+def _due_after(local: datetime, day: Optional[str]) -> datetime:
+    """10:00 local the day after ``day`` (``None``: a few days on)."""
+    if day is None:
+        on = local.date() + timedelta(days=OUTCOME_FOLLOW_UP_DAYS - 1)
+    elif day == "tomorrow":
         on = local.date() + timedelta(days=1)
+    elif day == "next week":
+        on = local.date() + timedelta(days=7)
+    elif day == "this week":
+        on = local.date() + timedelta(days=2)
     elif day.startswith("on "):
         ahead = (_DAYS.index(day[3:]) - local.weekday()) % 7
         on = local.date() + timedelta(days=ahead)
     else:
         on = local.date()
-    due = datetime.combine(on + timedelta(days=1), datetime.min.time(), local.tzinfo).replace(hour=10)
-    what = _clip(f"they said: {m.group('what').strip()} {day}", 200)
-    return what, due.isoformat()
+    return datetime.combine(on + timedelta(days=1), datetime.min.time(), local.tzinfo).replace(hour=10)
+
+
+def plan_of(text: str, at: str) -> Optional[tuple[str, str]]:
+    """``(what, follow_up_due)`` for a plan they stated, or anything they
+    discussed with an outcome still to come (DL-121 #7), or ``None``. The
+    follow-up is due at 10:00 local the day after the day it names, or a few
+    days on when it names none."""
+    moment = _parse(at)
+    if moment is None:
+        return None
+    local = moment.astimezone()
+    m = _PLAN.search(text or "")
+    if m is not None:
+        day = m.group("day").lower()
+        what = _clip(f"they said: {m.group('what').strip()} {day}", 200)
+        return what, _due_after(local, day).isoformat()
+    m = _OUTCOME.search(text or "")
+    if m is None:
+        return None
+    said = m.group(0).strip()
+    when = _WHEN.search(said)
+    what = _clip(f"they said: {said}", 200)
+    return what, _due_after(local, when.group(1).lower() if when else None).isoformat()
+
+
+#: Something they said they want or are doing (DL-121 #6), in their words.
+_GOAL = re.compile(
+    r"\b(?:(?:i want to|i'?d like to)(?!\s+(?:know|see|check|ask|tell|find|look|read|hear|"
+    r"remind|set|cancel|change|add|remove|delete|try|talk|say|go back|watch|listen|be reminded)\b)|"
+    r"i (?:really )?need to (?:get|learn|finish|start)|"
+    r"(?:i'?m|i am) (?:working on|trying to|planning to|learning|building|preparing for)|"
+    r"my goal is(?: to)?|i(?:'ve| have) decided to)\s+(?P<what>[^.!?\n]{3,120})",
+    re.I,
+)
+
+
+def goal_of(text: str) -> Optional[str]:
+    """``what`` for a goal they stated outright, or ``None``. Code only, and
+    narrow: never an interest read off what they happen to ask about."""
+    m = _GOAL.search(text or "")
+    if m is None or tender(m.group(0)):
+        return None
+    return _clip(f"they said they are on it: {m.group(0).strip()}", 200)
+
+
+#: "not now" / "stop" to a check-in (DL-121 #7), and asking for them again.
+CHECKIN_OFF = re.compile(
+    r"^\W*(?:not now|stop|stop (?:checking in|asking|it)|no more check-?ins?|"
+    r"don'?t check in)\b[^\n]{0,40}$",
+    re.I,
+)
+CHECKIN_ON = re.compile(r"\bcheck in (?:on me|again|with me)\b", re.I)
 
 
 def covers(reminder: Item, item: Item) -> bool:
@@ -653,7 +828,7 @@ class Ledger:
 
     __slots__ = ("_through", "_items", "_bulk", "_unprompted", "_inbound_keys",
                  "_fires", "_sends", "_unkeyed", "_repeats", "_counted", "_taint",
-                 "_routine", "_heard_at", "_returns", "_refollowed")
+                 "_routine", "_heard_at", "_returns", "_refollowed", "_checkins_off")
 
     def __init__(self) -> None:
         self._through = 0
@@ -673,6 +848,7 @@ class Ledger:
         self._heard_at: Optional[datetime] = None
         self._returns: dict[int, int] = {}
         self._refollowed = 0
+        self._checkins_off = False
 
     def _item(self, key: str, source: str, what: str, seq: int, at: str) -> Item:
         item = self._items.get(key)
@@ -694,7 +870,11 @@ class Ledger:
             item.what, item.source = str(payload["what"]), str(payload["source"])
             item.last_seq, item.last_at = seq, at
             item.observations += 1
-            item.closed = False
+            # A closing observation (DL-121 A1: its latest run came back
+            # green) ends the thread; any other one opens it again.
+            item.closed = payload.get("closed") is True
+            if payload.get("urgency") is not None:
+                item.urgency = str(payload["urgency"])
             for name in ("when", "deadline", "url"):
                 if payload.get(name) is not None:
                     setattr(item, name, str(payload[name]))
@@ -746,6 +926,18 @@ class Ledger:
                     self._routine = False
                 elif ROUTINE_ON.search(text):
                     self._routine = True
+                if CHECKIN_OFF.search(text):
+                    self._checkins_off = True
+                elif CHECKIN_ON.search(text):
+                    self._checkins_off = False
+                goal = goal_of(text)
+                if goal is not None:
+                    # Something they said they want or are doing (DL-121 #6):
+                    # a key a thinking slot decides on, never news to tell
+                    # back, and never an interest omega inferred.
+                    item = self._item(f"goal:{seq}", "words", goal, seq, str(payload.get("at", "")))
+                    item.considered_seq = seq
+                    item.refs.add(f"said@{seq}")
                 plan = plan_of(text, str(payload.get("at", "")))
                 if plan is not None:
                     # Their own words open a key (M3′) with its one
@@ -838,6 +1030,8 @@ class Ledger:
             routine_warnings=self._routine,
             returns=dict(self._returns),
             refollowed=self._refollowed,
+            heard_at=self._heard_at.isoformat() if self._heard_at else None,
+            checkins_off=self._checkins_off,
         )
 
     def authored(self, sid: str) -> bool:

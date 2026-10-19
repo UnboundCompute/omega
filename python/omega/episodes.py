@@ -183,6 +183,7 @@ __all__ = [
     "OBSERVATION_RECORDED",
     "LEDGER_KINDS",
     "OBSERVATION_SOURCES",
+    "URGENCIES",
     "MAX_OBSERVATION_WHAT",
     "MAX_KEYS",
     "observation_recorded",
@@ -636,11 +637,17 @@ LEDGER_KINDS = frozenset({OBSERVATION_RECORDED})
 #: What can see something worth a key: a person's mail, bulk mail (never a
 #: key), a CI failure, a Slack notification, travel mail, a calendar event,
 #: their own words (a reminder or watch they set), a standing watch's
-#: finding, a reminder omega wrote itself (DL-120), a machine reading.
+#: finding, a reminder omega wrote itself (DL-120), a machine reading, a
+#: project they touched or a goal they said (DL-121 #6), a check on a CI
+#: thread's latest run (DL-121 A1).
 OBSERVATION_SOURCES = frozenset({
     "mail", "bulk", "ci", "slack", "travel", "calendar", "words", "watch",
-    "followup", "machine",
+    "followup", "machine", "project",
 })
+#: How pressing a thread is (DL-121 A3), set by code: ``urgent`` may take one
+#: message past the day's cap, ``noise`` is folded into a brief and never a
+#: message of its own, ``normal`` is everything else.
+URGENCIES = frozenset({"urgent", "normal", "noise"})
 MAX_OBSERVATION_WHAT = 500
 MAX_OBSERVATION_REFS = 200
 #: What sort of thread an observation is on (M3′'s lifecycle fields): named
@@ -4187,6 +4194,7 @@ def observation_recorded(
     url: Optional[str] = None, when: Optional[str] = None, at: Optional[str] = None,
     thread_kind: Optional[str] = None, people: Optional[Sequence[str]] = None,
     follow_up_due: Optional[str] = None, next_expected: Optional[str] = None,
+    closed: bool = False, urgency: Optional[str] = None,
 ) -> dict[str, Any]:
     """One thing a sense saw (C1, DL-109), on the thread ``key``.
 
@@ -4201,7 +4209,11 @@ def observation_recorded(
     (one of :data:`THREAD_KINDS`), ``people`` (display names it names),
     ``next_expected`` (when the thing itself is next due, a flight's
     departure) and ``follow_up_due`` (from when one follow-up may ask how it
-    went)."""
+    went).
+
+    ``closed`` says the observation ends the thread (DL-121 A1: a CI
+    workflow's latest run came back green); ``urgency`` is one of
+    :data:`URGENCIES`."""
     payload: dict[str, Any] = {"v": VERSION, "kind": OBSERVATION_RECORDED, "key": key,
                                "source": source, "what": what,
                                "evidence_seq": evidence_seq, "at": at or now()}
@@ -4214,6 +4226,10 @@ def observation_recorded(
         payload["refs"] = list(refs)
     if people:
         payload["people"] = list(people)
+    if closed:
+        payload["closed"] = True
+    if urgency is not None:
+        payload["urgency"] = urgency
     _validate(payload)
     return payload
 
@@ -4259,6 +4275,10 @@ def _validate_observation(payload: dict[str, Any]) -> None:
                 raise BadPayload(f"{name} must be an ISO-8601 moment") from exc
     if "thread_kind" in payload and payload["thread_kind"] not in THREAD_KINDS:
         raise BadPayload(f"thread_kind must be one of {sorted(THREAD_KINDS)}")
+    if "closed" in payload and (payload["closed"] is not True or key is None):
+        raise BadPayload("closed is true on a keyed observation, or absent")
+    if "urgency" in payload and payload["urgency"] not in URGENCIES:
+        raise BadPayload(f"urgency must be one of {sorted(URGENCIES)}")
     if "people" in payload:
         people = payload["people"]
         if (

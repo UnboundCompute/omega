@@ -39,6 +39,7 @@ from omega import (
     access,
     blobs,
     calendar,
+    cirun,
     delegate,
     derive,
     episodes,
@@ -778,6 +779,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         # DL-087 #3: checks a lost sign-in again, at most hourly: an IMAP
         # login, the Google refresh, or one MCP listing. Never a write.
         probe=access.probe,
+        # DL-121 A1: an open CI key's latest run, read from GitHub, never a write.
+        ci_runs=cirun.latest,
         # DL-092: every mailbox, when there is more than the default one.
         inbox_names=tuple(inbox.names()) if inbox.multi() else (),
         # DL-091: the phone's Shortcut door, only when a usable token is set.

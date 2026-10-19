@@ -285,6 +285,9 @@ class Runtime:
         # DL-087 #3: asks whether a lost sign-in works again. ``None`` for the
         # same reason: a default would log into their accounts from a test.
         probe: Optional[Callable[[str], Optional[bool]]] = None,
+        # DL-121 A1: a CI key's latest run on GitHub, read-only. ``None`` for
+        # the same reason: a test never reaches GitHub.
+        ci_runs: Optional[Callable[[Any], Any]] = None,
         # DL-092: every mailbox the inbox sense reads, when there is more
         # than the default one. Empty, the one mailbox is read as before.
         inbox_names: Sequence[str] = (),
@@ -336,6 +339,7 @@ class Runtime:
         self._events = events
         self._inbox = inbox
         self._probe = probe
+        self._ci_runs = ci_runs
         self._inbox_names = tuple(inbox_names)
         self._clock = clock
         self._self_review = self_review
@@ -418,6 +422,7 @@ class Runtime:
                 inbox_names=self._inbox_names,
                 pace=self._pace,
                 events=self._events,
+                ci_runs=self._ci_runs,
             )
             self._report = self._executor.recover()
             self._thread = threading.Thread(

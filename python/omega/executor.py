@@ -104,6 +104,10 @@ _WATCH_ELSEWHERE = re.compile(
 _WATCH_SOURCES = {"mail": ("mail", "travel"), "calendar": ("calendar",)}
 #: How many keyed items one compose or thinking turn is shown, newest first.
 COMPOSE_ITEMS = 12
+#: How often one open CI key's latest run is read again (DL-121 A1).
+CI_CHECK_SECONDS = 30 * 60
+#: Urgency classes, most urgent first (DL-121 A3).
+_RANK = {"urgent": 0, "normal": 1, "noise": 2}
 
 #: The key an offer on a CI key is told under (C6), so it is made once.
 CI_OFFER_PREFIX = "offer:"
@@ -111,6 +115,36 @@ CI_OFFER_REASON = "a Claude Code session on your Mac is always yours to approve"
 #: Why a thinking slot's other offers (C4) wait for their yes: thinking time
 #: may only read, so anything it would do is asked first.
 THINK_OFFER_REASON = "thinking time only reads; anything it offers is yours to approve"
+
+
+#: How much worse a machine reading must get before it is said again
+#: (DL-121 A2): this much less free disk, this many battery points, this much
+#: more load per core.
+WORSE_DISK_GB = 5.0
+WORSE_BATTERY_POINTS = 10.0
+WORSE_LOAD_PER_CORE = 0.5
+_DISK = re.compile(r"([0-9]+(?:\.[0-9]+)?) GB free")
+_BATTERY = re.compile(r"Battery: ([0-9]+(?:\.[0-9]+)?)%")
+_LOAD = re.compile(r"Load: ([0-9]+(?:\.[0-9]+)?) across ([0-9]+) cores?")
+
+
+def machine_worse(before: str, now: str) -> bool:
+    """Is the reading ``now`` worse than the one last said, ``before``, past
+    its threshold? Less free disk, a lower battery, more load per core. A
+    reading either line does not show a number for is never worse: the key
+    stays said."""
+    for pattern, worse in (
+        (_DISK, lambda a, b: a - b >= WORSE_DISK_GB),
+        (_BATTERY, lambda a, b: a - b >= WORSE_BATTERY_POINTS),
+    ):
+        a, b = pattern.search(before), pattern.search(now)
+        if a and b:
+            return worse(float(a.group(1)), float(b.group(1)))
+    a, b = _LOAD.search(before), _LOAD.search(now)
+    if a and b and int(a.group(2)) and int(b.group(2)):
+        per = lambda m: float(m.group(1)) / int(m.group(2))  # noqa: E731
+        return per(b) - per(a) >= WORSE_LOAD_PER_CORE
+    return False
 
 
 def ci_offer(
@@ -398,8 +432,14 @@ class Executor:
         inbox_names: Sequence[str] = (),
         pace: bool = False,
         events: Optional[Callable[[datetime, datetime], Sequence[Any]]] = None,
+        ci_runs: Optional[Callable[[Any], Any]] = None,
     ) -> None:
         self._queue = queue
+        # DL-121 A1: a CI key's latest run, read-only (`omega.cirun.latest`),
+        # injected so a test never reaches GitHub. ``None`` checks nothing.
+        self._ci_runs = ci_runs
+        self._ci_checked: dict[str, datetime] = {}
+        self._ci_unchecked: dict[str, str] = {}
         self._complete = complete
         self._act = act
         # DL-068's two senses for the unprompted look, both injected so a test
@@ -1582,7 +1622,7 @@ class Executor:
                 machine_known=st.machine_known,
                 calendar=calendar_lines,
                 inbox=inbox_lines,
-                held=() if slot else outbox.held_lines(drafts, now=moment),
+                held=() if slot else outbox.held_lines(self._by_urgency(drafts), now=moment),
             )
             keys: Optional[list[str]] = None
             said = notice.said_taint(st, now=moment)
@@ -1592,12 +1632,31 @@ class Executor:
                 # a presence moment, from the keyed items still waiting. A
                 # look with nothing to compose is closed quiet when handled.
                 self._observe_machines(machine_lines, st, moment)
-                waiting = self._waiting(moment)
+                self._check_ci(moment)
+                self._observe_projects(moment)
+                self._observe_checkin(moment)
+                if self._ci_unchecked:
+                    text = "\n".join([text, "", *(
+                        f"- [{k}] couldn't check its latest run on GitHub ({why}): "
+                        "it may have gone green; do not call it failing as fact"
+                        for k, why in sorted(self._ci_unchecked.items())
+                    )])
+                waiting = self._waiting(
+                    moment, slot=slot is not None,
+                    brief=slot is not None and self._briefs_in(slot),
+                )
+                here = self._here(moment, box)
+                why = outbox.hold(box, moment, here=here) if slot is None and waiting else None
+                if why == outbox.HOLD_BUDGET:
+                    # DL-121 A3: an urgent thread may take one past the cap.
+                    urgent = [i for i in waiting if ledger.urgency(i) == "urgent"]
+                    if urgent and outbox.hold(box, moment, here=here, urgent=True) is None:
+                        waiting, why = urgent, None
                 if slot is not None:
-                    text = self._thinking_text(slot, text, drafts, moment, waiting)
-                elif waiting and outbox.hold(
-                    box, moment, here=self._here(moment, box)
-                ) is None:
+                    text = self._thinking_text(
+                        slot, text, self._by_urgency(drafts), moment, waiting,
+                    )
+                elif waiting and why is None:
                     text = outbox.compose_text(
                         ledger.lines(waiting, now=moment), situation=text
                     )
@@ -1939,22 +1998,32 @@ class Executor:
         """
         if not box.drafts or st.outstanding:
             return False
-        if outbox.hold(box, moment, here=self._here(moment, box)) is not None:
+        here = self._here(moment, box)
+        drafts = self._by_urgency(box.drafts)
+        why = outbox.hold(box, moment, here=here)
+        if why == outbox.HOLD_BUDGET:
+            # DL-121 A3: with the cap reached, only the urgent drafts may go
+            # (one past it); the rest stay held for tomorrow.
+            urgent = set(self._urgent_keys([k for d in drafts for k in d.keys]))
+            drafts = tuple(d for d in drafts if set(d.keys) & urgent)
+            if drafts and outbox.hold(box, moment, here=here, urgent=True) is None:
+                why = None
+        if why is not None:
             return False
         if self._online is not None and not self._online():
             return False
         if outbox.conversing(st.looked_at, now=moment):
             return False
         self._queue.append(episodes.inbound(
-            outbox.recheck_text(box.drafts, said=st.said, now=moment),
+            outbox.recheck_text(drafts, said=st.said, now=moment),
             channel=notice.CHANNEL,
-            queued=[d.seq for d in box.drafts],
+            queued=[d.seq for d in drafts],
             at=moment.isoformat(),
             # A draft a look wrote off their mail carries that mail's taint
             # into the re-check, and into every turn that recalls it (DL-108);
             # so does a reply in "what you last told them" drawn from mail.
-            untrusted=outbox.carried_taint(box.drafts, said=notice.said_taint(st)),
-            keys=self._keys(*(k for d in box.drafts for k in d.keys)),
+            untrusted=outbox.carried_taint(drafts, said=notice.said_taint(st)),
+            keys=self._keys(*(k for d in drafts for k in d.keys)),
         ))
         return True
 
@@ -2037,35 +2106,167 @@ class Executor:
             return None
         return outbox.brief_owed(self._outbox.advance(self._queue.store).state(), moment)
 
-    def _waiting(self, moment: datetime) -> list["ledger.Item"]:
-        """The keyed items the composer may tell them now (C3), newest
-        :data:`COMPOSE_ITEMS`; a fold that fails offers nothing."""
+    def _check_ci(self, moment: datetime) -> None:
+        """Close each open CI key whose workflow's latest run came back green
+        after it failed (DL-121 A1), read-only, at most every
+        :data:`CI_CHECK_SECONDS` a key. A run that cannot be read leaves the
+        key open and is remembered as "couldn't check" for the look to say."""
+        if self._ci_runs is None:
+            return
+        try:
+            state = self._ledger.advance(self._queue.store).state()
+        except Exception:  # noqa: BLE001 - a sense never kills the look
+            return
+        at = moment.isoformat()
+        for item in state.items.values():
+            if not item.key.startswith("ci:") or item.closed:
+                self._ci_unchecked.pop(item.key, None)
+                continue
+            last = self._ci_checked.get(item.key)
+            if last is not None and 0 <= (moment - last).total_seconds() < CI_CHECK_SECONDS:
+                continue
+            self._ci_checked[item.key] = moment
+            try:
+                run = self._ci_runs(item)
+            except Exception:  # noqa: BLE001 - fails closed
+                run = None
+            if run is None:
+                self._ci_unchecked[item.key] = "GitHub could not be read"
+                continue
+            self._ci_unchecked.pop(item.key, None)
+            failed = ledger._parse(item.when) or ledger._parse(item.last_at)
+            if run.conclusion != "success" or (failed is not None and run.at <= failed):
+                continue
+            name = item.what[len("CI failed: "):] if item.what.startswith("CI failed: ") else item.key
+            self._queue.append(episodes.observation_recorded(
+                key=item.key, source="ci",
+                what=ledger._clip(f"CI green again: {name} (its latest run passed)"),
+                url=getattr(run, "url", None) if str(getattr(run, "url", "") or "").startswith("https://") else None,
+                ref=f"{item.key}@green@{run.at.isoformat()}"[:300],
+                when=run.at.isoformat(), at=at, thread_kind="ci", closed=True,
+            ))
+
+    def _waiting(
+        self, moment: datetime, *, slot: bool = False, brief: bool = False
+    ) -> list["ledger.Item"]:
+        """The keyed items the composer may tell them now (C3): the most
+        urgent first (DL-121 A3), then the newest, :data:`COMPOSE_ITEMS` of
+        them, in log order; a fold that fails offers nothing. Noise only for
+        a brief, a project only for a thinking slot."""
         try:
             state = self._ledger.advance(self._queue.store).state()
         except Exception:  # noqa: BLE001 - a sense never kills the look
             return []
-        waiting = state.waiting(moment)
+        waiting = state.waiting(moment, slot=slot, brief=brief)
         # M3′: a key whose one follow-up is due waits too, told or not.
         have = {i.key for i in waiting}
         due = [i for i in state.follow_ups(moment) if i.key not in have]
-        return sorted([*waiting, *due], key=lambda i: i.last_seq)[-COMPOSE_ITEMS:]
+        kept = sorted([*waiting, *due], key=lambda i: (_RANK[ledger.urgency(i)], -i.last_seq))
+        return sorted(kept[:COMPOSE_ITEMS], key=lambda i: i.last_seq)
+
+    def _urgent_keys(self, keys: Any) -> tuple[str, ...]:
+        """Which of ``keys`` are urgent threads (DL-121 A3)."""
+        if not isinstance(keys, (list, tuple)) or not keys:
+            return ()
+        try:
+            state = self._ledger.advance(self._queue.store).state()
+        except Exception:  # noqa: BLE001 - unknown is not urgent
+            return ()
+        return tuple(
+            str(k) for k in keys
+            if (i := state.get(str(k))) is not None and ledger.urgency(i) == "urgent"
+        )
+
+    def _by_urgency(self, drafts: Sequence[outbox.Draft]) -> tuple[outbox.Draft, ...]:
+        """Held drafts, the most urgent first and oldest first within a class
+        (DL-121 A3): what a capped prompt keeps when it must cut."""
+        try:
+            state = self._ledger.advance(self._queue.store).state()
+        except Exception:  # noqa: BLE001 - as they were
+            return tuple(drafts)
+
+        def rank(d: outbox.Draft) -> int:
+            found = [state.get(k) for k in d.keys]
+            return min((_RANK[ledger.urgency(i)] for i in found if i is not None), default=1)
+
+        return tuple(sorted(drafts, key=lambda d: (rank(d), d.seq)))
+
+    def _observe_projects(self, moment: datetime) -> None:
+        """Each project they touched in the last week, as a key a thinking
+        slot decides on (DL-121 #6): ``project:<name>``, one observation per
+        coding session, from the projects data and nothing inferred."""
+        store = self._queue.store
+        try:
+            state = self._ledger.advance(store).state()
+            found = projects.latest(projects.states(store))
+        except Exception:  # noqa: BLE001 - a sense never kills the look
+            return
+        since = moment - timedelta(days=projects.DEFAULT_DAYS)
+        for name, p in sorted(found.items()):
+            ended = ledger._parse(p.get("ended_at"))
+            if ended is None or ended < since or ended > moment + timedelta(minutes=5):
+                continue
+            key = ledger.key("project", "-".join(str(name).lower().split()))
+            ref = f"session:{p.get('session')}"[:300]
+            if state.has_ref(key, ref):
+                continue
+            blocked = str(p.get("blocked") or "") or "nothing noted"
+            self._queue.append(episodes.observation_recorded(
+                key=key, source="project",
+                what=ledger._clip(
+                    f"project {name}: stopped at: {p.get('stopped_at') or 'not noted'} "
+                    f"Next: {p.get('next_step') or 'not noted'} Blocked: {blocked}"
+                ),
+                ref=ref, when=ended.isoformat(), at=moment.isoformat(),
+            ))
+
+    def _observe_checkin(self, moment: datetime) -> None:
+        """Open today's check-in after two days of their silence (DL-121
+        #7): once a day, never after their "not now", and never about a
+        tender topic they did not raise. The composer, or the slot, decides
+        whether it is said; the outbox's cap and backoff still hold."""
+        try:
+            state = self._ledger.advance(self._queue.store).state()
+        except Exception:  # noqa: BLE001 - a sense never kills the look
+            return
+        key = state.checkin_due(moment)
+        if key is None:
+            return
+        heard = ledger._parse(state.heard_at)
+        days = int((moment - heard).total_seconds() // 86400) if heard else 2
+        self._queue.append(episodes.observation_recorded(
+            key=key, source="followup",
+            what=(
+                f"They have been quiet for {days} days. A light check-in is fine, at most "
+                "about something open they raised themselves, never an emotional topic "
+                "they did not raise; if they say not now, stop."
+            ),
+            at=moment.isoformat(),
+        ))
 
     def _observe_machines(
         self, lines: Sequence[str], st: notice.Standing, moment: datetime
     ) -> None:
-        """A machine reading code newly flagged, as an observation (C3): the
-        look no longer speaks of it itself."""
-        known = {key for key, _, _ in st.flagged_since}
+        """A flagged machine reading, as an observation on its stable key
+        (C3, DL-121 A2): ``machine:<device-reading>``, said once, and again
+        only when it is worse past :func:`machine_worse`'s threshold. A flag
+        that clears and comes back (a stale Mac flickers) is not news."""
+        try:
+            state = self._ledger.advance(self._queue.store).state()
+        except Exception:  # noqa: BLE001 - a sense never kills the look
+            return
         at = moment.isoformat()
         for line in lines:
             if not (isinstance(line, str) and notice.is_flagged(line)):
                 continue
             about = notice.machine_key(line)
-            if about in known:
+            key = ledger.key("machine", "-".join(about.lower().split()))
+            item = state.get(key)
+            if item is not None and not machine_worse(item.what, line):
                 continue
             self._queue.append(episodes.observation_recorded(
-                key=ledger.key("machine", "-".join(about.lower().split())),
-                source="machine", what=ledger._clip(line, episodes.MAX_OBSERVATION_WHAT),
+                key=key, source="machine",
+                what=ledger._clip(line, episodes.MAX_OBSERVATION_WHAT),
                 ref=f"{about}@{at}"[:300], at=at,
             ))
 
@@ -2122,12 +2323,20 @@ class Executor:
         if moment is None or moment.tzinfo is None:
             why: Optional[str] = outbox.HOLD_CLOCK
         else:
-            why = outbox.hold(
-                box, moment, here=self._here(moment, box), slot=slot,
-                brief=slot and str(event.get("text", "")).startswith(tools.BRIEF_LEAD),
-            )
+            here = self._here(moment, box)
+            brief = slot and str(event.get("text", "")).startswith(tools.BRIEF_LEAD)
+            why = outbox.hold(box, moment, here=here, slot=slot, brief=brief)
+        over: Optional[str] = None
+        urgent = self._urgent_keys(event.get("keys"))
+        if why == outbox.HOLD_BUDGET and urgent and moment is not None and outbox.hold(
+            box, moment, here=here, slot=slot, brief=brief, urgent=True,
+        ) is None:
+            # DL-121 A3: past the cap by one, only if it speaks for one of
+            # these (the gate checks again once the turn names its keys).
+            why, over = None, outbox.HOLD_BUDGET
         compose = look and not slot and not recheck and bool(event.get("keys"))
         return outbox.Gate(
+            over=over, urgent=urgent,
             hold=why,
             source=(
                 "thinking" if slot else "recheck" if recheck

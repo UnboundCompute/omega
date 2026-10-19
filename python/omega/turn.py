@@ -1064,6 +1064,10 @@ def run_turn(
                 keys = tuple(thought.keys)
                 if gate is not None:
                     gate = replace(gate, keys=keys)
+            elif gate is not None and gate.over:
+                # Past the cap only for an urgent key it names (DL-121 A3):
+                # a message that names none is held like any other.
+                gate = replace(gate, keys=())
         else:
             verdict = judge(ctx)
             if verdict.choice != ACT_THEN_SPEAK and not unprompted(ctx) and granted.answers(
