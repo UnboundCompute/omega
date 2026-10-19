@@ -2418,7 +2418,30 @@ class Executor:
         lines = [f"where omega runs: {line}" for line in local]
         for r in reported:
             lines.extend(machine.reported_lines(r.device, r.at, r.body, now=now))
+            lines.extend(self._stale_cause(r, now=now))
         return tuple(lines)
+
+    def _stale_cause(self, r: Any, *, now: datetime) -> Sequence[str]:
+        """Why a reported machine is stale, when the log can tell (DL-121 A5).
+
+        Presence is reported on its own, every five minutes while they are at
+        the Mac. Stale readings with fresh presence mean the relay is up and
+        its machine sense is failing; both stale means nothing reaches the
+        core from it at all: asleep, off, or cut off from the core.
+        """
+        age = machine._age_seconds(r.at, now)
+        if age is not None and age <= machine.STALE_SECONDS:
+            return ()
+        try:
+            seen = self._readings.latest(episodes.REPORT_PRESENCE, r.device)
+        except Exception:  # noqa: BLE001 - a sense never kills the look
+            seen = None
+        heard = machine._age_seconds(seen.at, now) if seen is not None else None
+        if heard is not None and heard <= machine.STALE_SECONDS:
+            return (f"{r.device}: its relay still reports presence, so its machine "
+                    "readings are failing on the Mac itself",)
+        return (f"{r.device}: nothing at all from it for a while: the Mac is asleep, "
+                "off, or cannot reach the core",)
 
     def _handle(self, pending: Pending) -> Optional[TurnResult]:
         if not pending.is_event:

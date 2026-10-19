@@ -179,9 +179,14 @@ class Relay:
             ):
                 try:
                     sent[name] = step(client)
-                except (OSError, ChannelError, ValueError) as exc:
-                    # One sense failing does not stop the others; a dropped
-                    # connection fails them all, and the next pass reconnects.
+                except OSError as exc:
+                    # A dropped or timed-out connection: every later step
+                    # would write to the same dead socket and fail the same
+                    # way (DL-121 A5), so stop here; the next pass reconnects.
+                    self._note(f"relay: {name} pass failed, connection lost: {exc}")
+                    break
+                except (ChannelError, ValueError) as exc:
+                    # One sense failing does not stop the others.
                     self._note(f"relay: {name} pass failed: {exc}")
         finally:
             try:

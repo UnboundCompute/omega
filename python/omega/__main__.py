@@ -453,6 +453,14 @@ def serve(
         signal.signal(signal.SIGINT, previous_int)
 
 
+def _stamp() -> str:
+    """Local time to the second, for the relay's own lines (DL-121 A5): a
+    log of "cannot reach the core" with no time cannot say which morning."""
+    from datetime import datetime
+
+    return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
 def relay(
     host: str,
     port: int,
@@ -494,7 +502,7 @@ def relay(
         read_idle=machine.idle_seconds,
         transcribe=sarvam.with_fallback(chosen, log=write),
         not_ready=not_ready,
-        log=write,
+        log=lambda line: write(f"{_stamp()} {line}"),
     )
     previous_term = signal.signal(signal.SIGTERM, request_stop)
     previous_int = signal.signal(signal.SIGINT, request_stop)
