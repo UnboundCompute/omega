@@ -2093,9 +2093,10 @@ class Executor:
 
     def _gate(self, event: dict[str, Any]) -> Optional[outbox.Gate]:
         """The outbox's decision for this turn (DL-098), or ``None`` for a turn
-        it has no say over: everything they asked for, and every tell but the
-        ones it sent. A look, a thinking turn and the self-review may be held;
-        a tell it sent was already let through when it was written."""
+        it has no say over: everything they asked for, every tell but the
+        ones it sent, and the self-review (journal-only, DL-121 A4). A look
+        and a thinking turn may be held; a tell it sent was already let
+        through when it was written."""
         if event.get("kind", episodes.MESSAGE_INBOUND) != episodes.MESSAGE_INBOUND:
             return None
         channel = event.get("channel")
@@ -2106,7 +2107,9 @@ class Executor:
                 return None
             return outbox.Gate(hold=None, source="followup", at=at, queued=tuple(queued))
         look = channel == notice.CHANNEL
-        if not (look or lessons.is_review(event)):
+        if not look:
+            # The self-review is journal-only (DL-121 A4): it never speaks,
+            # so the outbox has nothing to hold.
             return None
         slot = look and isinstance(event.get("thinking"), str)
         recheck = look and not slot and isinstance(event.get("queued"), list)

@@ -1877,9 +1877,10 @@ def _review(
 ) -> TurnResult:
     """omega's weekly self-review (DL-086), in place of judge, act and reply.
 
-    One LEARN call over evidence code built (:mod:`omega.lessons`). It speaks
-    a short report when something changed and is quiet when nothing did,
-    which is a review that read the log and found nothing to learn, not a
+    One LEARN call over evidence code built (:mod:`omega.lessons`). Its short
+    report, when something changed, goes to the journal and never to them
+    (DL-121 A4), and the turn ends quiet. Quiet with no report is a review
+    that read the log and found nothing to learn, not a
     look that skipped looking: this path never reaches :func:`reply`, where
     the unlooked rule lives. An answer that was not the shape writes nothing
     and fails the turn, so the failure follow-up counts it.
@@ -1897,20 +1898,29 @@ def _review(
         return TurnResult(
             seq=pending.seq, outcome="failed", record_seq=record, error=error
         )
-    if done.report is None or (
-        gate is not None and outbox.settle(queue, pending.seq, gate, done.report)
-    ):
-        record = write_memory(
-            queue, seq=pending.seq, outcome="silent", usage=meter.usage(), at=at
-        )
-        return TurnResult(seq=pending.seq, outcome="silent", record_seq=record)
+    if done.report is not None:
+        # Journal-only (DL-121 A4): what the review learned is written where
+        # the next thinking slot reads it, and never queued to them.
+        queue.append(episodes.journal_written(
+            for_seq=pending.seq, slot=REVIEW_SLOT,
+            changed=_clip_journal(done.report), questions=(), insights=(),
+            decisions=(), considered=(), outcome="silent", why=REVIEW_WHY, at=at,
+        ))
     record = write_memory(
-        queue, seq=pending.seq, outcome="spoke", reply_text=done.report,
-        usage=meter.usage(), at=at,
+        queue, seq=pending.seq, outcome="silent", usage=meter.usage(), at=at
     )
-    return TurnResult(
-        seq=pending.seq, outcome="spoke", record_seq=record, reply=done.report
-    )
+    return TurnResult(seq=pending.seq, outcome="silent", record_seq=record)
+
+
+#: The self-review's journal entry (DL-121 A4).
+REVIEW_SLOT = "self-review"
+REVIEW_WHY = "the self-review is journal-only; it is never sent to them"
+
+
+def _clip_journal(text: str) -> str:
+    one = " ".join(str(text).split())
+    cap = episodes.MAX_JOURNAL_TEXT
+    return one if len(one) <= cap else one[: cap - 1].rstrip() + "…"
 
 
 def _judge_messages(ctx: TurnContext) -> list[provider.Message]:

@@ -311,9 +311,13 @@ def test_a_cited_lesson_is_learned_and_reported(q: EventQueue) -> None:
     result, _ = review(q, answer(learned=[{"text": "Look before answering.", "cites": [cite]}]))
     [learned] = kinds(q, episodes.LESSON_LEARNED)
     assert learned["text"] == "Look before answering." and learned["cites"] == [cite]
-    assert result.outcome == "spoke"
-    assert result.reply.startswith("Self-review: learned 1, retracted 0, saved 0 skills.")
-    assert "Look before answering." in result.reply
+    # Journal-only (DL-121 A4): the report is written down, never queued.
+    assert result.outcome == "silent" and result.reply is None
+    [entry] = kinds(q, episodes.JOURNAL_WRITTEN)
+    assert entry["slot"] == "self-review" and entry["outcome"] == "silent"
+    assert entry["changed"].startswith("Self-review: learned 1, retracted 0, saved 0 skills.")
+    assert "Look before answering." in entry["changed"]
+    assert kinds(q, episodes.MESSAGE_QUEUED) == []
     [done] = kinds(q, episodes.REVIEW_DONE)
     assert done["learned"] == 1 and done["since_seq"] == 0
 
@@ -425,7 +429,9 @@ def test_retraction_and_strike_remove_a_lesson(q: EventQueue) -> None:
     b = learn_lesson(q, "Lesson B.")
     cite = say(q, "no, that's wrong, I never said that")
     result, _ = review(q, answer(retracted=[{"lesson": a, "cites": [cite]}]))
-    assert result.reply.startswith("Self-review: learned 0, retracted 1, saved 0 skills.")
+    assert result.reply is None
+    assert kinds(q, episodes.JOURNAL_WRITTEN)[-1]["changed"].startswith(
+        "Self-review: learned 0, retracted 1, saved 0 skills.")
     assert [l.seq for l in state(q).lessons] == [b]
     q.append(episodes.lesson_struck(lesson=b, source_seq=cite, at=AT))
     assert not state(q)

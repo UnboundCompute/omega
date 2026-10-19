@@ -51,6 +51,8 @@ MAX_PASSES = 4
 MAX_ITEMS = 16
 MAX_OFFERS = 1
 DECISIONS = ("act", "ask", "fold", "let_go")
+#: Why an act with no lookup was folded (DL-121 #8).
+NO_LOOKUP = "act with no lookup this slot, so folded"
 _SILENT = ("SILENT", "NOTHING_NEW", "NOTHING NEW")
 _JSON = re.compile(r"\{.*\}", re.S)
 
@@ -64,6 +66,8 @@ SYSTEM = (
     "were not shown. Then a decision for every open thread: act (worth telling "
     "or doing something about now), ask (worth a question to them), fold (keep "
     "it, nothing to say yet), let_go (it no longer needs them).\n"
+    "An act needs a lookup: call a read-only tool on it this slot, or it is "
+    "folded.\n"
     "You may look things up with the read-only tools offered. You cannot do "
     "anything outward; to offer help on a thread, list it under offers (a "
     "'delegate' for a failing CI, 'handoff' for directions to an event) and "
@@ -321,6 +325,19 @@ def _settle(ctx: Any, *, slot: str, parsed: dict[str, Any], items: Sequence[ledg
             if ask:
                 asks.append(ask)
                 offered_keys.append(raw["key"])
+    # DL-121 #8: an act is a thread worth doing something about now, which
+    # takes a look first. One with no lookup this slot (and no offer on its
+    # key) is folded, and the journal says why.
+    downgraded = 0
+    for k, d in said.items():
+        if d["decision"] == "act" and not used and k not in offered_keys:
+            d["decision"] = "fold"
+            d["why"] = _sentence(f"{NO_LOOKUP}: {d['why']}", episodes.MAX_OUTBOX_WHY)
+            downgraded += 1
+    if downgraded and message and not asks and not brief and not any(
+        d["decision"] in ("act", "ask") for d in said.values()
+    ):
+        message, why = None, NO_LOOKUP
     if asks:
         message = "\n\n".join([*( [message] if message else []), *asks])
     if brief and message is None:
