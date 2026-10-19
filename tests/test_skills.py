@@ -32,7 +32,8 @@ def test_a_cited_skill_is_saved_and_reported(q: EventQueue) -> None:
     ]
     [s] = state(q).skills
     assert s.seq == skill
-    reply = [p for p in kinds(q, episodes.TURN_COMPLETED) if p.get("reply")][-1]["reply"]
+    # Journal-only (DL-121 A4): the report is the review's journal entry.
+    reply = kinds(q, episodes.JOURNAL_WRITTEN)[-1]["changed"]
     assert reply.startswith("Self-review: learned 0, retracted 0, saved 1 skill.")
     assert "weekly digest" in reply
 
@@ -66,13 +67,15 @@ def test_two_corrections_retire_a_skill(q: EventQueue) -> None:
     c1 = say(q, "no, that's wrong, I wanted mail too")
     r1, _ = review(q, answer(corrected=[{"skill": skill, "cites": [c1]}]))
     assert state(q).skill(skill).corrections == 1
-    assert "corrected" in r1.reply
+    assert r1.reply is None
+    assert "corrected" in kinds(q, episodes.JOURNAL_WRITTEN)[-1]["changed"]
     c2 = say(q, "no, I meant the whole month")
     r2, _ = review(q, answer(corrected=[{"skill": skill, "cites": [c2]}]))
     assert state(q).skill(skill) is None
     [retired] = kinds(q, episodes.SKILL_RETIRED)
     assert retired["skill"] == skill
-    assert "retired skill" in r2.reply
+    assert r2.reply is None
+    assert "retired skill" in kinds(q, episodes.JOURNAL_WRITTEN)[-1]["changed"]
 
 
 def test_saving_the_same_name_again_replaces_the_older_way(q: EventQueue) -> None:

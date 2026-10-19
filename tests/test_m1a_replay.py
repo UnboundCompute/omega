@@ -201,8 +201,11 @@ def test_flight_day(q: EventQueue) -> None:
 
 def test_argus_ci_day(q: EventQueue) -> None:
     q.append(episodes.inbound("hello", channel="tray", at=local(15, 6).isoformat()))
+    # Touched over a week ago: still a project of theirs for the offer's
+    # folder, but not a project: key of its own (DL-121 #6), so the morning
+    # slot has nothing to spend the day's budget on before the CI fails.
     q.append(episodes.project_state(
-        project="argus", session="s-synthetic", ended_at=local(14, 18).isoformat(),
+        project="argus", session="s-synthetic", ended_at=local(7, 18).isoformat(),
         stopped_at="synthetic stop", next_step="synthetic next", blocked="",
     ))
 

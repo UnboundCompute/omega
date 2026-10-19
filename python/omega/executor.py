@@ -370,6 +370,9 @@ class Executor:
 
     __slots__ = (
         "_queue",
+        "_ci_runs",
+        "_ci_checked",
+        "_ci_unchecked",
         "_complete",
         "_act",
         "_recovered",

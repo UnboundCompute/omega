@@ -624,14 +624,14 @@ def test_a_follow_up_with_them_here_is_told_as_before_and_counted(q: EventQueue)
 # --- the self-review ----------------------------------------------------------
 
 
-def test_the_self_review_is_gated_like_a_look(q: EventQueue) -> None:
+def test_the_self_review_is_journal_only_and_never_gated(q: EventQueue) -> None:
+    # DL-121 A4: the review never speaks, so the outbox has nothing to hold.
     ex = executor(q)
     event = episodes.inbound(
         f"{lessons.REVIEW_LEAD} x", channel="schedule", schedule_id=lessons.REVIEW_ID,
         at=local(18, 20, 0).isoformat(),
     )
-    gate = ex._gate(event)
-    assert gate is not None and gate.source == "review" and gate.hold == outbox.HOLD_AWAY
+    assert ex._gate(event) is None
 
 
 # --- what is exempt, and equivalence ----------------------------------------------
